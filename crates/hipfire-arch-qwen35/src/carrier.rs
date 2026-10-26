@@ -622,6 +622,7 @@ pub fn weight_slab_default(_gpu_arch: &str) -> Option<hip_bridge::SlabMode> {
 /// [`KvCache::free_gpu`]) and the original error is preserved with any
 /// cleanup/VMM-pending context appended.
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, String> {
+    crate::npu_trunk::check_mode()?;
     let ModelSource::Hfq(mut hfq) = src else {
         return Err("qwen35: directory source unsupported".into());
     };

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Flash-Next calibration identity: the compiled-in measured Halo records, the model trunk index digest and the
 //! host facts a record is keyed on. The schema-4 record itself is `hipfire_runtime::coproc::calibration`.
-use super::shapes::FLASH_NEXT;
-use hipfire_runtime::coproc::{calibration_key, CalKey, Calibration};
+use super::{arch_admits_auto, shapes::FLASH_NEXT, SWITCH};
+use hipfire_runtime::coproc::{calibration_key, CalKey, Calibration, Mode};
 use std::{fs, path::Path};
 
 /// The compiled-in measured Halo record of a trunk route (`stock` or the overlay).
@@ -203,9 +203,9 @@ pub fn model_index_identity(
     hfq: &hipfire_runtime::hfq::HfqFile,
     arch: &str,
 ) -> Option<Result<String, String>> {
-    if super::NpuTrunkMode::from_env()
+    if Mode::from_config(SWITCH, Mode::Auto)
         .ok()
-        .is_none_or(|mode| mode.resolve(arch).is_off())
+        .is_none_or(|mode| mode.resolve(arch_admits_auto(arch)).is_off())
     {
         return None;
     }

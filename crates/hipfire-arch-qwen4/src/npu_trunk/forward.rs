@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Calibrated Halo scheduler. Effective off performs no new I/O or allocation.
 use super::*;
-use crate::npu_trunk::{self as trunk, Family, FamilyMask, NpuTrunkMode, Shape, FLASH_NEXT};
+use crate::npu_trunk::{
+    self as trunk, arch_admits_auto, Family, FamilyMask, Shape, FLASH_NEXT, SWITCH,
+};
 use hipfire_dispatch::pipeline::{
     execute_gated_delta_net_core_rows, execute_gated_delta_net_uncovered,
     execute_grouped_depthwise_rows, execute_indexed_attention_core_rows,
     execute_indexed_attention_uncovered, execute_validated_steps_window, gdn_qkv_projection_bf16,
     CoreWindow, GdnTrunkArenas, HcFusionCursor, QsaTrunkArenas,
 };
-use hipfire_runtime::coproc::{self, EpilogueContract, PairOp};
+use hipfire_runtime::coproc::pair::{launch_geometry, BankLaunch, CutSite, PairShape};
+use hipfire_runtime::coproc::{self, EpilogueContract, Mode, PairOp};
 use railgun::npu::trunk::{
     padded_rows_of, LayerPanels, NpuTrunkRuntime, OpenOptions, PanelBuild, PanelProgram, Seq,
     TxnBuilder, MAX_ADAPTIVE_CONTEXTS,
@@ -18,7 +21,7 @@ use rdna_compute::tensor_ops::Bf16Arena;
 use std::{ffi::c_void, io::Write};
 
 pub(super) struct NpuForward {
-    mode: NpuTrunkMode,
+    mode: Mode,
     families: FamilyMask,
     request_families: FamilyMask,
     family_override: Option<FamilyMask>,
@@ -51,7 +54,7 @@ pub(super) struct NpuForward {
     /// Wave-padded bank rows below 8192 whose row-adaptive NPU programs this load admitted ([`admitted_plan`]).
     adaptive: Vec<usize>,
     /// The fault latch: set by the first pair fault under `auto`, it keeps the route off for the process.
-    latch: trunk::containment::FaultLatch,
+    latch: coproc::containment::FaultLatch,
     /// PCI bus id the runtime opened on (host facts in the fault line); `None` when no runtime opened.
     gpu_pci: Option<String>,
 }
@@ -314,7 +317,7 @@ enum PreparedLayers {
     Packed(Vec<(Shape, trunk::PackedB, Vec<u8>)>),
 }
 pub(crate) struct PreparedTrunk {
-    mode: NpuTrunkMode,
+    mode: Mode,
     layers: PreparedLayers,
     download_ms: f64,
     pack_ms: f64,
@@ -334,7 +337,7 @@ fn match_calibration(
     gpu: &Gpu,
     bundle: &Qwen4Bundle,
     route: &str,
-    mode: NpuTrunkMode,
+    mode: Mode,
     firmware: Option<&str>,
 ) -> Result<
     (
@@ -378,7 +381,7 @@ fn match_calibration(
                 key.kernel.uname_release, key.device.npu_fw_version, key.device.pci_bdf);
         }
     }
-    let families = if mode == NpuTrunkMode::Auto {
+    let families = if mode == Mode::Auto {
         coproc::auto_admission(&FLASH_NEXT, &cal, &key)?
     } else {
         cal.key_matches(&key)?;
@@ -388,7 +391,7 @@ fn match_calibration(
 }
 
 fn pack_stock(
-    mode: NpuTrunkMode,
+    mode: Mode,
     raw: Vec<(Shape, Vec<(usize, Vec<u8>)>)>,
     families: FamilyMask,
 ) -> Result<Vec<(Shape, trunk::PackedB, Vec<u8>)>, Qwen4GpuForwardError> {
@@ -422,12 +425,12 @@ fn pack_stock(
             scales: Vec::new(),
             map: shape.column_map(families),
         });
-        let mut codes = if mode == NpuTrunkMode::Emulate {
+        let mut codes = if mode == Mode::Emulate {
             vec![0u8; b.map.padded_cols() * 2560]
         } else {
             Vec::new()
         };
-        if mode == NpuTrunkMode::Emulate {
+        if mode == Mode::Emulate {
             let full = shape.column_map(FamilyMask::ALL);
             for &(family, col, width) in &b.map.parts {
                 let i = full
@@ -458,11 +461,13 @@ impl NpuForward {
         rows: usize,
         scratch_mode: Qwen4ForwardScratchMode,
     ) -> Result<Option<PreparedTrunk>, Qwen4GpuForwardError> {
-        let mode = NpuTrunkMode::from_env().map_err(fail)?.resolve(&gpu.arch);
+        let mode = Mode::from_config(SWITCH, Mode::Auto)
+            .map_err(fail)?
+            .resolve(arch_admits_auto(&gpu.arch));
         if mode.is_off() {
             return Ok(None);
         }
-        let result = trunk::admission::prepare_after_checks(
+        let result = coproc::admission::prepare_after_checks(
             || {
                 if *bundle.weights.band_scope()
                     != crate::weights::Qwen4BandScope::single(&bundle.config)
@@ -475,7 +480,7 @@ impl NpuForward {
                 {
                     return Err(fail("requires Flash-Next family B, K=2560, gfx1151"));
                 }
-                if mode != NpuTrunkMode::Emulate
+                if mode != Mode::Emulate
                     && (rows != 8192
                         || scratch_mode != Qwen4ForwardScratchMode::Full
                         || bundle.weights.ep_placement().is_some())
@@ -518,7 +523,7 @@ impl NpuForward {
                 FLASH_NEXT
                     .check_model(&kinds, bundle.config.hidden_size)
                     .map_err(fail)?;
-                if mode == NpuTrunkMode::Auto {
+                if mode == Mode::Auto {
                     // Reject the memory rung downgrade before downloading stock rows.
                     let (free, _) = gpu.device_mem_info()?;
                     let required = qwen4_forward_device_bytes(&bundle.config, rows, scratch_mode)
@@ -532,7 +537,7 @@ impl NpuForward {
                 Ok(())
             },
             || {
-                if mode == NpuTrunkMode::Auto {
+                if mode == Mode::Auto {
                     trunk::npu_firmware().map(Some).map_err(fail)
                 } else {
                     Ok(None)
@@ -544,7 +549,7 @@ impl NpuForward {
                     .as_ref()
                     .map(|overlay| overlay.default)
                     .or(bundle.config.trunk_iu4_default);
-                if mode != NpuTrunkMode::Auto {
+                if mode != Mode::Auto {
                     return Ok((None, FamilyMask::ALL, route));
                 }
                 let trunk_route = route.map_or_else(
@@ -570,7 +575,7 @@ impl NpuForward {
                     let mut mats = Vec::with_capacity(4);
                     for (reference, &family) in refs.into_iter().zip(shape.families()) {
                         let m = reference.shape[0];
-                        let bytes = if mode != NpuTrunkMode::Auto || families.contains(family) {
+                        let bytes = if mode != Mode::Auto || families.contains(family) {
                             let w = bundle.weights.resident(reference)?;
                             let mut bytes = vec![0; m * 2560 / 256 * 200];
                             gpu.hip.memcpy_dtoh(&mut bytes, &w.buf)?;
@@ -584,7 +589,7 @@ impl NpuForward {
                 }
                 let download_ms = started.elapsed().as_secs_f64() * 1000.0;
                 let packing_started = Instant::now();
-                let layers = if mode == NpuTrunkMode::Auto {
+                let layers = if mode == Mode::Auto {
                     PreparedLayers::Packed(pack_stock(mode, raw, families)?)
                 } else {
                     PreparedLayers::Stock(raw)
@@ -602,7 +607,7 @@ impl NpuForward {
                 }))
             },
         );
-        trunk::admission::finish(mode, result)
+        coproc::admission::finish(SWITCH, mode, result)
     }
 
     pub(super) fn load(
@@ -613,15 +618,18 @@ impl NpuForward {
         scratch_mode: Qwen4ForwardScratchMode,
         prepared: Option<Option<PreparedTrunk>>,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
-        let mode = NpuTrunkMode::from_env().map_err(fail)?.resolve(&gpu.arch);
+        let mode = Mode::from_config(SWITCH, Mode::Auto)
+            .map_err(fail)?
+            .resolve(arch_admits_auto(&gpu.arch));
         if mode.is_off() {
             return Ok(None);
         }
         // Eligibility was settled in `prepare_stock`; anything failing here failed to arm a qualifying model.
-        trunk::admission::finish(
+        coproc::admission::finish(
+            SWITCH,
             mode,
             Self::load_admitted(gpu, bundle, scratch, rows, scratch_mode, prepared)
-                .map_err(trunk::admission::Refusal::Failed),
+                .map_err(coproc::admission::Refusal::Failed),
         )
     }
 
@@ -657,7 +665,7 @@ impl NpuForward {
             .map(|value| parse_family_override(&value))
             .transpose()
             .or_else(|reason| {
-                if mode == NpuTrunkMode::Auto {
+                if mode == Mode::Auto {
                     eprintln!("npu-trunk: {reason}; ignoring override");
                     Ok(None)
                 } else {
@@ -668,7 +676,7 @@ impl NpuForward {
             || "stock".to_owned(),
             |default| format!("overlay:{}", default.marker()),
         );
-        let matched = if mode == NpuTrunkMode::Auto {
+        let matched = if mode == Mode::Auto {
             matched
         } else {
             match match_calibration(gpu, bundle, &trunk_route, mode, None) {
@@ -694,7 +702,7 @@ impl NpuForward {
         if families.is_empty() {
             return Ok(None);
         }
-        let physical = mode != NpuTrunkMode::Emulate;
+        let physical = mode != Mode::Emulate;
         if physical
             && (rows != 8192
                 || scratch_mode != Qwen4ForwardScratchMode::Full
@@ -922,7 +930,7 @@ impl NpuForward {
                 hipfire_config::load_summary::Facet::Prefill,
                 format!("npu trunk mode={mode} route={trunk_route}"),
             );
-            let rates = (mode == NpuTrunkMode::Auto && runtime.is_some()).then(|| {
+            let rates = (mode == Mode::Auto && runtime.is_some()).then(|| {
                 coproc::RateEstimator::new(calibration.as_ref().expect("auto calibration").clone())
             });
             let sampling = if rates.is_some() {
@@ -959,7 +967,7 @@ impl NpuForward {
                 request_plan: None,
                 request_origin: 0,
                 adaptive: Vec::new(),
-                latch: trunk::containment::FaultLatch::default(),
+                latch: coproc::containment::FaultLatch::default(),
                 gpu_pci,
             }))
         })();
@@ -988,14 +996,14 @@ impl NpuForward {
     /// (sticky context: a rerun could only fail) logs nothing here and the request fails with its original error. `on`
     /// keeps failing closed (the runtime's sticky failure); `emulate` has no runtime.
     pub(super) fn contain_fault(&mut self, error: &Qwen4GpuForwardError) {
-        use trunk::containment::FaultClass;
-        let class = FaultClass::of(error);
+        use coproc::containment::FaultClass;
+        let class = trunk::containment::fault_class_of(error);
         let reason = format!("{}: {error}", class.as_str());
         let Some(rt) = &self.runtime else {
             return;
         };
         rt.abort(&reason);
-        if self.mode == NpuTrunkMode::Auto
+        if self.mode == Mode::Auto
             && self.latch.trip(class, &reason)
             && class == FaultClass::NpuRuntime
         {
@@ -1052,9 +1060,12 @@ impl NpuForward {
             .map(|snapshot| &snapshot.calibration)
             .or(self.calibration.as_ref());
         let selected = self.family_override.unwrap_or_else(|| match cal {
-            Some(cal) if self.mode == NpuTrunkMode::Auto => FamilyMask::from(
-                coproc::choose_families(&FLASH_NEXT, cal, self.families.into(), rows),
-            ),
+            Some(cal) if self.mode == Mode::Auto => FamilyMask::from(coproc::choose_families(
+                &FLASH_NEXT,
+                cal,
+                self.families.into(),
+                rows,
+            )),
             Some(cal) => coproc::select_families(&FLASH_NEXT, cal).0.into(),
             None => self.families,
         });
@@ -1064,7 +1075,7 @@ impl NpuForward {
         };
         let families = self.request_families;
         let generation = snapshot.map_or(0, |snapshot| snapshot.generation);
-        let n_star = if self.mode == NpuTrunkMode::Auto {
+        let n_star = if self.mode == Mode::Auto {
             match self.n_star_cache {
                 Some((g, mask, star)) if g == generation && mask == families => star,
                 _ => {
@@ -1090,7 +1101,7 @@ impl NpuForward {
                 )
             },
         );
-        if self.mode == NpuTrunkMode::Auto {
+        if self.mode == Mode::Auto {
             let line = coproc::request_log_line(&FLASH_NEXT, rows, &executable);
             let rest = line
                 .strip_prefix(&format!("npu-trunk: rows={rows}"))
@@ -1101,7 +1112,7 @@ impl NpuForward {
                 family_names(families), rest, if frozen { " frozen" } else { "" });
         }
         self.request_cal =
-            (self.sample_log && self.mode == NpuTrunkMode::Auto).then(|| (generation, cal.clone()));
+            (self.sample_log && self.mode == Mode::Auto).then(|| (generation, cal.clone()));
         self.request_origin = position;
         self.request_plan = Some(executable);
         Ok(())
@@ -1135,7 +1146,7 @@ impl NpuForward {
         )
     }
     pub(super) fn note_pair(&mut self, rows: [usize; 2], position: usize) {
-        if !self.pair_logged && self.mode != NpuTrunkMode::Auto {
+        if !self.pair_logged && self.mode != Mode::Auto {
             eprintln!(
                 "npu-trunk: pair rows={}+{} position={position} families={}",
                 rows[0],
@@ -1447,34 +1458,6 @@ fn commit_qsa(bundle: &mut Qwen4Bundle, commits: &[(usize, usize, usize, usize, 
         state.position = position;
         state.clamp_f16_valid();
     }
-}
-
-/// What one bank launches in a pair group: its place in the group, where its
-/// Core and PLE step split at the session snapshot row (`cut`, bank-local), or
-/// whether its whole-bank state is staged after it (`stage_after`: the cut is
-/// the A/B split). The single source of the launch geometry for every NPU mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BankLaunch {
-    offset: usize,
-    rows: usize,
-    cut: Option<usize>,
-    stage_after: bool,
-}
-
-fn launch_geometry(shape: PairShape) -> [BankLaunch; 2] {
-    let site = shape.site();
-    std::array::from_fn(|bank| BankLaunch {
-        offset: if bank == 0 { 0 } else { shape.rows[0] },
-        rows: shape.rows[bank],
-        cut: match site {
-            CutSite::Bank {
-                bank: cut_bank,
-                row,
-            } if cut_bank == bank => Some(row),
-            _ => None,
-        },
-        stage_after: bank == 0 && site == CutSite::Split,
-    })
 }
 
 /// The session snapshot staged inside a pair, and the launch geometry it follows.
@@ -2729,7 +2712,7 @@ fn finish_bank(
 /// take the planner's pairs from the first row.
 fn request_plan(
     cal: &coproc::Calibration,
-    mode: NpuTrunkMode,
+    mode: Mode,
     families: FamilyMask,
     n_star: Option<usize>,
     rows: usize,
@@ -2743,8 +2726,8 @@ fn request_plan(
     coproc::executable_plan_for(&FLASH_NEXT, cal, families.into(), &planned, rows, armed)
 }
 /// The row the executable plan arms pairs from: the crossover `n_star` in `auto`, the first row in the forced modes.
-fn armed_from(mode: NpuTrunkMode, n_star: Option<usize>) -> Option<usize> {
-    if mode == NpuTrunkMode::Auto {
+fn armed_from(mode: Mode, n_star: Option<usize>) -> Option<usize> {
+    if mode == Mode::Auto {
         n_star
     } else {
         Some(0)
@@ -3399,7 +3382,7 @@ mod tests {
         .unwrap();
         let families = FamilyMask::from(coproc::select_families(&FLASH_NEXT, &cal).0);
         let star = coproc::crossover(&FLASH_NEXT, &cal, families.into());
-        let pairs = |mode: NpuTrunkMode, rows: usize| {
+        let pairs = |mode: Mode, rows: usize| {
             let plan = request_plan(&cal, mode, families, star, rows);
             let mut at = 0;
             let mut out = Vec::new();
@@ -3414,7 +3397,7 @@ mod tests {
             }
             out
         };
-        for mode in [NpuTrunkMode::On, NpuTrunkMode::Emulate, NpuTrunkMode::Auto] {
+        for mode in [Mode::On, Mode::Emulate, Mode::Auto] {
             assert_eq!(pairs(mode, 9319), vec![(0, [4672, 4647])], "{mode:?}");
             assert_eq!(
                 pairs(mode, 57556).last(),
@@ -3423,10 +3406,10 @@ mod tests {
             );
         }
         // The forced modes pair from the first row, auto only from the crossover.
-        assert!(pairs(NpuTrunkMode::Auto, 4096).is_empty());
+        assert!(pairs(Mode::Auto, 4096).is_empty());
         assert_eq!(
             planned_banks(
-                &request_plan(&cal, NpuTrunkMode::On, families, star, 9319),
+                &request_plan(&cal, Mode::On, families, star, 9319),
                 0,
                 0,
                 9319,
@@ -3444,8 +3427,8 @@ mod tests {
         .unwrap();
         for names in ["qkv", "zab", "q", "kvidx", "qkv,q", "all"] {
             let mask = parse_family_override(names).unwrap();
-            let on = request_plan(&cal, NpuTrunkMode::On, mask, None, 16384);
-            let emulate = request_plan(&cal, NpuTrunkMode::Emulate, mask, Some(usize::MAX), 16384);
+            let on = request_plan(&cal, Mode::On, mask, None, 16384);
+            let emulate = request_plan(&cal, Mode::Emulate, mask, Some(usize::MAX), 16384);
             assert_eq!(on, emulate, "{names}");
             assert_eq!(
                 on,
@@ -3460,7 +3443,7 @@ mod tests {
                 "{names}"
             );
         }
-        for mode in [NpuTrunkMode::Auto, NpuTrunkMode::On, NpuTrunkMode::Emulate] {
+        for mode in [Mode::Auto, Mode::On, Mode::Emulate] {
             let plan = request_plan(&cal, mode, FamilyMask::NONE, Some(0), 16384);
             assert!(plan
                 .steps
@@ -3492,15 +3475,9 @@ mod tests {
         };
         let (mut admitted, mut demoted) = (Vec::new(), 0);
         for rows in (8704..16384).step_by(256) {
-            let full = request_plan(&cal, NpuTrunkMode::Auto, families, star, rows);
+            let full = request_plan(&cal, Mode::Auto, families, star, rows);
             let got = admitted_plan(full.clone(), &mut admitted, |kept| {
-                coproc::executable_plan(
-                    &FLASH_NEXT,
-                    &cal,
-                    kept,
-                    rows,
-                    armed_from(NpuTrunkMode::Auto, star),
-                )
+                coproc::executable_plan(&FLASH_NEXT, &cal, kept, rows, armed_from(Mode::Auto, star))
             });
             assert!(admitted.len() <= MAX_ADAPTIVE_CONTEXTS, "{rows}");
             assert!(classes(&got).iter().all(|r| admitted.contains(r)), "{rows}");
@@ -3517,7 +3494,7 @@ mod tests {
         assert_eq!(admitted.len(), MAX_ADAPTIVE_CONTEXTS);
         assert!(demoted > 0);
         // An admitted wave count keeps its rebalanced pair.
-        let nine = request_plan(&cal, NpuTrunkMode::Auto, families, star, 9319);
+        let nine = request_plan(&cal, Mode::Auto, families, star, 9319);
         let mut first = Vec::new();
         assert_eq!(
             admitted_plan(nine.clone(), &mut first, |_| unreachable!()),
