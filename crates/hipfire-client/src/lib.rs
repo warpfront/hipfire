@@ -3069,7 +3069,10 @@ done
             &root,
             "#!/bin/sh\nprintf 'hipfire-daemon 0.0.0 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\\n'\n",
         );
-        let err = Engine::spawn(&daemon, &BTreeMap::new()).unwrap_err();
+        let err = match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(err) => err,
+            Ok(_) => panic!("a daemon from a different build must be refused"),
+        };
         let rendered = err.to_string();
         assert!(rendered.contains("mixed install"), "{rendered}");
         assert!(rendered.contains(daemon.to_str().unwrap()), "{rendered}");
@@ -3091,14 +3094,12 @@ done
             &root,
             "#!/bin/sh\ncase \"$1\" in --version) printf 'not a version line\\n';; esac\nexit 0\n",
         );
-        let result = Engine::spawn(&daemon, &BTreeMap::new());
-        assert!(
-            result.as_ref().map(|_| ()).is_ok()
-                || !matches!(
-                    result.unwrap_err(),
-                    ClientError::DaemonBuildMismatch { .. }
-                )
-        );
+        match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(ClientError::DaemonBuildMismatch { .. }) => {
+                panic!("an unparseable version answer must pass the probe")
+            }
+            _ => {}
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
