@@ -428,6 +428,7 @@ fn config_from_sidecar_tensors(source: &HfqFile) -> Result<LlamaConfig, String> 
         norm_eps: 1e-6,              // qwen3 standard
         max_seq_len: 1024,           // drafter; actual cap = block_size (set by KvCache)
         rope_freq_base: 1_000_000.0, // qwen3 rope θ = 1e6
+        rope_llama3: rdna_compute::rope::RopeLlama3::OFF,
         bos_token: 1,
         eos_token: 2,
         has_qk_norm,
