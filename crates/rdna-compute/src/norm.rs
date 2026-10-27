@@ -1272,6 +1272,31 @@ impl Gpu {
         head_dim: usize,
         freq_base: f32,
     ) -> HipResult<()> {
+        self.rope_scaled_f32(
+            q,
+            k,
+            pos_buf,
+            n_heads_q,
+            n_heads_k,
+            head_dim,
+            freq_base,
+            crate::rope::RopeLlama3::OFF,
+        )
+    }
+
+    /// [`Self::rope_f32`] with the Llama-3 inverse-frequency remap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_scaled_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        freq_base: f32,
+        llama3: crate::rope::RopeLlama3,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("rope", kernels::ROPE_SRC, "rope_f32")?;
         let func = &self.functions["rope_f32"];
@@ -1283,6 +1308,7 @@ impl Gpu {
         let nhk = n_heads_k as i32;
         let hd = head_dim as i32;
         let fb = freq_base;
+        let (l3f, l3m, l3a) = (llama3.inv_factor, llama3.smooth_mul, llama3.smooth_add);
 
         let mut params: Vec<*mut c_void> = vec![
             &q_ptr as *const _ as *mut c_void,
@@ -1292,6 +1318,9 @@ impl Gpu {
             &nhk as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
+            &l3f as *const _ as *mut c_void,
+            &l3m as *const _ as *mut c_void,
+            &l3a as *const _ as *mut c_void,
         ];
 
         let half = (head_dim / 2) as u32;
@@ -1313,6 +1342,9 @@ impl Gpu {
                 b.push_i32(nhk);
                 b.push_i32(hd);
                 b.push_f32(fb);
+                b.push_f32(l3f);
+                b.push_f32(l3m);
+                b.push_f32(l3a);
                 b
             },
         )
@@ -1332,11 +1364,38 @@ impl Gpu {
         freq_base: f32,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.rope_batched_scaled_f32(
+            q,
+            k,
+            positions,
+            n_heads_q,
+            n_heads_k,
+            head_dim,
+            freq_base,
+            batch_size,
+            crate::rope::RopeLlama3::OFF,
+        )
+    }
+
+    /// [`Self::rope_batched_f32`] with the Llama-3 inverse-frequency remap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_batched_scaled_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        freq_base: f32,
+        batch_size: usize,
+        llama3: crate::rope::RopeLlama3,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if batch_size > GRID_Y_ROW_CHUNK {
             let (q_row, k_row) = (n_heads_q * head_dim * 4, n_heads_k * head_dim * 4);
             for (r0, rows) in grid_y_row_chunks(batch_size) {
-                self.rope_batched_f32(
+                self.rope_batched_scaled_f32(
                     &rows_tensor(q, r0, rows, q_row),
                     &rows_tensor(k, r0, rows, k_row),
                     &rows_tensor(positions, r0, rows, 4),
@@ -1345,6 +1404,7 @@ impl Gpu {
                     head_dim,
                     freq_base,
                     rows,
+                    llama3,
                 )?;
             }
             return Ok(());
@@ -1362,6 +1422,7 @@ impl Gpu {
         let mut hd = head_dim as i32;
         let mut fb = freq_base;
         let mut bs = batch_size as i32;
+        let (mut l3f, mut l3m, mut l3a) = (llama3.inv_factor, llama3.smooth_mul, llama3.smooth_add);
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -1371,6 +1432,9 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut fb as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut l3f as *mut _ as *mut c_void,
+            &mut l3m as *mut _ as *mut c_void,
+            &mut l3a as *mut _ as *mut c_void,
         ];
         let half = (head_dim / 2) as u32;
         let block = 256u32.min(half);
