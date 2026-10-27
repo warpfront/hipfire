@@ -11,7 +11,10 @@ extern "C" __global__ void rope_f32(
     int n_heads_q,
     int n_heads_k,
     int head_dim,
-    float freq_base
+    float freq_base,
+    float l3_inv_factor,
+    float l3_smooth_mul,
+    float l3_smooth_add
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int half = head_dim / 2;
@@ -19,6 +22,11 @@ extern "C" __global__ void rope_f32(
 
     int pos = pos_buf[0];
     float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+    // Llama-3 remap (rdna_compute::rope::RopeLlama3); inv_factor 1 = plain RoPE.
+    if (l3_inv_factor != 1.0f) {
+        float s = fminf(fmaxf(freq * l3_smooth_mul + l3_smooth_add, 0.0f), 1.0f);
+        freq *= s + (1.0f - s) * l3_inv_factor;
+    }
     float val = (float)pos * freq;
     float cos_val = cosf(val);
     float sin_val = sinf(val);
