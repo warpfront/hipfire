@@ -3085,6 +3085,24 @@ done
         assert_eq!(daemon_commit_from_version_line(""), None);
     }
 
+    /// The client must stamp its build commit through the same build script as
+    /// `hipfire-cli` (which `hipfire-daemon` already shares). A divergent
+    /// script once watched only `.git/HEAD`, which still reads
+    /// `ref: refs/heads/...` after a commit, so the client kept the previous
+    /// commit while the daemon restamped on HEAD and index - and after a
+    /// commit that touched no client sources, every spawn would refuse as a
+    /// mixed install (review of this PR).
+    #[test]
+    fn client_shares_the_cli_build_stamp_source() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line.trim() == "build = \"../hipfire-cli/build.rs\""),
+            "hipfire-client must share hipfire-cli's build script, not stamp its own commit"
+        );
+    }
+
     /// A daemon that answers `--version` with a different build commit is the
     /// mixed-install state; the spawn must name it instead of surfacing the
     /// daemon's own startup failure later. Skipped when the client itself was
