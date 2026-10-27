@@ -376,7 +376,12 @@ mod tests {
                 );
             }
         }
-        assert!(seen > 0, "expected at least one BENCHMARKS.md row");
+        // No minimum count: e7571f03e pointed BENCHMARKS.md at the README's
+        // dated table and dropped the competitor-comparison rows, orphaning
+        // the receipts that quoted them. Any receipt still sourced from the
+        // file must be historical; whether one exists at all depends on the
+        // doc, not the receipts.
+        let _ = seen;
     }
 
     #[test]
