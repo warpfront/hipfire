@@ -764,12 +764,9 @@ fn check_daemon_build_matches(daemon: &Path) -> Result<()> {
     }
     // The child has exited, so reading its piped stdout cannot block.
     let mut stdout = String::new();
-    let read = child
-        .stdout
-        .take()
-        .map_or(false, |mut pipe| {
-            std::io::Read::read_to_string(&mut pipe, &mut stdout).is_ok()
-        });
+    let read = child.stdout.take().map_or(false, |mut pipe| {
+        std::io::Read::read_to_string(&mut pipe, &mut stdout).is_ok()
+    });
     if !read {
         return Ok(());
     }
@@ -3078,10 +3075,16 @@ done
             daemon_commit_from_version_line("hipfire-daemon 0.4.4 abc123def456"),
             Some("abc123def456")
         );
-        assert_eq!(daemon_commit_from_version_line("hipfire-daemon 0.4.4 unknown"), Some("unknown"));
+        assert_eq!(
+            daemon_commit_from_version_line("hipfire-daemon 0.4.4 unknown"),
+            Some("unknown")
+        );
         // Not the daemon's line shape, or truncated.
         assert_eq!(daemon_commit_from_version_line("hipfire 0.4.4 abc"), None);
-        assert_eq!(daemon_commit_from_version_line("hipfire-daemon 0.4.4"), None);
+        assert_eq!(
+            daemon_commit_from_version_line("hipfire-daemon 0.4.4"),
+            None
+        );
         assert_eq!(daemon_commit_from_version_line(""), None);
     }
 
@@ -3169,10 +3172,7 @@ done
             std::process::id(),
             line!()
         ));
-        let daemon = write_fake_daemon(
-            &root,
-            "#!/bin/sh\nwhile read line; do :; done\n",
-        );
+        let daemon = write_fake_daemon(&root, "#!/bin/sh\nwhile read line; do :; done\n");
         let started = std::time::Instant::now();
         match Engine::spawn(&daemon, &BTreeMap::new()) {
             Err(ClientError::DaemonBuildMismatch { .. }) => {
