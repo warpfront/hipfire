@@ -1120,6 +1120,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "dflash-gfx1100-host-handoff",
+        predicates: &[IsRecording, G0Observing, CaptureMode],
+        condition: "propose_candidates_device_with_ready (hipfire-runtime dflash.rs) and spec_step_dflash_with_railgun (qwen35 speculative.rs): exact gfx1100 greedy selector R256/K16, H5120/V248320, active stream, no recording/G0/capture or FP8/IU4 scope; the snapshot overlap additionally requires dense B16, MQ4V2 target head, full context and no admitted PM4/phase path",
+        effect: LaunchMechanism,
+        switches: "eager: three selector D2H transfers share one pinned host packet and completion, then the existing bulk DeltaNet snapshot is queued before CPU candidate scoring and drained before lookup/verify; recorded/G0/captured/refused: incumbent synchronous readback and snapshot ordering",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "successful admitted paths keep projection, top-k, bulk snapshot and verify kernel order, grids and arguments; only host transfers/completion and the snapshot's placement relative to CPU scoring and lookup/splice change. Lookup does not write live DN, so the same pre-verify state is copied, and both paths complete the snapshot before verify. Error paths are not trace-equivalence evidence: the candidate drains submitted work before propagating an error. GPU fixtures compare every selector packet bit (including signed zero/NaNs/raw IDs) and every snapshot S/scale/conv/EF byte, plus partial-enqueue cleanup. No kernel difference is authorized by this decision. Exact gfx1100 is arch-unreachable from the gfx1201 DFlash default; the gfx1100 default inventory programs are AR",
+        reaches: &[],
+    },
+    Decision {
         id: "ds4-gfx942-compressor-sentinel-gate",
         predicates: &[CaptureMode],
         condition: "DS4 compressor host gate: gfx942 && !capture_mode && (pos + 1) % ratio != 0 skips the compressor (forward.rs compressor_op)",
@@ -2039,6 +2050,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "spec_step_dflash_with_railgun",
+        occurrences: 3,
+        decisions: &["dflash-gfx1100-host-handoff"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
         function: "verify_dflash_block_inner_body",
         occurrences: 1,
         decisions: &["graph-capture-lifecycle"],
@@ -2472,6 +2489,12 @@ pub const SITES: &[Site] = &[
         function: "gemm_dispatch_shared",
         occurrences: 2,
         decisions: &["dflash-gfx1100-shared-rotation"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "propose_candidates_device_with_ready",
+        occurrences: 3,
+        decisions: &["dflash-gfx1100-host-handoff"],
     },
     Site {
         file: "hipfire-runtime/src/dflash/lanes.rs",

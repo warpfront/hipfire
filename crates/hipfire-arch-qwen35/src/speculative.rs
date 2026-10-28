@@ -1897,6 +1897,16 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
+    // Bulk-only save without its wait. A stale table retains save_from's
+    // synchronous fallback; the caller must drain even a failed enqueue.
+    fn enqueue_bulk_save(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<bool> {
+        let Some((table, n)) = self.bulk_table(state, gpu, true) else {
+            return Ok(false);
+        };
+        gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
+        Ok(true)
+    }
+
     /// Async copy live state → backup on `stream`.
     ///
     /// Caller owns cross-stream ordering. MTP trunk-spine uses this as an
@@ -5419,6 +5429,21 @@ fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape:
     caller_supplied_tape && verify_populates_tape
 }
 
+fn dflash_snapshot_overlap_shape(
+    arch: &str,
+    experts: usize,
+    b: usize,
+    h: usize,
+    vocab: usize,
+) -> bool {
+    arch == "gfx1100" && experts == 0 && b == 16 && h == 5120 && vocab == 248320
+}
+
+fn dflash_snapshot_overlap_hip_only(route: Option<&DflashVerifyPm4>) -> bool {
+    // Serving keeps a Disabled owner even when PM4 was never admitted.
+    route.is_none_or(|route| !route.admitted())
+}
+
 /// Actual verify-route facts the decision→commit body needs. These are
 /// measured by whoever ran the verify forward, never assumed by the commit.
 ///
@@ -7916,6 +7941,43 @@ pub fn draft_dflash_block_rank(
     seed_token: u32,
     vocab: usize,
 ) -> HipResult<Vec<u32>> {
+    draft_dflash_block_rank_ready(
+        gpu,
+        target_weights,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        verify_scratch,
+        target_hidden_host,
+        block,
+        position,
+        compact_offset,
+        ctx_slice,
+        draft_ffn_graph,
+        seed_token,
+        vocab,
+        &mut |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draft_dflash_block_rank_ready(
+    gpu: &mut Gpu,
+    target_weights: &Qwen35Weights,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    verify_scratch: &VerifyScratch,
+    target_hidden_host: &[f32],
+    block: &[u32],
+    position: usize,
+    compact_offset: i32,
+    ctx_slice: Option<usize>,
+    draft_ffn_graph: bool,
+    seed_token: u32,
+    vocab: usize,
+    ready: &mut impl FnMut(&mut Gpu) -> HipResult<()>,
+) -> HipResult<Vec<u32>> {
     let b = block.len();
     let h = draft_cfg.hidden;
     debug_assert_eq!(vocab, draft_cfg.vocab_size);
@@ -7969,7 +8031,7 @@ pub fn draft_dflash_block_rank(
             h,
         )?;
         if selector_mode {
-            let proposal = dflash::propose_candidates_device(
+            let proposal = dflash::propose_candidates_device_with_ready(
                 gpu,
                 draft_weights,
                 draft_scratch,
@@ -7979,6 +8041,7 @@ pub fn draft_dflash_block_rank(
                 seed_token,
                 0.0,
                 None,
+                ready,
             )?;
             apply_dflash2_selector_proposal(
                 &proposal,
@@ -9128,6 +9191,7 @@ pub fn spec_step_dflash_with_railgun(
     let mut drafted: Vec<u32> = vec![seed_token];
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
+    let mut snapshot_ready = false;
     // Selector / PLD q rows in the sparse FAST_SAMPLE representation; `None`
     // keeps the dense `draft_softmaxes` rows.
     let mut q_receipt: Option<DflashSampledDraft> = None;
@@ -9380,22 +9444,59 @@ pub fn spec_step_dflash_with_railgun(
     } else if !use_temp_sampling && !host_path_active {
         // Greedy fast path shared verbatim with the dense-TP mesh ranks
         // (byte-identical draft production through draft_dflash_block_rank).
-        drafted = draft_dflash_block_rank(
-            gpu,
-            &target.weights,
-            draft_weights,
-            draft_cfg,
-            draft_scratch,
-            verify_scratch,
-            target_hidden_host,
-            &block,
-            position,
-            target.kv_cache.compact_offset as i32,
-            ctx_slice,
-            draft_ffn_graph,
-            seed_token,
-            vocab,
-        )?;
+        let overlap = gpu.flags.gfx1100_dflash_snapshot_overlap
+            && dflash_snapshot_overlap_shape(&gpu.arch, target.config.num_experts, b, h, vocab)
+            && gpu.arch_caps.is_gfx1100()
+            && selector_mode
+            && draft_cfg.selector_rank == Some(256)
+            && draft_cfg.selector_top_k == Some(16)
+            && target.weights.output.gpu_dtype == DType::MQ4G256V2
+            && ctx_slice.is_none()
+            && dflash_snapshot_overlap_hip_only(verify_pm4.as_deref())
+            && !phase_on
+            && !gpu.replay.is_recording()
+            && !gpu.replay.is_g0_observing()
+            && !gpu.graphs.capture_mode
+            && !gpu.fp8_verify_scope
+            && !gpu.iu4_verify_scope;
+        let mut attempted = false;
+        let mut queued = false;
+        let result = {
+            let mut ready = |gpu: &mut Gpu| {
+                if overlap {
+                    attempted = true;
+                    queued = target_snap.enqueue_bulk_save(&target.dn_state, gpu)?;
+                    attempted = queued;
+                }
+                Ok(())
+            };
+            draft_dflash_block_rank_ready(
+                gpu,
+                &target.weights,
+                draft_weights,
+                draft_cfg,
+                draft_scratch,
+                verify_scratch,
+                target_hidden_host,
+                &block,
+                position,
+                target.kv_cache.compact_offset as i32,
+                ctx_slice,
+                draft_ffn_graph,
+                seed_token,
+                vocab,
+                &mut ready,
+            )
+        };
+        // Drain before propagating enqueue/scoring/application errors. A sync
+        // failure propagates immediately; never proceed to verify or retry.
+        if attempted {
+            DeltaNetSnapshot::bulk_sync(gpu)?;
+        }
+        // Copy/Tail lookup only changes CPU candidates after this drain; the
+        // full pre-verify DN snapshot is independent of the effective width.
+        snapshot_ready = queued;
+        drafted = result?;
     } else {
         // Sampled / host-shaped (RP, n-gram-block, logit-dump) path: shared
         // forward prefix, per-row head selection below.
@@ -9903,7 +10004,7 @@ pub fn spec_step_dflash_with_railgun(
     // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
     // replay just the GDN recurrence for `accept+1` steps without
     // re-running the target.
-    if railgun_verify.is_none() {
+    if railgun_verify.is_none() && !snapshot_ready {
         target_snap.save_from(&target.dn_state, gpu)?;
     }
     // Mutable variable to allow both verify capture + rollback replay usage.
@@ -14132,6 +14233,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dflash_snapshot_overlap_only_admits_measured_dense_shape() {
+        assert!(dflash_snapshot_overlap_shape(
+            "gfx1100", 0, 16, 5120, 248320
+        ));
+        for arch in ["gfx1101", "gfx1151", "gfx1201"] {
+            assert!(!dflash_snapshot_overlap_shape(arch, 0, 16, 5120, 248320));
+        }
+        for (experts, b, h, vocab) in [
+            (128, 16, 5120, 248320),
+            (0, 8, 5120, 248320),
+            (0, 16, 4096, 248320),
+            (0, 16, 5120, 151936),
+        ] {
+            assert!(!dflash_snapshot_overlap_shape(
+                "gfx1100", experts, b, h, vocab
+            ));
+        }
+    }
+
+    #[test]
+    fn dflash_snapshot_overlap_accepts_disabled_owner_not_admitted_pm4() {
+        assert!(dflash_snapshot_overlap_hip_only(None));
+        let disabled = DflashVerifyPm4::disabled("PM4 opt-in absent");
+        assert!(dflash_snapshot_overlap_hip_only(Some(&disabled)));
+        let mut admitted = DflashVerifyPm4::armed();
+        assert!(!dflash_snapshot_overlap_hip_only(Some(&admitted)));
+        admitted.poison("synthetic route failure");
+        assert!(!dflash_snapshot_overlap_hip_only(Some(&admitted)));
+    }
+
+    #[test]
     fn two_slot_alternating_keys_hit_after_two_misses() {
         let mut s = TwoSlot::<u64>::new();
         // Cold: slot 0, then slot 1 (an unwritten slot is always the victim).
@@ -14764,6 +14896,62 @@ mod tests {
             s_ef_residual: vec![gpu.zeros(&[8], DType::F16).expect("ef")],
             quant: qwen35::StateQuant::Q8,
         }
+    }
+
+    #[test]
+    #[ignore = "requires an idle gfx1100 GPU; snapshot byte-copy and fallback checks"]
+    fn dflash_snapshot_overlap_bulk_copy_is_exact() {
+        let mut gpu = Gpu::init().unwrap();
+        assert_eq!(gpu.arch, "gfx1100");
+        gpu.active_stream = Some(gpu.hip.stream_create().unwrap());
+        std::sync::Arc::make_mut(&mut gpu.flags).dn_snapshot_bulk_off = false;
+        let mut state = tiny_dn_with_ef(&mut gpu);
+        for (family, tensor) in state
+            .s_matrices
+            .iter()
+            .chain(&state.s_scales)
+            .chain(&state.conv_states)
+            .chain(&state.s_ef_residual)
+            .enumerate()
+        {
+            let bytes: Vec<_> = (0..tensor.buf.size())
+                .map(|i| ((i * 13 + family * 71) % 251) as u8)
+                .collect();
+            gpu.hip.memcpy_htod(&tensor.buf, &bytes).unwrap();
+        }
+        let mut reference = DeltaNetSnapshot::new_for(&mut gpu, &state).unwrap();
+        let mut candidate = DeltaNetSnapshot::new_for(&mut gpu, &state).unwrap();
+        reference.save_from(&state, &mut gpu).unwrap();
+        assert!(candidate.enqueue_bulk_save(&state, &mut gpu).unwrap());
+        DeltaNetSnapshot::bulk_sync(&gpu).unwrap();
+        fn read(gpu: &Gpu, snapshot: &DeltaNetSnapshot) -> Vec<Vec<u8>> {
+            snapshot
+                .s_matrix_bufs
+                .iter()
+                .chain(&snapshot.s_scale_bufs)
+                .chain(&snapshot.conv_state_bufs)
+                .chain(&snapshot.s_ef_residual_bufs)
+                .map(|buffer| {
+                    let mut bytes = vec![0; buffer.size()];
+                    gpu.hip.memcpy_dtoh(&mut bytes, buffer).unwrap();
+                    bytes
+                })
+                .collect()
+        }
+        let expected = read(&gpu, &reference);
+        assert_eq!(read(&gpu, &candidate), expected);
+        let mut other = tiny_dn_with_ef(&mut gpu);
+        assert!(!candidate.enqueue_bulk_save(&other, &mut gpu).unwrap());
+        assert_eq!(read(&gpu, &candidate), expected);
+        candidate.save_from(&other, &mut gpu).unwrap();
+        reference.save_from(&other, &mut gpu).unwrap();
+        assert_eq!(read(&gpu, &candidate), read(&gpu, &reference));
+        std::sync::Arc::make_mut(&mut gpu.flags).dn_snapshot_bulk_off = true;
+        assert!(!candidate.enqueue_bulk_save(&state, &mut gpu).unwrap());
+        reference.free_gpu(&mut gpu);
+        candidate.free_gpu(&mut gpu);
+        state.free_gpu(&mut gpu);
+        other.free_gpu(&mut gpu);
     }
 
     fn read_f16_as_f32(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {

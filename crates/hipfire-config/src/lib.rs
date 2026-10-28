@@ -3053,6 +3053,24 @@ pub static FIELDS: &[ConfigField] = &[
         "Use the Q8 FA2 split-KV VerifyAttn route by default on exact gfx1100 inside the existing dense H24/KV4/HD256 long-context VMM-KV envelope (false or HIPFIRE_GFX1100_FA2_SPLIT_VERIFY=0 restores the established VerifyAttn/R4-R8/batched route). The independent parent kernel.verify_attn=false / HIPFIRE_VERIFY_ATTN=0 also opts out. Other architectures remain off."
     ),
     process_bool_field!(
+        "kernel.gfx1100_selector_async_readback",
+        "gfx1100_selector_async_readback",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX1100_SELECTOR_ASYNC_READBACK",
+        "Default on for the validated Qwen3.8 greedy selector on exact gfx1100 (H5120/V248320/R256/K16, rows1..16, no capture): batch projection/top-K D2H into reused pinned host storage with one stream wait; scoring, confidence and tie order unchanged. Set false or HIPFIRE_GFX1100_SELECTOR_ASYNC_READBACK=0 for synchronous readback; other architectures default off."
+    ),
+    process_bool_field!(
+        "kernel.gfx1100_dflash_snapshot_overlap",
+        "gfx1100_dflash_snapshot_overlap",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP",
+        "Default on for the validated dense Qwen3.8 B16 greedy selector on exact gfx1100: enqueue the existing validated DN bulk snapshot after readback, overlap CPU scoring and wait before verify/CPU lookup splice; no new resident buffers or async-memcpy fallback. Set false or HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP=0 for the original save timing; admitted PM4/capture and other architectures keep the incumbent."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fa_prep_fused",
         "gfx12_fa_prep_fused",
         Kernel,

@@ -376,6 +376,12 @@ pub struct FeatureFlags {
     /// elsewhere; outputs are byte-identical to the base kernels.
     /// `HIPFIRE_GFX1151_XLDS=0` restores the historical base kernels.
     pub gfx1151_xlds: bool,
+    /// Default-on for exact gfx1100; guarded greedy selector readback.
+    /// HIPFIRE_GFX1100_SELECTOR_ASYNC_READBACK=0 restores synchronous copies.
+    pub gfx1100_selector_async_readback: bool,
+    /// Default-on for exact gfx1100; guarded bulk snapshot/CPU overlap.
+    /// HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP=0 restores the original save timing.
+    pub gfx1100_dflash_snapshot_overlap: bool,
     /// Exact-K5120 MQ4V2 gate/up decode on gfx1100: default on (byte-identical
     /// to the generic kernel; `HIPFIRE_MQ4V2_GATEUP_K5120=0` opts out).
     pub mq4v2_gateup_k5120: bool,
@@ -1173,6 +1179,10 @@ impl FeatureFlags {
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gfx1100_q8x_verify: parse_bool("HIPFIRE_GFX1100_Q8X_VERIFY").unwrap_or(arch == "gfx1100"),
             gfx1151_xlds: parse_bool("HIPFIRE_GFX1151_XLDS").unwrap_or(arch == "gfx1151"),
+            gfx1100_selector_async_readback: parse_bool("HIPFIRE_GFX1100_SELECTOR_ASYNC_READBACK")
+                .unwrap_or(arch == "gfx1100"),
+            gfx1100_dflash_snapshot_overlap: parse_bool("HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP")
+                .unwrap_or(arch == "gfx1100"),
             mq4v2_gateup_k5120: parse_bool("HIPFIRE_MQ4V2_GATEUP_K5120").unwrap_or(true),
             gfx12_mq4v2_gateup_k5120: parse_bool("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120")
                 .unwrap_or(false),
@@ -1888,6 +1898,8 @@ impl FeatureFlags {
             gate_up_ldsstage: false,
             gfx1100_q8x_verify: false,
             gfx1151_xlds: false,
+            gfx1100_selector_async_readback: false,
+            gfx1100_dflash_snapshot_overlap: false,
             mq4v2_gateup_k5120: false,
             gfx12_mq4v2_gateup_k5120: false,
             gfx12_mq4v2_fp8_gateup: false,
@@ -1986,6 +1998,68 @@ impl FeatureFlags {
 mod tests {
     use super::*;
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    #[test]
+    fn dflash_handoff_defaults_and_independent_opt_outs_survive_process_handoff() {
+        let keys = [
+            "kernel.gfx1100_selector_async_readback",
+            "kernel.gfx1100_dflash_snapshot_overlap",
+        ];
+        let envs = [
+            "HIPFIRE_GFX1100_SELECTOR_ASYNC_READBACK",
+            "HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP",
+        ];
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        let defaults: ProcessConfig =
+            serde_json::from_str(&serde_json::to_string(&defaults).unwrap()).unwrap();
+        for (key, env) in keys.iter().zip(envs.iter()) {
+            assert_eq!(hipfire_config::field(key).unwrap().env_compat, Some(*env));
+            assert_eq!(defaults.legacy_value(env), None);
+        }
+        for arch in [
+            "gfx906",
+            "gfx90a",
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
+            "gfx1151",
+            "gfx1201",
+            "gfx1100:xnack-",
+        ] {
+            let flags = FeatureFlags::from_process_config(arch, &defaults);
+            assert_eq!(flags.gfx1100_selector_async_readback, arch == "gfx1100");
+            assert_eq!(flags.gfx1100_dflash_snapshot_overlap, arch == "gfx1100");
+            for mask in 0..4 {
+                let mut cli = ConfigLayer::default();
+                for (index, key) in keys.iter().enumerate() {
+                    cli.set_cli(key, if mask & (1 << index) == 0 { "0" } else { "1" })
+                        .unwrap();
+                }
+                let resolved = resolve([NamedLayer {
+                    source: ConfigSource::OneShot {
+                        argument: "handoff flags".into(),
+                    },
+                    layer: cli,
+                }])
+                .unwrap();
+                let process = ProcessConfig::from_resolved(&resolved).unwrap();
+                let decoded: ProcessConfig =
+                    serde_json::from_str(&serde_json::to_string(&process).unwrap()).unwrap();
+                decoded.validate().unwrap();
+                let flags = FeatureFlags::from_process_config(arch, &decoded);
+                assert_eq!(flags.gfx1100_selector_async_readback, mask & 1 != 0);
+                assert_eq!(flags.gfx1100_dflash_snapshot_overlap, mask & 2 != 0);
+                assert_eq!(
+                    decoded.legacy_value(envs[0]).as_deref(),
+                    Some(if mask & 1 == 0 { "0" } else { "1" })
+                );
+                assert_eq!(
+                    decoded.legacy_value(envs[1]).as_deref(),
+                    Some(if mask & 2 == 0 { "0" } else { "1" })
+                );
+            }
+        }
+    }
 
     #[test]
     fn qsa_extent_check_parses_only_exact_developer_modes() {

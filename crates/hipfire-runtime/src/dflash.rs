@@ -28,7 +28,7 @@
 
 use crate::hfq::{awq_scale_f32_bytes, HfqFile};
 use crate::llama::WeightTensor;
-use hip_bridge::{DeviceBuffer, Graph, GraphExec, HipResult, HipRuntime};
+use hip_bridge::{DeviceBuffer, Graph, GraphExec, HipResult, HipRuntime, PinnedTransferBuffer};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 
@@ -1714,6 +1714,8 @@ pub struct DflashScratch {
     pub selector_proj: Option<GpuTensor>, // [B, rank]
     pub topk_ids: Option<GpuTensor>,      // [B, K] i32 (stored as F32 buffer)
     pub topk_vals: Option<GpuTensor>,     // [B, K] f32
+    // Downloads retire before their GPU sources or this pinned owner are freed.
+    selector_readback: std::sync::Mutex<Option<PinnedTransferBuffer>>,
 
     // Encapsulated `target_hidden` cursors: uploaded-row watermark, per-row
     // absolute positions, and projection-cache extent. The delta-upload
@@ -2121,6 +2123,7 @@ impl DflashScratch {
             selector_proj: i_selector_proj.map(|j| take!(j)),
             topk_ids: i_topk_ids.map(|j| take!(j)),
             topk_vals: i_topk_vals.map(|j| take!(j)),
+            selector_readback: std::sync::Mutex::new(None),
             thlog: TargetHiddenLog::new(),
             k_ctx_cached,
             v_ctx_cached,
@@ -2188,6 +2191,18 @@ impl DflashScratch {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        let readback_retired = match self.selector_readback.lock() {
+            Ok(mut buffer) => buffer.as_mut().is_none_or(|b| {
+                b.device() == gpu.device_id
+                    && gpu.bind_thread().and_then(|_| b.complete(&gpu.hip)).is_ok()
+            }),
+            Err(_) => false,
+        };
+        if !readback_retired {
+            // Do not release GPU sources while a failed D2H may still use them.
+            std::mem::forget(self);
+            return;
+        }
         for per_layer in self.draft_ffn_graphs {
             for (_, (graph, exec, _blobs)) in per_layer {
                 let _ = gpu.hip.graph_exec_destroy(exec);
@@ -5175,6 +5190,36 @@ pub fn propose_candidates_device(
     temperature: f32,
     uniforms: Option<&[f32]>,
 ) -> HipResult<DflashCandidateProposal> {
+    propose_candidates_device_with_ready(
+        gpu,
+        weights,
+        scratch,
+        hidden,
+        logits,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Same proposal with a hook after readbacks and before CPU scoring.
+/// The hook's owner must retire all submitted work, including on errors;
+/// it must not change the device/stream or mutate selector inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn propose_candidates_device_with_ready(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+    ready: &mut impl FnMut(&mut Gpu) -> HipResult<()>,
+) -> HipResult<DflashCandidateProposal> {
     if rows == 0 {
         return Err(hip_bridge::HipError::new(0, "rows must be >0"));
     }
@@ -5195,6 +5240,68 @@ pub fn propose_candidates_device(
     }
     if logits.buf.size() < rows * vocab * 4 {
         return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
+    }
+    if gpu.flags.gfx1100_selector_async_readback
+        && selector_async_readback_shape(
+            &gpu.arch,
+            weights.layers.first().map_or(0, |layer| layer.wq.k),
+            vocab,
+            rank,
+            k,
+            rows,
+            temperature,
+        )
+        && gpu.arch_caps.is_gfx1100()
+        && gpu.active_stream.is_some()
+        && !gpu.replay.is_recording()
+        && !gpu.replay.is_g0_observing()
+        && !gpu.graphs.capture_mode
+        && !gpu.fp8_verify_scope
+        && !gpu.iu4_verify_scope
+    {
+        gpu.bind_thread()?;
+        let ids_slice = scratch
+            .topk_ids
+            .as_ref()
+            .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?
+            .sub_offset(0, rows * k);
+        let vals_slice = scratch
+            .topk_vals
+            .as_ref()
+            .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?
+            .sub_offset(0, rows * k);
+        let (host_proj, top_ids, top_vals) = {
+            let mut owner = scratch
+                .selector_readback
+                .lock()
+                .map_err(|_| hip_bridge::HipError::new(0, "selector readback lock poisoned"))?;
+            if owner.is_none() {
+                *owner = Some(gpu.hip.transfer_buffer(16 * (rank + 2 * k) * 4)?);
+            }
+            let proj_slice = selector_projection_device(gpu, weights, scratch, hidden, rows, rank)?;
+            gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
+            download_selector_planes(
+                gpu,
+                owner.as_mut().unwrap(),
+                &proj_slice,
+                &ids_slice,
+                &vals_slice,
+                rows,
+                rank,
+                k,
+            )?
+        };
+        ready(gpu)?;
+        return propose_candidates_from_rows(
+            weights,
+            &host_proj,
+            &top_ids,
+            &top_vals,
+            rows,
+            anchor,
+            temperature,
+            uniforms,
+        );
     }
     // Project hidden -> rank
     let host_proj = selector_projection_host(gpu, weights, scratch, hidden, rows, rank)?;
@@ -5217,6 +5324,7 @@ pub fn propose_candidates_device(
     }
     gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
     let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows * k)?;
+    ready(gpu)?;
     propose_candidates_from_rows(
         weights,
         &host_proj,
@@ -5760,6 +5868,23 @@ fn selector_projection_host(
     rows: usize,
     rank: usize,
 ) -> HipResult<Vec<f32>> {
+    let proj_slice = selector_projection_device(gpu, weights, scratch, hidden, rows, rank)?;
+    let mut host_proj = vec![0f32; rows * rank];
+    let bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
+    };
+    gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
+    Ok(host_proj)
+}
+
+fn selector_projection_device(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    rows: usize,
+    rank: usize,
+) -> HipResult<GpuTensor> {
     let proj = scratch
         .selector_proj
         .as_ref()
@@ -5775,12 +5900,83 @@ fn selector_projection_host(
         scratch.mq_x_rot.as_ref(),
         scratch.mq_x_rot_f16.as_ref(),
     )?;
-    let mut host_proj = vec![0f32; rows * rank];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
-    Ok(host_proj)
+    Ok(proj_slice)
+}
+
+fn selector_async_readback_shape(
+    arch: &str,
+    hidden: usize,
+    vocab: usize,
+    rank: usize,
+    k: usize,
+    rows: usize,
+    temp: f32,
+) -> bool {
+    arch == "gfx1100"
+        && hidden == 5120
+        && vocab == 248320
+        && rank == 256
+        && k == 16
+        && (1..=16).contains(&rows)
+        && temp == 0.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_selector_planes(
+    gpu: &Gpu,
+    buffer: &mut PinnedTransferBuffer,
+    proj: &GpuTensor,
+    ids: &GpuTensor,
+    vals: &GpuTensor,
+    rows: usize,
+    rank: usize,
+    k: usize,
+) -> HipResult<(Vec<f32>, Vec<u32>, Vec<f32>)> {
+    gpu.bind_thread()?;
+    if buffer.device() != gpu.device_id {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector readback device mismatch",
+        ));
+    }
+    buffer.complete(&gpu.hip)?;
+    let pbytes = rows * rank * 4;
+    let tbytes = rows * k * 4;
+    let queued = (|| {
+        buffer.download_async(&gpu.hip, &proj.buf, 0, pbytes, gpu.active_stream.as_ref())?;
+        buffer.download_async(
+            &gpu.hip,
+            &ids.buf,
+            pbytes,
+            tbytes,
+            gpu.active_stream.as_ref(),
+        )?;
+        buffer.download_async(
+            &gpu.hip,
+            &vals.buf,
+            pbytes + tbytes,
+            tbytes,
+            gpu.active_stream.as_ref(),
+        )
+    })();
+    // Complete even a partial packet before returning its copy error.
+    let retired = buffer.complete(&gpu.hip);
+    retired?;
+    queued?;
+    let data = &buffer.as_bytes_mut()[..pbytes + 2 * tbytes];
+    let projection = data[..pbytes]
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let top_ids = data[pbytes..pbytes + tbytes]
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let top_vals = data[pbytes + tbytes..]
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    Ok((projection, top_ids, top_vals))
 }
 
 /// Download `n` top-K ids (i32 stored in an F32 buffer) and values (f32).
@@ -5803,4 +5999,101 @@ fn download_top(
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     Ok((top_ids, top_vals))
+}
+
+#[cfg(test)]
+mod selector_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn selector_async_shape_keeps_other_routes_unchanged() {
+        for rows in [1, 8, 15, 16] {
+            assert!(selector_async_readback_shape(
+                "gfx1100", 5120, 248320, 256, 16, rows, 0.0
+            ));
+        }
+        for rows in [0, 17, 32, 64] {
+            assert!(!selector_async_readback_shape(
+                "gfx1100", 5120, 248320, 256, 16, rows, 0.0
+            ));
+        }
+        for arch in ["gfx1101", "gfx1151", "gfx1201"] {
+            assert!(!selector_async_readback_shape(
+                arch, 5120, 248320, 256, 16, 15, 0.0
+            ));
+        }
+        for temp in [0.1, f32::NAN] {
+            assert!(!selector_async_readback_shape(
+                "gfx1100", 5120, 248320, 256, 16, 15, temp
+            ));
+        }
+        for (h, v, r, k) in [
+            (4096, 248320, 256, 16),
+            (5120, 151936, 256, 16),
+            (5120, 248320, 128, 16),
+            (5120, 248320, 256, 8),
+        ] {
+            assert!(!selector_async_readback_shape(
+                "gfx1100", h, v, r, k, 15, 0.0
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an idle gfx1100 GPU; bit-exact readback and partial enqueue checks"]
+    fn pinned_selector_readback_bits_and_partial_enqueue() {
+        let mut gpu = Gpu::init().unwrap();
+        assert_eq!(gpu.arch, "gfx1100");
+        gpu.active_stream = Some(gpu.hip.stream_create().unwrap());
+        let rank = 256;
+        let k = 16;
+        let mut packet = gpu.hip.transfer_buffer(16 * (rank + 2 * k) * 4).unwrap();
+        let bits = [
+            0, 0x80000000, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0x7fc12345, 1,
+        ];
+        let projection: Vec<f32> = (0..16 * rank)
+            .map(|i| f32::from_bits(bits[i % bits.len()]))
+            .collect();
+        let values: Vec<f32> = (0..16 * k)
+            .map(|i| f32::from_bits(bits[i % bits.len()]))
+            .collect();
+        let ids: Vec<u32> = (0..16 * k)
+            .map(|i| (i as u32).wrapping_mul(0x9e3779b9))
+            .collect();
+        let proj = gpu.upload_f32(&projection, &[16 * rank]).unwrap();
+        let vals = gpu.upload_f32(&values, &[16 * k]).unwrap();
+        let ids_f32: Vec<_> = ids.iter().map(|&id| f32::from_bits(id)).collect();
+        let ids_gpu = gpu.upload_f32(&ids_f32, &[16 * k]).unwrap();
+        for rows in [16, 1, 15, 8, 16] {
+            packet.as_bytes_mut().fill(0xa5);
+            let result =
+                download_selector_planes(&gpu, &mut packet, &proj, &ids_gpu, &vals, rows, rank, k)
+                    .unwrap();
+            assert_eq!(
+                result.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                projection[..rows * rank]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(result.1, ids[..rows * k]);
+            assert_eq!(
+                result.2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                values[..rows * k]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert!(!packet.is_pending());
+        }
+        let short = vals.sub_offset(0, 1);
+        assert!(
+            download_selector_planes(&gpu, &mut packet, &proj, &ids_gpu, &short, 15, rank, k)
+                .is_err()
+        );
+        assert!(!packet.is_pending());
+        gpu.free_tensor(proj).unwrap();
+        gpu.free_tensor(vals).unwrap();
+        gpu.free_tensor(ids_gpu).unwrap();
+    }
 }
