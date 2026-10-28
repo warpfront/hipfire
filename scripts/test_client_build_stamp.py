@@ -64,6 +64,7 @@ class IncrementalBuildStamp(unittest.TestCase):
             return result
 
         run(["git", "clone", "--quiet", "--no-hardlinks", str(REPO), str(root)], cwd=REPO)
+        run(["git", "switch", "--quiet", "-C", "build-stamp-fixture"])
         env["CARGO_TARGET_DIR"] = str(root.parent / (mode + "-target"))
         run(["git", "config", "user.name", "Build stamp fixture"])
         run(["git", "config", "user.email", "fixture@example.invalid"])
