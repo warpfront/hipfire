@@ -292,3 +292,24 @@ fn zero_dimension_floors_to_factor() {
     assert!(h >= 32, "zero-dimension input should floor to factor");
     assert!(w >= 32, "zero-dimension input should floor to factor");
 }
+
+#[test]
+fn extreme_aspect_ratio_is_rejected_through_bytes_and_path() {
+    // Only 1 MP on disk, but the minimum 32-pixel short axis would
+    // resize this to 8 MP and overflow the attention kernel's LDS.
+    let bytes = solid_png_bytes(30, 40, 50, 1, 1_048_576);
+    let error = load_and_preprocess_from_bytes(&bytes, 16, 2).unwrap_err();
+    assert!(error.contains("vision limit"), "{error}");
+    let path = std::env::temp_dir().join(format!(
+        "hipfire-vision-aspect-{}-{}.png",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let result = hipfire_arch_qwen35_vl::image::load_and_preprocess(&path, 16, 2);
+    std::fs::remove_file(path).unwrap();
+    assert!(result.unwrap_err().contains("vision limit"));
+}

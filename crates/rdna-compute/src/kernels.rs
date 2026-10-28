@@ -12,6 +12,13 @@ pub const QSA_FILTER_SELECT_SRC: &str = include_str!("../../../kernels/src/qsa_f
 /// Exact serial-FMA BF16 pooled-key scoring, portable across gfx11/gfx12.
 pub const QSA_BF16_SCORES_SRC: &str = include_str!("../../../kernels/src/qsa_bf16_scores.hip");
 
+/// Image-only QSA mRoPE; the measured text tensor_ops module stays unchanged.
+pub const QSA_MROPE_SRC: &str = concat!(
+    "#include <hip/hip_runtime.h>\n",
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/qsa_mrope.hip")
+);
+
 /// G80 activation producer and exact integer BF16 epilogue (logged PM gaps).
 pub const NPU_TRUNK_SRC: &str = include_str!("../../../kernels/src/npu_trunk.hip");
 /// Certified signed-IU8 WMMA and BF16/F32 scatter, exact gfx1151.

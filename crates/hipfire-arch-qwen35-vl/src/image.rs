@@ -122,6 +122,35 @@ pub fn smart_resize(
     }
 }
 
+/// Validate the actual rounded dimensions before allocating resized pixels.
+/// Clamping each axis to `factor` can make an extreme aspect ratio exceed
+/// the requested budget even when the original image passed the header cap.
+fn checked_resized_dimensions(
+    height: usize,
+    width: usize,
+    factor: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize), String> {
+    if height == 0 || width == 0 || factor == 0 || height.checked_mul(width).is_none() {
+        return Err("image dimensions or patch/merge factor are zero or overflow".into());
+    }
+    let (h, w) = smart_resize(height, width, factor, VISION_MIN_PIXELS, max_pixels);
+    let pixels = h
+        .checked_mul(w)
+        .ok_or("resized image dimensions overflow")?;
+    if h == 0
+        || w == 0
+        || h > u32::MAX as usize
+        || w > u32::MAX as usize
+        || pixels > VISION_LDS_MAX_PIXELS
+    {
+        return Err(format!(
+            "resized image dimensions ({w}x{h}) exceed the vision limit ({VISION_LDS_MAX_PIXELS} pixels); reduce the aspect ratio"
+        ));
+    }
+    Ok((h, w))
+}
+
 /// Shared preprocessing logic that takes an already-loaded `DynamicImage`.
 /// Returns (CHW data, height, width) where height and width are multiples of
 /// `patch_size * spatial_merge_size`.
@@ -129,13 +158,14 @@ fn preprocess_dynamic_image(
     img: image::DynamicImage,
     patch_size: usize,
     spatial_merge_size: usize,
-) -> (Vec<f32>, usize, usize) {
+) -> Result<(Vec<f32>, usize, usize), String> {
     let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
 
-    let factor = patch_size * spatial_merge_size;
-    let min_pixels = VISION_MIN_PIXELS;
-    let max_pixels = vision_max_pixels();
-    let (final_h, final_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
+    let factor = patch_size
+        .checked_mul(spatial_merge_size)
+        .ok_or("image patch/merge factor overflow")?;
+    let (final_h, final_w) =
+        checked_resized_dimensions(orig_h, orig_w, factor, vision_max_pixels())?;
 
     // HF's `Qwen2VLImageProcessorFast` uses PIL's BICUBIC (`resample=3`).
     // `FilterType::CatmullRom` is the `image` crate's bicubic filter; this
@@ -174,7 +204,7 @@ fn preprocess_dynamic_image(
             out[2 * plane + idx] = pixel[2] as f32 / 127.5 - 1.0; // channel 2 = B
         }
     }
-    (out, h, w)
+    Ok((out, h, w))
 }
 
 /// Load an image from a filesystem path, smart-resize, normalize.
@@ -188,12 +218,9 @@ pub fn load_and_preprocess(
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
-    let img = hipfire_runtime::imagedec::decode_dynamic_path(path)?;
-    Ok(preprocess_dynamic_image(
-        img,
-        patch_size,
-        spatial_merge_size,
-    ))
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("failed to open image {}: {error}", path.display()))?;
+    load_and_preprocess_from_bytes(&bytes, patch_size, spatial_merge_size)
 }
 
 /// Load an image from raw bytes (PNG or JPEG), smart-resize, normalize.
@@ -212,18 +239,17 @@ pub fn load_and_preprocess_from_bytes(
 ) -> Result<(Vec<f32>, usize, usize), String> {
     let (orig_w, orig_h) = hipfire_runtime::imagedec::probe_dimensions(data)?;
     let (orig_w, orig_h) = (orig_w as usize, orig_h as usize);
-    if orig_w * orig_h > MAX_DIMENSION_PIXELS {
+    if orig_w
+        .checked_mul(orig_h)
+        .is_none_or(|pixels| pixels > MAX_DIMENSION_PIXELS)
+    {
         return Err(format!(
             "image dimensions ({orig_w}x{orig_h}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
         ));
     }
 
     let img = hipfire_runtime::imagedec::decode_dynamic(data)?;
-    Ok(preprocess_dynamic_image(
-        img,
-        patch_size,
-        spatial_merge_size,
-    ))
+    preprocess_dynamic_image(img, patch_size, spatial_merge_size)
 }
 
 /// Extract non-overlapping patches from a CHW image.
@@ -858,6 +884,41 @@ mod tests {
             v, 10200.0,
             "patch_out_idx=2, c=1,t=0,dy=0,dx=0 should hold (1,2,0)"
         );
+    }
+
+    #[test]
+    fn resized_dimensions_refuse_extreme_aspect_ratio_before_allocation() {
+        for (h, w) in [(1_048_576, 1), (1, 1_048_576)] {
+            // Header accepts 1 MP, but the minimum 32-pixel short axis
+            // would turn it into 8 MP / 32,768 patches.
+            let (rh, rw) = smart_resize(h, w, 32, VISION_MIN_PIXELS, VISION_MAX_PIXELS);
+            assert_eq!(rh * rw, 8_388_608);
+            assert!(checked_resized_dimensions(h, w, 32, VISION_MAX_PIXELS)
+                .unwrap_err()
+                .contains("vision limit"));
+        }
+        let image = image::DynamicImage::new_rgb8(1, 1_048_576);
+        assert!(preprocess_dynamic_image(image, 16, 2).is_err());
+    }
+
+    #[test]
+    fn resized_dimensions_keep_ordinary_images_unchanged() {
+        for (h, w) in [(192, 288), (720, 1280), (2160, 3840), (4096, 4096), (1, 1)] {
+            for budget in [65_536, VISION_MAX_PIXELS, VISION_LDS_MAX_PIXELS] {
+                let expected = smart_resize(h, w, 32, VISION_MIN_PIXELS, budget);
+                assert_eq!(
+                    checked_resized_dimensions(h, w, 32, budget).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resized_dimensions_reject_zero_and_overflow() {
+        for (h, w, factor) in [(0, 1, 32), (1, 0, 32), (1, 1, 0), (usize::MAX, 2, 32)] {
+            assert!(checked_resized_dimensions(h, w, factor, VISION_MAX_PIXELS).is_err());
+        }
     }
 
     /// 4×6 image, patch_size=2, SMS=2: ph=2, pw=3 — non-square. ph%SMS=0,

@@ -789,7 +789,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "eager-only-refusals",
         predicates: &[IsRecording, CaptureMode, ReplayEnabled, GraphSlotCapturing],
-        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199), DFlash CB GDN lane-table staging (Gpu::upload_gdn_lane_table, lane_gdn.rs:378-380: `capture_mode` returns an error before the copy; callers stage_gdn_lane_table and stage_gdn_lane_table_from, qwen35 prefill_multi.rs:751, 853), sealed MoE expert-parallel row gather (hipfire-dispatch pipeline/moe_program.rs row_gather:1103-1106: `capture_mode`, a verify or replay `capturing` slot, or `is_recording()` returns an error before the gather exchange; EP decode is eager-only), the MoE CPU expert splice and the CPU transfer refuse capture or recording before any copy (hipfire-dispatch src/cpu_exec.rs moe_cpu_experts:619, with_cpu_transfer:1532), the Qwen35 placement and serve loaders refuse CPU-executed host weights with an enabled retained-replay backend before loading weights (qwen35 src/arch.rs load_weights_with_placement:108, src/serve_engine.rs build:1015), and the narrow MTP verify graph refuses a nested capture or replay recording (qwen35 src/mtp_spec.rs mtp_verify_graph_eligible:1517-1518), and a bounded-wait kernel launched under capture before its wait-error block exists (dispatch.rs Gpu::device_wait_block: `capture_mode` without a block returns an error before any allocation; the blocks are preallocated by Gpus::prepare_tp_graph_signals, gfx1100 wavegrid Gpu init and DS4 rsqrt_once control-state setup)",
+        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: Flash-Next image preparation (hipfire-arch-qwen4 src/bundle/image_context.rs prepare_image_context: capture_mode or is_recording refuses before allocating per-request image state) and QSA image mRoPE (rdna-compute src/qsa_mrope.rs ensure_eager: active-stream capture, capture_mode, verify/replay capturing slots, recording, a retained body, or AQL/PM4 routing refuses before rotary/pooling launches), prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199), DFlash CB GDN lane-table staging (Gpu::upload_gdn_lane_table, lane_gdn.rs:378-380: `capture_mode` returns an error before the copy; callers stage_gdn_lane_table and stage_gdn_lane_table_from, qwen35 prefill_multi.rs:751, 853), sealed MoE expert-parallel row gather (hipfire-dispatch pipeline/moe_program.rs row_gather:1103-1106: `capture_mode`, a verify or replay `capturing` slot, or `is_recording()` returns an error before the gather exchange; EP decode is eager-only), the MoE CPU expert splice and the CPU transfer refuse capture or recording before any copy (hipfire-dispatch src/cpu_exec.rs moe_cpu_experts:619, with_cpu_transfer:1532), the Qwen35 placement and serve loaders refuse CPU-executed host weights with an enabled retained-replay backend before loading weights (qwen35 src/arch.rs load_weights_with_placement:108, src/serve_engine.rs build:1015), and the narrow MTP verify graph refuses a nested capture or replay recording (qwen35 src/mtp_spec.rs mtp_verify_graph_eligible:1517-1518), and a bounded-wait kernel launched under capture before its wait-error block exists (dispatch.rs Gpu::device_wait_block: `capture_mode` without a block returns an error before any allocation; the blocks are preallocated by Gpus::prepare_tp_graph_signals, gfx1100 wavegrid Gpu init and DS4 rsqrt_once control-state setup)",
         effect: Refusal,
         switches: "error before any launch; the admission predicate that routes to the eager-only entry is inventoried at the caller",
         kernels: &[],
@@ -2048,6 +2048,12 @@ pub const SITES: &[Site] = &[
         function: "write_rows_to_staging",
         occurrences: 1,
         decisions: &["dflash-hidden-staging-recorded-copy"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/bundle/image_context.rs",
+        function: "prepare_image_context",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
@@ -3376,6 +3382,12 @@ pub const SITES: &[Site] = &[
         function: "row_tile_twin_enabled",
         occurrences: 2,
         decisions: &["qwen4-wide-verify-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/qsa_mrope.rs",
+        function: "ensure_eager",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
     },
     Site {
         file: "rdna-compute/src/replay.rs",

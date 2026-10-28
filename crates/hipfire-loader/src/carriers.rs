@@ -755,7 +755,7 @@ impl Carrier for Qwen4Carrier {
             spec_excludes_adaptive: true,
             semantic_contract_version: Some(2),
             has_deltanet: false,
-            supports_images: false,
+            supports_images: true,
             reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
         }
     }
@@ -826,7 +826,61 @@ impl Carrier for Qwen4Carrier {
         let dflash_draft = ctx.draft_path.filter(|_| ctx.spec.dflash == Some(true));
         let native_mtp = native_mtp && dflash_draft.is_none();
         let meta = resolve_source_meta(&src, ctx.path)?;
+        // Flash Next currently keeps its tower resident. Auto/on select that
+        // implementation explicitly; beta's other VL carriers still stream.
+        // Price both weights and the largest image before placement, then
+        // upload the tower after the text rank has preserved this room.
+        let vision_request = if ctx.vision_mode == "off" {
+            None
+        } else {
+            ctx.vision_path
+                .as_ref()
+                .map(|path| {
+                    let sidecar = hipfire_runtime::hfq::HfqFile::open(path)
+                        .map_err(|error| format!("qwen4 vision sidecar: {error}"))?;
+                    let config = hipfire_arch_qwen4::vision::config_from_hfq(&sidecar)?;
+                    let pitch =
+                        hipfire_arch_qwen35_vl::qwen35_vl::vision_fc2_pitch(ctx.gpu, &config);
+                    let padding = config.num_layers as u64
+                        * config.hidden_size as u64
+                        * (pitch - config.mlp_dim) as u64
+                        * 2;
+                    let weights = hipfire_arch_qwen4::vision::DEVICE_WEIGHT_BYTES
+                        .checked_add(padding)
+                        .ok_or("qwen4: vision weight reserve overflows")?;
+                    let has_wmma =
+                        ctx.gpu.arch_caps.has_wmma_w32() || ctx.gpu.arch_caps.has_wmma_w32_gfx12();
+                    let patches = hipfire_arch_qwen4::vision::MAX_IMAGE_PATCHES;
+                    let scratch =
+                        hipfire_arch_qwen4::vision::device_scratch_bytes(patches, has_wmma)?
+                            .checked_add((patches as u64 / 4) * config.out_hidden_size as u64 * 4)
+                            .and_then(|bytes| bytes.checked_add(1 << 20))
+                            .ok_or("qwen4: vision activation reserve overflows")?;
+                    let total = weights
+                        .checked_add(scratch)
+                        .ok_or("qwen4: vision reserve overflows")?;
+                    Ok::<_, String>((path.clone(), config, weights, scratch, total))
+                })
+                .transpose()?
+        };
+        let vision_reserve_bytes = vision_request.as_ref().map_or(0, |request| request.4);
+        let vision_activation_bytes = vision_request.as_ref().map_or(0, |request| request.3);
+        if vision_reserve_bytes != 0 {
+            if let Some(sequence) = ctx.sequence.as_mut() {
+                let bytes = usize::try_from(vision_reserve_bytes)
+                    .map_err(|_| "qwen4: vision reserve exceeds platform address space")?;
+                sequence.reserve_bytes = sequence
+                    .reserve_bytes
+                    .checked_add(bytes)
+                    .ok_or("qwen4: sequence vision reserve overflows")?;
+            }
+            if let Some((_, _, weights, scratch, _)) = &vision_request {
+                eprintln!("qwen4 vision: mode={} -> resident; vision_reserve={} bytes ({} resident weights incl. row padding + {} largest-image scratch incl. projected rows)",
+                    ctx.vision_mode, vision_reserve_bytes, weights, scratch);
+            }
+        }
         let shared = Qwen4RankShared {
+            vision_reserve_bytes,
             continuous_batch: ctx.batch_request.lanes().is_some(),
             path: ctx.path.to_string(),
             max_seq: ctx.max_seq,
@@ -875,95 +929,174 @@ impl Carrier for Qwen4Carrier {
                 eprintln!("{line}");
             }
         }
-        let mut loaded = load_qwen4_rank(
-            ctx.gpu,
-            ep_plan.as_ref().map(|plan| plan.rank(0)),
-            &shared,
-            ep_plan.as_ref().map(|plan| plan.expert_vram_layers),
-            Some(Qwen4SessionSeed {
-                tokenizer: &meta.tokenizer,
-                chat_template: meta.chat_template.as_deref(),
-            }),
-            src,
-        )?;
-        // Seam: the EP mesh owner builds peer ranks 1..N-1 here, after rank 0
-        // is loaded (see `attach_qwen4_ep_peers`).
-        if let Some(plan) = &ep_plan {
-            if let Err(error) = attach_qwen4_ep_peers(&mut loaded.bundle, ctx.gpu, plan) {
-                let _ = loaded.bundle.free_gpu(ctx.gpu);
-                return Err(error);
-            }
-        }
-        if let (Some(sequence), Some(card_cap)) = (ctx.sequence.as_mut(), loaded.card_cap) {
-            sequence.card_cap = card_cap;
-        }
-        let (native_mtp, max_k, max_seq) = (loaded.native_mtp, loaded.max_k, loaded.max_seq);
-        // Rows a verify forward of the placed load runs row-exact; the n-gram
-        // copy lane's take cap reads it. Experts hosted on the CPU verify at most the
-        // admitted CPU window (legacy 4 floor, 64 only when actually prewarmed),
-        // otherwise the per-GPU row-exact rows apply.
-        let verify_rows = qwen4_placed_verify_rows(&loaded.bundle, &ctx.gpu.arch);
-        // An explicit K keeps its value up to the physical executor width and
-        // the placed load's qualified verify window (the CPU-window hard cap
-        // narrows it below); the `auto` cap is resolved here from the placed
-        // load's own CPU ownership: one below the smaller of the GPU's
-        // row-exact rows and the armed CPU mode's window. A resource-64
-        // reserve alone never widens an actual proposer.
-        let max_k = if qwen4_explicit_mtp_k(ctx.spec).is_some() {
-            max_k
-                .min(hipfire_runtime::spec_economics::DERIVED_MAX_DRAFTS)
-                .min(verify_rows.saturating_sub(1).max(1))
-        } else {
-            qwen4_auto_mtp_k(&ctx.gpu.arch, loaded.bundle.native_mtp_cpu_window_rows())
-        };
-        let cpu_splice = loaded.bundle.has_cpu_deferred_experts();
-        let speculator = match dflash_draft {
-            Some(draft) => match qwen4_dflash2_speculator(
+        let result = (|| -> Result<LoadedModel, String> {
+            let loaded = load_qwen4_rank(
                 ctx.gpu,
-                draft,
-                &mut loaded.bundle,
-                max_seq,
-                cpu_splice,
-                qwen4_dflash2_block(ctx.spec, verify_rows),
-                verify_rows,
-            ) {
-                Ok(speculator) => Some(speculator),
-                Err(error) => {
+                ep_plan.as_ref().map(|plan| plan.rank(0)),
+                &shared,
+                ep_plan.as_ref().map(|plan| plan.expert_vram_layers),
+                Some(Qwen4SessionSeed {
+                    tokenizer: &meta.tokenizer,
+                    chat_template: meta.chat_template.as_deref(),
+                }),
+                src,
+            );
+            let mut loaded = loaded?;
+            if let Some((path, config, _, _, _)) = &vision_request {
+                let tower = (|| {
+                    let sidecar = hipfire_runtime::hfq::HfqFile::open(path)
+                        .map_err(|error| format!("qwen4 vision sidecar: {error}"))?;
+                    hipfire_arch_qwen4::vision::load_weights(&sidecar, config, ctx.gpu)
+                        .map_err(|error| format!("qwen4 vision upload: {error}"))
+                })();
+                match tower {
+                    Ok(weights) => loaded.bundle.vision = Some((config.clone(), weights)),
+                    Err(error) => {
+                        let _ = loaded.bundle.free_gpu(ctx.gpu);
+                        return Err(error);
+                    }
+                }
+            }
+            // Seam: the EP mesh owner builds peer ranks 1..N-1 here, after rank 0
+            // is loaded (see `attach_qwen4_ep_peers`).
+            if let Some(plan) = &ep_plan {
+                if let Err(error) = attach_qwen4_ep_peers(&mut loaded.bundle, ctx.gpu, plan) {
                     let _ = loaded.bundle.free_gpu(ctx.gpu);
                     return Err(error);
                 }
-            },
-            None => native_mtp.then(|| {
-                qwen4_native_mtp_speculator(
-                    max_k,
-                    qwen4_explicit_mtp_k(ctx.spec),
+            }
+            if let (Some(sequence), Some(card_cap)) = (ctx.sequence.as_mut(), loaded.card_cap) {
+                sequence.card_cap = card_cap;
+            }
+            let (native_mtp, max_k, max_seq) = (loaded.native_mtp, loaded.max_k, loaded.max_seq);
+            // Rows a verify forward of the placed load runs row-exact; the n-gram
+            // copy lane's take cap reads it. Experts hosted on the CPU verify at most the
+            // admitted CPU window (legacy 4 floor, 64 only when actually prewarmed),
+            // otherwise the per-GPU row-exact rows apply.
+            let verify_rows = qwen4_placed_verify_rows(&loaded.bundle, &ctx.gpu.arch);
+            // An explicit K keeps its value up to the physical executor width and
+            // the placed load's qualified verify window (the CPU-window hard cap
+            // narrows it below); the `auto` cap is resolved here from the placed
+            // load's own CPU ownership: one below the smaller of the GPU's
+            // row-exact rows and the armed CPU mode's window. A resource-64
+            // reserve alone never widens an actual proposer.
+            let max_k = if qwen4_explicit_mtp_k(ctx.spec).is_some() {
+                max_k
+                    .min(hipfire_runtime::spec_economics::DERIVED_MAX_DRAFTS)
+                    .min(verify_rows.saturating_sub(1).max(1))
+            } else {
+                qwen4_auto_mtp_k(&ctx.gpu.arch, loaded.bundle.native_mtp_cpu_window_rows())
+            };
+            let cpu_splice = loaded.bundle.has_cpu_deferred_experts();
+            let speculator = match dflash_draft {
+                Some(draft) => match qwen4_dflash2_speculator(
+                    ctx.gpu,
+                    draft,
+                    &mut loaded.bundle,
                     max_seq,
-                    &ctx.gpu.arch,
-                    meta.tokenizer.special_token_id("<|im_end|>"),
-                    meta.tokenizer.special_token_id("</think>"),
-                    true,
+                    cpu_splice,
+                    qwen4_dflash2_block(ctx.spec, verify_rows),
                     verify_rows,
-                    loaded.bundle.state_format().gdn,
-                    loaded.measured_load_identity.clone(),
-                )
-            }),
-        };
+                ) {
+                    Ok(speculator) => Some(speculator),
+                    Err(error) => {
+                        let _ = loaded.bundle.free_gpu(ctx.gpu);
+                        return Err(error);
+                    }
+                },
+                None => native_mtp.then(|| {
+                    qwen4_native_mtp_speculator(
+                        max_k,
+                        qwen4_explicit_mtp_k(ctx.spec),
+                        max_seq,
+                        &ctx.gpu.arch,
+                        meta.tokenizer.special_token_id("<|im_end|>"),
+                        meta.tokenizer.special_token_id("</think>"),
+                        true,
+                        verify_rows,
+                        loaded.bundle.state_format().gdn,
+                        loaded.measured_load_identity.clone(),
+                    )
+                }),
+            };
 
-        let mut model = LoadedModel {
-            state: Some(Box::new(loaded.bundle)),
-            speculator,
-            ..LoadedModel::skeleton(
-                meta.arch_id,
-                meta.tokenizer,
-                max_seq,
-                max_seq,
-                ctx.path.to_string(),
-                meta.chat_template,
-                meta.chat_template_source,
-            )
-        };
-        apply_qwen4_native_mtp(&mut model, native_mtp, max_k, ctx.spec);
-        Ok(model)
+            let mut model = LoadedModel {
+                state: Some(Box::new(loaded.bundle)),
+                speculator,
+                ..LoadedModel::skeleton(
+                    meta.arch_id,
+                    meta.tokenizer,
+                    max_seq,
+                    max_seq,
+                    ctx.path.to_string(),
+                    meta.chat_template,
+                    meta.chat_template_source,
+                )
+            };
+            apply_qwen4_native_mtp(&mut model, native_mtp, max_k, ctx.spec);
+            Ok(model)
+        })();
+        // Optional draft/verify construction may allocate after rank admission.
+        // With the tower now resident, check actual remaining image/context
+        // room again. A refused load releases every model owner through the
+        // common teardown path; no scratch allocation is used as a budget.
+        match result {
+            Ok(model) if vision_activation_bytes != 0 => {
+                let fit = (|| {
+                    let bundle = model.qwen4().ok_or("qwen4 vision: missing loaded bundle")?;
+                    let mtp_request = if model.mtp_weights_present {
+                        let config = &bundle.config;
+                        let drafts = hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(
+                            model.mtp_k,
+                            &ctx.gpu.arch,
+                        );
+                        hipfire_arch_qwen4::mtp_spec::native_mtp_request_bytes(
+                            config,
+                            model.max_seq,
+                            bundle.spec_chunk_rows().unwrap_or(1).max(1),
+                            drafts,
+                            hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
+                                ctx.gpu,
+                                config,
+                                bundle.state_format().gdn,
+                                drafts,
+                            )
+                            .filter(|(_, rows)| bundle.native_mtp_capture_rows() < *rows),
+                            hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(ctx.gpu),
+                        )
+                        .ok_or("qwen4 vision: native MTP request bytes overflow")?
+                    } else {
+                        0
+                    };
+                    let (free, _) = ctx
+                        .gpu
+                        .device_mem_info()
+                        .map_err(|error| format!("qwen4 vision: final memory query: {error}"))?;
+                    crate::admission::qwen4_memory_admission_with_reserve(
+                        model.max_seq,
+                        Some(model.max_seq),
+                        free as u64,
+                        mtp_request,
+                        0,
+                        crate::admission::QWEN4_MEMORY_HEADROOM_BYTES,
+                        vision_activation_bytes,
+                        |tokens| bundle.context_growth_bytes(ctx.gpu, tokens),
+                    )
+                    .map(|_| ())
+                })();
+                if let Err(error) = fit {
+                    let cleanup = crate::unload_model(model, ctx.gpu);
+                    return Err(match cleanup {
+                        Ok(()) => format!("qwen4 vision reserve after draft allocation: {error}"),
+                        Err(cleanup) => {
+                            format!("qwen4 vision reserve: {error}; cleanup: {cleanup}")
+                        }
+                    });
+                }
+                Ok(model)
+            }
+            result => result,
+        }
     }
 
     /// Bench-prefill for Qwen4: the daemon has reset the request state; run
@@ -1332,6 +1465,9 @@ fn qwen4_pp_session_budget(pp_native_mtp: bool, configured: u64) -> u64 {
 /// touched the device.
 #[derive(Clone)]
 pub struct Qwen4RankShared {
+    /// The same per-load reserve as SequenceHint.reserve_bytes; retained
+    /// explicitly for discrete ranks that do not use automatic max_seq.
+    pub vision_reserve_bytes: u64,
     pub path: String,
     pub max_seq: usize,
     pub sequence: Option<hipfire_runtime::loader_api::SequenceHint>,
@@ -1633,6 +1769,15 @@ fn qwen4_measured_load_identity(
     }
 }
 
+/// Only GTT-backed device heaps share the host budget. BIOS carve-outs are
+/// already excluded from MemTotal/MemAvailable; their bytes stay on the device
+/// ledger while explicit host owners remain charged on every GPU.
+fn qwen4_host_union(host_only: u64, device_backed: u64, shared: bool) -> Result<u64, String> {
+    host_only
+        .checked_add(if shared { device_backed } else { 0 })
+        .ok_or_else(|| "qwen4: planned shared RAM union overflows".into())
+}
+
 /// One owning placement census plus settled placement-component upper bounds.
 /// No second planner: borrowed views/aliases own nothing, the new capture is
 /// inside the native-MTP reserve, and VMM census terms charge mapped granules.
@@ -1651,6 +1796,8 @@ struct Qwen4SettledResourceEvidence {
     mem_available: Option<u64>,
     ttm_pool: u64,
     gtt_free_bytes: Option<u64>,
+    // Heap backing, distinct from the integrated-GPU range-read policy.
+    device_uses_host_ram: bool,
 }
 
 /// Compose the frozen resource snapshot beside the measured-load identity.
@@ -1810,7 +1957,7 @@ fn qwen4_measured_resource_snapshot(
         gtt_budget_bytes: evidence.gtt_free_bytes,
     };
     let backing = Qwen4LoadBacking {
-        kind: if gpu.is_uma() {
+        kind: if evidence.device_uses_host_ram {
             Qwen4BackingKind::UmaShared
         } else {
             Qwen4BackingKind::Discrete
@@ -1860,7 +2007,7 @@ fn qwen4_measured_resource_snapshot(
                 .host_check_bytes
                 .checked_add(evidence.stage_mirror_bytes)
                 .and_then(|bytes| {
-                    bytes.checked_add(if gpu.is_uma() {
+                    bytes.checked_add(if evidence.device_uses_host_ram {
                         snapshot.device_plan_bytes()
                     } else {
                         0
@@ -2274,6 +2421,7 @@ fn qwen4_placement_inputs(
     ranks: usize,
     chunk_rows: usize,
     share: Option<hipfire_arch_qwen4::expert_residency::DecodeShareForward>,
+    vision_reserve_bytes: u64,
 ) -> Result<
     (
         u64,
@@ -2296,6 +2444,7 @@ fn qwen4_placement_inputs(
         );
     let inputs = hipfire_arch_qwen4::expert_residency::placement_inputs_with_forward(
         &hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
+            vision_reserve_bytes,
             gpu,
             config,
             weights,
@@ -2814,6 +2963,7 @@ pub fn qwen4_ep_vram_layers(
         ranks,
         chunk_rows,
         None,
+        shared.vision_reserve_bytes,
     )?;
     // Same charges as each rank's load applies to an expert-parallel split
     // (no slab stage: `new_slab` has no EP route), so the agreed split never
@@ -2999,6 +3149,7 @@ pub fn qwen4_preload_resource_plan(
             usize::from(routed_experts),
         );
     let inputs = residency::placement_inputs(&residency::PlacementInputsArgs {
+        vision_reserve_bytes: shared.vision_reserve_bytes,
         gpu,
         config: &config,
         weights: &manifest.weights,
@@ -3054,6 +3205,7 @@ pub fn qwen4_preload_resource_plan(
         routed_experts,
         use_ranges,
         &shared.path,
+        shared.vision_reserve_bytes,
     )?;
     // Shared cohesive metadata: fixed-N / auto / hotset / native intent resolved
     // through the genuine owners before byte accounting, with no fake admission.
@@ -3583,6 +3735,7 @@ pub fn qwen4_preload_resource_plan(
     );
     let component_union = hipfire_arch_qwen4::measured_resources::preload_component_union(
         &residency::PlacementInputsArgs {
+            vision_reserve_bytes: shared.vision_reserve_bytes,
             gpu,
             config: &config,
             weights: &manifest.weights,
@@ -3622,7 +3775,8 @@ pub fn qwen4_preload_resource_plan(
     // counted exactly once inside A, never re-added.
     let (whole_host_union_bytes, whole_load_join) = preload_whole_host_join(
         &component_union,
-        use_ranges,
+        gpu.device_allocations_share_host_ram()
+            .map_err(|error| format!("qwen4 preload plan: device backing: {error}"))?,
         ple_data_bytes,
         ple_staging_upload_bytes,
         page_cache_bytes,
@@ -3684,7 +3838,7 @@ pub fn qwen4_preload_resource_plan(
 #[allow(clippy::too_many_arguments)]
 fn preload_whole_host_join(
     component_union: &serde_json::Value,
-    use_ranges: bool,
+    device_uses_host_ram: bool,
     ple_resident_envelope_bytes: u64,
     ple_staging_upload_bytes: u64,
     page_cache_bytes: u64,
@@ -3708,7 +3862,7 @@ fn preload_whole_host_join(
         .ok_or_else(|| {
             "qwen4 preload plan: component union has no bool 'uma_shared_backing'".to_string()
         })?;
-    if a_uma != use_ranges {
+    if a_uma != device_uses_host_ram {
         return Err("qwen4 preload plan: component union backing disagrees with this rank".into());
     }
     let ck = |a: u64, b: u64, what: &str| {
@@ -3823,6 +3977,7 @@ fn preload_s1_union(
     routed_experts: bool,
     use_ranges: bool,
     model_path: &str,
+    vision_reserve_bytes: u64,
 ) -> Result<(u64, String, serde_json::Value), String> {
     use hipfire_arch_qwen4::slowlink_admission as s1;
     let declined = |reason: String| {
@@ -3917,6 +4072,7 @@ fn preload_s1_union(
     // the layout route holds (the blessed no-artifact-bytes answer).
     let no_scan = || Ok::<bool, String>(false);
     let load = s1::SingleDeviceLoad {
+        vision_reserve_bytes,
         gpu,
         config,
         weights,
@@ -4140,6 +4296,9 @@ fn load_qwen4_rank_scoped(
     src: ModelSource,
     band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
 ) -> Result<Qwen4RankLoad, String> {
+    // Keep metadata, EP/S1 placement and final admission on the same quote,
+    // including discrete loads without an automatic sequence hint.
+    let vision_reserve_bytes = shared.vision_reserve_bytes;
     let backend = shared.backend;
     let vmm_granularity = shared.vmm_granularity;
     let max_k = shared.max_k;
@@ -4482,6 +4641,12 @@ fn load_qwen4_rank_scoped(
         eprintln!("  qwen4 forward scratch: {scratch_mode:?} plan ({reason})");
     }
     let use_ranges = ctx.gpu.is_uma();
+    // A carve-out APU still uses range reads, but its resident device owners
+    // are outside /proc/meminfo and must not consume the host/GTT budget.
+    let device_uses_host_ram = ctx
+        .gpu
+        .device_allocations_share_host_ram()
+        .map_err(|error| format!("qwen4: device allocation backing query: {error}"))?;
     if use_ranges {
         hfq.drop_mmap();
     }
@@ -4602,6 +4767,7 @@ fn load_qwen4_rank_scoped(
             ep_ranks,
             placement_chunk,
             None,
+            vision_reserve_bytes,
         )?)
     } else {
         None
@@ -4697,6 +4863,7 @@ fn load_qwen4_rank_scoped(
                     borrowed,
                     shadows_borrowed: decode_share_shadow_bytes,
                 }),
+                vision_reserve_bytes,
             )
             .ok(),
             _ => None,
@@ -4916,6 +5083,7 @@ fn load_qwen4_rank_scoped(
             },
             || {
                 let load = s1::SingleDeviceLoad {
+                    vision_reserve_bytes,
                     gpu: &*ctx.gpu,
                     config: &config,
                     weights: &manifest.weights,
@@ -5870,9 +6038,10 @@ fn load_qwen4_rank_scoped(
             ttm_pool: preallocation_ttm_pool,
             gtt_free_bytes: preallocation_gtt
                 .map(|budget| budget.limit_bytes.saturating_sub(budget.used_bytes)),
+            device_uses_host_ram,
         };
-        // UMA's device owners are backed by the same RAM. The historical
-        // expert-only host check missed this entire disjoint component. Charge
+        // GTT-backed UMA device owners share host RAM; BIOS carve-outs do not.
+        // The expert-only host check misses the former component. Charge
         // the admitted full-context census (VMM mapped granules, not virtual
         // extent), owners, stage and parked pool ONCE, plus host-only owners.
         let device_backed = non_expert
@@ -5886,9 +6055,7 @@ fn load_qwen4_rank_scoped(
         let host_only = host_mapped_bytes
             .checked_add(stage_mirror_bytes)
             .ok_or("qwen4: planned host-only component union overflows")?;
-        let host_union = host_only
-            .checked_add(if use_ranges { device_backed } else { 0 })
-            .ok_or("qwen4: planned shared RAM union overflows")?;
+        let host_union = qwen4_host_union(host_only, device_backed, device_uses_host_ram)?;
         let admitted_capture_64 = fresh_resource_basis
             && native_mtp
             && capture_plan_admitted
@@ -6851,13 +7018,14 @@ fn load_qwen4_rank_scoped(
                 .device_mem_info()
                 .map_err(|error| format!("qwen4: device memory query: {error}"))?;
             let gpu = &*ctx.gpu;
-            crate::admission::qwen4_memory_admission(
+            crate::admission::qwen4_memory_admission_with_reserve(
                 ctx.max_seq,
                 (!automatic).then_some(ctx.max_seq),
                 free as u64,
                 mtp_request,
                 ple_resident,
                 crate::admission::QWEN4_MEMORY_HEADROOM_BYTES,
+                vision_reserve_bytes,
                 |tokens| bundle.context_growth_bytes(gpu, tokens),
             )
         },
@@ -6878,6 +7046,10 @@ fn load_qwen4_rank_scoped(
                     admission.card_cap,
                     admission.card_cap
                 );
+            if admission.vision_reserve != 0 {
+                eprintln!("  qwen4 memory admission: vision_reserve={} bytes (tower weights plus maximum image scratch; excluded from automatic context capacity)",
+                    admission.vision_reserve);
+            }
             if admission.ple_shrunk() {
                 eprintln!(
                     "  qwen4 ple budget: {} MiB of {} MiB kept resident so the {}-token context fits (the context takes precedence over the reclaimable PLE page cache)",
@@ -7726,6 +7898,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
     let max_k = qwen4_native_mtp_k(ctx.spec, &ctx.gpu.arch);
     let meta = resolve_source_meta(&src, ctx.path)?;
     let shared = Qwen4RankShared {
+        vision_reserve_bytes: 0,
         continuous_batch: false,
         path: ctx.path.to_string(),
         max_seq: ctx.max_seq,
@@ -12681,6 +12854,101 @@ mod ep_lane_reservation_tests {
             })
             .unwrap();
         assert!(lane.bytes.unwrap_err().contains("not VMM"));
+    }
+}
+
+#[cfg(test)]
+mod qwen4_backing_tests {
+    use super::{preload_whole_host_join, qwen4_host_union};
+    use hipfire_arch_qwen4::expert_residency::{check_gtt_cap, check_host_ram, GttBudget};
+    use rdna_compute::uma_memory::{device_free_from, gtt_backed, DeviceMemory};
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn carveout_96gib_and_31gib_host_keep_disjoint_budgets() {
+        let shared = gtt_backed(96 * GIB, Some(96 * GIB));
+        assert!(!shared);
+        let device = 70 * GIB;
+        let host_only = GIB / 4;
+        let union = qwen4_host_union(host_only, device, shared).unwrap();
+        assert_eq!(union, host_only);
+        check_host_ram(union, Some(21 * GIB), 0).unwrap();
+        check_gtt_cap(
+            union,
+            Some(GttBudget {
+                limit_bytes: 16 * GIB,
+                used_bytes: GIB,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            device_free_from(DeviceMemory {
+                device_free: 95 * GIB,
+                device_total: 96 * GIB,
+                uma: true,
+                carveout_total: Some(96 * GIB),
+                host_available: Some(21 * GIB),
+            }),
+            Some(95 * GIB)
+        );
+        let component = serde_json::json!({
+            "host_union_upper_bound_bytes": union,
+            "device_union_upper_bound_bytes": device,
+            "device_backed_host_bytes": 0,
+            "uma_shared_backing": shared,
+        });
+        let (whole, report) = preload_whole_host_join(
+            &component,
+            shared,
+            GIB,
+            GIB / 16,
+            0,
+            GIB / 16,
+            0,
+            Some(21 * GIB),
+            0,
+        )
+        .unwrap();
+        assert_eq!(whole, host_only + GIB + GIB / 8);
+        assert_eq!(report["whole_device_union_bytes"], device);
+        // Real host-only overcommit remains refused even on a carve-out APU.
+        assert!(check_host_ram(
+            qwen4_host_union(28 * GIB, device, shared).unwrap(),
+            Some(31 * GIB),
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gtt_aperture_and_unknown_backing_charge_device_memory_to_host() {
+        for carveout in [Some(4 * GIB), None] {
+            let shared = gtt_backed(96 * GIB, carveout);
+            assert!(shared);
+            let union = qwen4_host_union(GIB / 4, 70 * GIB, shared).unwrap();
+            assert_eq!(union, 70 * GIB + GIB / 4);
+            assert!(check_host_ram(union, Some(31 * GIB), 0).is_err());
+            assert!(check_gtt_cap(
+                union,
+                Some(GttBudget {
+                    limit_bytes: 16 * GIB,
+                    used_bytes: 0
+                })
+            )
+            .is_err());
+            assert_eq!(
+                device_free_from(DeviceMemory {
+                    device_free: 95 * GIB,
+                    device_total: 96 * GIB,
+                    uma: true,
+                    carveout_total: carveout,
+                    host_available: Some(21 * GIB),
+                }),
+                Some(21 * GIB)
+            );
+        }
+        assert!(qwen4_host_union(u64::MAX, 1, true).is_err());
     }
 }
 

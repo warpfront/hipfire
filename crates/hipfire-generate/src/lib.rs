@@ -62,6 +62,9 @@ pub mod embed;
 /// dots.ocr path.
 pub mod vision;
 
+/// Flash-Next image-conditioned AR generation.
+pub mod qwen4_vision;
+
 /// Redline capture/replay fixtures lifted out of the daemon.
 pub mod redline;
 

@@ -2113,12 +2113,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         // neither fed nor streamed, so the request moves into an exact lane
         // that feeds and streams it, instead of the peer waiting for this
         // whole generation. A refusal changes nothing: the same token is fed
-        // below.
+        // below. Image contexts stay on the singleton because text-only lanes
+        // cannot carry their per-token mRoPE positions.
         if !promotion_tried
             && forced_close.is_empty()
             && greedy_on_gpu
             && !decode_penalizes
-            && m.qwen4().is_some_and(|b| b.lanes().is_some())
+            && m.qwen4()
+                .is_some_and(|b| b.lanes().is_some() && !b.image_context_active())
         {
             if let Some(permit) = crate::batch::promotion_permit()
                 .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))

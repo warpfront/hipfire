@@ -408,6 +408,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
 pub enum VisionRoute {
     DotsOcr,
     QwenVl,
+    Qwen4Vl,
     Lfm2Vl,
     None,
 }
@@ -428,6 +429,7 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
     match arch_id {
         8 => VisionRoute::DotsOcr,
         5 | 6 => VisionRoute::QwenVl,
+        16 => VisionRoute::Qwen4Vl,
         11 => VisionRoute::Lfm2Vl,
         _ => VisionRoute::None,
     }
@@ -1485,7 +1487,8 @@ impl LoadedModel {
         if self.embeddinggemma2().is_some_and(|b| b.vision.is_some()) {
             return true;
         }
-        self.qwen35().is_some_and(|b| b.vision_config.is_some())
+        self.qwen4().is_some_and(|b| b.vision.is_some())
+            || self.qwen35().is_some_and(|b| b.vision_config.is_some())
     }
 
     /// Declared audio capability: an audio tower is resident in this load.
@@ -6994,6 +6997,7 @@ mod registry_tests {
         // VisionRoute must be declarative via caps, not just arch_id.
         assert_eq!(super::vision_route(5), super::VisionRoute::QwenVl);
         assert_eq!(super::vision_route(6), super::VisionRoute::QwenVl);
+        assert_eq!(super::vision_route(16), super::VisionRoute::Qwen4Vl);
         assert_eq!(super::vision_route(8), super::VisionRoute::DotsOcr);
         assert_eq!(super::vision_route(11), super::VisionRoute::Lfm2Vl);
         assert_eq!(super::vision_route(0), super::VisionRoute::None);
@@ -7221,6 +7225,7 @@ mod registry_tests {
             let want = match id {
                 8 => VisionRoute::DotsOcr,
                 5 | 6 => VisionRoute::QwenVl,
+                16 => VisionRoute::Qwen4Vl,
                 11 => VisionRoute::Lfm2Vl,
                 _ => VisionRoute::None,
             };

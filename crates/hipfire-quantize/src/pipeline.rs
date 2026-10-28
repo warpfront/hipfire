@@ -1066,7 +1066,16 @@ pub(crate) fn run() {
                 std::process::exit(2);
             }
         };
-        match crate::qwen4::run_cli_with_mode(Path::new(input), Path::new(&args.output), mode) {
+        if args.vision_only && mode != crate::qwen4::Qwen4Mode::Production {
+            eprintln!("error: --qwen4-flash-next --vision-only requires production component mode");
+            std::process::exit(2);
+        }
+        let result = if args.vision_only {
+            crate::qwen4::run_vision_cli(Path::new(input), Path::new(&args.output))
+        } else {
+            crate::qwen4::run_cli_with_mode(Path::new(input), Path::new(&args.output), mode)
+        };
+        match result {
             Ok(summary) => {
                 eprintln!(
                     "qwen4: wrote {} ({} entries: {} experts, {} PLE shards; \

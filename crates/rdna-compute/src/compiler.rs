@@ -3510,8 +3510,8 @@ mod tests {
                 .filter(|s| !REPAIRED.contains(s))
                 .collect();
             if arch == "gfx1100" {
-                // Keep the sealed inventory unchanged. The later HC x8
-                // export is gfx1201-only and does not alter gfx11 exports.
+                // Keep the sealed inventory unchanged; the later rope table
+                // extends it. Image mRoPE has its own module; HC x8 stays gfx1201-only.
                 assert_eq!(
                     old.iter()
                         .copied()
@@ -3519,7 +3519,7 @@ mod tests {
                     sealed
                         .iter()
                         .copied()
-                        .chain(["indexed_attention_rope_table_f32"])
+                        .chain(["indexed_attention_rope_table_f32",])
                         .collect::<std::collections::BTreeSet<_>>()
                 );
             }

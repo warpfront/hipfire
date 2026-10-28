@@ -60,6 +60,10 @@ use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use pp::{Qwen4PpBandMeta, Qwen4PpMesh};
 pub use pp::{Qwen4PpLaneExecutor, Qwen4PpWindow};
 
+mod image_context;
+use image_context::ImageContext;
+pub use image_context::ImageSpan;
+
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn pp_owner_required() -> BundleError {
@@ -165,6 +169,12 @@ pub struct Qwen4Bundle {
     pub config: Qwen4Config,
     pub weights: Qwen4Weights,
     pub state: Qwen4State,
+    /// Resident image tower; absent when vision is disabled or no sidecar was admitted.
+    pub vision: Option<(
+        crate::vision::Qwen4VisionConfig,
+        crate::vision::Qwen4VisionWeights,
+    )>,
+    pub(crate) image_context: Option<ImageContext>,
     /// PLE rows, hash metadata and their attachments; `None` exactly when
     /// `config.ple` is `None`.
     pub(crate) ple: Option<Qwen4BundlePle>,
@@ -885,6 +895,8 @@ impl Qwen4Bundle {
             config,
             weights,
             state,
+            vision: None,
+            image_context: None,
             ple,
             weight_store: AttachedWeightStore::new(transaction),
             execution: None,
@@ -3786,6 +3798,7 @@ impl Qwen4Bundle {
         if self.ep.is_some() {
             return self.ep_reset(gpu);
         }
+        self.clear_image_context(gpu)?;
         // A new request starts with a clear router fault word. Only here, never
         // mid-pipeline: a clear would drop an earlier row's pending report.
         gpu.clear_router_fault();
@@ -5141,6 +5154,16 @@ impl Qwen4Bundle {
         }
         // Peers drain and free first: their gather events and P2P reads end
         // before rank 0's buffers go.
+        if let Err(error) = self.clear_image_context(gpu) {
+            // A failed fence means image and trunk readers may still be live.
+            // Quarantine the entire owner instead of recycling any of its
+            // buffers into a subsequent model's allocation pool.
+            std::mem::forget(self);
+            return Err(error);
+        }
+        if let Some((_, vision)) = self.vision.take() {
+            vision.free_gpu(gpu);
+        }
         let ep_result = self.ep_close(gpu);
         let Qwen4Bundle {
             weights,

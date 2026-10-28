@@ -2320,6 +2320,7 @@ fn forward_lanes_scoped(
                                 head_dim: dims.head_dim,
                                 rotary_dim: config.rotary_dim(),
                                 rope: config.rope(),
+                                mrope: None,
                                 input_width: dims.hidden,
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,

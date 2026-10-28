@@ -1025,6 +1025,12 @@ Acceptance evidence for this default (fresh-process determinism, the batching C1
 ---
 ## Vision tower
 
+Flash Next (arch 16) currently uses a resident tower for a present sidecar under
+`auto`, `on` or `resident`; `auto`/`resident` without a sidecar remain text-only,
+and `on` requires a sidecar. Other Qwen VL carriers keep the streamed behavior
+described below. See [Flash Next vision](qwen4-vision.md) for its resource
+reservation and current validation scope.
+
 | Key | Default | Values / range |
 |---|---|---|
 | `vision_mode` | `"auto"` | `auto` \| `resident` \| `on` \| `off` |

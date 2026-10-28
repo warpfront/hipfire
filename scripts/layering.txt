@@ -58,7 +58,6 @@
  6 hipfire-arch-qwen2
  6 hipfire-arch-lfm2-vl
  6 hipfire-arch-qwen35-vl
- 6 hipfire-arch-qwen4
  6 hipfire-arch-toy
  6 hipfire-dispatch-tests
  6 hipfire-ds4-parent
@@ -68,10 +67,13 @@
  7 hipfire-arch-lfm2moe
  7 hipfire-arch-minimax
  7 hipfire-arch-qwen35
+# Qwen4 reuses the layer-6 Qwen vision tower, like Qwen35 and its encoder.
+ 7 hipfire-arch-qwen4
  7 hipfire-arch-qwen35-embed
  7 hipfire-arch-embeddinggemma2
- 7 hipfire-quantize
  7 saddle-quant
+# The quantizer validates artifacts through the layer-7 Qwen4 contract.
+ 8 hipfire-quantize
  8 hipfire-loader
  8 hipfire-pflash
  9 hipfire-engine

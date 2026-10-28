@@ -263,6 +263,7 @@ pub(super) fn build_program<'a>(
                     head_dim: dims.head_dim,
                     rotary_dim: config.rotary_dim(),
                     rope: config.rope(),
+                    mrope: None,
                     input_width: dims.hidden,
                     trunk_a4: owner.trunk_a4.get(layer_index).copied().unwrap_or(0),
                     phase: MixerPhase::Whole,

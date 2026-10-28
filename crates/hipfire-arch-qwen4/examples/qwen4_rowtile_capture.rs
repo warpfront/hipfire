@@ -274,6 +274,7 @@ impl Model {
             path: model_str.to_string(),
             max_seq: n_ctx,
             sequence: None,
+            vision_reserve_bytes: 0,
             backend,
             vmm_granularity,
             kv_mode: hipfire_runtime::config::get().kv_mode.clone(),

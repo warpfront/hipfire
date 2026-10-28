@@ -2076,6 +2076,7 @@ pub fn native_mtp_granule_slack(
 /// [`ReserveCensus`]; where the census carries the measured HIP runtime
 /// overhead ([`runtime_overhead_bytes`]) the floor is retired
 /// (`historical` is `None`) and the census alone is the reserve. The
+/// independent vision reservation is added after that decision; the
 /// whole-layer stage buffers and safety margin ([`PlacementCharges`]) are
 /// added on top of [`Self::bytes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2083,6 +2084,10 @@ pub struct AutoReserve {
     pub historical: Option<u64>,
     pub census: ReserveCensus,
     pub census_total: u64,
+    /// Device bytes reserved for a vision tower loaded after text placement:
+    /// resident weights (including row padding), activation scratch and
+    /// projected image rows. Added after the text floor/census decision.
+    pub vision_reserve_bytes: u64,
     /// `Some(S)` when a decode-share load charged only its dedicated forward:
     /// `S` bytes of prefill scratch are borrowed from the donor tail instead
     /// of reserved ([`DecodeShareForward`]).
@@ -2100,8 +2105,25 @@ impl AutoReserve {
             historical,
             census,
             census_total,
+            vision_reserve_bytes: 0,
             decode_share_borrowed: None,
             decode_share_shadows: 0,
+        })
+    }
+
+    /// Set the independent vision reserve, checking the combined bound before
+    /// it can be used for placement. Zero preserves the text-only reserve.
+    pub fn with_vision_reserve(mut self, bytes: u64) -> Result<Self, String> {
+        self.text_bytes()
+            .checked_add(bytes)
+            .ok_or("qwen4: vision reserve overflows the placement budget")?;
+        self.vision_reserve_bytes = bytes;
+        Ok(self)
+    }
+
+    fn text_bytes(&self) -> u64 {
+        self.historical.map_or(self.census_total, |historical| {
+            historical.max(self.census_total)
         })
     }
 
@@ -2138,13 +2160,13 @@ impl AutoReserve {
         }
     }
 
-    /// The bytes `auto` reserves: `max(historical, census)`, or the census
-    /// alone once the floor is retired.
+    /// The bytes `auto` reserves: `max(historical, census) + vision`, or
+    /// `census + vision` once the text floor is retired. The vision term
+    /// cannot be swallowed by the historical floor.
     pub fn bytes(&self) -> u64 {
-        match self.historical {
-            Some(historical) => historical.max(self.census_total),
-            None => self.census_total,
-        }
+        self.text_bytes()
+            .checked_add(self.vision_reserve_bytes)
+            .expect("vision reserve was checked before placement")
     }
 
     /// The base reserve a whole-layer placement is sized from. Every load that
@@ -2156,16 +2178,19 @@ impl AutoReserve {
     /// census) that would put even the preferred ten resident layers out of reach, and the S1
     /// profile adds its own explicit terms and the safety margin on top
     /// ([`PlacementCharges`]); the Hold 1 gate verifies the measured peak
-    /// against census + safety + allowance.
+    /// against census + safety + allowance. Both routes retain the independent
+    /// vision reservation in addition to their selected text reserve.
     pub fn placement_bytes(&self, slowlink: bool) -> u64 {
         if slowlink {
             self.census_total
+                .checked_add(self.vision_reserve_bytes)
+                .expect("vision reserve was checked before placement")
         } else {
             self.bytes()
         }
     }
 
-    /// Which formula set [`Self::bytes`].
+    /// Which text formula won before the independent vision reservation.
     pub fn winner(&self) -> &'static str {
         match self.historical {
             None => "census (historical floor retired)",
@@ -2176,10 +2201,10 @@ impl AutoReserve {
 
     /// The reserve and its parts for the placement log, every census term.
     pub fn describe(&self) -> String {
-        match self.historical {
+        let text = match self.historical {
             Some(historical) => format!(
                 "{} MiB = max({} MiB historical floor, {} MiB census [{}]): {} wins",
-                self.bytes() >> 20,
+                self.text_bytes() >> 20,
                 historical >> 20,
                 self.census_total >> 20,
                 self.census_text(),
@@ -2188,9 +2213,18 @@ impl AutoReserve {
             None => format!(
                 "{} MiB = census [{}] (historical floor retired: the census carries the \
                  measured HIP runtime overhead)",
-                self.bytes() >> 20,
+                self.text_bytes() >> 20,
                 self.census_text()
             ),
+        };
+        if self.vision_reserve_bytes == 0 {
+            text
+        } else {
+            format!(
+                "{} MiB = text ({text}) + {} MiB vision (resident weights + activation/projected rows)",
+                self.bytes() >> 20,
+                self.vision_reserve_bytes >> 20,
+            )
         }
     }
 }
@@ -2396,6 +2430,7 @@ pub fn incumbent_auto_resident_layers(
         scratch_mode,
         ranks: 1,
         chunk_rows: crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, scratch_mode),
+        vision_reserve_bytes: 0,
     })?;
     let (free, _) = gpu
         .device_mem_info()
@@ -3688,6 +3723,10 @@ pub struct PlacementInputsArgs<'a> {
     pub ranks: usize,
     /// The chunk the reserve is sized from; never probes the host link here.
     pub chunk_rows: usize,
+    /// Independent device reserve for the deferred vision tower and image
+    /// scratch; zero for a text-only load. The capacity quote must precede
+    /// the tower's upload so these bytes are charged exactly once.
+    pub vision_reserve_bytes: u64,
 }
 
 /// What the expert placement is sized from, for one rank of a `ranks`-way load.
@@ -3763,6 +3802,7 @@ pub fn placement_inputs_with_forward(
         scratch_mode,
         ranks,
         chunk_rows,
+        vision_reserve_bytes,
     } = *args;
     let qsa_format = state_format.qsa;
     let (non_expert, layer_experts) = resident_split_ranks(weights, bytes_of, ranks)
@@ -3942,8 +3982,9 @@ pub fn placement_inputs_with_forward(
         gather: gather_for(&census_context)?.unwrap_or(0),
         runtime: runtime.unwrap_or(0),
     };
-    let reserve =
-        AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
+    let reserve = AutoReserve::new(historical, census)
+        .and_then(|reserve| reserve.with_vision_reserve(vision_reserve_bytes))
+        .map_err(|error| format!("qwen4: {error}"))?;
     let reserve = match share {
         Some(share) => reserve
             .with_decode_share(share.borrowed)

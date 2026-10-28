@@ -2435,6 +2435,9 @@ pub struct SingleDeviceLoad<'a> {
     pub max_k: usize,
     pub state_format: crate::Qwen4StateFormat,
     pub scratch_mode: crate::gpu_forward::Qwen4ForwardScratchMode,
+    /// The same deferred tower/image reserve as the ordinary placement. It
+    /// remains charged at every S1 tile and in the incumbent comparison.
+    pub vision_reserve_bytes: u64,
     /// What the admitted profile is for: the product, or the Hold 1 primitive
     /// self-tests (which charge their own diagnostic reserve inside the
     /// admission, never beside it).
@@ -2608,6 +2611,7 @@ fn single_device_reserve(
         scratch_mode: load.scratch_mode,
         ranks: 1,
         chunk_rows,
+        vision_reserve_bytes: load.vision_reserve_bytes,
     })
     .map(|inputs| inputs.reserve)
 }

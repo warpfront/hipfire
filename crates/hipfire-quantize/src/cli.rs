@@ -43,9 +43,11 @@ pub(crate) struct QuantizeArgs {
     pub input: Option<String>,
 
     /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
-    /// transactional path always includes typed PLE metadata, all PLE shards,
+    /// transactional text path includes typed PLE metadata, all PLE shards,
     /// and native MTP experts.  It reads no legacy recipe flags: imatrix, AWQ,
     /// symmetric-requant, tier and Hessian controls are refused, not ignored.
+    /// Combine with `--vision-only` to produce only the vision companion;
+    /// remote sources fetch only its shard headers and visual payload ranges.
     #[arg(long, conflicts_with = "flux_pipe")]
     pub qwen4_flash_next: bool,
     /// Explicit non-production bounded fixture mode for exercising the full
@@ -326,7 +328,8 @@ pub(crate) struct QuantizeArgs {
 
     /// Vision-tower-only sidecar shorthand: `--include-vision` plus
     /// `--include-prefix model.visual.` (an explicit `--include-prefix`
-    /// still wins). Emits the shared `qwen3.8-27b-vision.hfq` sidecar.
+    /// still wins). With `--qwen4-flash-next`, emits the complete Flash Next
+    /// visual tower and merger instead; requires production component mode.
     #[arg(long)]
     pub vision_only: bool,
 
@@ -494,7 +497,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("include_vision", &[Main]),
     ("vision_quant", &[Main]),
     ("include_prefix", &[Main]),
-    ("vision_only", &[Main]),
+    ("vision_only", &[Main, Qwen4]),
     ("tier", &[Gguf, Main]),
     ("fixed_tier", &[Gguf, Main]),
 ];
@@ -791,6 +794,29 @@ mod route_tests {
                 "--imatrix",
                 "x",
             ]),
+            Main,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn qwen4_vision_only_uses_native_route_without_legacy_filters() {
+        let argv = [
+            "--qwen4-flash-next",
+            "--vision-only",
+            "--input",
+            "i",
+            "--output",
+            "o",
+        ];
+        reject_unreachable(&matches(&argv), Qwen4).unwrap();
+        let mut invalid = argv.to_vec();
+        invalid.extend(["--include-prefix", "model.visual."]);
+        assert!(reject_unreachable(&matches(&invalid), Qwen4)
+            .unwrap_err()
+            .starts_with("--include-prefix has no effect"));
+        reject_unreachable(
+            &matches(&["--vision-only", "--input", "i", "--output", "o"]),
             Main,
         )
         .unwrap();

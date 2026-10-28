@@ -273,6 +273,7 @@ fn load_inner(
             max_k: 0,
             state_format,
             scratch_mode,
+            vision_reserve_bytes: 0,
             purpose,
             routed_source_symmetric: &|| routed_symmetric.clone().unwrap_or(Ok(false)),
         };

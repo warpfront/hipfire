@@ -110,8 +110,8 @@ pub struct SequenceHint {
     pub automatic: bool,
     pub card_cap: usize,
     /// Device bytes the automatic max_seq leaves free beyond the minimum
-    /// prefill reservation — today the vision tower's activation scratch for
-    /// the largest admitted image.
+    /// prefill reservation: the largest admitted image's activation scratch
+    /// and, when placement precedes tower upload (Flash Next), tower weights.
     pub reserve_bytes: usize,
 }
 

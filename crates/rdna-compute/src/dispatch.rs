@@ -2128,6 +2128,28 @@ impl Gpu {
         crate::uma_memory::gtt_backed(total as u64, carveout_total)
     }
 
+    /// Whether device allocations also consume the host RAM/GTT pool.
+    /// Integrated GPUs with a BIOS VRAM carve-out keep a separate device heap;
+    /// `is_uma()` alone only describes the hardware, not allocation backing.
+    /// Match `device_mem_info`'s existing carve-out test. An unreadable carve-out
+    /// remains conservatively shared; a failed HIP capacity query is an error.
+    pub fn device_allocations_share_host_ram(&self) -> HipResult<bool> {
+        if let Some(snapshot) = self.emu_budget_snapshot() {
+            return Ok(snapshot.limits.uma);
+        }
+        if !self.is_uma() {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let (_, total) = self.hip.get_vram_info()?;
+        let carveout = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .ok()
+            .and_then(|bdf| crate::uma_memory::carveout_total_bytes(&bdf));
+        Ok(crate::uma_memory::gtt_backed(total as u64, carveout))
+    }
+
     /// `(free, total)` device bytes for sizing allocations: `hipMemGetInfo`,
     /// with the free figure of a GTT-backed unified-memory APU clamped to
     /// the host RAM a GTT allocation can take (`MemAvailable - CMA` plus

@@ -46,6 +46,18 @@ use std::sync::Arc;
 use crate::expert_residency::AutoReserve;
 use crate::measured_identity::Qwen4MeasuredLoadIdentity;
 
+/// Preserve text-only records byte for byte. A vision load reports the
+/// planner's independent weight-and-scratch reservation outside the text
+/// census; it is already included in reserve_bytes and the device/host sums.
+fn record_vision_reserve(value: &mut serde_json::Value, reserve: &AutoReserve) {
+    if reserve.vision_reserve_bytes != 0 {
+        value["vision_reserve_bytes"] = serde_json::json!(reserve.vision_reserve_bytes);
+        value["vision_reserve_scope"] = serde_json::json!(
+            "resident_weights_including_padding_plus_activation_and_projected_rows"
+        );
+    }
+}
+
 /// Schema marker of the frozen resource snapshot.
 pub const LOAD_RESOURCE_SNAPSHOT_SCHEMA: &str = "fn-oracle.load-resource-snapshot.v1";
 
@@ -143,14 +155,15 @@ pub struct Qwen4HostCheckInputs {
 }
 
 /// Device-memory backing class of the producing load. Wire tokens are frozen
-/// as `discrete` / `uma_shared`; the loader (`Gpu::is_uma`) and E validators
-/// must match these exact tokens. A `gfx1151` load reports
-/// [`Qwen4BackingKind::UmaShared`]; a `gfx1201` load reports
-/// [`Qwen4BackingKind::Discrete`]. Never infer GTT budgets from a nonzero pool
-/// reading.
+/// as `discrete` / `uma_shared`. These classify allocation heaps, not GPU
+/// architecture: the historical `discrete` token includes an integrated GPU's
+/// BIOS VRAM carve-out. Only GTT-backed device allocations report `uma_shared`.
+/// The loader queries `Gpu::device_allocations_share_host_ram`; never infer
+/// backing from an architecture name or a nonzero parked-pool reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Qwen4BackingKind {
-    /// Discrete VRAM heap: pooled-parked bytes live on the device heap.
+    /// Dedicated VRAM heap (including APU carve-outs): parked device bytes
+    /// do not consume the remaining host RAM/GTT pool.
     #[serde(rename = "discrete")]
     Discrete,
     /// UMA-shared heap: the root device plan is device-backed host memory and
@@ -160,7 +173,7 @@ pub enum Qwen4BackingKind {
     UmaShared,
 }
 /// The ACTUAL backing inputs of one fresh rank load. `kind` comes from the
-/// real production `Gpu::is_uma()`; the pooled sizes come from the public pool
+/// real production `Gpu::device_allocations_share_host_ram()`; pool sizes come from the public pool
 /// accessor (`Gpu::pool_parked_bytes`) read at the preallocation instant and
 /// again at the settled instant. Never hand-fill these; an unsupported source
 /// path stays absent upstream with a named reason.
@@ -280,6 +293,9 @@ impl Qwen4LoadResourceSnapshot {
                 reserve.census.mtp, admitted.new_capture_bytes
             ));
         }
+        let reserve = reserve
+            .with_vision_reserve(reserve.vision_reserve_bytes)
+            .map_err(|err| format!("{HERE}: {err}"))?;
         let reserve_bytes = reserve.bytes();
         // Base device plan: the OLD settled-owner formula, verbatim.
         let mut base_device_plan_bytes = placement
@@ -323,7 +339,7 @@ impl Qwen4LoadResourceSnapshot {
             .iter()
             .map(|(name, bytes)| serde_json::json!({"name": name, "bytes": bytes}))
             .collect();
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "schema": LOAD_RESOURCE_SNAPSHOT_SCHEMA,
             "evidence_kind": LOAD_RESOURCE_EVIDENCE_KIND,
             "measured_load": measured_load,
@@ -396,6 +412,7 @@ impl Qwen4LoadResourceSnapshot {
             "device_plan_bytes": device_plan_bytes,
             "host_plan_bytes": host_plan_bytes,
         });
+        record_vision_reserve(&mut value["reserve"], &reserve);
         let canonical = serde_json::to_string(&value)
             .map_err(|err| format!("{HERE}: snapshot JSON does not render: {err}"))?;
         Ok(Self {
@@ -610,6 +627,7 @@ pub fn preload_component_union(
     }
     if reserve.historical != inputs.reserve.historical
         || reserve.census_total != inputs.reserve.census_total
+        || reserve.vision_reserve_bytes != inputs.reserve.vision_reserve_bytes
     {
         return Err(format!(
             "{HERE}: caller reserve differs from the placement_inputs reserve"
@@ -625,6 +643,9 @@ pub fn preload_component_union(
             reserve.census_total
         ));
     }
+    let reserve = reserve
+        .with_vision_reserve(reserve.vision_reserve_bytes)
+        .map_err(|err| format!("{HERE}: {err}"))?;
     let reserve_bytes = reserve.bytes();
     // Per-owner backing slack of the same reserve, from the owners' own
     // allocation lists (individual-allocation counterfactual: no arena plan).
@@ -772,7 +793,10 @@ pub fn preload_component_union(
     // Host scope stays the existing disjoint host-mapped plus explicit-host-only
     // check; on UMA-shared backing the root device union is device-backed host
     // memory and is charged once more here, exactly as the settled record does.
-    let uma_shared = args.gpu.is_uma();
+    let uma_shared = args
+        .gpu
+        .device_allocations_share_host_ram()
+        .map_err(|error| format!("{HERE}: device allocation backing query: {error}"))?;
     let device_backed_host_bytes = if uma_shared { device_union_bytes } else { 0 };
     let host_union_bytes = host_mapped_bytes
         .checked_add(stage_mirror_bytes)
@@ -784,7 +808,7 @@ pub fn preload_component_union(
         .iter()
         .map(|(name, bytes)| serde_json::json!({"name": name, "bytes": bytes}))
         .collect();
-    Ok(serde_json::json!({
+    let mut value = serde_json::json!({
         "evidence_kind": PRELOAD_UNION_EVIDENCE_KIND,
         "owner_contract_version": LOAD_RESOURCE_OWNER_CONTRACT_VERSION,
         "parked_policy": PRELOAD_UNION_PARKED_POLICY,
@@ -859,7 +883,9 @@ pub fn preload_component_union(
         "device_backed_host_bytes": device_backed_host_bytes,
         "device_union_upper_bound_bytes": device_union_bytes,
         "host_union_upper_bound_bytes": host_union_bytes,
-    }))
+    });
+    record_vision_reserve(&mut value["planned"]["reserve"], &reserve);
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -1385,6 +1411,40 @@ mod tests {
         )
         .expect_err("host plan overflows");
         assert!(err.contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn carveout_snapshot_keeps_device_owners_out_of_host_plan() {
+        const GIB: u64 = 1 << 30;
+        for (carveout, expected_shared) in [(96 * GIB, false), (4 * GIB, true)] {
+            let shared = rdna_compute::uma_memory::gtt_backed(96 * GIB, Some(carveout));
+            assert_eq!(shared, expected_shared);
+            let mut backing = synthetic_backing();
+            backing.kind = if shared {
+                Qwen4BackingKind::UmaShared
+            } else {
+                Qwen4BackingKind::Discrete
+            };
+            let snapshot = synthetic_snapshot_backed(Qwen4RingMode::DirectInitial64, 0, backing);
+            let host = synthetic_host();
+            let expected_host = host.host_check_bytes
+                + host.stage_mirror_bytes
+                + host.host_headroom_bytes
+                + if expected_shared {
+                    snapshot.device_plan_bytes()
+                } else {
+                    0
+                };
+            assert_eq!(snapshot.host_plan_bytes(), expected_host);
+            assert_eq!(
+                snapshot.value()["upper_bound"]["device_backed_host_bytes"],
+                if expected_shared {
+                    snapshot.device_plan_bytes()
+                } else {
+                    0
+                }
+            );
+        }
     }
 
     #[test]

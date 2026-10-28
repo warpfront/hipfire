@@ -13,6 +13,7 @@ serde_json.workspace = true
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
@@ -138,3 +139,7 @@ required-features = ["lab", "reference-parity"]
 [[test]]
 name = "slowlink_prefill_hw"
 required-features = ["lab", "reference-parity"]
+
+[[example]]
+name = "qwen4_vision_dump"
+required-features = ["lab"]

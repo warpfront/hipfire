@@ -7920,6 +7920,11 @@ impl<'a> LayerPhaseEnv<'a> {
                     head_dim: dims.head_dim,
                     rotary_dim: config.rotary_dim(),
                     rope: config.rope(),
+                    mrope: self
+                        .bundle
+                        .image_context
+                        .as_ref()
+                        .map(|image| image.mrope()),
                     input_width: dims.hidden,
                     trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                     phase: MixerPhase::Whole,
@@ -13054,6 +13059,9 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
+        if bundle.image_context.is_some() {
+            rdna_compute::qsa_mrope::ensure_eager(gpu)?;
+        }
         // Host arithmetic is host synchronous: never a retained body, and an
         // eager forward. D1 and an explicit-mode D2 hold for the whole forward;
         // the automatic default's D2 only for the calls that execute it (a real
@@ -13870,6 +13878,15 @@ impl Qwen4GpuForward {
                 },
             )
             .map_err(|e| Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {e:?}")))?;
+            if let Some(image) = bundle.image_context.as_ref() {
+                image.splice(
+                    gpu,
+                    &embeddings,
+                    bundle.state.position,
+                    n,
+                    config.hidden_size,
+                )?;
+            }
             Ok(())
         })();
         if let Err(error) = embedded {
@@ -14017,7 +14034,7 @@ impl Qwen4GpuForward {
             // launch bypasses the Redline recorder (census 82 launched / 80
             // recorded on tiny-dense-dev-gpu, card B) and the per-row GDN conv
             // carries a position kernarg linear AQL cannot rebind.
-            let eligible = n == 1
+            let eligible = bundle.image_context.is_none() && n == 1
                 && self.ep.is_none()
                 && !cpu_deferred_experts
                 && config.profile.is_flash_next()

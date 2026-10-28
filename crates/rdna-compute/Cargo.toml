@@ -1160,6 +1160,10 @@ name = "gate_up_tiles_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "qsa_mrope_parity"
+required-features = ["lab"]
+
+[[example]]
 name = "mq6_railgun_oracle"
 required-features = ["lab"]
 

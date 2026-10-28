@@ -204,6 +204,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
 
     if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
         add!(
+            "qsa_mrope",
+            kernels::QSA_MROPE_SRC,
+            [
+                "indexed_attention_norm_mrope_f32_batched",
+                "indexed_attention_pool_mrope_bf16",
+                "indexed_attention_pool_mrope_f32"
+            ]
+        );
+        add!(
             "qsa_filter_select",
             kernels::QSA_FILTER_SELECT_SRC,
             [
@@ -10486,9 +10495,24 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Image-only QSA rotations are isolated from the measured text module.
+        const IMAGE_MROPE_ADDED_MODULES: [&str; 1] = ["qsa_mrope"];
+        for module in IMAGE_MROPE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing image module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
+                + IMAGE_MROPE_ADDED_MODULES.len()
                 + PRE_S1_ADDED_SINCE_P0
                 + S1_ADDED_MODULES.len()
                 + NATIVE_A3B_ADDED_MODULES.len()
@@ -10837,6 +10861,48 @@ mod tests {
         source_exports(crate::tensor_ops::TENSOR_OPS_SRC, arch)
     }
 
+    /// Image mRoPE has its own source and complete pack index. Loading images
+    /// must not mutate the measured text-only tensor_ops module identity.
+    #[test]
+    fn image_mrope_has_an_independent_packaged_module_and_preserves_text_source() {
+        use std::collections::BTreeSet;
+        const TEXT_SHA: &str = "44f2f8122e0cb2f1040076d7bf56c379a52e6ff031d6c31cb354806873578407";
+        let expected: BTreeSet<String> = [
+            "indexed_attention_norm_mrope_f32_batched",
+            "indexed_attention_pool_mrope_bf16",
+            "indexed_attention_pool_mrope_f32",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let wrappers = include_str!("qsa_mrope.rs");
+        assert_eq!(
+            wrappers
+                .matches("ensure_kernel_public(\"qsa_mrope\"")
+                .count(),
+            2
+        );
+        assert!(!wrappers.contains("TENSOR_OPS_SRC"));
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let text = lookup(arch, "tensor_ops", "").unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(text.source().as_bytes())),
+                TEXT_SHA,
+                "{arch}: measured text source changed"
+            );
+            let image = lookup(arch, "qsa_mrope", "").unwrap();
+            let index: BTreeSet<String> = image.symbols.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(index, expected, "{arch}: image index");
+            assert_eq!(
+                source_exports(image.source(), arch),
+                expected,
+                "{arch}: image exports"
+            );
+            assert_eq!(image.source(), kernels::QSA_MROPE_SRC);
+            assert!(text.symbols.iter().all(|s| !expected.contains(*s)));
+        }
+    }
+
     /// The legacy `moe_down_combine_grouped_top10` source is byte-for-byte the
     /// one the G0 fixtures and the walked gfx1201 plans recorded, and the S1
     /// slow-link kernels live in a module of their own, `slowlink_prefill`.
@@ -10922,7 +10988,8 @@ mod tests {
         include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt");
 
     /// Preserve the measured sealed gfx1100 object's historical export/index
-    /// gap; the later gfx1201-only x8 addition does not alter gfx11 exports.
+    /// gap, accounting for the later rope-table export.
+    /// The gfx1201-only HC x8 export does not alter gfx11 exports.
     #[test]
     fn source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap() {
         use std::collections::BTreeSet;
@@ -10960,7 +11027,7 @@ mod tests {
                 "indexed_attention_decode_prologue_q8",
             ]
         );
-        // The current gfx11 registry contains exactly the measured source exports.
+        // The current gfx11 registry contains the sealed exports and later additions.
         for arch in ["gfx1100", "gfx1151"] {
             let registered: BTreeSet<String> = lookup(arch, "tensor_ops", "")
                 .unwrap()
