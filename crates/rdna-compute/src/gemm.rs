@@ -36851,6 +36851,137 @@ impl Gpu {
 
         result
     }
+    /// T0 experiment: MQ4G256V2-Lloyd (qt=52) QKVZA BT twin for gfx1100.
+    /// Same grid/block/arithmetic as
+    /// [`Self::gemm_qkvza_mq4g256v2_wmma_gfx1100_bt`], except the dequant
+    /// reads the centered f16 codebooks (qkv, z, beta, alpha; 32 kernel-arg
+    /// dwords staged to LDS) instead of the uniform affine grid. Distinct
+    /// `_lloyd` symbols so the module cannot alias the uniform one.
+    /// Eager-only throwaway path for the T0 differential; not wired into
+    /// dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq4g256v2_wmma_gfx1100_bt_lloyd(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+        luts: [[u32; 8]; 4],
+    ) -> HipResult<()> {
+        let func_name = match batch_tile {
+            4 => "gemm_qkvza_mq4g256v2_wmma_gfx11_bt4_lloyd",
+            12 => "gemm_qkvza_mq4g256v2_wmma_gfx11_bt12_lloyd",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_qkvza_mq4g256v2_wmma_gfx1100_bt_lloyd: batch_tile must be 4 or 12",
+                ));
+            }
+        };
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_qkvza_mq4g256v2_wmma_gfx11_bt_lloyd";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_LUT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut flat: [[u32; 8]; 4] = luts;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        for row in flat.iter_mut() {
+            for d in row.iter_mut() {
+                params.push(d as *mut u32 as *mut c_void);
+            }
+        }
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 16 * batch_tile - 1) / (16 * batch_tile);
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+            + batch_size * k * 2
+            + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(q_m);
+                b.push_i32(z_m_val);
+                b.push_i32(b_m);
+                b.push_i32(a_m);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                for row in luts.iter() {
+                    for d in row.iter() {
+                        b.push_u32(*d);
+                    }
+                }
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// MQ4V2 gfx1151 qkvza batch-tile (BT4 / BT12) — default-off.
     ///
     /// Direct harness entry for exact gfx1151. Reuses the same portable gfx11
@@ -37403,6 +37534,123 @@ impl Gpu {
                 b.push_i32(v_m_val);
                 b.push_i32(k_val);
                 b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// T0 experiment: MQ4G256V2-Lloyd (qt=52) QKV BT twin for gfx1100.
+    /// Same grid/block/arithmetic as
+    /// [`Self::gemm_qkv_mq4g256v2_wmma_gfx1100_bt`], except the dequant reads
+    /// the centered f16 codebooks (q, k, v; 24 kernel-arg dwords staged to
+    /// LDS) instead of the uniform affine grid. Distinct `_lloyd` symbols so
+    /// the module cannot alias the uniform one. Eager-only throwaway path
+    /// for the T0 differential; not wired into dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_mq4g256v2_wmma_gfx1100_bt_lloyd(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+        luts: [[u32; 8]; 3],
+    ) -> HipResult<()> {
+        let func_name = match batch_tile {
+            4 => "gemm_qkv_mq4g256v2_wmma_gfx11_bt4_lloyd",
+            12 => "gemm_qkv_mq4g256v2_wmma_gfx11_bt12_lloyd",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_qkv_mq4g256v2_wmma_gfx1100_bt_lloyd: batch_tile must be 4 or 12",
+                ));
+            }
+        };
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_qkv_mq4g256v2_wmma_gfx11_bt_lloyd";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_LUT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut flat: [[u32; 8]; 3] = luts;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        for row in flat.iter_mut() {
+            for d in row.iter_mut() {
+                params.push(d as *mut u32 as *mut c_void);
+            }
+        }
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 16 * batch_tile - 1) / (16 * batch_tile);
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+            + batch_size * k * 2
+            + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_val);
+                b.push_i32(k_m_val);
+                b.push_i32(v_m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                for row in luts.iter() {
+                    for d in row.iter() {
+                        b.push_u32(*d);
+                    }
+                }
                 b
             },
         );
@@ -39085,6 +39333,109 @@ impl Gpu {
                 b.push_i32(u_m);
                 b.push_i32(k_val);
                 b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// T0 experiment: MQ4G256V2-Lloyd (qt=52) gate/up BT twin for gfx1100.
+    /// Same grid/block/arithmetic as
+    /// [`Self::gemm_gate_up_mq4g256v2_wmma_gfx1100_bt`], except the dequant
+    /// reads the centered f16 codebooks (gate + up, 16 kernel-arg dwords
+    /// staged to LDS) instead of the uniform affine grid. Distinct `_lloyd`
+    /// symbols so the module cannot alias the uniform one. Eager-only
+    /// throwaway path for the T0 differential; not wired into dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_mq4g256v2_wmma_gfx1100_bt_lloyd(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+        gate_lut: [u32; 8],
+        up_lut: [u32; 8],
+    ) -> HipResult<()> {
+        let func_name = match batch_tile {
+            6 => "gemm_gate_up_mq4g256v2_wmma_gfx11_bt6_lloyd",
+            12 => "gemm_gate_up_mq4g256v2_wmma_gfx11_bt12_lloyd",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_gate_up_mq4g256v2_wmma_gfx1100_bt_lloyd: batch_tile must be 6 or 12",
+                ));
+            }
+        };
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_gate_up_mq4g256v2_wmma_gfx11_bt_lloyd";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_LUT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut g_m = gate_m as i32;
+        let mut u_m = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut gl = gate_lut;
+        let mut ul = up_lut;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void,
+            &mut g_m as *mut _ as *mut c_void,
+            &mut u_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        for d in gl.iter_mut().chain(ul.iter_mut()) {
+            params.push(d as *mut u32 as *mut c_void);
+        }
+        let total_m = gate_m + up_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 16 * batch_tile - 1) / (16 * batch_tile);
+        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+            + batch_size * k * 2
+            + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag);
+                b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(yg);
+                b.push_ptr(yu);
+                b.push_i32(g_m);
+                b.push_i32(u_m);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                for d in gate_lut.iter().chain(up_lut.iter()) {
+                    b.push_u32(*d);
+                }
                 b
             },
         );
@@ -41129,7 +41480,109 @@ impl Gpu {
         result
     }
 
-    /// MQ4V2 gfx1100 multi-wave same-row LDS residual (MW4/MW8).
+    /// T0 experiment: MQ4G256V2-Lloyd (qt=52) residual BT twin for gfx1100.
+    /// Same grid/block/arithmetic as
+    /// [`Self::gemm_mq4g256v2_residual_wmma_gfx1100_bt`], except the dequant
+    /// reads the centered f16 codebook (`lut`, 8 kernel-arg dwords staged to
+    /// LDS) instead of the uniform affine grid. Distinct `_lloyd` symbols so
+    /// the module cannot alias the uniform one. Eager-only throwaway path for
+    /// the T0 differential; not wired into dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+        lut: [u32; 8],
+    ) -> HipResult<()> {
+        let func_name = match batch_tile {
+            4 => "gemm_mq4g256v2_residual_wmma_gfx11_bt4_lloyd",
+            6 => "gemm_mq4g256v2_residual_wmma_gfx11_bt6_lloyd",
+            8 => "gemm_mq4g256v2_residual_wmma_gfx11_bt8_lloyd",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd: batch_tile must be 4,6,8",
+                ));
+            }
+        };
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_residual_wmma_gfx11_bt_lloyd";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_LUT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut l0 = lut[0];
+        let mut l1 = lut[1];
+        let mut l2 = lut[2];
+        let mut l3 = lut[3];
+        let mut l4 = lut[4];
+        let mut l5 = lut[5];
+        let mut l6 = lut[6];
+        let mut l7 = lut[7];
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+            &mut l0 as *mut _ as *mut c_void,
+            &mut l1 as *mut _ as *mut c_void,
+            &mut l2 as *mut _ as *mut c_void,
+            &mut l3 as *mut _ as *mut c_void,
+            &mut l4 as *mut _ as *mut c_void,
+            &mut l5 as *mut _ as *mut c_void,
+            &mut l6 as *mut _ as *mut c_void,
+            &mut l7 as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 16 * batch_tile - 1) / (16 * batch_tile);
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b.push_u32(l0);
+                b.push_u32(l1);
+                b.push_u32(l2);
+                b.push_u32(l3);
+                b.push_u32(l4);
+                b.push_u32(l5);
+                b.push_u32(l6);
+                b.push_u32(l7);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     ///
     /// One 16-row M tile per block, `waves` adjacent 16-column N tiles, and
     /// static 8 KiB tile-major weight LDS staged once per group. Exact gfx1100
