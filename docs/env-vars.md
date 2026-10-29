@@ -603,6 +603,8 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
 | `HIPFIRE_REDLINE_GAP_TIMING` | Developer-only diagnostic: `1` = per-token host breakdown of the Qwen3.5 plain-AR decode step (embedding, position copy, retained-PM4 patch, submit+wait with its in-IB GPU span, or the HIP-graph launch, and the host time between consecutive steps), one `[gap-timing]` stderr summary per run of consecutive decode positions. Unset reads no clocks. |
+| `HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV` | Developer-only negative control, default off: `1` stops gfx11 retained PM4 dispatches from setting `COMPUTE_PGM_RSRC1.PRIV`, which CWSR needs; with queue preemption active this reproduces the SQC page-0 fault in [`investigations/2026-10-29-gfx11-pm4-cwsr-priv.md`](investigations/2026-10-29-gfx11-pm4-cwsr-priv.md). Never set it outside that repro. |
+| `HIPFIRE_DEBUG_FORCE_EVICT_MS` | Developer-only repro aid, default off: `N` (ms, >0) starts one thread on the first PM4 replay that registers a 2 MiB host buffer with `hipHostRegister` and drops/re-faults one page every N ms, so the userptr MMU notifier makes KFD evict and restore (CWSR save/restore) the process's queues. Forces queue preemption without a profiler; costs throughput. |
 | `HIPFIRE_GFX1100_PM4_EXPERIMENTS` | Developer-only diagnostic: `1` lets the gfx1151 `HIPFIRE_GFX1151_PM4_INITIATOR` / `_INTERLEAVE` / `_RESOURCE_LIMITS` knobs apply to gfx1100 too. Unset, gfx1100 keeps its legacy encoding byte for byte. |
 | `HIPFIRE_GFX1100_Q8X_VERIFY` | Default on for exact gfx1100 (other arches never take the route); `0` restores the f16 WMMA residual tiers. Runs 2..=5-row MQ4G256V2 projections (MTP speculative verify; also 2..5-row prefill tails) through the int8-activation small-batch GEMV (`gemv_q8x.rs`, `kernels/src/gemv_mq4g256v2_q8x.hip`: activations quantized once per projection group, `v_dot4_i32_iu8`, one launch per q/k/v, GDN qkv/z/beta/alpha and gate/up group) instead of the f16 WMMA residual tiers. Eager only; HipGraph capture and Redline recording keep the WMMA tiers. Not byte-identical (q8_1-class activation quantization, KLD-gated); the modules are in the gfx1100 kernel registry and pack (no first-request JIT); logs one `[q8x-verify] route active` line per kernel on first use. |
 | `HIPFIRE_RAILGUN_SHADOW` | Developer-only railgun M1 shadow: a `railgun-jit-corpus` directory. railgun authors its program next to every Redline recording from the corpus facts and diffs its prepared PM4 lowering against the gfx12 tape; never submitted, route unchanged. See REDLINE.md §5 "railgun shadow diff". |
@@ -886,7 +888,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1770
+**Count:** 1772
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1056,6 +1058,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DDTREE_TREE_LA` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_DDTREE_VERIFY` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_DEBUG_BATCH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
+| `HIPFIRE_DEBUG_FORCE_EVICT_MS` | crates/rdna-compute/src/replay.rs | developer |
+| `HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_DEBUG_POOL_INVARIANTS` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_DEEPSEEK4_AR` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_ATTN` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |

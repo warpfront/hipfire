@@ -277,7 +277,8 @@ impl Pm4Commands {
                 }
                 .with_dispatch_initiator_policy(dispatch_initiator_policy)
                 .with_dispatch_interleave(dispatch_interleave)
-                .with_resource_limits_policy(resource_limits_policy);
+                .with_resource_limits_policy(resource_limits_policy)
+                .with_gfx11_cwsr_priv(gfx11_cwsr_priv(architecture));
                 Self::Legacy {
                     architecture,
                     commands,
@@ -3291,6 +3292,125 @@ fn gfx1100_experiment_alias(architecture: Pm4Architecture, device_name: &str) ->
     }
 }
 
+/// GFX11 raw-PM4 dispatches must set `COMPUTE_PGM_RSRC1.PRIV` (bit 20) for
+/// CWSR. The AQL dispatch microcode sets it implicitly; without it a queue
+/// preemption (CWSR save/restore) during a retained PM4 dispatch faulted on
+/// gfx1100 with an SQC page-0 read (see
+/// docs/investigations/2026-10-29-gfx11-pm4-cwsr-priv.md).
+///
+/// Negative control (test-only, default off):
+/// `HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV=1` leaves the bit clear on GFX11 so the
+/// fault can be reproduced against the same build.
+fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
+    if architecture != Pm4Architecture::Gfx11 {
+        return false;
+    }
+    if hipfire_config::process_value("HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV").as_deref() == Some("1") {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!("[redline] DEBUG negative control: gfx11 COMPUTE_PGM_RSRC1.PRIV not set")
+        });
+        return false;
+    }
+    true
+}
+
+/// DEBUG (test-only, default off): `HIPFIRE_DEBUG_FORCE_EVICT_MS=N` starts one
+/// background thread, on the first PM4 replay, that registers a 2 MiB
+/// anonymous host buffer with `hipHostRegister` (a KFD userptr BO) and every
+/// N ms drops and re-faults one of its pages (`madvise(MADV_DONTNEED)` plus a
+/// write). Each drop fires the userptr MMU notifier, so KFD evicts (preempts,
+/// CWSR-saves) and later restores every queue of the process. It drives the
+/// queue-preemption path without a profiler; it is a repro aid, not a
+/// production setting.
+fn debug_force_evict_start() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(ms) = hipfire_config::process_value("HIPFIRE_DEBUG_FORCE_EVICT_MS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+    else {
+        return;
+    };
+    ONCE.call_once(move || {
+        unsafe extern "C" {
+            fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+            fn dlsym(
+                h: *mut std::ffi::c_void,
+                name: *const std::ffi::c_char,
+            ) -> *mut std::ffi::c_void;
+            fn mmap(
+                addr: *mut std::ffi::c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut std::ffi::c_void;
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+        const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
+        const RTLD_LAZY_NOLOAD: i32 = 0x1 | 0x4;
+        const MADV_DONTNEED: i32 = 4;
+        let len: usize = 2 << 20;
+        let buf = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ_WRITE,
+                MAP_PRIVATE_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if buf as isize == -1 {
+            eprintln!("[force-evict] mmap failed");
+            return;
+        }
+        unsafe { std::ptr::write_bytes(buf as *mut u8, 1, len) };
+        // The HIP runtime is already loaded by the time a PM4 replay runs.
+        let handle = [c"libamdhip64.so", c"libamdhip64.so.6", c"libamdhip64.so.7"]
+            .iter()
+            .map(|name| unsafe { dlopen(name.as_ptr(), RTLD_LAZY_NOLOAD) })
+            .find(|h| !h.is_null());
+        let Some(handle) = handle else {
+            eprintln!("[force-evict] libamdhip64 not loaded");
+            return;
+        };
+        let register = unsafe { dlsym(handle, c"hipHostRegister".as_ptr()) };
+        if register.is_null() {
+            eprintln!("[force-evict] hipHostRegister missing");
+            return;
+        }
+        let register: unsafe extern "C" fn(*mut std::ffi::c_void, usize, u32) -> i32 =
+            unsafe { std::mem::transmute(register) };
+        let status = unsafe { register(buf, len, 0) };
+        eprintln!("[force-evict] hipHostRegister({len} B) status={status} period={ms} ms");
+        if status != 0 {
+            return;
+        }
+        let addr = buf as usize;
+        std::thread::Builder::new()
+            .name("force-evict".into())
+            .spawn(move || {
+                let mut drops: u64 = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    let page = addr + ((drops as usize % 512) << 12);
+                    unsafe {
+                        madvise(page as *mut std::ffi::c_void, 4096, MADV_DONTNEED);
+                        std::ptr::write_volatile(page as *mut u8, 1);
+                    }
+                    drops += 1;
+                    if drops.is_multiple_of(1000) {
+                        eprintln!("[force-evict] {drops} drops");
+                    }
+                }
+            })
+            .ok();
+    });
+}
+
 fn gfx10_dispatch_initiator_policy(
     architecture: Pm4Architecture,
     device_name: &str,
@@ -5090,6 +5210,7 @@ impl PreparedPm4Replay {
                 });
             }
         }
+        debug_force_evict_start();
         let patch_started = crate::gap_timing::now();
         // Patch typed kernarg bindings while queue is quiescent.
         // Single code path shared with recorded-HIP replay: both transports
