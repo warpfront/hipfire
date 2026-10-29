@@ -99,7 +99,8 @@ impl<'a> Qwen4Ops<'a> {
     }
 
     /// The device of a path that only exists on one card (n-gram takeover,
-    /// sampled verification): refused under a mesh.
+    /// derived K): refused under a mesh. Sampled Leviathan verification is not
+    /// one of them: it reads the output band's device through [`Self::gpu`].
     pub(crate) fn single(&mut self, what: &str) -> Result<&mut Gpu, String> {
         match self {
             Self::Single(gpu) => Ok(&mut **gpu),
@@ -5327,6 +5328,23 @@ impl Qwen4MtpDrafter {
         self
     }
 
+    /// `HIPFIRE_MTP_SAMPLED_MODE=naive` resolved at construction. Under
+    /// `topology.pp` that mode is refused (its draws come from the
+    /// process-wide AR sampler), so the router keeps such sampled requests on
+    /// the PP AR producer.
+    pub fn sampled_mode_is_naive(&self) -> bool {
+        matches!(self.sampled_mode, Ok(SampledMode::Naive))
+    }
+
+    /// The configured request carries a non-neutral repeat / presence /
+    /// frequency penalty (the router's definition: the window is not
+    /// consulted).
+    pub fn request_has_nonneutral_penalties(&self) -> bool {
+        self.request.repeat_penalty != 1.0
+            || self.request.presence_penalty != 0.0
+            || self.request.frequency_penalty != 0.0
+    }
+
     /// A sampled request needs sampled verification enabled (and a valid
     /// `HIPFIRE_MTP_SAMPLED_MODE`).
     fn require_supported_request(&self) -> Result<(), String> {
@@ -8982,19 +9000,46 @@ impl Qwen4MtpDrafter {
     }
 
     /// What a PP mesh does not serve, refused before any state changes:
-    /// sampled verification (its acceptance reads one card's logit rows and
-    /// the process-wide sampler) and the n-gram takeover (one-card route).
+    /// naive sampled verification (its draws come from the process-wide
+    /// sampler, not the request-seeded stream), a penalized sampled request
+    /// (the GPU penalty prepass refuses the mesh) and the n-gram takeover
+    /// (one-card route). Greedy requests and unpenalized Leviathan sampled
+    /// requests run: every device read of the verify (draft `q`, target rows,
+    /// bonus) goes through [`Qwen4Ops::gpu`], the output band's device.
     fn refuse_unsupported_under_pp(&self) -> Result<(), String> {
-        if self.sampled.is_some()
-            || !self.request.temp.is_finite()
-            || self.request.temp.abs() > 1.0e-6
-        {
+        if !self.request.temp.is_finite() {
             return Err(
-                "Qwen4 native MTP under qwen4 topology.pp verifies greedy requests only; \
-                 sampled MTP (speculation.mtp_sampled with temperature > 0) is unsupported \
-                 under the pipeline mesh"
+                "Qwen4 native MTP under qwen4 topology.pp needs a finite request temperature"
                     .to_string(),
             );
+        }
+        match self.sampled.as_ref() {
+            Some(sampled) if !sampled.draws_drafts() => {
+                return Err(
+                    "Qwen4 native MTP under qwen4 topology.pp does not support \
+                     HIPFIRE_MTP_SAMPLED_MODE=naive (its draws come from the process-wide AR \
+                     sampler); use the default leviathan mode"
+                        .to_string(),
+                );
+            }
+            Some(_) if self.request.penalties_active() => {
+                return Err(
+                    "Qwen4 native MTP under qwen4 topology.pp does not support sampled requests \
+                     with repeat/presence/frequency penalties (the GPU penalty prepass refuses \
+                     the pipeline mesh); such requests decode AR"
+                        .to_string(),
+                );
+            }
+            Some(_) => {}
+            None if self.request.temp.abs() > 1.0e-6 => {
+                return Err(
+                    "Qwen4 native MTP under qwen4 topology.pp verifies greedy requests only \
+                     while sampled verification is off (speculation.mtp_sampled / \
+                     HIPFIRE_MTP_SAMPLED=0)"
+                        .to_string(),
+                );
+            }
+            None => {}
         }
         if self.ngram_active {
             return Err(
@@ -10862,26 +10907,56 @@ mod tests {
     }
 
     #[test]
-    fn pp_serves_greedy_native_requests_without_the_ngram_pool_only() {
+    fn pp_serves_greedy_and_unpenalized_leviathan_requests_without_the_ngram_pool() {
+        let sampled = SpecRequestConfig {
+            temp: 0.8,
+            top_p: 0.9,
+            rng_seed: 7,
+            ..SpecRequestConfig::default()
+        };
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
-        assert!(drafter.refuse_unsupported_under_pp().is_ok());
-        // A sampled request needs one card's logit rows and the process-wide
-        // sampler: refused before any state changes.
         drafter.sampled_enabled = true;
-        drafter.request.temp = 0.8;
-        let sampled = drafter.refuse_unsupported_under_pp().unwrap_err();
-        assert!(sampled.contains("greedy"), "{sampled}");
-        // Never silently greedy: a nonzero temperature is refused with the
-        // sampling feature off too (the typed entry bypasses the AR gate).
+        drafter.sampled_mode = Ok(SampledMode::Leviathan);
+        assert!(drafter.refuse_unsupported_under_pp().is_ok());
+        // A sampled Leviathan request with neutral penalties runs on the mesh:
+        // every read of its verify goes through the output band's device.
+        MtpDrafter::configure_request(&mut drafter, sampled);
+        assert!(drafter.sampled.is_some());
+        assert!(drafter.refuse_unsupported_under_pp().is_ok());
+        // Penalties need the GPU prepass, which refuses the mesh.
+        MtpDrafter::configure_request(
+            &mut drafter,
+            SpecRequestConfig {
+                repeat_penalty: 1.1,
+                repeat_window: 64,
+                ..sampled
+            },
+        );
+        let penalized = drafter.refuse_unsupported_under_pp().unwrap_err();
+        assert!(penalized.contains("penalties"), "{penalized}");
+        // Naive draws come from the process-wide sampler.
+        drafter.sampled_mode = Ok(SampledMode::Naive);
+        MtpDrafter::configure_request(&mut drafter, sampled);
+        let naive = drafter.refuse_unsupported_under_pp().unwrap_err();
+        assert!(naive.contains("naive"), "{naive}");
+        // Never silently greedy: a nonzero temperature with sampled
+        // verification off is refused (the typed entry bypasses the AR gate).
+        drafter.sampled_mode = Ok(SampledMode::Leviathan);
         drafter.sampled_enabled = false;
+        MtpDrafter::configure_request(&mut drafter, sampled);
+        assert!(drafter.sampled.is_none());
         let disabled = drafter.refuse_unsupported_under_pp().unwrap_err();
         assert!(disabled.contains("greedy"), "{disabled}");
         // An ordinary greedy request is accepted with the flag on or off.
-        drafter.request.temp = 0.0;
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
         assert!(drafter.refuse_unsupported_under_pp().is_ok());
         drafter.sampled_enabled = true;
         assert!(drafter.refuse_unsupported_under_pp().is_ok());
+        // A non-finite temperature is never admitted.
+        drafter.request.temp = f32::NAN;
+        assert!(drafter.refuse_unsupported_under_pp().is_err());
         // An armed n-gram pool is a one-card route.
+        drafter.request.temp = 0.0;
         drafter.ngram_active = true;
         let pool = drafter.refuse_unsupported_under_pp().unwrap_err();
         assert!(pool.contains("n-gram"), "{pool}");

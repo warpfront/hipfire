@@ -3366,21 +3366,25 @@ pub fn generate_dflash(
         return true;
     }
 
-    // Qwen4 pipeline parallelism runs native greedy MTP on the mesh only (no
-    // n-gram takeover, DFlash/DSpark or sampled verify); anything else is
-    // refused here, before the prompt plan or any state mutation. Handled
-    // (true): the caller must not also emit an AR response.
+    // Qwen4 pipeline parallelism runs native MTP on the mesh only (greedy, or
+    // sampled with the Leviathan verify and neutral penalties; no n-gram
+    // takeover, DFlash/DSpark, naive sampled mode or penalties); anything
+    // else is refused here, before the prompt plan or any state mutation.
+    // Handled (true): the caller must not also emit an AR response.
     let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
     if pp_mesh {
-        let native_drafter = m
+        let native_naive = m
             .speculator
             .as_mut()
             .and_then(|s| s.drafter_any_mut())
-            .is_some_and(|any| any.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+            .and_then(|any| any.downcast_ref::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+            .map(|drafter| drafter.sampled_mode_is_naive());
         if let Some(refusal) = qwen4_pp_spec_refusal(
             spec_name,
-            native_drafter,
+            native_naive.is_some(),
             temp,
+            native_naive.unwrap_or(false),
+            repeat_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0,
             m.pp_gpus.is_some(),
             m.eviction.is_some(),
             false,
@@ -4460,19 +4464,28 @@ pub fn generate_spec(
             return None;
         }
     };
-    // Qwen4 pipeline parallelism runs native greedy MTP on the mesh only;
-    // every other speculative request is refused before any state mutation.
+    // Qwen4 pipeline parallelism runs native MTP on the mesh only (greedy, or
+    // sampled with the Leviathan verify and neutral penalties); every other
+    // speculative request is refused before any state mutation.
     let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
     if pp_mesh {
-        let native_drafter = m
+        let native = m
             .speculator
             .as_mut()
             .and_then(|s| s.drafter_any_mut())
-            .is_some_and(|any| any.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+            .and_then(|any| any.downcast_ref::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+            .map(|drafter| {
+                (
+                    drafter.sampled_mode_is_naive(),
+                    drafter.request_has_nonneutral_penalties(),
+                )
+            });
         if let Some(refusal) = qwen4_pp_spec_refusal(
             m.speculator.as_ref().map_or("", |s| s.name()),
-            native_drafter,
+            native.is_some(),
             temp,
+            native.is_some_and(|(naive, _)| naive),
+            native.is_some_and(|(_, penalized)| penalized),
             m.pp_gpus.is_some(),
             m.eviction.is_some(),
             resume_from.is_some(),
@@ -11001,13 +11014,20 @@ pub(crate) fn qwen4_bundle_and_mesh(
 }
 
 /// Why a Qwen4 speculative request cannot run on the pipeline-parallel mesh
-/// (`None` = it can). Only native greedy MTP reaches the mesh, on the model's
+/// (`None` = it can). Only native MTP reaches the mesh (greedy, or sampled
+/// with the default Leviathan verify and neutral penalties), on the model's
 /// own `Gpus`, without eviction or a divergent-render resume; everything else
-/// is refused before any state mutation.
+/// is refused before any state mutation. `naive_sampled`: the drafter runs
+/// `HIPFIRE_MTP_SAMPLED_MODE=naive` (process-wide sampler draws);
+/// `penalized`: the request carries a non-neutral repeat / presence /
+/// frequency penalty (the GPU penalty prepass refuses the mesh).
+#[allow(clippy::too_many_arguments)]
 fn qwen4_pp_spec_refusal(
     spec_name: &str,
     native_drafter: bool,
     temp: f32,
+    naive_sampled: bool,
+    penalized: bool,
     has_gpus: bool,
     evicting: bool,
     resumes: bool,
@@ -11017,10 +11037,25 @@ fn qwen4_pp_spec_refusal(
             "qwen4 topology.pp supports native MTP speculation only; `{spec_name}` is refused"
         ));
     }
-    if !(temp.is_finite() && temp <= 1.0e-6) {
+    if !temp.is_finite() {
         return Some(format!(
-            "qwen4 topology.pp native MTP is greedy only; a sampled request (temp {temp}) is refused"
+            "qwen4 topology.pp native MTP needs a finite temperature (got {temp})"
         ));
+    }
+    if temp > 1.0e-6 && naive_sampled {
+        return Some(
+            "qwen4 topology.pp native MTP does not support HIPFIRE_MTP_SAMPLED_MODE=naive for a \
+             sampled request (its draws come from the process-wide AR sampler); use the default \
+             leviathan mode"
+                .to_string(),
+        );
+    }
+    if penalized {
+        return Some(
+            "qwen4 topology.pp native MTP does not support repeat/presence/frequency penalties; \
+             penalized requests decode AR"
+                .to_string(),
+        );
     }
     if !has_gpus {
         return Some("qwen4 topology.pp native MTP has no admitted Gpus owner".to_string());
@@ -11043,7 +11078,7 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn greedy_native_mtp_with_gpus_is_admitted() {
         assert_eq!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, false),
+            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, false),
             None
         );
     }
@@ -11051,23 +11086,61 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn other_speculators_and_foreign_drafters_are_refused() {
         for name in ["dflash", "dspark", "ngram", ""] {
-            assert!(qwen4_pp_spec_refusal(name, true, 0.0, true, false, false).is_some());
+            assert!(
+                qwen4_pp_spec_refusal(name, true, 0.0, false, false, true, false, false).is_some()
+            );
         }
-        assert!(qwen4_pp_spec_refusal("mtp", false, 0.0, true, false, false).is_some());
+        assert!(
+            qwen4_pp_spec_refusal("mtp", false, 0.0, false, false, true, false, false).is_some()
+        );
     }
 
     #[test]
-    fn sampled_requests_are_refused() {
-        for temp in [0.7, 1.0e-3, f32::NAN, f32::INFINITY] {
-            assert!(qwen4_pp_spec_refusal("mtp", true, temp, true, false, false).is_some());
+    fn unpenalized_leviathan_sampled_requests_are_admitted() {
+        for temp in [0.7, 1.0e-3, 1.0, 2.0] {
+            assert_eq!(
+                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false, false),
+                None,
+                "temp {temp}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_naive_and_penalized_requests_are_refused() {
+        for temp in [f32::NAN, f32::INFINITY] {
+            assert!(
+                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false, false)
+                    .is_some()
+            );
+        }
+        // Naive sampled mode (process-wide sampler draws) stays refused ...
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.7, true, false, true, false, false).is_some());
+        // ... but a greedy request never draws, whatever the mode.
+        assert_eq!(
+            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true, false, false),
+            None
+        );
+        // Penalties are refused greedy or sampled.
+        for temp in [0.0, 0.7] {
+            assert!(
+                qwen4_pp_spec_refusal("mtp", true, temp, false, true, true, false, false)
+                    .is_some()
+            );
         }
     }
 
     #[test]
     fn missing_gpus_eviction_and_resume_are_refused() {
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false).is_some());
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, true, true, false).is_some());
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true).is_some());
+        assert!(
+            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false, false, false).is_some()
+        );
+        assert!(
+            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, true, false).is_some()
+        );
+        assert!(
+            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, true).is_some()
+        );
     }
 }
 

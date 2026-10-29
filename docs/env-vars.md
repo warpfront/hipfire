@@ -588,10 +588,17 @@ harness exports pending their cleanup.
 | `HIPFIRE_FAULT_HIP` / `HIPFIRE_FAULT_PREFIX_PUBLISH` / `HIPFIRE_FAULT_MTP_FULL_REJECT` | Test-only fault injection used by `test_serve_prefix_cache`: `HIP` fails one `upload`/`launch`/`sync` below the HIP bridge, `PREFIX_PUBLISH=1` fails the first prefix-cache publication, `MTP_FULL_REJECT=1` forces every MTP draft to be rejected. Never set in production. |
 | `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): records HIP recipes, module handles/images and resolved symbols for offline route-closure audits. Qwen3.5-family loads also print `route plan axes:` with the resolved architecture, heads, speculation route, context ceiling, KV/state formats, backend and prefill chunk, including when `HIPFIRE_ROUTE_PLAN=0` is used. A sealed route has every planned module bound before `loaded` and no unplanned loads afterwards. Never set in production or timing runs. |
 
-Flash-Next/Qwen4 PP native MTP is greedy-only; sampled/penalized requests
-decode AR through the same PP mesh instead of failing the request. The route
-decision logs once per process. This does not change Single native-MTP
-sampling support or admit other speculative engines under PP.
+Flash-Next/Qwen4 PP native MTP serves greedy requests and sampled requests with
+the default Leviathan verify (`HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
+and neutral penalties. Penalized requests (repeat/presence/frequency),
+sampled requests with `HIPFIRE_MTP_SAMPLED=0` (`speculation.mtp_sampled =
+false`, the kill switch) and sampled requests with
+`HIPFIRE_MTP_SAMPLED_MODE=naive` (draws from the process-wide AR sampler) decode
+AR through the same PP mesh instead of failing the request. The route decision
+logs once per process. The sampled-MTP chi-square oracle
+(`sampled_mtp_distribution_hw`) runs its short arms on a PP2 mesh with
+`HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2` (test harness variable, with
+`HIPFIRE_PP_LAYERS`). This does not admit other speculative engines under PP.
 
 #### Logical GPU emulation (developer-only)
 
@@ -2543,6 +2550,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SAMPLED_MTP_THINK_SEEDS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_THINK_TOKENS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOKENS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_TOPOLOGY` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOP_K` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOP_P` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TRIALS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
