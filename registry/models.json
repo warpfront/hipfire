@@ -2045,6 +2045,45 @@
       "desc": "EmbeddingGemma 2 (`google/embeddinggemma-2`) single-vector embedding encoder (arch 18): 24 bidirectional Gemma-4-family layers (sliding/full 5:1, per-layer head_dim/KV overrides, half-split RoPE, projection-only PLE, sandwich norms, `layer_scalar`), mean pool + L2 into the 768-d `embedding_projection`, Matryoshka 768/512/256/128 via the request's `dims`. **Not a chat model** — no LM head, served only through the non-chat `embed` verb (`hipfire embed`, `POST /v1/embeddings`). Text, image, audio and video: the checkpoint's vision and audio towers ride the `<trunk-stem>.vl` pack declared in `vision`, and the video leg drives that same vision tower per frame (no extra weights). Tower VRAM follows `vision_mode`, which defaults to `auto` (the pack is loaded and media served; `vision_mode=off` keeps the load text-only, media refused per modality). LOCAL-ONLY staged artifact, NOT uploaded/pullable: produced with `hipfire-quantize --input <google/embeddinggemma-2 snapshot> --output <this file> --format mq4v2`, which writes the tower pack beside it; place both in the models directory. The digests are of the bytes that command reproduced, so a re-quantized artifact carries different ones. Parity against a float32 CPU transformers 5.19.0 reference (2e-2 rel-L2 band, `scripts/check_embeddinggemma2_parity.py`): text 2.2e-4-1.0e-3, images 2.7e-4-3.1e-3, audio 2.4e-4-2.6e-3, video 3.1e-4-4.9e-3 on the raw checkpoint; on this mq4v2 trunk the worst fixture is 2.75e-1 against its 5e-1 band, and `scripts/check_embeddinggemma2_multislot.py` is bit-identical to the sequential route with mixed media in one batched forward.",
       "sha256": "793e692303905fe54d3f65db7f0fe7d79bc07390f399a76a6aa6ef416819cc07",
       "size_bytes": 253110320
+    },
+    "lightonocr3:0.8b": {
+      "repo": "",
+      "file": "lightonocr3-0.8b.mq4",
+      "vision": {
+        "file": "lightonocr3-0.8b.vl",
+        "sha256": "708c7b798b075c3b6f1a2c50b0d4fca3ffd4eebb8ff220baadcb5762360e9079",
+        "size_bytes": 227722240
+      },
+      "size_gb": 0.58,
+      "min_vram_gb": 2,
+      "desc": "LightOnOCR-3-0.8B (`lightonai/LightOnOCR-3-0.8B`) — Apache-2.0 document-OCR VLM on the Qwen3.5-VL architecture (arch 5): 24 hybrid layers (18 DeltaNet `linear_attention` + 6 `full_attention` every 4th), 1024d, tied 248320 vocab, plus the `model.visual.*` patch-16 ViT tower on the `<trunk>.vl` sidecar (F16). Prompt modes per the model card: empty prompt = transcription, `grounding` = labelled bounding boxes. Trained/evaluated with thinking disabled — the card's `enable_thinking=false`, temp 0.2, top_p 0.9 are the lowered recommended_settings. Tower VRAM is opt-in: `vision_mode` defaults to `off` (text-only), set `hipfire config lightonocr3:0.8b set vision.mode auto` for image turns. LOCAL-ONLY until an HF pack ships — `hipfire pull` refuses by design (place the trunk + `.vl` in the models dir, or catalog them via models.toml).",
+      "recommended_settings": {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "reasoning_effort": "none"
+      },
+      "sha256": "8e14f0dddfaa0041bc57eeb5b28c18379e69bb7640b04771cb5bf4cd57bf13fb",
+      "size_bytes": 577923712
+    }
+,
+    "lightonocr3:0.8b-q8": {
+      "repo": "",
+      "file": "lightonocr3-0.8b.q8",
+      "vision": {
+        "file": "lightonocr3-0.8b.vl",
+        "sha256": "708c7b798b075c3b6f1a2c50b0d4fca3ffd4eebb8ff220baadcb5762360e9079",
+        "size_bytes": 227722240
+      },
+      "size_gb": 0.82,
+      "min_vram_gb": 2,
+      "desc": "LightOnOCR-3-0.8B (`lightonai/LightOnOCR-3-0.8B`) — the Q8 trunk tier (all weights Q8 interleaved, embed/norms F16; 0.77 GiB) of the same document-OCR VLM as `lightonocr3:0.8b`, paired with the same F16 vision-tower pack `lightonocr3-0.8b.q8.vl`. Highest-fidelity tier: use when OCR accuracy over latency is the priority. Same card modes and recommended_settings as the MQ4 tier; same `vision.mode auto` opt-in for image turns. LOCAL-ONLY — `hipfire pull` refuses by design.",
+      "recommended_settings": {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "reasoning_effort": "none"
+      },
+      "sha256": "8fa2093744a69d67b553875bcc1695fd039665938bcddaa29072005639fc2a4e",
+      "size_bytes": 822227584
     }
   },
   "aliases": {
@@ -2132,6 +2171,9 @@
     "muse-glimmer:30b:draft": "muse-glimmer:draft",
     "muse-glimmer-30b:draft": "muse-glimmer:draft",
     "embeddinggemma-2": "embeddinggemma-2:q8f16",
-    "embeddinggemma": "embeddinggemma-2:q8f16"
+    "embeddinggemma": "embeddinggemma-2:q8f16",
+    "lightonocr3": "lightonocr3:0.8b",
+    "lightonocr3:0.8b-mq4": "lightonocr3:0.8b",
+    "lightonocr3:q8": "lightonocr3:0.8b-q8"
   }
 }

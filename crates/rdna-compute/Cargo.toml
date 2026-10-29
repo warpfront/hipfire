@@ -167,6 +167,10 @@ name = "bench_attention_vision"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_vit_attention"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_decode_attention"
 required-features = ["lab"]
 
