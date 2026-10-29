@@ -1592,6 +1592,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[reach(DflashGfx1201, "verify hidden extraction into each fixed staging buffer before ring commit", "g0; arm3")],
     },
     Decision {
+        id: "qwen4-exact-cache-capture-guard",
+        predicates: &[CaptureMode],
+        condition: "Qwen4GpuForward::forward_chunk_inner refuses HIP graph capture before acquiring an exact expert-cache reader or launching the token; prompt entries use their separate canonical prefill scope",
+        effect: Refusal,
+        switches: "error before launch: mutable table publication and route readback require an explicit retired reader, so the singleton exact-cache call cannot be nested inside HIP graph capture",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the capture branch returns before begin_token, table refresh, route reset or forward_chunk_tile; it records no alternative body. Ordinary eager and checked retained AR keep their existing lifetime proof",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-mesh-refuses-retained-replay",
         predicates: &[ReplayState],
         condition: "hipfire-arch-qwen4 check_mesh_admission (gpu_forward.rs), run by every pipeline-parallel mesh band forward and by prepare_mesh_capacity: the band forward is refused unless `gpu.replay.state()` is Hip or Fallback, i.e. no retained replay body is armed on that band's device",
@@ -2076,6 +2087,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "forward_chunk_inner",
+        occurrences: 1,
+        decisions: &["qwen4-exact-cache-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
         function: "forward_chunk_scoped",
         occurrences: 11,
         decisions: &[
@@ -2453,7 +2470,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-generate/src/redline.rs",
         function: "redline_qwen4_replay_failure",
-        occurrences: 1,
+        occurrences: 2,
         decisions: &["redline-oracle-diagnostics"],
     },
     Site {

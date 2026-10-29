@@ -119,6 +119,277 @@ pub enum NormKind {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded slot residency
+// ---------------------------------------------------------------------------
+// Adapted from warpfront/hipfire PR #870, a73d9491d3e07f3e821a974a9c5f72e35e34ab93.
+// The original per-pool LRU/transaction boundary is extended with generation
+// tickets and access-ordered (rather than completion-ordered) recency.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Pending,
+    Resident,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlotEntry<P> {
+    pool: P,
+    slot: usize,
+    state: SlotState,
+    generation: u64,
+}
+
+/// A reservation in one [`SlotCache`] instance. Only the first request for a
+/// missing key owns its fill; duplicate pending requests do not acquire it.
+/// A caller must withdraw `victim()` from its pointer table before overwriting
+/// the slot, and publish the new pointer only after the copy succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotReservation<K, P> {
+    pub key: K,
+    pub pool: P,
+    pub slot: usize,
+    generation: u64,
+    needs_fill: bool,
+    victim: Option<K>,
+}
+
+impl<K: Copy, P> SlotReservation<K, P> {
+    pub fn needs_fill(&self) -> bool {
+        self.needs_fill
+    }
+
+    /// Monotonically increasing identity of this fill within its cache.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The formerly resident key replaced by this new fill, if any.
+    pub fn victim(&self) -> Option<K> {
+        self.victim
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotCacheError {
+    ZeroSlots,
+    PoolMismatch,
+    AllSlotsPending,
+    GenerationExhausted,
+}
+
+impl std::fmt::Display for SlotCacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroSlots => write!(f, "slot cache requires at least one slot per pool"),
+            Self::PoolMismatch => write!(f, "cache key was requested from a different pool"),
+            Self::AllSlotsPending => write!(f, "all slots in the pool have pending fills"),
+            Self::GenerationExhausted => write!(f, "slot reservation generation exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for SlotCacheError {}
+
+/// Device-independent, fixed-capacity per-pool LRU with transactional fills.
+///
+/// Logical recency follows successful [`reserve`](Self::reserve) calls,
+/// including pending duplicates. Completion order never changes recency.
+/// Pending entries are not visible as resident and cannot be evicted. Failed
+/// fills are forgotten rather than restoring potentially overwritten victims.
+///
+/// This is bookkeeping, not a copy/event owner or a consumer lease. Callers
+/// must order table withdrawal, copies, publication and consuming launches;
+/// before invalidating a pending key they must retire its physical copy. A
+/// generation rejects stale completion tickets but cannot stop an old DMA.
+/// Tickets belong to the originating cache; do not pass them between instances.
+pub struct SlotCache<K, P>
+where
+    K: Copy + Eq + std::hash::Hash,
+    P: Copy + Eq + std::hash::Hash,
+{
+    slots_per_pool: usize,
+    entries: HashMap<K, SlotEntry<P>>,
+    occupants: HashMap<(P, usize), K>,
+    lru: HashMap<P, VecDeque<usize>>,
+    next_slot: HashMap<P, usize>,
+    generation: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl<K, P> SlotCache<K, P>
+where
+    K: Copy + Eq + std::hash::Hash,
+    P: Copy + Eq + std::hash::Hash,
+{
+    pub fn new(slots_per_pool: usize) -> Result<Self, SlotCacheError> {
+        if slots_per_pool == 0 {
+            return Err(SlotCacheError::ZeroSlots);
+        }
+        Ok(Self {
+            slots_per_pool,
+            entries: HashMap::new(),
+            occupants: HashMap::new(),
+            lru: HashMap::new(),
+            next_slot: HashMap::new(),
+            generation: 0,
+            hits: 0,
+            misses: 0,
+        })
+    }
+
+    pub fn slots_per_pool(&self) -> usize {
+        self.slots_per_pool
+    }
+
+    /// Committed hits and newly reserved fills. Pending duplicates count as
+    /// neither: they touch recency but schedule no additional fill.
+    pub fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+
+    /// Inspect residency without recording a logical access; use `reserve`
+    /// to access a key and update LRU. Pending fills are invisible here.
+    pub fn resident_slot(&self, key: K) -> Option<usize> {
+        self.entries
+            .get(&key)
+            .and_then(|entry| (entry.state == SlotState::Resident).then_some(entry.slot))
+    }
+
+    pub fn reserve(&mut self, pool: P, key: K) -> Result<SlotReservation<K, P>, SlotCacheError> {
+        if let Some(entry) = self.entries.get(&key).copied() {
+            if entry.pool != pool {
+                return Err(SlotCacheError::PoolMismatch);
+            }
+            if entry.state == SlotState::Resident {
+                self.hits = self.hits.saturating_add(1);
+            }
+            self.touch_slot(pool, entry.slot);
+            return Ok(SlotReservation {
+                key,
+                pool,
+                slot: entry.slot,
+                generation: entry.generation,
+                needs_fill: false,
+                victim: None,
+            });
+        }
+
+        // Check before changing occupancy or LRU. Never wrap a ticket identity.
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(SlotCacheError::GenerationExhausted)?;
+        let next = self.next_slot.get(&pool).copied().unwrap_or(0);
+        let slot = if next < self.slots_per_pool {
+            self.next_slot.insert(pool, next + 1);
+            next
+        } else {
+            let queue = self.lru.get(&pool).expect("allocated pool has an LRU");
+            // Reuse holes left by rollback/invalidate before evicting residents.
+            // Searching, instead of rotating pending slots, preserves all other
+            // keys' logical recency even when a request cannot obtain a slot.
+            queue
+                .iter()
+                .copied()
+                .find(|&slot| !self.occupants.contains_key(&(pool, slot)))
+                .or_else(|| {
+                    queue.iter().copied().find(|&slot| {
+                        self.occupants
+                            .get(&(pool, slot))
+                            .and_then(|old| self.entries.get(old))
+                            .is_some_and(|entry| entry.state == SlotState::Resident)
+                    })
+                })
+                .ok_or(SlotCacheError::AllSlotsPending)?
+        };
+        let victim = self.occupants.remove(&(pool, slot));
+        if let Some(old) = victim {
+            self.entries.remove(&old);
+        }
+        self.generation = generation;
+        self.misses = self.misses.saturating_add(1);
+        self.entries.insert(
+            key,
+            SlotEntry {
+                pool,
+                slot,
+                state: SlotState::Pending,
+                generation,
+            },
+        );
+        self.occupants.insert((pool, slot), key);
+        self.touch_slot(pool, slot);
+        Ok(SlotReservation {
+            key,
+            pool,
+            slot,
+            generation,
+            needs_fill: true,
+            victim,
+        })
+    }
+
+    fn pending_ticket_matches(&self, reservation: &SlotReservation<K, P>) -> bool {
+        reservation.needs_fill
+            && self.entries.get(&reservation.key).is_some_and(|entry| {
+                entry.pool == reservation.pool
+                    && entry.slot == reservation.slot
+                    && entry.generation == reservation.generation
+                    && entry.state == SlotState::Pending
+            })
+    }
+
+    /// Publish after successful I/O and copy. Duplicate/stale tickets are
+    /// rejected. This deliberately does not touch the logical-access LRU.
+    pub fn commit(&mut self, reservation: SlotReservation<K, P>) -> bool {
+        if !self.pending_ticket_matches(&reservation) {
+            return false;
+        }
+        self.entries.get_mut(&reservation.key).unwrap().state = SlotState::Resident;
+        true
+    }
+
+    /// Forget a failed fill; never resurrect the victim's overwritten bytes.
+    pub fn rollback(&mut self, reservation: SlotReservation<K, P>) -> bool {
+        if !self.pending_ticket_matches(&reservation) {
+            return false;
+        }
+        self.invalidate(reservation.key)
+    }
+
+    /// Remove a mapping. Caller must retire any pending copy and users of the
+    /// old slot before allowing the freed capacity to be reused.
+    pub fn invalidate(&mut self, key: K) -> bool {
+        let Some(entry) = self.entries.remove(&key) else {
+            return false;
+        };
+        self.occupants.remove(&(entry.pool, entry.slot));
+        true
+    }
+
+    /// Forget every mapping and restore physical slot allocation order.
+    ///
+    /// The caller must first retire every pending copy and consumer. Ticket
+    /// generations and cumulative statistics deliberately survive the reset,
+    /// so a stale completion cannot commit a later use of the same slot.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.occupants.clear();
+        self.lru.clear();
+        self.next_slot.clear();
+    }
+
+    fn touch_slot(&mut self, pool: P, slot: usize) {
+        let queue = self.lru.entry(pool).or_default();
+        if let Some(pos) = queue.iter().position(|&candidate| candidate == slot) {
+            queue.remove(pos);
+        }
+        queue.push_back(slot);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Transport: how bytes get from HFQ file to VRAM
 // ---------------------------------------------------------------------------
 
@@ -710,6 +981,161 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn slot_cache_clear_restores_slot_order_without_reusing_ticket_identity() {
+        let mut cache = SlotCache::new(2).unwrap();
+        let first = cache.reserve((), 11usize).unwrap();
+        assert!(cache.commit(first));
+        let second = cache.reserve((), 22usize).unwrap();
+        assert!(cache.commit(second));
+        cache.reserve((), 11).unwrap(); // LRU is now slot 1, then slot 0.
+        let old_pending = cache.reserve((), 33).unwrap();
+        assert_eq!(old_pending.slot, 1);
+        let stats = cache.stats();
+        // Stand in for the transport's proven DMA retirement before clearing.
+        cache.clear();
+        assert_eq!(cache.stats(), stats);
+        let reset = cache.reserve((), 33).unwrap();
+        assert_eq!(reset.slot, 0);
+        assert!(reset.generation() > old_pending.generation());
+        assert!(!cache.commit(old_pending));
+        assert!(!cache.rollback(old_pending));
+        assert!(cache.commit(reset));
+        assert_eq!(cache.reserve((), 44).unwrap().slot, 1);
+    }
+
+    #[test]
+    fn slot_cache_generation_rejects_aba_commit_and_rollback() {
+        let mut cache = SlotCache::new(1).unwrap();
+        let old = cache.reserve(0u8, 7u16).unwrap();
+        assert!(cache.invalidate(7));
+        let intervening = cache.reserve(0, 8).unwrap();
+        assert!(cache.rollback(intervening));
+        let current = cache.reserve(0, 7).unwrap();
+        assert_eq!(old.slot, current.slot);
+        assert!(old.generation() < intervening.generation());
+        assert!(intervening.generation() < current.generation());
+        assert!(!cache.commit(old));
+        assert!(!cache.rollback(old));
+        assert_eq!(cache.resident_slot(7), None);
+        assert!(cache.commit(current));
+        assert!(!cache.rollback(current));
+        assert!(!cache.commit(current));
+        assert_eq!(cache.resident_slot(7), Some(current.slot));
+    }
+
+    #[test]
+    fn slot_cache_reverse_completion_preserves_logical_lru() {
+        let mut cache = SlotCache::new(3).unwrap();
+        let a = cache.reserve(0u8, 1u16).unwrap();
+        let b = cache.reserve(0, 2).unwrap();
+        let c = cache.reserve(0, 3).unwrap();
+        assert!(cache.commit(c));
+        assert!(cache.commit(b));
+        assert!(cache.commit(a));
+        let d = cache.reserve(0, 4).unwrap();
+        assert_eq!(d.victim(), Some(1));
+        assert_eq!(d.slot, a.slot);
+    }
+
+    #[test]
+    fn slot_cache_pending_duplicate_touches_without_claiming_fill() {
+        let mut cache = SlotCache::new(2).unwrap();
+        let a = cache.reserve(0u8, 1u16).unwrap();
+        let b = cache.reserve(0, 2).unwrap();
+        let duplicate = cache.reserve(0, 1).unwrap();
+        assert_eq!(duplicate.generation(), a.generation());
+        assert!(!duplicate.needs_fill());
+        assert_eq!(duplicate.victim(), None);
+        assert!(!cache.commit(duplicate));
+        assert!(!cache.rollback(duplicate));
+        assert!(cache.commit(a));
+        assert!(cache.commit(b));
+        assert_eq!(cache.reserve(0, 3).unwrap().victim(), Some(2));
+        assert_eq!(cache.stats(), (0, 3));
+    }
+
+    #[test]
+    fn slot_cache_partial_rollback_reuses_hole_without_evicting_or_resurrecting() {
+        let mut cache = SlotCache::new(2).unwrap();
+        let a = cache.reserve(0u8, 1u16).unwrap();
+        let b = cache.reserve(0, 2).unwrap();
+        assert!(cache.commit(a));
+        assert!(cache.rollback(b));
+        let c = cache.reserve(0, 3).unwrap();
+        assert_eq!(c.slot, b.slot);
+        assert_eq!(c.victim(), None);
+        assert!(cache.commit(c));
+        let d = cache.reserve(0, 4).unwrap();
+        assert_eq!(d.victim(), Some(1));
+        assert!(cache.rollback(d));
+        assert_eq!(cache.resident_slot(1), None);
+        assert_eq!(cache.resident_slot(3), Some(c.slot));
+        assert!(!cache.commit(b));
+        assert!(!cache.rollback(b));
+    }
+
+    #[test]
+    fn slot_cache_all_pending_refusal_preserves_access_order() {
+        let mut cache = SlotCache::new(2).unwrap();
+        let a = cache.reserve(0u8, 1u16).unwrap();
+        let b = cache.reserve(0, 2).unwrap();
+        assert_eq!(
+            cache.reserve(0, 3).unwrap_err(),
+            SlotCacheError::AllSlotsPending
+        );
+        assert_eq!(cache.stats(), (0, 2));
+        assert!(cache.commit(b));
+        // Skip the older pending A without moving it in the recency queue.
+        let c = cache.reserve(0, 3).unwrap();
+        assert_eq!(c.victim(), Some(2));
+        assert!(cache.commit(c));
+        assert!(cache.commit(a));
+        assert_eq!(cache.reserve(0, 4).unwrap().victim(), Some(1));
+    }
+
+    #[test]
+    fn slot_cache_victim_identity_and_pools_are_independent() {
+        let mut cache = SlotCache::new(1).unwrap();
+        let a = cache.reserve(0u8, 1u16).unwrap();
+        let b = cache.reserve(1, 2).unwrap();
+        assert_eq!((a.slot, b.slot), (0, 0));
+        assert!(cache.commit(a));
+        assert!(cache.commit(b));
+        assert_eq!(
+            cache.reserve(1, 1).unwrap_err(),
+            SlotCacheError::PoolMismatch
+        );
+        let hit = cache.reserve(0, 1).unwrap();
+        assert!(!hit.needs_fill());
+        assert_eq!(hit.victim(), None);
+        let c = cache.reserve(0, 3).unwrap();
+        assert_eq!(c.victim(), Some(1));
+        assert_eq!(cache.resident_slot(1), None);
+        assert_eq!(cache.resident_slot(2), Some(0));
+        assert_eq!(cache.stats(), (1, 3));
+    }
+
+    #[test]
+    fn slot_cache_generation_exhaustion_fails_without_eviction() {
+        assert!(matches!(
+            SlotCache::<u16, u8>::new(0),
+            Err(SlotCacheError::ZeroSlots)
+        ));
+        let mut cache = SlotCache::new(1).unwrap();
+        let a = cache.reserve(0u8, 1u16).unwrap();
+        assert!(cache.commit(a));
+        cache.generation = u64::MAX;
+        assert_eq!(
+            cache.reserve(0, 2).unwrap_err(),
+            SlotCacheError::GenerationExhausted
+        );
+        assert_eq!(cache.resident_slot(1), Some(a.slot));
+        assert_eq!(cache.stats(), (0, 1));
+        // Existing accesses need no generation and still succeed.
+        assert!(!cache.reserve(0, 1).unwrap().needs_fill());
+    }
 
     #[test]
     fn weight_id_is_hashable() {

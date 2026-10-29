@@ -17,7 +17,8 @@ use crate::families::gemv::WeightRef;
 use crate::families::moe::{
     ExpertTierIdentity, MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries,
     MoePrefillParams, MoeQ8RouterPolicy, MoeRecipe, MoeResolution, MoeRouteCapability, MoeScores,
-    MoeSelectionBias, RoutedExpertWeights, MOE_BIASED_SIGMOID_MAX_K,
+    MoeSelectionBias, MutableExpertResidency, ResidencySpan, RoutedExpertWeights,
+    MOE_BIASED_SIGMOID_MAX_K,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1245,6 +1246,8 @@ struct LiveMoeBinding {
     mapping_fingerprint: String,
     /// [`RoutedExpertWeights::immutable_identity`] of the bound expert set.
     source_identity: Option<u64>,
+    /// Fixed canonical/owner/table/pool capability, independent of publication.
+    mutable_residency: Option<MutableExpertResidency>,
     /// `experts[i].0/.1.buffer.ptr`, contiguous: the per-call host pointer
     /// entry check compares whole slices.
     gate_up_entries: Box<[usize]>,
@@ -1584,7 +1587,11 @@ impl ExpertBindingCache {
     /// the cache's tables or tapes alive (captured graphs, retained bodies)
     /// must hold it until its GPU work is retired.
     pub fn tier_keepalive(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        self.tier_identity().map(|tier| tier.keepalive().clone())
+        self.live
+            .as_ref()
+            .and_then(|live| live.mutable_residency.as_ref())
+            .map(MutableExpertResidency::keepalive)
+            .or_else(|| self.tier_identity().map(|tier| tier.keepalive().clone()))
     }
 
     pub fn new(
@@ -1668,6 +1675,9 @@ impl ExpertBindingCache {
         dtype_tags: Option<&GpuTensor>,
     ) -> Result<(), DispatchError> {
         check_cache_table(self, table)?;
+        if routed_experts.mutable_residency().is_some() && self.rank_count != 1 {
+            return Err(invalid("mutable residency binding requires a single rank"));
+        }
         if self.live.is_some() {
             return Err(invalid("expert live resources are already bound"));
         }
@@ -3676,10 +3686,22 @@ fn validate_shared_prefill(
 }
 
 fn validate_decode(
-    _ctx: &DispatchCtx,
+    ctx: &DispatchCtx,
     experts: &BoundMoeExperts<'_>,
     params: &MoeParams<'_>,
 ) -> Result<(), DispatchError> {
+    if params.routed_experts.mutable_residency().is_some() && ctx.arch.arch() != "gfx1201" {
+        return Err(invalid("mutable residency decode requires exact gfx1201"));
+    }
+    if params.routed_experts.mutable_residency().is_some()
+        && (params.cpu_deferred_experts
+            || params.routed_experts.cpu_split().is_some()
+            || params.ep_mode != MoeEpMode::None)
+    {
+        return Err(invalid(
+            "mutable residency decode refuses CPU splice/split and EP",
+        ));
+    }
     if params.batch_size != 1 {
         return Err(invalid(format!(
             "indexed decode requires batch_size=1, got {}",
@@ -3833,6 +3855,11 @@ fn validate_prefill(
     experts: &BoundMoeExperts<'_>,
     params: &MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
+    if params.routed_experts.mutable_residency().is_some() {
+        return Err(invalid(
+            "mutable residency is decode-only; prefill requires frozen resources",
+        ));
+    }
     if params.batch_size == 0 {
         return Err(invalid("grouped prefill batch_size is zero"));
     }
@@ -4338,11 +4365,59 @@ fn build_live_binding(
                 "live routed expert table is missing expert {index}"
             ))
         })?;
+        if routed_experts.mutable_residency().is_some()
+            && (gate_up.awq_scale.is_some() || down.awq_scale.is_some())
+        {
+            return Err(invalid(
+                "mutable residency canonical experts refuse AWQ scales",
+            ));
+        }
         let gate_up = bind_live_weight(metadata, &gate_up, true, index, "gate/up")?;
         let down = bind_live_weight(metadata, &down, false, index, "down")?;
         live_experts.push((gate_up, down));
     }
 
+    let mutable_residency = routed_experts.mutable_residency().cloned();
+    if let Some(residency) = &mutable_residency {
+        if routed_experts.immutable_identity().is_none()
+            || down_awq_ptrs.is_some()
+            || dtype_tags.is_some()
+            || live_experts
+                .iter()
+                .any(|(gu, dn)| gu.dtype != DType::MQ4G256V2 || dn.dtype != DType::MQ4G128V2)
+        {
+            return Err(invalid(
+                "mutable residency requires immutable canonical QT44/QT53 experts without AWQ/tags",
+            ));
+        }
+        let spans = |gate_up: bool| {
+            live_experts
+                .iter()
+                .map(|(gu, dn)| {
+                    let tensor = if gate_up { &gu.buffer } else { &dn.buffer };
+                    ResidencySpan {
+                        address: tensor.ptr,
+                        bytes: tensor.byte_capacity,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        residency
+            .validate_binding(
+                residency.owner_generation(),
+                &spans(true),
+                &spans(false),
+                ResidencySpan {
+                    address: gate_up_identity.ptr,
+                    bytes: gate_up_identity.byte_capacity,
+                },
+                ResidencySpan {
+                    address: down_identity.ptr,
+                    bytes: down_identity.byte_capacity,
+                },
+            )
+            .map_err(invalid)?;
+    }
     let mut canonical = format!("single-live/v1|n|{n_experts}|experts|");
     for (index, (gate_up, down)) in live_experts.iter().enumerate() {
         canonical.push_str(&format!(
@@ -4377,6 +4452,10 @@ fn build_live_binding(
         canonical.push_str(&tier_identity_suffix(tier));
     }
 
+    if let Some(residency) = &mutable_residency {
+        canonical.push('|');
+        canonical.push_str(residency.stable_fingerprint());
+    }
     let (gate_up_entries, down_entries) = live_entry_ptrs(&live_experts);
     if let Some(tier) = &tier {
         for index in 0..n_experts {
@@ -4404,6 +4483,7 @@ fn build_live_binding(
         dtype_tags: dtype_tag_identity,
         mapping_fingerprint: fingerprint_hex(&canonical),
         source_identity: routed_experts.immutable_identity(),
+        mutable_residency,
         gate_up_entries,
         down_entries,
         tier,
@@ -4644,6 +4724,7 @@ fn build_compact_live_binding(
         dtype_tags: dtype_tag_identity,
         mapping_fingerprint: fingerprint_hex(&canonical),
         source_identity: None,
+        mutable_residency: None,
         gate_up_entries,
         down_entries,
         tier: None,
@@ -4858,6 +4939,34 @@ fn table_has_mixed_dtypes(table: &ExpertTable) -> Result<bool, DispatchError> {
     Ok(mixed)
 }
 
+/// Revalidate the complete live expert binding before a retained HIP/PM4/AQL
+/// replay, which bypasses the ordinary per-layer decode sealer. This checks
+/// immutable canonical/tier/table ownership as well as the sanctioned current
+/// mapping. A mutable binding requires its active token guard and exact host
+/// mirrors; obtaining retained identity strings alone is not launch authority.
+///
+/// The caller must also validate the retained route identities and executing
+/// device, and retain the token guard through proven GPU retirement.
+pub fn validate_retained_moe_binding(
+    experts: &BoundMoeExperts<'_>,
+    routed_experts: &dyn RoutedExpertWeights,
+    gate_up_ptrs: &GpuTensor,
+    down_ptrs: &GpuTensor,
+    down_awq_ptrs: Option<&GpuTensor>,
+    dtype_tags: Option<&GpuTensor>,
+    host_entries: Option<MoePointerEntries<'_>>,
+) -> Result<(), DispatchError> {
+    validate_live_binding(
+        experts,
+        Some(routed_experts),
+        gate_up_ptrs,
+        down_ptrs,
+        down_awq_ptrs,
+        dtype_tags,
+        host_entries,
+    )
+}
+
 fn validate_live_binding(
     experts: &BoundMoeExperts<'_>,
     routed_experts: Option<&dyn RoutedExpertWeights>,
@@ -4904,10 +5013,24 @@ fn validate_live_binding(
             ));
         }
     }
+    match (&live.mutable_residency, routed_experts.mutable_residency()) {
+        (None, None) => {}
+        (Some(expected), Some(actual)) if expected == actual => {}
+        _ => {
+            return Err(invalid(
+                "mutable residency capability/owner generation changed",
+            ))
+        }
+    }
     // The set this binding was captured from promised immutability: its id
     // stands for every expert identity checked at bind time.
     let bound_source = live.source_identity.is_some()
         && routed_experts.immutable_identity() == live.source_identity;
+    if live.mutable_residency.is_some() && !bound_source {
+        return Err(invalid(
+            "mutable residency canonical source identity changed",
+        ));
+    }
     if !bound_source {
         for (index, (expected_gate_up, expected_down)) in live.experts.iter().enumerate() {
             let (gate_up, down) = routed_experts.get(index).ok_or_else(|| {
@@ -4925,7 +5048,14 @@ fn validate_live_binding(
     // Table *contents*, not just the table tensor: a replay dereferences these
     // entries without re-uploading them, so each entry must point at the live
     // expert tensor it claims to name. Mirrors the compact path's check.
-    if let Some(entries) = host_entries {
+    if let Some(residency) = &live.mutable_residency {
+        let entries = host_entries.ok_or_else(|| {
+            invalid("mutable residency requires the published host pointer entries")
+        })?;
+        residency
+            .validate_current_entries(entries.gate_up, entries.down)
+            .map_err(invalid)?;
+    } else if let Some(entries) = host_entries {
         if entries.gate_up.len() != live.experts.len() || entries.down.len() != live.experts.len() {
             return Err(invalid(format!(
                 "expert pointer entries cover {} gate/up and {} down, expected {}",
@@ -5474,6 +5604,312 @@ mod tests {
             dtype_rotation_plan(dtype),
         )
         .unwrap()
+    }
+
+    struct MutableRouted<'a> {
+        inner: &'a FakeRouted,
+        residency: MutableExpertResidency,
+        identity: u64,
+    }
+    impl RoutedExpertWeights for MutableRouted<'_> {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn get(&self, expert: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+            self.inner.get(expert)
+        }
+        fn immutable_identity(&self) -> Option<u64> {
+            Some(self.identity)
+        }
+        fn mutable_residency(&self) -> Option<&MutableExpertResidency> {
+            Some(&self.residency)
+        }
+    }
+
+    fn mutable_table() -> ExpertTable {
+        ExpertTable::new(
+            (0..2)
+                .map(|index| {
+                    ExpertMetadata::new(
+                        index,
+                        0,
+                        index,
+                        ExpertResources::fused(
+                            resource(&format!("mgu{index}"), DType::MQ4G256V2, &[8, 256]),
+                            resource(&format!("mdn{index}"), DType::MQ4G128V2, &[4, 128]),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn mutable_capability(fixture: &LiveFixture, generation: u64) -> MutableExpertResidency {
+        use crate::families::moe::{MutableExpertResidencySpec, ResidencySlot};
+        let span = |tensor: &GpuTensor| ResidencySpan {
+            address: tensor.buf.as_ptr() as usize,
+            bytes: tensor.buf.size(),
+        };
+        let gu: Vec<_> = fixture
+            .routed
+            .experts
+            .iter()
+            .map(|e| span(&e.gate_up.buf))
+            .collect();
+        let dn: Vec<_> = fixture
+            .routed
+            .experts
+            .iter()
+            .map(|e| span(&e.down.buf))
+            .collect();
+        // SAFETY: these CPU-only synthetic descriptors never launch or
+        // dereference the addresses; no real allocation can be freed here.
+        unsafe {
+            MutableExpertResidency::new(MutableExpertResidencySpec {
+                owner_generation: generation,
+                slots: vec![ResidencySlot {
+                    gate_up: ResidencySpan {
+                        address: 0x9000_0000,
+                        bytes: gu[0].bytes,
+                    },
+                    down: ResidencySpan {
+                        address: 0x9001_0000,
+                        bytes: dn[0].bytes,
+                    },
+                }],
+                canonical_gate_up: gu,
+                canonical_down: dn,
+                gate_up_table: span(&fixture.gate_up_ptrs),
+                down_table: span(&fixture.down_ptrs),
+                keepalive: std::sync::Arc::new(()),
+            })
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn mutable_live_mapping_is_guarded_and_retained_identity_excludes_epoch() {
+        use crate::families::moe::{ResidencyLocation, ResidencyPublication, ResidencySlotTicket};
+        let table = mutable_table();
+        let fixture = live_fixture(&table, 0x5000_0000);
+        let residency = mutable_capability(&fixture, 7);
+        let routed = MutableRouted {
+            inner: &fixture.routed,
+            residency: residency.clone(),
+            identity: 77,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        cache
+            .bind_live(
+                &table,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .unwrap();
+        let identities = cache.retained_route_identities(&table, 3).unwrap();
+        let initial = residency.snapshot().unwrap();
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        assert!(
+            validate_retained_moe_binding(
+                &bound,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                Some(MoePointerEntries {
+                    gate_up: &initial.gate_up,
+                    down: &initial.down,
+                })
+            )
+            .is_err(),
+            "unacquired tables cannot launch"
+        );
+        let ticket = ResidencySlotTicket {
+            slot: 0,
+            expert: 0,
+            generation: 1,
+        };
+        // SAFETY: metadata-only transaction, no GPU reads or uploads exist.
+        let snapshot = unsafe {
+            residency.publish_after_gpu_wait(
+                ResidencyPublication {
+                    expected_epoch: 0,
+                    mapping: vec![
+                        ResidencyLocation::Slot(ticket),
+                        ResidencyLocation::Canonical,
+                    ],
+                    completed_slots: vec![ticket],
+                },
+                |_| Ok(()),
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            cache.retained_route_identities(&table, 3).unwrap(),
+            identities
+        );
+        let guard = residency.begin_token(snapshot.epoch).unwrap();
+        let entries = || MoePointerEntries {
+            gate_up: &snapshot.gate_up,
+            down: &snapshot.down,
+        };
+        validate_retained_moe_binding(
+            &bound,
+            &routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(entries()),
+        )
+        .unwrap();
+        assert!(
+            validate_retained_moe_binding(
+                &bound,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                Some(MoePointerEntries {
+                    gate_up: &[0xdead, snapshot.gate_up[1]],
+                    down: &snapshot.down,
+                })
+            )
+            .is_err(),
+            "unapproved host pointer must be rejected"
+        );
+        let swapped = live_tensor(0x9002_0000, 16, &[4], DType::F32);
+        assert!(validate_retained_moe_binding(
+            &bound,
+            &routed,
+            &swapped,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(entries())
+        )
+        .is_err());
+        let changed = MutableRouted {
+            inner: &fixture.routed,
+            residency: mutable_capability(&fixture, 8),
+            identity: 77,
+        };
+        assert!(validate_retained_moe_binding(
+            &bound,
+            &changed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(entries())
+        )
+        .is_err());
+        let changed_source = MutableRouted {
+            inner: &fixture.routed,
+            residency: residency.clone(),
+            identity: 78,
+        };
+        assert!(validate_retained_moe_binding(
+            &bound,
+            &changed_source,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(entries())
+        )
+        .is_err());
+
+        // Frozen None capability keeps the original exact-entry check.
+        let mut frozen = table.prepare_binding(0, 1, 0).unwrap();
+        bind_fixture(&table, &mut frozen, &fixture);
+        let frozen_bound = BoundMoeExperts::from_cache(&table, &frozen).unwrap();
+        assert!(
+            validate_retained_moe_binding(
+                &frozen_bound,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                Some(entries())
+            )
+            .is_err(),
+            "frozen binding cannot adopt a slot"
+        );
+        // SAFETY: no GPU work was submitted.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
+    }
+
+    #[test]
+    fn mutable_decode_refuses_unqualified_arch_cpu_and_ep_before_sealing() {
+        let table = mutable_table();
+        let fixture = live_fixture(&table, 0x5100_0000);
+        let routed = MutableRouted {
+            inner: &fixture.routed,
+            residency: mutable_capability(&fixture, 9),
+            identity: 79,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        cache
+            .bind_live(
+                &table,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .unwrap();
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let scratch = decode_scratch(0x5200_0000);
+        for (arch, cpu, ep, expected) in [
+            ("gfx1100", false, MoeEpMode::None, "exact gfx1201"),
+            ("gfx1200", false, MoeEpMode::None, "exact gfx1201"),
+            ("gfx1201", true, MoeEpMode::None, "CPU splice/split and EP"),
+            (
+                "gfx1201",
+                false,
+                MoeEpMode::RootRoutedPartial,
+                "CPU splice/split and EP",
+            ),
+        ] {
+            let ctx = DispatchCtx::for_test(arch);
+            let mut params = ep_decode_params(
+                &scratch,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                2,
+                2,
+                ep,
+                None,
+                false,
+            );
+            params.cpu_deferred_experts = cpu;
+            let error = validate_decode(&ctx, &bound, &params).unwrap_err();
+            assert!(format!("{error:?}").contains(expected), "{error:?}");
+        }
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = prefill_scratch(0x5300_0000);
+        let params = ep_prefill_params(
+            &scratch,
+            &routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+        );
+        let error = validate_prefill(&ctx, &bound, &params).unwrap_err();
+        assert!(format!("{error:?}").contains("decode-only"), "{error:?}");
     }
 
     #[test]

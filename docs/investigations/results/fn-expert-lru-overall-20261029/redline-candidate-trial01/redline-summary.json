@@ -1,0 +1,467 @@
+{
+  "schema": "hipfire.expert-cache.redline-summary/v1",
+  "created_at_utc": "2026-10-29T12:05:32.510372+00:00",
+  "scope": "凍結證據整理；只讀report.json/daemon.log、獲准的redline snapshot/tests與FN state resolver/config/log格式；無beta更新、產品修改、參數變更或GPU實驗。",
+  "overall_report_pass": true,
+  "sources": [
+    {
+      "file": "report.json",
+      "bytes": 3915868,
+      "sha256": "b4dac3ea1709146346f845e0b3f6296f5e1d6d136dc6828a15f18b0fcf5d4fea"
+    },
+    {
+      "file": "daemon.log",
+      "bytes": 36741,
+      "sha256": "33d7babef1c53ed67abc6c55031de98c741176fc117113f08ea3c12d74020ec3"
+    },
+    {
+      "file": "/home/husrcf/Code/hipfire-fn-expert-lru-beta-20261025/crates/hipfire-generate/src/redline.rs",
+      "sha256": "3ba2c466a3d7513401f484211cf108cc0200170bc3817b8d145b17645476c198",
+      "role": "僅核對目前snapshot列舉與EF-only CPU負控；不是獨立binary/source identity證明。"
+    },
+    {
+      "file": "/home/husrcf/Code/hipfire-fn-expert-lru-beta-20261025/crates/hipfire-arch-qwen4/src/state.rs",
+      "sha256": "4826f45c00d64208c4dc640aae0506f00bd880699358a10ad161c3c42fd354f7",
+      "role": "獲准只讀核對FN GDN format resolver、載入日誌與state_quant配置來源；未修改來源。"
+    },
+    {
+      "file": "/home/husrcf/Code/hipfire-fn-expert-lru-beta-20261025/crates/hipfire-loader/src/carriers.rs",
+      "sha256": "5beacfdd70944a27eb6313bbe0c70cd3ceb335a9159b8182e373c5867dda773f",
+      "role": "獲准只讀核對FN GDN format resolver、載入日誌與state_quant配置來源；未修改來源。"
+    },
+    {
+      "file": "/home/husrcf/Code/hipfire-fn-expert-lru-beta-20261025/crates/hipfire-config/src/lib.rs",
+      "sha256": "f7c51e7709453effe7ddeecb10fb91c55d1e21d42bb06340dfebdb4c79c86ae7",
+      "role": "獲准只讀核對FN GDN format resolver、載入日誌與state_quant配置來源；未修改來源。"
+    }
+  ],
+  "identity": {
+    "model": "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+    "model_bytes": 125288544792,
+    "daemon": "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/update-f85ea28/beta-6c99/runtime/daemon_lruq",
+    "binary_sha256": "此report/log未包含，未另讀binary。",
+    "gpu": [
+      {
+        "line": 5,
+        "text": "GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)"
+      }
+    ],
+    "load_request": {
+      "max_seq": 16384,
+      "kv_mode": "fp8",
+      "dflash_mode": "off",
+      "dspark_mode": "off",
+      "mtp_mode": "off",
+      "ngram_draft": false
+    },
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen4",
+      "dim": 2560,
+      "layers": 48,
+      "vocab": 248320,
+      "vl": false,
+      "pp": 1,
+      "audio": false,
+      "video": false,
+      "reasoning_contract": "qwen_jinja",
+      "reasoning_effort_native": true,
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "xhigh"
+      ],
+      "reasoning_effort_probe_error": null,
+      "cache_capable": true,
+      "retry_reset_eligible": false,
+      "continuous_batch_capable": false,
+      "kv_backend_request": "automatic",
+      "kv_backend": "vmm",
+      "kv_backend_reason": null,
+      "kv_backend_legacy": false,
+      "kv_backend_warning": null,
+      "max_seq": 16384,
+      "max_seq_bound": "user",
+      "max_seq_reason": null,
+      "model_ctx": null,
+      "card_cap": null,
+      "kv_mode": "fp8",
+      "mtp_mode_effective": "off"
+    },
+    "ple_and_cache": [
+      {
+        "line": 14,
+        "text": "  qwen4 ple rows: q4 from /home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts.ple-q4 (Q4LM, row order, 28.8 GB)"
+      },
+      {
+        "line": 22,
+        "text": "  qwen4 exact expert cache: 4015 core experts in VRAM, 4016 evictable slots (10000 MiB), immutable host mirror +10000 MiB; prefill restores the canonical donor tail"
+      },
+      {
+        "line": 27,
+        "text": "  qwen4 D2 default: off (exact expert-cache load)"
+      },
+      {
+        "line": 31,
+        "text": "  qwen4 exact expert cache: decode-only, tail=50%, max-inflight=64, routed ids unchanged"
+      }
+    ]
+  },
+  "capture": {
+    "sequence_stable": true,
+    "capture_count": 3,
+    "capture_iterations_each": 1,
+    "samples": [
+      {
+        "launches": 1149,
+        "unique_kernels": 31,
+        "sequence_hash": "9315621026394ac5"
+      },
+      {
+        "launches": 1149,
+        "unique_kernels": 31,
+        "sequence_hash": "9315621026394ac5"
+      },
+      {
+        "launches": 1149,
+        "unique_kernels": 31,
+        "sequence_hash": "9315621026394ac5"
+      }
+    ],
+    "scope_note": "這是同一daemon harness內3次capture，不是3個fresh-process速度樣本。",
+    "recorded_route_copy_f32_buffer_launches_each": 49,
+    "aql_probe_kernel_count": 31,
+    "aql_contract_count": 31,
+    "prepared_identity": {
+      "dispatch_count": 1149,
+      "packet_count": 1,
+      "queue_id": 5,
+      "command_dwords": 39726,
+      "queues": 1,
+      "phases": 1,
+      "dispatch_equals_launches": true,
+      "queue_count": 1,
+      "phase_count": 1
+    },
+    "typed_binding_and_wait_audit": [
+      {
+        "line": 131,
+        "text": "[redline] PM4 wait audit policy=Resource boundaries=1148 covered=1148 allowlist_independent=0 resource_independent=50 allowlist_only={} resource_only={(\"gemv_bf16_xf32_bf16_scaled_add\", \"copy_f32_buffer\"): 48, (\"gemv_mq6g256v2\", \"hyper_norm_f32\"): 2} suballocation_candidates={(\"copy_f32_buffer\", \"hyper_norm_f32\"): 48, (\"gemv_bf16_xf32\", \"copy_f32_buffer\"): 1, (\"gemv_bf16_xf32\", \"gemv_bf16_xf32\"): 1, (\"hyper_write_f32\", \"gemv_bf16_xf32\"): 1}"
+      },
+      {
+        "line": 132,
+        "text": "[redline] PM4 tape binding layouts: arch=gfx1201 launches=1149 typed=1149 untyped=0 (no_effects=0 slot_failed=0) resources=1316 revision=0 backlog=[]"
+      },
+      {
+        "line": 140,
+        "text": "[redline] PM4 wait audit policy=Resource boundaries=1148 covered=1148 allowlist_independent=0 resource_independent=50 allowlist_only={} resource_only={(\"gemv_bf16_xf32_bf16_scaled_add\", \"copy_f32_buffer\"): 48, (\"gemv_mq6g256v2\", \"hyper_norm_f32\"): 2} suballocation_candidates={(\"copy_f32_buffer\", \"hyper_norm_f32\"): 48, (\"gemv_bf16_xf32\", \"copy_f32_buffer\"): 1, (\"gemv_bf16_xf32\", \"gemv_bf16_xf32\"): 1, (\"hyper_write_f32\", \"gemv_bf16_xf32\"): 1}"
+      },
+      {
+        "line": 141,
+        "text": "[redline] PM4 tape binding layouts: arch=gfx1201 launches=1149 typed=1149 untyped=0 (no_effects=0 slot_failed=0) resources=1316 revision=0 backlog=[]"
+      }
+    ]
+  },
+  "parity": {
+    "unique_reported_position_count": 16,
+    "reported_window_positions": [
+      513,
+      514,
+      515,
+      516,
+      517,
+      518,
+      519,
+      520,
+      521,
+      522,
+      523,
+      524,
+      525,
+      526,
+      527,
+      528
+    ],
+    "context_tokens": 512,
+    "iterations": 16,
+    "position_step": 1,
+    "arms": [
+      "ordinary HIP",
+      "recorded HIP",
+      "PM4 IB"
+    ],
+    "reference": "ordinary HIP",
+    "comparison_pairs": [
+      "PM4 vs ordinary HIP",
+      "recorded HIP vs ordinary HIP"
+    ],
+    "pair_position_check_count": 32,
+    "claim": "16個不同報告位置513–528；三臂不能寫成48個不同位置。",
+    "checks": {
+      "pm4": {
+        "tokens_equal": true,
+        "argmax_equal": true,
+        "state_bit_exact": true,
+        "lengths_equal": true,
+        "position_equal": true,
+        "qsa_full_equal": true,
+        "gdn_equal": true,
+        "ple_equal": true,
+        "logits_bytes_equal": true,
+        "logits_max_abs_values": [
+          0.0
+        ],
+        "logits_max_rel_values": [
+          0.0
+        ]
+      },
+      "recorded_hip": {
+        "tokens_equal": true,
+        "argmax_equal": true,
+        "state_bit_exact": true,
+        "lengths_equal": true,
+        "position_equal": true,
+        "qsa_full_equal": true,
+        "gdn_equal": true,
+        "ple_equal": true,
+        "logits_bytes_equal": true,
+        "logits_max_abs_values": [
+          0.0
+        ],
+        "logits_max_rel_values": [
+          0.0
+        ]
+      }
+    },
+    "top_level_bit_exact": true,
+    "top_level_blob_bit_exact": true,
+    "top_level_logits_equal": true,
+    "q8_byte_parity_invalid": false,
+    "reported_state_bytes_compared_per_position": 43566320,
+    "byte_count_note": "保留原報告scalar，不據此外推全位置合計、全VRAM或全部Weights覆蓋。",
+    "final_state": {
+      "position": 528,
+      "argmax": 248046,
+      "logits_bytes": 993280,
+      "logits_hash": "1f633f0e54be85b2",
+      "region_count": 158,
+      "region_bytes": 42817168,
+      "regions_equal_across_arms": true,
+      "regions_by_kind": [
+        {
+          "kind": "gdn.*.recurrent",
+          "count": 36,
+          "bytes": 29196288
+        },
+        {
+          "kind": "gdn.*.conv",
+          "count": 36,
+          "bytes": 4423680
+        },
+        {
+          "kind": "qsa.*.full_keys",
+          "count": 12,
+          "bytes": 3269376
+        },
+        {
+          "kind": "qsa.*.full_values",
+          "count": 12,
+          "bytes": 3269376
+        },
+        {
+          "kind": "qsa.*.raw_keys",
+          "count": 12,
+          "bytes": 1622016
+        },
+        {
+          "kind": "qsa.*.pooled_keys",
+          "count": 12,
+          "bytes": 405504
+        },
+        {
+          "kind": "qsa.*.partial_keys",
+          "count": 12,
+          "bytes": 24576
+        },
+        {
+          "kind": "qsa.*.partial_values",
+          "count": 12,
+          "bytes": 98304
+        },
+        {
+          "kind": "qsa.*.selected",
+          "count": 12,
+          "bytes": 98448
+        },
+        {
+          "kind": "ple.conv",
+          "count": 1,
+          "bytes": 368640
+        },
+        {
+          "kind": "ple.hyper_feedback",
+          "count": 1,
+          "bytes": 40960
+        }
+      ]
+    }
+  },
+  "state_configuration": {
+    "kv_mode_applied": "fp8",
+    "kv_backend_applied": "vmm",
+    "state_log": [
+      {
+        "line": 17,
+        "text": "  qwen4 state: QSA fp8 K/V (vmm context storage), GDN q8 recurrent"
+      }
+    ],
+    "gdn_q8_recurrent_count": 36,
+    "gdn_conv_count": 36,
+    "ef_evidence": {
+      "report_explicit_ef_regions": [],
+      "report_recurrent_bytes_each": [
+        811008
+      ],
+      "report_conv_bytes_each": [
+        122880,
+        368640
+      ],
+      "current_code_iterator_line": 3632,
+      "current_code_snapshot_call_line": 3683,
+      "current_code_behavior": "目前helper列舉recurrent、conv，並chain gdn.ef_residual Some時的獨立ef_residual tensor；snapshot各自push gdn.{layer}.{name}。此段沒有把EF append到recurrent region。",
+      "cpu_tests_in_source": [
+        {
+          "name": "qwen4_snapshot_reads_the_live_optional_ef_owner",
+          "line": 6188
+        },
+        {
+          "name": "qwen4_ef_only_byte_divergence_fails_state_and_gdn_parity",
+          "line": 6223
+        }
+      ],
+      "cpu_test_scope": "iterator測試確認Some(F16)列入live owner、None不列；EF-only mock byte修改使state_bit_exact/GDN false而tokens、QSA/PLE仍true。此source核對不宣稱CPU測試此次已執行，也不是GPU fault injection。",
+      "claim_boundary": "本次實際載入日誌明示GDN q8；FN在gfx1201預設auto為plain Q8，只有明確state_quant=q8_ef才有live F16 residual。report無ef_residual正符合此Q8狀態。因此可宣稱這次Q8 recurrent/conv、FP8/VMM GPU三臂parity；不可宣稱live Q8Ef GPU qualification。現有live-owner iterator與EF-only byte mutation CPU負控提供獨立CPU覆蓋，不能擴張成此GPU run測過非空EF。凍結下不改參數、不重跑。",
+      "actual_gdn_format": "Q8",
+      "actual_live_ef_residual": false,
+      "live_q8ef_gpu_qualified_by_this_run": false,
+      "format_resolution": {
+        "setting": "memory.state_quant",
+        "compatibility_environment": "HIPFIRE_STATE_QUANT",
+        "schema_default": "auto",
+        "loader_input": "ctx.state_quant_override.unwrap_or()",
+        "resolver": "state.rs resolve_state_format -> resolve_gdn_format_for_arch -> resolve_gdn_format",
+        "gfx1201_default": "non-AR-only Flash-Next with 128x128 heads: empty/auto -> Q8",
+        "q8ef_policy": "q8_ef明確opt-in才會選Q8Ef；auto永不選它。",
+        "residual_allocation": "state.rs allocation plan及live owner construction都以format.gdn.has_residual()判定；plain Q8不建立ef_residual，Q8Ef建立獨立F16 owner。",
+        "unrelated_flag": "這條FN format resolver不讀HIPFIRE_DN_STATE_EF；設定該通用family flag不會把resolved Q8變成Q8Ef。",
+        "source_lines": {
+          "config_schema": 804,
+          "loader_resolve": 4703,
+          "loader_log": 4711,
+          "resolve_gdn_format": 865,
+          "auto_q8": 882,
+          "explicit_q8ef": 887,
+          "arch_policy": 910,
+          "resolve_state_format": 983,
+          "residual_plan": 1674,
+          "residual_live_owner": 2287
+        }
+      }
+    },
+    "actual_gdn_format": "Q8",
+    "actual_live_error_feedback_owner": false
+  },
+  "failure_behavior": {
+    "observed": {
+      "error": "Qwen4 shadow retained-plan iteration 0 at position 512: Qwen4 bundle forward: Qwen4 GPU forward invalid input: Qwen4 retained replay failed: position 512 exceeds prepared max_position 511",
+      "recovery_error": null,
+      "recovered_bit_exact_against_clean_hip": true,
+      "recovery_uses_hip": true,
+      "induced": "boundary position beyond the plan's prepared max_position",
+      "boundary_position": 512,
+      "prepared_max_position": 511,
+      "route_poisoned": true,
+      "fallback_reason": "Qwen4 PM4 replay failed: position 512 exceeds prepared max_position 511"
+    },
+    "coverage_kind": "prepared-position boundary refusal + HIP fallback negative case",
+    "covered": "position512超過prepared max_position511，route poisoned，recovery_error=null，回HIP後對clean HIP bitexact。",
+    "actual_kernel_fault_injection": false,
+    "actual_unknown_quiescence_submit_failure": false,
+    "boundary": "這兩份GPU artifacts未展示device loss、kernel fault、copy failure或unknown-quiescence恢復。另有CPU/mock負控須獨立引用，不可改稱實際GPU未知quiescence實驗。"
+  },
+  "route": {
+    "phase": "ready",
+    "transport": "pm4_ib",
+    "configured_transport": "aql",
+    "reason": null,
+    "counters": {
+      "replays": 16,
+      "replay_failures": 0,
+      "poison_count": 0,
+      "contract_failures": 0,
+      "prepare_failures": 0
+    }
+  },
+  "qwen4_shadow_failures": [],
+  "cache_activity": {
+    "sample_count": 13,
+    "first_sample": {
+      "daemon_log_line": 125,
+      "stats": {
+        "tokens": 1,
+        "selected": 480,
+        "core_hits": 58,
+        "cache_hits": 62,
+        "host_misses": 360,
+        "miss_bytes": 940032000,
+        "fills_started": 64,
+        "fills_completed": 0,
+        "fill_bytes": 167116800,
+        "evictions": 64,
+        "skipped_full": 296,
+        "prefill_restores": 1,
+        "restore_bytes": 10486579200,
+        "peak_inflight": 64,
+        "begin_token_wall_ns": 3040816,
+        "finish_token_wall_ns": 2132366,
+        "publish_wall_ns": 5733742,
+        "table_upload_bytes": 1179648,
+        "publish_calls": 144,
+        "prefill_restore_wall_ns": 372129621
+      }
+    },
+    "last_sample": {
+      "daemon_log_line": 144,
+      "stats": {
+        "tokens": 102,
+        "selected": 48960,
+        "core_hits": 8298,
+        "cache_hits": 20339,
+        "host_misses": 20323,
+        "miss_bytes": 53067417600,
+        "fills_started": 4997,
+        "fills_completed": 4229,
+        "fill_bytes": 13048166400,
+        "evictions": 4997,
+        "skipped_full": 14746,
+        "prefill_restores": 11,
+        "restore_bytes": 115352371200,
+        "peak_inflight": 64,
+        "begin_token_wall_ns": 5218364839,
+        "finish_token_wall_ns": 185729460,
+        "publish_wall_ns": 5352545194,
+        "table_upload_bytes": 64839680,
+        "publish_calls": 7915,
+        "prefill_restore_wall_ns": 4088546102
+      }
+    },
+    "scope": "cumulative stats涵蓋整個capture/measurement/shadow/failure harness，不只16位置parity窗口，也不是matched baseline吞吐比較。"
+  },
+  "limitations": [
+    "已載入的FP8/VMM、單GPU AR cache route；未外推其它KV backend/模型/speculation/EP/continuous batching。",
+    "16個不同位置，不能以3arm外推48個不同位置。",
+    "本次plain Q8無live EF residual；Q8Ef僅CPU iterator/EF-only negative coverage，不由此run宣稱其GPU qualification。",
+    "boundary拒絕恢復不等於真實GPU fault/unknown-quiescence恢復。",
+    "harness內計時不是配對性能證據，不由此宣稱加速。"
+  ]
+}

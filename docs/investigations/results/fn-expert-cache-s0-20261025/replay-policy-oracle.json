@@ -1,0 +1,43 @@
+{
+  "scope": "CPU-only replay checker vs independent full-history timestamp reference",
+  "source_sha256": "4e4738125f157699c117c0be4472b85028274b05b1852e3408dbd20cdad26195",
+  "checker_sha256": "b8232952753a2239c67fb40145c6babca31e976760d41dd04635c3ece8efa76b",
+  "cases": [
+    {
+      "capacity": 0,
+      "tokens": 120,
+      "layers": 48,
+      "slots_equal_slow_timestamp_reference": true,
+      "hit_miss_fill_counts_equal": true
+    },
+    {
+      "capacity": 10,
+      "tokens": 120,
+      "layers": 48,
+      "slots_equal_slow_timestamp_reference": true,
+      "hit_miss_fill_counts_equal": true
+    },
+    {
+      "capacity": 11,
+      "tokens": 120,
+      "layers": 48,
+      "slots_equal_slow_timestamp_reference": true,
+      "hit_miss_fill_counts_equal": true
+    },
+    {
+      "capacity": 17,
+      "tokens": 120,
+      "layers": 48,
+      "slots_equal_slow_timestamp_reference": true,
+      "hit_miss_fill_counts_equal": true
+    },
+    {
+      "capacity": 64,
+      "tokens": 120,
+      "layers": 48,
+      "slots_equal_slow_timestamp_reference": true,
+      "hit_miss_fill_counts_equal": true
+    }
+  ],
+  "passed": true
+}

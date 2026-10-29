@@ -603,9 +603,24 @@ impl Gpu {
     ///
     /// Same contract as [`crate::replay::ReplayController::replay_pm4`].
     pub unsafe fn replay_pm4_routed(&mut self, pos: usize) -> Result<(), String> {
+        // SAFETY: forwarded from this API's caller.
+        unsafe { self.replay_pm4_routed_checked(pos) }.map_err(|failure| failure.error)
+    }
+
+    /// Preserve the retained queue's retirement proof for owners that must
+    /// distinguish a recoverable refusal from a possibly live failed submit.
+    /// Railgun check mode keeps its full HIP-twin/digest path. Its String-only
+    /// failures conservatively report Unknown rather than inventing a proof.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::replay_pm4_routed`].
+    pub unsafe fn replay_pm4_routed_checked(
+        &mut self,
+        pos: usize,
+    ) -> Result<(), crate::replay::RetainedReplayFailure> {
         let Some(mut state) = self.replay.railgun_check.take() else {
             // SAFETY: forwarded.
-            return unsafe { self.replay.replay_pm4(pos) }.map(|_| ());
+            return unsafe { self.replay.replay_pm4_checked(pos) }.map(|_| ());
         };
         // SAFETY: forwarded.
         let result = unsafe { state.step(self, pos) };
@@ -614,7 +629,10 @@ impl Gpu {
             state.emit(json!({"pos": pos, "error": reason}));
         }
         self.replay.railgun_check = Some(state);
-        result
+        result.map_err(|error| crate::replay::RetainedReplayFailure {
+            error,
+            quiescence: crate::replay::ReplayQuiescence::Unknown,
+        })
     }
 }
 

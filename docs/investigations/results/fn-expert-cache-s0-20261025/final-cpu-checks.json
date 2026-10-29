@@ -1,0 +1,58 @@
+{
+  "scope": "required precommit and targeted lab-example check; GPU hidden; no model",
+  "base": "9f71309bfc7542a78e748e478bc751d4111c2845",
+  "results": [
+    {
+      "name": "clippy-final",
+      "command": [
+        "/home/husrcf/.cargo/bin/cargo",
+        "clippy",
+        "-p",
+        "rdna-compute",
+        "--features",
+        "lab",
+        "--example",
+        "fn_expert_table_indirection",
+        "--locked"
+      ],
+      "started": "2026-10-26T04:23:42.247312+00:00",
+      "exit_code": 0,
+      "ended": "2026-10-26T04:23:42.626681+00:00"
+    },
+    {
+      "name": "precommit-final",
+      "command": [
+        "bash",
+        "scripts/pre-commit-ci.sh",
+        "9f71309bfc7542a78e748e478bc751d4111c2845"
+      ],
+      "started": "2026-10-26T04:23:42.626893+00:00",
+      "exit_code": 0,
+      "ended": "2026-10-26T04:24:17.502481+00:00"
+    },
+    {
+      "name": "diff-final",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "started": "2026-10-26T04:24:17.502728+00:00",
+      "exit_code": 0,
+      "ended": "2026-10-26T04:24:17.507045+00:00"
+    },
+    {
+      "name": "staged-diff-final",
+      "command": [
+        "git",
+        "diff",
+        "--cached",
+        "--check"
+      ],
+      "started": "2026-10-26T04:24:17.507208+00:00",
+      "exit_code": 0,
+      "ended": "2026-10-26T04:24:17.519168+00:00"
+    }
+  ],
+  "passed": true
+}

@@ -1,0 +1,108 @@
+{
+  "base": "9f71309bfc7542a78e748e478bc751d4111c2845",
+  "branch": "feat/flash-next-exact-lru-beta",
+  "worktree": "/home/husrcf/Code/hipfire-fn-expert-lru-beta-20261025",
+  "guidance": {
+    "path": "/home/husrcf/Code/momentmonGate/hipfire-guidance-LRU/README.md",
+    "sha256": "91af6974fcf51a3320553ad4a4e5bdea352c312ee46bb2b6c7df2d1d884e4cab"
+  },
+  "read_only_user_worktree": {
+    "path": "/home/husrcf/wk/hipfire-psr",
+    "existing_trace_diff_sha256": "0567160b63846000516f150c5708290b561754f5d9954bf46cecd41d54d462e2"
+  },
+  "mechanism": "Exact routing, host fallback for misses, asynchronous expert fills and deferred pointer-table publication",
+  "current_beta_support": {
+    "kernel_indirection": "Hardware S0 PASS: unchanged table bases and captured tape, VRAM/identical mapped-host round trips exact in HIP eager, recorded HIP, PM4 and optional hipGraph; wrong-expert controls change output.",
+    "sealed_contract": "Frozen per-expert addresses, CPU mirrors, tier owner retention and mapping fingerprint. Device-only updates cannot be presented as valid product integration.",
+    "existing_epoch": "A mapping change requires invalidation/re-capture today; allocation-growth refresh does not authorize residency mutation.",
+    "decode_share": "Prebuilt frozen resident/borrow views plus restore, not a dynamic residency precedent."
+  },
+  "required_contract": [
+    "Immutable canonical logical expert bytes and stable retained table/pool/host owner identity.",
+    "Explicit residency publication epoch; coherent host mirror and legal source/slot mapping.",
+    "Retire victim table mapping on compute stream; copy stream waits its event before overwriting slot.",
+    "Publish gate/up and down only after both copies complete; verify slot generation against late completion.",
+    "Retain source/destination/metadata allocations through completion and fail closed after copy/publication errors."
+  ],
+  "prefill_constraint": "Freezing the cache is insufficient: cached slots contain other experts. Restore canonical donor bytes/tables before using original prefill runtime, or redesign and re-budget prefill staging.",
+  "host_capacity": "Host payload increases by the evictable device-tail payload. Keep a never-evicted core; do not allocate full host copies speculatively or request root/GTT changes.",
+  "related_prs": [
+    {
+      "number": 870,
+      "state": "open draft, unmerged",
+      "head": "a73d9491d",
+      "reusable": "Generic SlotCache pending/resident commit/rollback and LRU; no async deferred completion.",
+      "url": "https://github.com/warpfront/hipfire/pull/870"
+    },
+    {
+      "number": 563,
+      "state": "closed, unmerged, superseded by870",
+      "lesson": "Failure to distinguish completed and stale async slot contents caused incorrect residency publication.",
+      "url": "https://github.com/warpfront/hipfire/pull/563"
+    },
+    {
+      "number": 133,
+      "state": "merged",
+      "reusable": "Existing synchronous WeightPager; not a completed asynchronous slot publication implementation."
+    }
+  ],
+  "source_references": {
+    "crates/hipfire-dispatch/src/families/moe.rs": [
+      "1372-1377 immutable_identity get() contract"
+    ],
+    "crates/hipfire-dispatch/src/pipeline/sealed_moe.rs": [
+      "4251-4259 address mapping fingerprint",
+      "4798-4856 tier/mirror checks"
+    ],
+    "crates/hipfire-arch-qwen4/src/gpu_forward.rs": [
+      "1476-1478 frozen host mirrors",
+      "14050-14063 replay route identity refusal"
+    ],
+    "crates/rdna-compute/src/replay.rs": [
+      "5511-5562 rearm discards tape",
+      "7716-7752 growth refresh scope"
+    ],
+    "crates/hipfire-arch-qwen4/src/expert_tier_plan.rs": [
+      "475-585 donor-tail and host shadow layout"
+    ],
+    "crates/hipfire-arch-qwen4/src/gpu_forward/slab_stage.rs": [
+      "974-1036 prefill host-stage capacity changes"
+    ]
+  },
+  "implementation_status": "S0 hardware mechanism validated and core/capacity replay checked. Production exact-LRU cache, mutable sealed residency contract, async fills and prefill restoration are NOT implemented.",
+  "model_loaded": false,
+  "root_requested": false,
+  "published": false,
+  "created_utc": "2026-10-26T04:13:52.179192+00:00",
+  "tools_commit": "f0c4cd3c3e3e3b5b3ae3549563611fba89592fb9",
+  "s0_mechanism_test": {
+    "status": "PASS",
+    "checks": 44,
+    "pm4_replays": 11,
+    "hip_graph_tested": true,
+    "no_model": true,
+    "production_contract_validated": false,
+    "negative_gu_changed_f32_words": [
+      640,
+      640,
+      0
+    ],
+    "negative_down_changed_f32_words": [
+      0,
+      0,
+      2560
+    ],
+    "gpu_cleanup_errors": []
+  },
+  "platform_gtt_preflight": {
+    "upstream_file": "expert_residency.rs:3626-3634",
+    "upstream_reads": "/sys/module/ttm/parameters/pages_limit",
+    "X570_ttm_pages_limit": 0,
+    "X570_amdttm_pages_limit": 16475590,
+    "observed_gtt_total_bytes": 67484016640,
+    "user_psr_worktree_has_local_fallback_patch": true,
+    "scope": "Unmodified beta full-model GTT preflight needs separate active-provider handling; no model load or root action performed for this probe."
+  },
+  "offline_qualification": "One existing trace, idealized completion before next token, no DMA delay/pending slots/prefill restore cost; no independent holdout validation or speed claim.",
+  "completed_utc": "2026-10-26T04:25:34.106209+00:00"
+}

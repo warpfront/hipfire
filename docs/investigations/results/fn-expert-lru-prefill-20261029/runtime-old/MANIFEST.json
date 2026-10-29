@@ -1,0 +1,31 @@
+{
+  "commit": "b0fda0da1ee62fdbf59d2448866330c53893bded",
+  "base": "6c99bef7f8fcb966c4104aab2583e894f20c9d10",
+  "source_clean": true,
+  "build": "cargo build --release --locked -p hipfire-cli -p hipfire-daemon",
+  "binaries": {
+    "hipfire": {
+      "size": 102843808,
+      "sha256": "377ddf62ef484920c6a6c215132a8aa1193c29f56257f9ee62022b253c7716b6",
+      "md5": "ddcef7e8217165846105377eb0c2b333"
+    },
+    "daemon_lru_old": {
+      "size": 112706560,
+      "sha256": "bca19fd88689c87b314f031cdd3d247129f23063668a327ad380f5dc7fdb93e5",
+      "md5": "3aab6b1082c06798c6c1dd3dc386353d"
+    }
+  },
+  "created_at": "2026-10-29T11:57:34.531888+00:00",
+  "lab_build_note": "Lab executable built from same frozen source contents before final two commits; git version label may precede commit metadata.",
+  "model": {
+    "path": "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+    "size": 125288544792,
+    "mtime_ns": 1792424439201838153,
+    "sha256_from_verified_bound_hotset": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+    "full_file_rehashed": false
+  },
+  "hotset_sha256": "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086",
+  "variant": "old LRU bulk-prefill restoration",
+  "daemon_basename": "daemon_lru_old",
+  "binary_contents_unchanged": true
+}

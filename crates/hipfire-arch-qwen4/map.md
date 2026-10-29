@@ -18,6 +18,8 @@ Native Qwen4 / Qwen3.8-Flash-Next (arch 16): strict config and admission, typed 
 - Exact AR lanes (`lane.rs`, `lane_exec.rs`, `gpu_forward_lanes.rs`; served as the `fn-lanes` route) never touch `bundle.state`/`bundle.mtp` in a lane step; a lane's prefill tile swaps its state into the bundle for one singleton chunk call with `Qwen4GpuForward::lane_scope` set, which keeps the retained tape (recorded against the resident state's pointers) out. A row-local stage may only become `OnceAllRows` in `STAGE_SHARE` when EVERY owned weight-instance route of that stage (`LaneStageRoutes`, derived from the actually bound weights) matches a `RowTwinProof` {arch, stage, route: `StageRoute`, domain: `&[LaneTopology]`, receipt} row of `LANE_ROW_TWIN_PROOFS`; an unmatched instance leaves only that stage per lane (the reason is recorded in the `LanePolicyResolution`), the evidence is the deduplicated set of receipts of the proofs used and is carried in the resolved policy, not inferred from the production shape (`examples/fn_lane_oracle --g0` produces G0 receipts). gfx1151 keeps its historical topologies and expert classes through wildcard-route rows over every topology under `GFX1151_LANE_RECEIPT`. The gfx1201 rows are route-bound and carry one receipt per proved topology. PP rows (PP domain) cover PP2 mq2 under `GFX1201_PP2_MQ2_RECEIPT` (hold j1574: lane ids and every logits row byte-identical to the serialized PP singleton at K=1..8, 8 prompts x 64 tokens): the actual all-MQ6 projection route of the PP2 artifact, Q8 embedding, BF16 HC/router/shared routes, resident MQ4/E8P MoE with per-expert `DecodeGemv` capability admission. EP rows (`[Ep]` domain; twelve: eleven non-MoE rows for embed, PLE rows, HC read, HC write, GDN in/out projections, QSA in/out projections, final HC read, head and argmax, plus one MoE row) carry `GFX1201_EP2_MQ4_RECEIPT` (hold j1570, `mcb-notes/runs/ep-diag-8e148906a-1`: production ids and logits byte-identical to the serialized EP singleton at K=1, 2, 4 and 8, 64 tokens, on one gfx1201 EP2 mq4-xts load). The bound routes a non-MoE row requires are exactly the ones that artifact binds: MQ6 for every GDN qkv/z/a/b/out and QSA indexer/q/k/v/out projection and for the head, Q8 embed, BF16 HC, BF16 PLE rows, F32 argmax. The EP MoE row requires `LaneExpertRoute::EpPackedStaticOrBalanced` plus BF16 router/shared routes and per-expert `DecodeGemv` capability admission: every owned MoE layer must be either the actual static gathered runtime over fully resident packed QT44/QT53 experts or the actual balanced-live gathered runtime over fully host-mapped packed QT44/QT53 experts, with the gather installed, no CPU (D1/D2), tier, slab, pruned or FP8 route, and dtype buffers and selected runtime in agreement; any mix of the two across layers is admitted (27 + 21, 28 + 20, ...) with no resident-count restriction. A different bound route, arch or topology, or one MoE layer outside that class, matches no row, and the fallback is stage-specific: only the affected stage (for the MoE class, the MoE stage) runs per lane. The `Ep` domain does not encode the rank count and the measured EP cells are EP2 mq4-xts at K=1, 2, 4 and 8 only; it evidences no other width, topology count or latency, and both receipts are exactness evidence, not performance. A future arch qualifies by adding a proof row alone. The store logs one `qwen4 lanes: stage policy <describe()> (proofs <receipts>; per-lane: <stage>=<reason>,...)` line. Stateful stages are always per lane.
 - `memory.offload_exec=cpu|passback` may arm whole host-mapped trunk expert aggregates for eager CPU routed FFNs (decode and at most four verify rows); wide prefill keeps the GPU path. The splice's CPU work runs on a pinned physical-core pool (`hipfire_cpu::splice_pool`; `HIPFIRE_CPU_EXPERT_THREADS` / `HIPFIRE_CPU_EXPERT_PIN`). `gpu_forward/cpu_splice.rs` caches checked host spans from the owning aggregate tensors, never borrowed expert device aliases. EP, slab and tier/hot-set leases do not arm this D1 whole-layer splice. Hot-set (tier) layers arm the separate D2 tier split under `memory.offload_exec=cpu` with no CPU-side arch gate: it follows the tier plan the loader admitted (`expert_hotset::hotset_arch_admits`: the default sibling sidecar on gfx1201 only, an explicit absolute `HIPFIRE_QWEN4_EXPERT_HOTSET` path on any arch) when uniform QT44/QT53 and not EP/slab/AWQ/FP8; a route it has no masked ids or cold-slot installation for is refused with one `[moe-cpu-split]` log line per reason and stays on PCIe.
 
+- Exact expert-cache decode uses mutable GU/DN tables. Dirty short prefill instead uses an immutable `BorrowPrefill(0)` runtime over the owner's existing canonical tables (core Device, donor/cold Host), preserving pending copies and LRU. It never stages experts or enters retained decode and does not widen mutable residency beyond one row. Resident prefill still requires donor restoration when selected; its entries point at writable donor VRAM. The immutable runtime inherits the Resident symmetry proof and its selector is restored on every return path. `.borrow_classes() == 0` intentionally keeps the cache's canonical view separate from decode-share scratch loans.
+
 ## Crate map
 
 <!-- crate-map:generated:begin -->
@@ -179,6 +181,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `session_pair`
   - `session_plan_is_live`
   - `session_snapshot_bytes`
+  - `set_expert_cache`
   - `set_lane_stage_policy`
   - `set_qsa_projection_hook`
   - `set_qsa_tap`
@@ -443,6 +446,21 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `physical_bytes`
   - `recipe_arena_payload`
   - `w3_max_read_end`
+- [`src/expert_cache.rs`](src/expert_cache.rs)
+- [`src/expert_cache_config.rs`](src/expert_cache_config.rs)
+  - `admit`
+  - `device_reserve_bytes`
+  - `EXPERT_CACHE_ENV`
+  - `EXPERT_CACHE_INFLIGHT_ENV`
+  - `EXPERT_CACHE_TAIL_PERCENT_ENV`
+  - `ExpertCacheAdmission`
+  - `ExpertCacheConfig`
+  - `ExpertCacheLoad`
+  - `from_env`
+  - `host_reserve_bytes`
+  - `parse`
+  - `railgun_check_always`
+  - `tail_bytes`
 - [`src/expert_hotset.rs`](src/expert_hotset.rs)
   - `base_index_sha256`
   - `base_size`
@@ -696,6 +714,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `to_json_value`
   - `TRUNK_LAYERS`
 - [`src/expert_tier_owners.rs`](src/expert_tier_owners.rs)
+  - `allocate_expert_cache_tables`
   - `any_host`
   - `bind_hotset_sidecar_sha256`
   - `borrow_class_donors`
@@ -709,7 +728,15 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `DecodeShareRanges`
   - `down_ptrs`
   - `down_ptrs_device`
+  - `down_table`
   - `entry`
+  - `expert_cache_layer`
+  - `expert_cache_ranges`
+  - `expert_cache_slots`
+  - `ExpertCacheRanges`
+  - `ExpertCacheSlot`
+  - `ExpertCacheSlotRanges`
+  - `ExpertCacheTableLease`
   - `ExpertReadView`
   - `ExpertTierBinding`
   - `ExpertTierLease`
@@ -717,6 +744,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ExpertTierOwners`
   - `gate_up_ptrs`
   - `gate_up_ptrs_device`
+  - `gate_up_table`
   - `generation`
   - `host_cpu_range`
   - `hotset_sidecar_sha256`
@@ -746,6 +774,8 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `donors_dirtied_by`
   - `entries`
   - `entry`
+  - `EXPERT_CACHE_MIRROR_LABEL`
+  - `expert_cache_tail`
   - `ExpertTierEntry`
   - `ExpertTierError`
   - `ExpertTierPlan`
@@ -766,6 +796,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `with_decode_share`
   - `with_decode_share_classes`
   - `with_decode_share_shadows`
+  - `with_expert_cache_tail`
   - `with_host_window`
 - [`src/gpu_forward.rs`](src/gpu_forward.rs)
   - `band_scope`
@@ -955,6 +986,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ep_seal`
   - `ep_trunk_split`
   - `expert_arena`
+  - `expert_cache_config`
   - `expert_hotset`
   - `expert_keep`
   - `expert_residency`

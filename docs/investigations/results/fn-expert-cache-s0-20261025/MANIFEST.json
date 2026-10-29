@@ -1,0 +1,74 @@
+{
+  "base": "9f71309bfc7542a78e748e478bc751d4111c2845",
+  "tools_commit": "f0c4cd3c3e3e3b5b3ae3549563611fba89592fb9",
+  "binary": {
+    "sha256": "a226b7ecb12ac4dc82788ad4c4bfde7ceb71de7b9dde69a1b17fd5dc27da7e63",
+    "bytes": 5704544,
+    "retained_outside_git": "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/fn_expert_table_indirection"
+  },
+  "sources": {
+    "crates/rdna-compute/examples/fn_expert_table_indirection.rs": {
+      "sha256": "b6c906126accb79bfeb9ee8d2a043502b627307fb17c95b577ec6e7793182ea3",
+      "bytes": 29477
+    },
+    "scripts/fn-expert-lru-replay.py": {
+      "sha256": "4e4738125f157699c117c0be4472b85028274b05b1852e3408dbd20cdad26195",
+      "bytes": 9604
+    }
+  },
+  "files": {
+    "build-s0-final.log.gz": {
+      "sha256": "a8e4cf6602de5fe6e453f7207ecc1c2d268c16cdf94672ce347d4c24498a9e53",
+      "bytes": 2858
+    },
+    "clippy-final.log.gz": {
+      "sha256": "9e1e895a0a21e3e9acadce9333e30fd883ec67b0cb64c206a707bcd5818764b1",
+      "bytes": 103845
+    },
+    "final-cpu-checks.json": {
+      "sha256": "bafbee96114739ee1397e7a37a27b60050922be2e3b5b87b615dec9b938d14b2",
+      "bytes": 1404
+    },
+    "integration-audit.json": {
+      "sha256": "1bab7ba88ea165606d9164dd626e1fdca4b5452114317d38135bc8c64aad74a4",
+      "bytes": 5375
+    },
+    "offline-core-replay.json": {
+      "sha256": "d8fdd559a62a9857676436ee25e1b4170801162483e2dc55cba76a20ea447a53",
+      "bytes": 19394
+    },
+    "precommit-final.log.gz": {
+      "sha256": "c48681c387a03951cee20275f546bc55785d1f93bcfda8a73e94154aaccc7718",
+      "bytes": 497848
+    },
+    "replay-policy-oracle.json": {
+      "sha256": "d13c857e40564b91832c73c9068386a171f6ed3b822542bc3be4e2908d08f946",
+      "bytes": 1143
+    },
+    "run-cpu-checks.py": {
+      "sha256": "e743a9e230df7cc34ca30faf198b4ed6386c076c2564e3210c90ce607340005f",
+      "bytes": 1636
+    },
+    "run-s0.sh": {
+      "sha256": "76a2f6d452c1bb02b50309b15e33c0b03204ec2f9b1185ed62e4af6e430a2cd3",
+      "bytes": 358
+    },
+    "s0-gpu-final.stderr.log.gz": {
+      "sha256": "05be27da8d08b1443d12da618ad5859833ff4e1bdbd0d4562eeb1cb289e52415",
+      "bytes": 561
+    },
+    "s0-gpu-final.stdout.log.gz": {
+      "sha256": "3543b674bdbe8b24cbd71c862331e4d9d827137c55a4f5af0212f7b9378f33e9",
+      "bytes": 2733
+    },
+    "s0-gpu.json": {
+      "sha256": "d59876941cd2d3a90faae3416b446f59e21f4020a970f9772328b7cc09a6caa4",
+      "bytes": 50612
+    },
+    "verify_offline_replay.py": {
+      "sha256": "b8232952753a2239c67fb40145c6babca31e976760d41dd04635c3ece8efa76b",
+      "bytes": 3197
+    }
+  },
+  "scope": "S0 and idealized offline feasibility evidence, no production cache or speedup qualification"
+}

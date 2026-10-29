@@ -1,0 +1,40 @@
+{
+  "schema": "hipfire.prefill-posthoc-verifier-checks/v1",
+  "recorded_at": "2026-10-29T12:52:53.452225+00:00",
+  "scope": "QC-only scripts; no product/git/GPU/model/retry changes",
+  "py_compile": {
+    "status": "PASS",
+    "file": "verify-prefill-comparison.py"
+  },
+  "synthetic_controls": {
+    "status": "PASS",
+    "tests": 7,
+    "elapsed_seconds": 0.063,
+    "coverage": [
+      "complete six-cell positive fixture and UNOBSERVED backend metadata",
+      "UTF-8 transcript corruption",
+      "terminal count/DONE/late payload failures even under --partial",
+      "illegal short-only bulk restore",
+      "wrong long restore byte count",
+      "missing case remains PARTIAL",
+      "natural longdecode stop preserves unmet 1024 coverage without retry"
+    ]
+  },
+  "initial_partial": {
+    "status": "PARTIAL",
+    "all_pass": false,
+    "failures": 0,
+    "pending": 26,
+    "note": "Initial missing runtime manifests/cases; pending count is historical, not current run state."
+  },
+  "files": {
+    "verify-prefill-comparison.py": {
+      "bytes": 30815,
+      "sha256": "77444d2934465947aaa612559f1cdde8e94c0b6241673a2af269800ba3600233"
+    },
+    "test-verify-prefill-comparison.py": {
+      "bytes": 8676,
+      "sha256": "19c80ad584b9e42e21f764e78cd2096b61ffe10cce41466eec71494a18426b4a"
+    }
+  }
+}

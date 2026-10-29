@@ -1,0 +1,518 @@
+diff --git a/crates/hipfire-arch-qwen4/map.md b/crates/hipfire-arch-qwen4/map.md
+index 0c2a56a21..96fb19a02 100644
+--- a/crates/hipfire-arch-qwen4/map.md
++++ b/crates/hipfire-arch-qwen4/map.md
+@@ -18,6 +18,8 @@ Native Qwen4 / Qwen3.8-Flash-Next (arch 16): strict config and admission, typed
+ - Exact AR lanes (`lane.rs`, `lane_exec.rs`, `gpu_forward_lanes.rs`; served as the `fn-lanes` route) never touch `bundle.state`/`bundle.mtp` in a lane step; a lane's prefill tile swaps its state into the bundle for one singleton chunk call with `Qwen4GpuForward::lane_scope` set, which keeps the retained tape (recorded against the resident state's pointers) out. A row-local stage may only become `OnceAllRows` in `STAGE_SHARE` when EVERY owned weight-instance route of that stage (`LaneStageRoutes`, derived from the actually bound weights) matches a `RowTwinProof` {arch, stage, route: `StageRoute`, domain: `&[LaneTopology]`, receipt} row of `LANE_ROW_TWIN_PROOFS`; an unmatched instance leaves only that stage per lane (the reason is recorded in the `LanePolicyResolution`), the evidence is the deduplicated set of receipts of the proofs used and is carried in the resolved policy, not inferred from the production shape (`examples/fn_lane_oracle --g0` produces G0 receipts). gfx1151 keeps its historical topologies and expert classes through wildcard-route rows over every topology under `GFX1151_LANE_RECEIPT`. The gfx1201 rows are route-bound and carry one receipt per proved topology. PP rows (PP domain) cover PP2 mq2 under `GFX1201_PP2_MQ2_RECEIPT` (hold j1574: lane ids and every logits row byte-identical to the serialized PP singleton at K=1..8, 8 prompts x 64 tokens): the actual all-MQ6 projection route of the PP2 artifact, Q8 embedding, BF16 HC/router/shared routes, resident MQ4/E8P MoE with per-expert `DecodeGemv` capability admission. EP rows (`[Ep]` domain; twelve: eleven non-MoE rows for embed, PLE rows, HC read, HC write, GDN in/out projections, QSA in/out projections, final HC read, head and argmax, plus one MoE row) carry `GFX1201_EP2_MQ4_RECEIPT` (hold j1570, `mcb-notes/runs/ep-diag-8e148906a-1`: production ids and logits byte-identical to the serialized EP singleton at K=1, 2, 4 and 8, 64 tokens, on one gfx1201 EP2 mq4-xts load). The bound routes a non-MoE row requires are exactly the ones that artifact binds: MQ6 for every GDN qkv/z/a/b/out and QSA indexer/q/k/v/out projection and for the head, Q8 embed, BF16 HC, BF16 PLE rows, F32 argmax. The EP MoE row requires `LaneExpertRoute::EpPackedStaticOrBalanced` plus BF16 router/shared routes and per-expert `DecodeGemv` capability admission: every owned MoE layer must be either the actual static gathered runtime over fully resident packed QT44/QT53 experts or the actual balanced-live gathered runtime over fully host-mapped packed QT44/QT53 experts, with the gather installed, no CPU (D1/D2), tier, slab, pruned or FP8 route, and dtype buffers and selected runtime in agreement; any mix of the two across layers is admitted (27 + 21, 28 + 20, ...) with no resident-count restriction. A different bound route, arch or topology, or one MoE layer outside that class, matches no row, and the fallback is stage-specific: only the affected stage (for the MoE class, the MoE stage) runs per lane. The `Ep` domain does not encode the rank count and the measured EP cells are EP2 mq4-xts at K=1, 2, 4 and 8 only; it evidences no other width, topology count or latency, and both receipts are exactness evidence, not performance. A future arch qualifies by adding a proof row alone. The store logs one `qwen4 lanes: stage policy <describe()> (proofs <receipts>; per-lane: <stage>=<reason>,...)` line. Stateful stages are always per lane.
+ - `memory.offload_exec=cpu|passback` may arm whole host-mapped trunk expert aggregates for eager CPU routed FFNs (decode and at most four verify rows); wide prefill keeps the GPU path. The splice's CPU work runs on a pinned physical-core pool (`hipfire_cpu::splice_pool`; `HIPFIRE_CPU_EXPERT_THREADS` / `HIPFIRE_CPU_EXPERT_PIN`). `gpu_forward/cpu_splice.rs` caches checked host spans from the owning aggregate tensors, never borrowed expert device aliases. EP, slab and tier/hot-set leases do not arm this D1 whole-layer splice. Hot-set (tier) layers arm the separate D2 tier split under `memory.offload_exec=cpu` with no CPU-side arch gate: it follows the tier plan the loader admitted (`expert_hotset::hotset_arch_admits`: the default sibling sidecar on gfx1201 only, an explicit absolute `HIPFIRE_QWEN4_EXPERT_HOTSET` path on any arch) when uniform QT44/QT53 and not EP/slab/AWQ/FP8; a route it has no masked ids or cold-slot installation for is refused with one `[moe-cpu-split]` log line per reason and stays on PCIe.
+ 
++- Exact expert-cache decode uses mutable GU/DN tables. Dirty short prefill instead uses an immutable `BorrowPrefill(0)` runtime over the owner's existing canonical tables (core Device, donor/cold Host), preserving pending copies and LRU. It never stages experts or enters retained decode and does not widen mutable residency beyond one row. Resident prefill still requires donor restoration when selected; its entries point at writable donor VRAM. The immutable runtime inherits the Resident symmetry proof and its selector is restored on every return path. `.borrow_classes() == 0` intentionally keeps the cache's canonical view separate from decode-share scratch loans.
++
+ ## Crate map
+ 
+ <!-- crate-map:generated:begin -->
+diff --git a/crates/hipfire-arch-qwen4/src/expert_cache.rs b/crates/hipfire-arch-qwen4/src/expert_cache.rs
+index fe0da4b98..334c4fbb9 100644
+--- a/crates/hipfire-arch-qwen4/src/expert_cache.rs
++++ b/crates/hipfire-arch-qwen4/src/expert_cache.rs
+@@ -1,7 +1,8 @@
+ //! Decode-only exact LRU of immutable Flash-Next expert payloads.
+ //!
+ //! A token uses the tables acquired at its start. Misses execute from immutable
+-//! mapped host backing; asynchronous copies serve later tokens. Prefill restores
++//! mapped host backing; asynchronous copies serve later tokens. Dirty short
++//! prefill reads independent immutable core/host tables. Long prefill restores
+ //! the original donor bytes before using the frozen resident view.
+ 
+ use crate::expert_cache_config::ExpertCacheConfig;
+@@ -76,6 +77,10 @@ pub(crate) struct ExpertCacheStats {
+     pub fill_bytes: u64,
+     pub evictions: u64,
+     pub skipped_full: u64,
++    /// Calls and rows admitted to the independent immutable mapped-prefill
++    /// view. Admission does not prove GPU execution or measure GPU time.
++    pub mapped_prefill_calls: u64,
++    pub mapped_prefill_rows: u64,
+     pub prefill_restores: u64,
+     pub restore_bytes: u64,
+     pub peak_inflight: usize,
+@@ -402,6 +407,31 @@ impl ExpertCache {
+     pub(crate) fn stats(&self) -> ExpertCacheStats {
+         self.stats
+     }
++    pub(crate) fn is_dirty(&self) -> bool {
++        self.dirty
++    }
++
++    /// Check readiness for a prefill that reads only the independent immutable
++    /// canonical core/device and donor/host view. The caller must disable the
++    /// Resident staging path and the retained decode route for this view.
++    ///
++    /// Copies may keep filling donor slots: neither those slots nor the mutable
++    /// decode tables are read here. Keep pending tickets, LRU, mappings and dirty
++    /// state intact so later decode publication or long-prefill restoration uses
++    /// the same physical ownership and generation history.
++    pub(crate) fn prepare_host_prefill(&mut self, gpu: &mut Gpu, rows: usize) -> Result<()> {
++        self.check(gpu)?;
++        if rows == 0 {
++            return Err("expert cache mapped prefill requires at least one row".into());
++        }
++        self.stats.mapped_prefill_calls = self.stats.mapped_prefill_calls.saturating_add(1);
++        self.stats.mapped_prefill_rows = self
++            .stats
++            .mapped_prefill_rows
++            .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
++        Ok(())
++    }
++
+     fn emit_stats(&self) {
+         match serde_json::to_string(&self.stats) {
+             Ok(json) => eprintln!("  qwen4 exact expert cache stats: {json}"),
+diff --git a/crates/hipfire-arch-qwen4/src/expert_cache_config.rs b/crates/hipfire-arch-qwen4/src/expert_cache_config.rs
+index 6752f2926..0e336e91e 100644
+--- a/crates/hipfire-arch-qwen4/src/expert_cache_config.rs
++++ b/crates/hipfire-arch-qwen4/src/expert_cache_config.rs
+@@ -129,12 +129,13 @@ impl ExpertCacheConfig {
+             .ok_or_else(|| "expert-cache device reserve overflows".into())
+     }
+ 
+-    /// Conservative bound for the second 24,576-expert runtime's CPU metadata,
+-    /// projection/resource descriptors, LRU state, pointer upload mirrors and
+-    /// route landing buffer. It is admission headroom, not measured usage.
+-    /// The large immutable donor mirror is charged by the actual tier plan.
++    /// Conservative margin for both additional runtimes (decode and immutable
++    /// short prefill), their CPU projection/resource and binding metadata, LRU
++    /// state, upload mirrors and route landing storage. Current layouts motivate
++    /// this allowance; it is not measured usage or a bound for all future
++    /// layouts/allocators. The payload mirror is charged by the actual tier plan.
+     pub fn host_reserve_bytes(self) -> u64 {
+-        64 << 20
++        128 << 20
+     }
+ }
+ 
+@@ -209,7 +210,7 @@ mod tests {
+         }
+         assert!(c.tail_bytes(u64::MAX).is_err());
+         assert!(c.device_reserve_bytes(usize::MAX, 512, 10).is_err());
+-        assert_eq!(c.host_reserve_bytes(), 64 << 20);
++        assert_eq!(c.host_reserve_bytes(), 128 << 20);
+     }
+ 
+     fn facts() -> ExpertCacheAdmission<'static> {
+diff --git a/crates/hipfire-arch-qwen4/src/expert_tier_owners.rs b/crates/hipfire-arch-qwen4/src/expert_tier_owners.rs
+index df8980f50..867f2fda6 100644
+--- a/crates/hipfire-arch-qwen4/src/expert_tier_owners.rs
++++ b/crates/hipfire-arch-qwen4/src/expert_tier_owners.rs
+@@ -3632,6 +3632,36 @@ mod decode_share_tests {
+                 );
+             }
+         }
++        // A short prefill may overlap slot DMA only because its immutable
++        // tables cannot address any byte of the writable donor pool.
++        let donor_start = (DEV_BASE + tail.donor_offset) as usize;
++        let donor_end = donor_start + tail.donor_bytes as usize;
++        let overlaps = |ptr: usize, len: u64| ptr < donor_end && donor_start < ptr + len as usize;
++        let mut resident_donor_reads = 0;
++        for layer in 0..48 {
++            let warm = binding.layer_view(layer, ExpertReadView::Resident).unwrap();
++            let canonical = binding
++                .layer_view(layer, ExpertReadView::BorrowPrefill(0))
++                .unwrap();
++            assert_ne!(canonical.gate_up_table_base(), warm.gate_up_table_base());
++            assert_ne!(canonical.down_table_base(), warm.down_table_base());
++            for expert in 0..EXPERTS {
++                let entry = canonical.entry(expert).unwrap();
++                assert!(!overlaps(
++                    canonical.gate_up_ptrs()[expert],
++                    entry.gate_up_len
++                ));
++                assert!(!overlaps(canonical.down_ptrs()[expert], entry.down_len));
++                let resident = warm.entry(expert).unwrap();
++                resident_donor_reads +=
++                    usize::from(overlaps(warm.gate_up_ptrs()[expert], resident.gate_up_len));
++                resident_donor_reads +=
++                    usize::from(overlaps(warm.down_ptrs()[expert], resident.down_len));
++            }
++        }
++        // Negative control: using Resident without restoration reads every
++        // original donor from mutable VRAM, so that view is unsafe here.
++        assert_eq!(resident_donor_reads, 2 * tail.donors.len());
+         assert_ne!(
+             binding.view_digest(ExpertReadView::Resident),
+             binding.view_digest(ExpertReadView::BorrowPrefill(0))
+diff --git a/crates/hipfire-arch-qwen4/src/gpu_forward.rs b/crates/hipfire-arch-qwen4/src/gpu_forward.rs
+index 1abec2c7c..caa8c866f 100644
+--- a/crates/hipfire-arch-qwen4/src/gpu_forward.rs
++++ b/crates/hipfire-arch-qwen4/src/gpu_forward.rs
+@@ -3356,8 +3356,8 @@ impl Qwen4MoeLayerRuntime {
+     /// The BorrowPrefill runtime of a decode-share load for prefill capacity
+     /// class `class`: the same layer built from the lease's class view (the
+     /// donors that class can overwrite at their pinned host mirror, the rest
+-    /// at their device bytes). Serves only prompt tiles of at least the
+-    /// resident bank's rows; never arms a CPU splice or D2 split.
++    /// at their device bytes). Class zero also supplies the exact-cache
++    /// immutable core/host prefill view. Never arms a CPU splice or D2 split.
+     pub(crate) fn from_moe_borrow(
+         gpu: &mut Gpu,
+         weights: &Qwen4Weights,
+@@ -8367,6 +8367,32 @@ fn tile_moe_of<'a, T>(
+     }
+ }
+ 
++/// A dirty short prompt can read immutable core/host weights while the cache
++/// keeps its donor slots. A clean prompt or a staged-width tile retains the
++/// original Resident prefill route, including a long prompt's short clean tail.
++fn expert_cache_prefill_uses_host(dirty: bool, rows: usize, stage_min_rows: usize) -> bool {
++    dirty && rows > 0 && rows < stage_min_rows
++}
++
++/// The cache's immutable prompt tables are distinct from its mutable decode
++/// tables. Keep this selection shared by tile descriptors and program building.
++fn cache_tile_moe_of<'a, T>(
++    decode_active: bool,
++    host_prefill_active: bool,
++    resident: &'a [T],
++    decode: &'a [T],
++    host_prefill: &'a [T],
++) -> &'a [T] {
++    debug_assert!(!(decode_active && host_prefill_active));
++    if decode_active {
++        decode
++    } else if host_prefill_active {
++        host_prefill
++    } else {
++        resident
++    }
++}
++
+ /// The BorrowPrefill class view a prompt tile reads: the epoch's dirty class,
+ /// i.e. the largest class any tile of the current borrow epoch (this one
+ /// included) ran on. `dirty_extent` is the loan's dirty byte prefix after this
+@@ -8887,8 +8913,12 @@ pub struct Qwen4GpuForward {
+     pub(crate) moe: Vec<Option<Qwen4MoeLayerRuntime>>,
+     expert_cache: Option<crate::expert_cache::ExpertCache>,
+     moe_cache: Vec<Option<Qwen4MoeLayerRuntime>>,
++    /// Frozen core-device/donor-host/cold-host views, without a mutable
++    /// residency capability or ownership of their borrowed pointer tables.
++    moe_cache_prefill: Vec<Option<Qwen4MoeLayerRuntime>>,
+     cache_routes: Option<ExpertCacheRoutes>,
+     cache_active: bool,
++    cache_host_prefill_active: bool,
+     cache_replay_quiescent: Cell<bool>,
+     cpu_deferred_experts: bool,
+     /// Trunk layers armed for the D2 tier split (a distinct numerical mode:
+@@ -10959,8 +10989,10 @@ impl Qwen4GpuForward {
+             moe_borrow,
+             expert_cache: None,
+             moe_cache: Vec::new(),
++            moe_cache_prefill: Vec::new(),
+             cache_routes: None,
+             cache_active: false,
++            cache_host_prefill_active: false,
+             cache_replay_quiescent: Cell::new(true),
+             borrow_class_rows,
+             borrow_runtimes_active: false,
+@@ -11651,9 +11683,7 @@ impl Qwen4GpuForward {
+         borrow_view_class(views, tile_class, spans, extent)
+     }
+ 
+-    /// The per-layer MoE runtimes the running tile reads: the BorrowPrefill
+-    /// twins during a decode-share prompt tile, the Resident runtimes in every
+-    /// other forward (decode, verify, lanes, EP, mesh, small tiles, attach).
++    /// Attach the decode cache and its independent immutable prompt views.
+     pub(crate) fn enable_expert_cache(
+         &mut self,
+         gpu: &mut Gpu,
+@@ -11695,11 +11725,56 @@ impl Qwen4GpuForward {
+         let mut runtimes = (0..config.num_hidden_layers)
+             .map(|_| None)
+             .collect::<Vec<_>>();
++        let mut prefill_runtimes = (0..config.num_hidden_layers)
++            .map(|_| None)
++            .collect::<Vec<_>>();
+         let built = populate_moe_runtimes(&mut runtimes, &weights.layer_refs, |layer, moe| {
+             let binding = cache
+                 .layer_binding(layer)
+                 .ok_or_else(|| invalid(format!("layer {layer}: missing cache binding")))?;
+             Qwen4MoeLayerRuntime::from_moe_cache(gpu, weights, moe, layer, config, &binding)
++        })
++        .and_then(|()| {
++            populate_moe_runtimes(&mut prefill_runtimes, &weights.layer_refs, |layer, moe| {
++                if weights
++                    .expert_tiers()
++                    .and_then(|lease| lease.expert_cache_layer(layer))
++                    .is_none()
++                {
++                    return Err(invalid(format!(
++                        "layer {layer}: missing immutable cache prefill view"
++                    )));
++                }
++                let resident = self
++                    .moe
++                    .get(layer)
++                    .and_then(Option::as_ref)
++                    .ok_or_else(|| {
++                        invalid(format!("layer {layer}: missing Resident prefill runtime"))
++                    })?;
++                let mut prefill = Qwen4MoeLayerRuntime::from_moe_borrow(
++                    gpu, weights, moe, layer, config, false, 0,
++                )?;
++                // The immutable host mirror contains the same verified headers.
++                // Losing this verdict would change the >=512-row IU4 route and
++                // can exceed the compact plan's F32 fallback scratch.
++                prefill.symmetric = resident.symmetric;
++                let decode = runtimes
++                    .get(layer)
++                    .and_then(Option::as_ref)
++                    .expect("decode runtimes were built first");
++                if prefill.mutable_residency.is_some()
++                    || prefill.expert_gate_up_ptrs.buf.as_ptr()
++                        == decode.expert_gate_up_ptrs.buf.as_ptr()
++                    || prefill.expert_down_ptrs.buf.as_ptr() == decode.expert_down_ptrs.buf.as_ptr()
++                {
++                    let _ = prefill.free_gpu(gpu);
++                    return Err(invalid(format!(
++                        "layer {layer}: cache prefill must use independent immutable tables"
++                    )));
++                }
++                Ok(prefill)
++            })
+         });
+         let routes = built.and_then(|()| {
+             ExpertCacheRoutes::new(gpu, config.num_hidden_layers, config.num_experts_per_tok)
+@@ -11707,7 +11782,7 @@ impl Qwen4GpuForward {
+         let routes = match routes {
+             Ok(routes) => routes,
+             Err(error) => {
+-                for runtime in runtimes.into_iter().flatten() {
++                for runtime in runtimes.into_iter().chain(prefill_runtimes).flatten() {
+                     let _ = runtime.free_gpu(gpu);
+                 }
+                 let _ = cache.shutdown(gpu);
+@@ -11715,21 +11790,33 @@ impl Qwen4GpuForward {
+             }
+         };
+         self.moe_cache = runtimes;
++        self.moe_cache_prefill = prefill_runtimes;
+         self.cache_routes = Some(routes);
+         self.expert_cache = Some(cache);
+         eprintln!("  qwen4 exact expert cache: decode-only, tail={}%, max-inflight={}, routed ids unchanged", policy.tail_percent, policy.max_inflight);
++        eprintln!("  qwen4 exact expert cache: dirty prompt tiles below {} rows read immutable core/host tables", self.cache_prefill_stage_min_rows(gpu));
+         Ok(())
+     }
+ 
++    fn cache_prefill_stage_min_rows(&self, gpu: &Gpu) -> usize {
++        self.expert_stage.as_ref().map_or_else(
++            || qwen4_expert_stage_min_rows(gpu, self.scratch.max_chunk).0,
++            |stage| stage.min_rows,
++        )
++    }
++
+     pub(crate) fn tile_moe(&self) -> &[Option<Qwen4MoeLayerRuntime>] {
+-        if self.cache_active {
+-            return &self.moe_cache;
+-        }
+-        tile_moe_of(
+-            self.borrow_runtimes_active,
+-            self.borrow_view,
+-            &self.moe,
+-            &self.moe_borrow,
++        cache_tile_moe_of(
++            self.cache_active,
++            self.cache_host_prefill_active,
++            tile_moe_of(
++                self.borrow_runtimes_active,
++                self.borrow_view,
++                &self.moe,
++                &self.moe_borrow,
++            ),
++            &self.moe_cache,
++            &self.moe_cache_prefill,
+         )
+     }
+ 
+@@ -12097,6 +12184,7 @@ impl Qwen4GpuForward {
+             moe,
+             moe_borrow,
+             moe_cache,
++            moe_cache_prefill,
+             cache_routes,
+             expert_stage,
+             ep,
+@@ -12211,7 +12299,12 @@ impl Qwen4GpuForward {
+                 }
+             }
+         }
+-        for layer in moe.into_iter().chain(moe_cache).flatten() {
++        for layer in moe
++            .into_iter()
++            .chain(moe_cache)
++            .chain(moe_cache_prefill)
++            .flatten()
++        {
+             if let Some(error) = layer.free_gpu(gpu) {
+                 if first.is_none() {
+                     first = Some(error);
+@@ -13283,12 +13376,27 @@ impl Qwen4GpuForward {
+         self.share_check()?;
+         if self.expert_cache.is_some() {
+             if self.prefill_scope {
+-                self.expert_cache
+-                    .as_mut()
+-                    .expect("cache present")
+-                    .prepare_prefill(gpu)
+-                    .map_err(invalid)?;
+-                return self.forward_chunk_tile(
++                let host_prefill = expert_cache_prefill_uses_host(
++                    self.expert_cache
++                        .as_ref()
++                        .expect("cache present")
++                        .is_dirty(),
++                    tokens.len(),
++                    self.cache_prefill_stage_min_rows(gpu),
++                );
++                let cache = self.expert_cache.as_mut().expect("cache present");
++                if host_prefill {
++                    // Only immutable core/host payloads and static tables are
++                    // read. Pending fills can continue writing the donor pool;
++                    // neither their mappings nor cache recency need changing.
++                    cache
++                        .prepare_host_prefill(gpu, tokens.len())
++                        .map_err(invalid)?;
++                } else {
++                    cache.prepare_prefill(gpu).map_err(invalid)?;
++                }
++                let prior = std::mem::replace(&mut self.cache_host_prefill_active, host_prefill);
++                let result = self.forward_chunk_tile(
+                     bundle,
+                     gpu,
+                     tokens,
+@@ -13298,6 +13406,8 @@ impl Qwen4GpuForward {
+                     wide_hidden_capture,
+                     output_policy,
+                 );
++                self.cache_host_prefill_active = prior;
++                return result;
+             }
+             if tokens.len() != 1
+                 || self.qsa_tap.is_some()
+@@ -13917,6 +14027,10 @@ impl Qwen4GpuForward {
+             // Cache decode has independent mutable tables and donor slots;
+             // the existing stage remains available only to canonical prefill.
+             .filter(|_| !self.cache_active)
++            // This stage was built for Resident placement. Its host mask and
++            // sparse tables cannot stage the extra host-backed donor entries
++            // of the immutable core/host prompt view.
++            .filter(|_| !self.cache_host_prefill_active)
+             .filter(|stage| stage.begin_forward(tile_active))
+         {
+             Some(stage)
+@@ -13938,19 +14052,21 @@ impl Qwen4GpuForward {
+             // layers compute (the legacy donors refill from their own MoE).
+             stage.slab_prime(gpu, self.tile_moe().len())?;
+         }
+-        // The runtimes this tile reads, as a slice borrowed from the two
++        // The runtimes this tile reads, as a slice borrowed from the
+         // runtime fields only (`Self::tile_moe` would borrow all of `self`
+         // across the program build and its closures).
+-        let tile_moe = if self.cache_active {
+-            &self.moe_cache[..]
+-        } else {
++        let tile_moe = cache_tile_moe_of(
++            self.cache_active,
++            self.cache_host_prefill_active,
+             tile_moe_of(
+                 self.borrow_runtimes_active,
+                 self.borrow_view,
+                 &self.moe,
+                 &self.moe_borrow,
+-            )
+-        };
++            ),
++            &self.moe_cache,
++            &self.moe_cache_prefill,
++        );
+         // Whether the donor tail is whole for this call (read once, before the
+         // program closures borrow `self`; the loan state cannot change inside a tile).
+         let donor_resident = self.share_state_resident();
+@@ -16881,6 +16997,28 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn expert_cache_prefill_preserves_resident_on_pristine_and_staged_tiles() {
++        use super::{expert_cache_prefill_uses_host as host, resolve_expert_stage_min_rows};
++        let floor = resolve_expert_stage_min_rows("gfx1201", 4096, false, None).0;
++        assert_eq!(floor, 2048);
++        // Covers singleton prompt tails, the few-row boundary, the compact
++        // fallback/IU4 boundary, and the first staged-width tile.
++        for rows in [1, 8, 9, 511, 512, 2047] {
++            assert!(host(true, rows, floor), "dirty prompt of {rows} rows");
++            assert!(!host(false, rows, floor), "pristine prompt of {rows} rows");
++        }
++        for rows in [0, 2048, 4096] {
++            assert!(!host(true, rows, floor), "resident tile of {rows} rows");
++        }
++        // After a long prompt restored the tail, its short remainder keeps
++        // Resident weights rather than needlessly moving those reads to host.
++        assert!(!host(false, 1007, floor));
++        let explicit_floor = resolve_expert_stage_min_rows("gfx1201", 4096, false, Some("2")).0;
++        assert!(host(true, 1, explicit_floor));
++        assert!(!host(true, 2, explicit_floor));
++    }
++
+     #[test]
+     fn decode_share_borrow_view_class_is_the_epochs_dirty_class() {
+         use super::borrow_view_class;
+diff --git a/docs/CONFIG.md b/docs/CONFIG.md
+index 7a18f746c..8ff49cf2c 100644
+--- a/docs/CONFIG.md
++++ b/docs/CONFIG.md
+@@ -362,8 +362,8 @@ The EP owner-routed prefill and the expert-staging levers have no typed schema k
+ | `developer.qwen4_expert_stage` | `HIPFIRE_QWEN4_EXPERT_STAGE` | on for gfx1201 and, for the borrowed-donor (packed) stage, on any discrete device whose measured host-to-device link is narrow (< 16 GB/s); off for unified memory and an unmeasured link; `1` / `0` force | Long-prefill host-expert staging: a long forward borrows the VRAM of the last two resident expert layers as DMA stages (no dedicated VRAM) and restores them before it returns, so decode residency is unchanged. The restore copies are pinned host RAM on top of the placement's pinned experts (2 x 1,275 MiB on the Flash-Next packed artifact), reported separately in the `qwen4 long-prefill expert staging` log line. With the variable unset the load measures the link once per device (64 MiB pinned `hipMemcpyAsync` H2D, one warm-up then the best of 5 event-timed copies, GB/s = 10^9 B/s); on gfx1100 this happens before the expert placement is sized, because the narrow-link default prefill chunk (`prefill.chunk_rows`) sizes it, and fast arches and an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` never probe for the chunk. The stage charge the placement applies reads only the probe-free switch (explicit value, else gfx1201), so a measured link changes which expert layers stay resident only through that 8192-row chunk. Slab and tier layouts, whose stage buffers are dedicated VRAM, stage only under that probe-free switch (explicit `1`, or gfx1201) and otherwise keep the zero-copy mapped reads. A failed probe is "unmeasured" and never narrow. Unified-memory devices are never copy-probed. gfx1201 (an R9700 in a Gen5 x16 slot included) keeps its existing default whatever the probe returns. |
+ | `developer.qwen4_expert_stage_min_rows` | `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` | `min(2048, prefill chunk rows)`; a fixed `768` on a measured narrow discrete link off gfx1201; gfx1201 `2048` | Forwards with at least this many rows stage (integer ≥ 2, authoritative when set); smaller ones, decode and verify keep the mapped reads. The default is capped at the prefill chunk so a full chunk qualifies where the chunk is below 2048 (gfx1100 on a fast link: 1536); the narrow-link 768 is not lowered to the chunk, so a chunk admitted below 768 never stages. |
+ | `developer.qwen4_expert_stage_capture` | `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE` | on | `0` keeps the native-MTP prompt-fill tiles on the mapped reads. |
+-| `developer.qwen4_expert_cache` | `HIPFIRE_QWEN4_EXPERT_CACHE` | off | Experimental exact expert LRU for single-GPU gfx1201 Flash-Next with a bound ranked hotset and uniform QT44/QT53 experts. A typed boolean (`true`/`false`/`1`/`0`). Keeps a fixed VRAM core and uses the cold resident tail as evictable slots. Routing and expert bytes are unchanged; misses read canonical mapped host weights while bounded asynchronous fills prepare later tokens. Requires speculation off, decode-share off and PCIe expert execution; refuses CPU/D2, EP/PP/TP, continuous batching, NPU, S1 and expert-keep. Rejects `HIPFIRE_RAILGUN_CHECK=always` (including resolved `developer.railgun_check`) before weight fulfillment: physical donor-slot payloads change, while that check requires a fixed `Weights` digest baseline. Cache-off keeps the existing check behavior; `sample(N)` has no such weight-digest conflict, which does not itself qualify that combination. Missing or ineligible hotsets fail the opted-in load. Prefill drains fills and restores the canonical donor tail before using its original resident view. No default-on or performance claim. |
+-| `developer.qwen4_expert_cache_tail_percent` | `HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT` | `50` | Integer `1..=100`: fraction of the ranked resident expert owner requested for evictable slots, rounded to whole expert spans; only mixed-residency layers donate. Immutable core experts have no host mirror; only donor bytes add a mirror. The exact plan, mutable tables, route readback and 32 MiB device queue headroom plus 64 MiB host metadata headroom are charged before materialization; host headroom covers the second expert runtime and LRU/upload/readback state and is not measured usage. |
++| `developer.qwen4_expert_cache` | `HIPFIRE_QWEN4_EXPERT_CACHE` | off | Experimental exact expert LRU for single-GPU gfx1201 Flash-Next with a bound ranked hotset and uniform QT44/QT53 experts. A typed boolean (`true`/`false`/`1`/`0`). Keeps a fixed VRAM core and uses the cold resident tail as evictable slots. Routing and expert bytes are unchanged; misses read canonical mapped host weights while bounded asynchronous fills prepare later tokens. Requires speculation off, decode-share off and PCIe expert execution; refuses CPU/D2, EP/PP/TP, continuous batching, NPU, S1 and expert-keep. Rejects `HIPFIRE_RAILGUN_CHECK=always` (including resolved `developer.railgun_check`) before weight fulfillment: physical donor-slot payloads change, while that check requires a fixed `Weights` digest baseline. Cache-off keeps the existing check behavior; `sample(N)` has no such weight-digest conflict, which does not itself qualify that combination. Missing or ineligible hotsets fail the opted-in load. Dirty prefill tiles below the effective expert-staging threshold use separate immutable core/host tables and preserve pending fills and decode LRU without restoring the donor tail. Other prefill tiles keep the original resident view and restore donor bytes when required, including long staged prefill and its subsequent clean tail. No default-on or performance claim. |
++| `developer.qwen4_expert_cache_tail_percent` | `HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT` | `50` | Integer `1..=100`: fraction of the ranked resident expert owner requested for evictable slots, rounded to whole expert spans; only mixed-residency layers donate. Immutable core experts have no host mirror; only donor bytes add a mirror. The exact plan, mutable tables, route readback and 32 MiB device queue headroom plus 128 MiB host metadata headroom are charged before materialization; host headroom covers both additional expert runtimes (decode and immutable short prefill), binding metadata and LRU/upload/readback state and is not measured usage. Short prefill reuses existing canonical tables and payloads. |
+ | `developer.qwen4_expert_cache_inflight` | `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` | `64` | Integer `1..=4096`: maximum paired gate/up + down fills in flight. Pending slots cannot be evicted or published; completed bytes are published only after GPU retirement and paired completion. Invalid explicit cache settings fail even when the cache is off. |
+ | `developer.qwen4_decode_share` | `HIPFIRE_QWEN4_DECODE_SHARE` | `on` (unset or `auto`; `DECODE_SHARE_DEFAULT`) | Decode-share mode: `on` (default on admitted loads), `off` / `0` (and any unrecognised value), `bind`, `bank`, `fixed`. Lends the long-prefill scratch to a donor tail of the coldest resident experts' VRAM (mirrored in pinned host RAM, read through a BorrowPrefill expert view while borrowed, restored after the prompt) and, in `on`, charges only the dedicated forward in the expert-placement reserve so the hot budget grows by the difference. Scope: exact gfx1201, single device, ranked hot set, compact scratch plan; refused (silently unless set explicitly) with EP, a pp band, the NPU trunk, S1, DFlash, a CPU expert split, continuous batching or a chunk of 512 rows or fewer. An explicit `developer.qwen4_expert_hot_budget_mib` does not grow, so `on` becomes `off` for that load. `bind` (second expert view only), `bank` (owned test scratch) and `fixed` (real donor tail, plain budget) are A/B controls. Disable with `HIPFIRE_QWEN4_DECODE_SHARE=off`. Admission, the placement charge, the loan protocol and the log lines are in the `HIPFIRE_QWEN4_DECODE_SHARE` row of [env-vars.md](env-vars.md). |
+ | `developer.qwen4_decode_share_verify` | `HIPFIRE_QWEN4_DECODE_SHARE_VERIFY` | off | `1` verifies the donor tail against its host mirror right after materialization and, in `fixed` / `on`, after every donor restore (debug oracle; a mismatch fails the load or poisons the loan). |
+diff --git a/docs/env-vars.md b/docs/env-vars.md
+index 68049dc95..5ca65426b 100644
+--- a/docs/env-vars.md
++++ b/docs/env-vars.md
+@@ -33,8 +33,14 @@ Set speculation off, `HIPFIRE_QWEN4_DECODE_SHARE=off` and
+ `HIPFIRE_OFFLOAD_EXEC=pcie`. CPU/D2, EP/PP/TP, continuous batching, NPU, S1,
+ expert-keep and whole-first placement are refused. Routing is unchanged; a
+ miss runs from canonical mapped host bytes and schedules a bounded paired
+-fill for later tokens. Prefill restores original resident donor bytes before
+-using its frozen view.
++fill for later tokens. Dirty prefill tiles below the effective expert-staging
++threshold (2048 rows by default on gfx1201) use independent immutable tables:
++core experts stay in VRAM; donors and cold experts read their immutable host
++backing. This route preserves pending fills and decode LRU without draining
++copies, restoring donor bytes or widening mutable residency beyond one row;
++it never stages experts. Other prefill tiles retain the frozen resident view
++and restore donor bytes when required, including long staged prefill and its
++subsequent clean short tail.
+ 
+ `HIPFIRE_RAILGUN_CHECK=always` is refused before weight fulfillment when
+ this cache is enabled. Its fixed physical `Weights` digest baseline conflicts
+@@ -48,9 +54,11 @@ which is not a claim that the combination has been qualified.
+ rounded to whole experts from mixed-residency layers. Only that tail needs an
+ extra immutable host mirror. `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` defaults to
+ `64` and accepts `1..=4096` paired fills. Table/route owners and a conservative
+-32 MiB device queue margin plus 64 MiB host metadata margin join admission;
+-the host margin covers the second expert runtime, LRU state and upload/readback
+-storage.
++32 MiB device queue margin plus 128 MiB host metadata margin join admission;
++the host margin covers both additional expert runtimes (decode and immutable
++short prefill), binding identities, LRU state and upload/readback storage. The
++short prefill route borrows existing canonical tables and payloads and adds
++no expert payload or GPU table allocation.
+ These margins are reserves, not measured peak-memory receipts. Invalid
+ explicit values fail the load, including when the cache is disabled. This
+ opt-in path carries no default-on or performance claim.

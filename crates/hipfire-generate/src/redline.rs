@@ -3629,6 +3629,18 @@ impl RedlineQwen4Snapshot {
     }
 }
 
+fn redline_qwen4_gdn_buffers(
+    gdn: &hipfire_arch_qwen4::state::GdnGpuState,
+) -> impl Iterator<Item = (&'static str, &rdna_compute::GpuTensor)> {
+    [("recurrent", &gdn.recurrent), ("conv", &gdn.conv)]
+        .into_iter()
+        .chain(
+            gdn.ef_residual
+                .as_ref()
+                .map(|tensor| ("ef_residual", tensor)),
+        )
+}
+
 /// Read one Qwen4 arm's state surfaces to host memory.
 ///
 /// Capacity-pinned arenas are read only up to their active mark: beyond
@@ -3665,7 +3677,10 @@ fn redline_qwen4_snapshot(
     let state = &bundle.state;
     let mut regions: Vec<(String, Vec<u8>)> = Vec::new();
     for (layer, gdn) in state.gdn.iter().enumerate() {
-        for (name, tensor) in [("recurrent", &gdn.recurrent), ("conv", &gdn.conv)] {
+        // The live Q8-EF residual affects the next token even when the packed
+        // recurrent bytes agree. It participates in the same raw-byte state
+        // and GDN group verdict, including when no session snapshot owns it.
+        for (name, tensor) in redline_qwen4_gdn_buffers(gdn) {
             let mut bytes = Vec::new();
             redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
             regions.push((format!("gdn.{layer}.{name}"), bytes));
@@ -3747,17 +3762,25 @@ fn redline_qwen4_arm(
     iterations: usize,
     position_step: usize,
 ) -> Result<(Vec<RedlineQwen4Snapshot>, f64), String> {
+    let arm = match route {
+        Some(rdna_compute::replay::ShadowBodyRoute::Plan) => "retained-plan",
+        Some(rdna_compute::replay::ShadowBodyRoute::HipOracle) => "recorded-HIP",
+        Some(rdna_compute::replay::ShadowBodyRoute::Hip) => "ordinary-HIP",
+        None => "production-recovery",
+    };
     let vocab = bundle.config.vocab_size;
     let prime: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-    bundle.reset(gpu).map_err(|error| error.to_string())?;
+    bundle
+        .reset(gpu)
+        .map_err(|error| format!("Qwen4 shadow {arm} reset: {error}"))?;
     let logits = gpu
         .zeros(&[vocab], rdna_compute::DType::F32)
-        .map_err(|error| format!("Qwen4 shadow logits: {error:?}"))?;
+        .map_err(|error| format!("Qwen4 shadow {arm} logits: {error:?}"))?;
     let outcome = (|| -> Result<(Vec<RedlineQwen4Snapshot>, f64), String> {
         gpu.replay.set_shadow_body_route(route);
         bundle
             .forward_chunk_final(gpu, &prime, &logits, None)
-            .map_err(|error| format!("Qwen4 shadow prime: {error}"))?;
+            .map_err(|error| format!("Qwen4 shadow {arm} prime: {error}"))?;
         let started = Instant::now();
         let mut snapshots = Vec::with_capacity(iterations);
         for i in 0..iterations {
@@ -3770,7 +3793,7 @@ fn redline_qwen4_arm(
                 .forward_token(gpu, token, &logits, None)
                 .map_err(|error| {
                     format!(
-                        "Qwen4 shadow iteration {i} at position {}: {error}",
+                        "Qwen4 shadow {arm} iteration {i} at position {}: {error}",
                         bundle.state.position
                     )
                 })?;
@@ -3780,7 +3803,7 @@ fn redline_qwen4_arm(
             // The snapshot below reads logits and state raw: a non-finite router row
             // (layer, row in the message) must fail the arm, not be compared.
             gpu.take_device_wait_error()
-                .map_err(|error| format!("Qwen4 shadow iteration {i}: {error}"))?;
+                .map_err(|error| format!("Qwen4 shadow {arm} iteration {i}: {error}"))?;
             snapshots.push(redline_qwen4_snapshot(gpu, bundle, &logits)?);
         }
         Ok((snapshots, started.elapsed().as_secs_f64() * 1_000_000.0))
@@ -3813,6 +3836,24 @@ fn redline_qwen4_row(
         "gdn_equal": snapshot.group_equal(hip, "gdn."),
         "ple": snapshot.group_error(hip, "ple."),
         "ple_equal": snapshot.group_equal(hip, "ple."),
+    })
+}
+
+fn redline_qwen4_recovery_report(
+    original_error: String,
+    recovery: Result<bool, String>,
+    route_uses_hip: bool,
+) -> serde_json::Value {
+    let (recovered_exact, recovery_error) = match recovery {
+        Ok(exact) => (exact, None),
+        Err(error) => (false, Some(error)),
+    };
+    let recovery_uses_hip = recovery_error.is_none() && route_uses_hip;
+    serde_json::json!({
+        "error": original_error,
+        "recovery_error": recovery_error,
+        "recovered_bit_exact_against_clean_hip": recovered_exact,
+        "recovery_uses_hip": recovery_uses_hip,
     })
 }
 
@@ -3876,27 +3917,34 @@ fn redline_qwen4_replay_failure(
         1,
         0,
     );
-    let (error, poisoned) = match attempted {
+    let (error, attempt_failed) = match attempted {
         Ok(_) => (
             "replay succeeded beyond the prepared max_position (expected a refusal)".to_string(),
             false,
         ),
         Err(reason) => (reason, true),
     };
+    let poisoned =
+        attempt_failed && gpu.replay.state() == rdna_compute::replay::ReplayState::Fallback;
     let fallback = gpu.replay.fallback_reason().map(str::to_string);
     // No shadow route set: this is the production decision for a poisoned route.
-    let (recovered, _) = redline_qwen4_arm(gpu, bundle, None, context, 1, 0)?;
-    Ok(serde_json::json!({
-        "induced": "boundary position beyond the plan's prepared max_position",
-        "boundary_position": context,
-        "prepared_max_position": context.saturating_sub(1),
-        "error": error,
-        "route_poisoned": poisoned,
-        "fallback_reason": fallback,
-        "recovered_bit_exact_against_clean_hip": recovered == hip_reference
-            && hip_reference == hip_clean,
-        "recovery_uses_hip": gpu.replay.state() == rdna_compute::replay::ReplayState::Fallback,
-    }))
+    // A failed recovery must not replace the induced refusal or discard the
+    // already completed parity windows. Return both causes with failed recovery
+    // verdicts so the harness archives the full evidence and still rejects it.
+    let recovery = redline_qwen4_arm(gpu, bundle, None, context, 1, 0)
+        .map(|(recovered, _)| recovered == hip_reference && hip_reference == hip_clean);
+    let mut report = redline_qwen4_recovery_report(
+        error,
+        recovery,
+        gpu.replay.state() == rdna_compute::replay::ReplayState::Fallback,
+    );
+    report["induced"] =
+        serde_json::json!("boundary position beyond the plan's prepared max_position");
+    report["boundary_position"] = serde_json::json!(context);
+    report["prepared_max_position"] = serde_json::json!(context.saturating_sub(1));
+    report["route_poisoned"] = serde_json::json!(poisoned);
+    report["fallback_reason"] = serde_json::json!(fallback);
+    Ok(report)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6115,8 +6163,95 @@ fn redline_greedy_trace(
 #[cfg(test)]
 mod redline_snapshot_tests {
     use super::{
-        redline_kv_token_stride, redline_snapshots_bit_exact, RedlineQwenSnapshot, RedlineSnapshot,
+        redline_kv_token_stride, redline_qwen4_gdn_buffers, redline_qwen4_recovery_report,
+        redline_qwen4_row, redline_snapshots_bit_exact, RedlineQwen4Snapshot, RedlineQwenSnapshot,
+        RedlineSnapshot,
     };
+
+    #[test]
+    fn qwen4_failure_probe_keeps_the_induced_error_when_recovery_fails() {
+        let original = "position 512 exceeds prepared max_position 511";
+        let secondary = "Qwen4 shadow production-recovery prime: expert cache token is unretired";
+        let failed = redline_qwen4_recovery_report(original.into(), Err(secondary.into()), true);
+        assert_eq!(failed["error"], original);
+        assert_eq!(failed["recovery_error"], secondary);
+        assert_eq!(failed["recovered_bit_exact_against_clean_hip"], false);
+        assert_eq!(failed["recovery_uses_hip"], false);
+        let recovered = redline_qwen4_recovery_report(original.into(), Ok(true), true);
+        assert_eq!(recovered["error"], original);
+        assert!(recovered["recovery_error"].is_null());
+        assert_eq!(recovered["recovered_bit_exact_against_clean_hip"], true);
+        assert_eq!(recovered["recovery_uses_hip"], true);
+    }
+
+    #[test]
+    fn qwen4_snapshot_reads_the_live_optional_ef_owner() {
+        fn empty(dtype: rdna_compute::DType) -> rdna_compute::GpuTensor {
+            rdna_compute::GpuTensor {
+                // SAFETY: empty non-owning descriptor; this CPU-only iterator
+                // test never dereferences or submits the null address.
+                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), 0) },
+                shape: vec![0],
+                dtype,
+            }
+        }
+        let mut state = hipfire_arch_qwen4::state::GdnGpuState {
+            recurrent: empty(rdna_compute::DType::Raw),
+            conv: empty(rdna_compute::DType::F32),
+            ef_residual: Some(empty(rdna_compute::DType::F16)),
+        };
+        let buffers = redline_qwen4_gdn_buffers(&state).collect::<Vec<_>>();
+        assert_eq!(
+            buffers.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["recurrent", "conv", "ef_residual"]
+        );
+        assert!(std::ptr::eq(
+            buffers[2].1,
+            state.ef_residual.as_ref().unwrap()
+        ));
+        assert_eq!(buffers[2].1.dtype, rdna_compute::DType::F16);
+        state.ef_residual = None;
+        assert_eq!(
+            redline_qwen4_gdn_buffers(&state)
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            ["recurrent", "conv"]
+        );
+    }
+
+    #[test]
+    fn qwen4_ef_only_byte_divergence_fails_state_and_gdn_parity() {
+        fn snapshot(ef: u8) -> RedlineQwen4Snapshot {
+            // One real FP8 K/V row has 2 * (256 codes + 2 scale bytes).
+            // NaN-looking packed bytes must still compare as raw storage.
+            let mut packed = vec![0u8; 516];
+            packed[..4].fill(0x7f);
+            RedlineQwen4Snapshot {
+                logits: 1.0f32.to_le_bytes().to_vec(),
+                argmax: 0,
+                position: 1,
+                lengths: vec![(1, 1, 0, 1, 0)],
+                regions: vec![
+                    ("qsa.0.full_keys".into(), packed),
+                    ("gdn.0.recurrent".into(), vec![0; 8]),
+                    ("gdn.0.conv".into(), vec![0; 4]),
+                    ("gdn.0.ef_residual".into(), vec![ef, 0, 0, 0]),
+                    ("ple.conv".into(), vec![0; 4]),
+                ],
+            }
+        }
+        let reference = snapshot(0);
+        let identical = redline_qwen4_row(&snapshot(0), &reference, 0);
+        assert_eq!(identical["state_bit_exact"], true);
+        assert_eq!(identical["qsa_full_equal"], true);
+        assert_eq!(identical["gdn_equal"], true);
+        let changed = redline_qwen4_row(&snapshot(1), &reference, 0);
+        assert_eq!(changed["state_bit_exact"], false);
+        assert_eq!(changed["gdn_equal"], false);
+        assert_eq!(changed["qsa_full_equal"], true);
+        assert_eq!(changed["ple_equal"], true);
+        assert_eq!(changed["tokens_equal"], true);
+    }
 
     fn qwen_snapshot(gdn_frame: u32) -> RedlineSnapshot {
         RedlineSnapshot::Qwen(RedlineQwenSnapshot {

@@ -176,6 +176,8 @@ pub struct Qwen4Bundle {
     /// the published bundle so unload owns the scratch, expert pointer tables,
     /// and all per-layer dispatch state exactly once.
     pub(crate) execution: Option<Qwen4GpuForward>,
+    /// Admitted decode-cache policy. The forward owns mutable residency and DMA.
+    pub(crate) expert_cache: Option<crate::expert_cache_config::ExpertCacheLoad>,
     /// Reusable native MTP execution resources, attached only when the
     /// admitted artifact carries the validated one-layer MTP head.
     pub(crate) mtp: Option<Qwen4MtpGpu>,
@@ -889,6 +891,7 @@ impl Qwen4Bundle {
             ple,
             weight_store: AttachedWeightStore::new(transaction),
             execution: None,
+            expert_cache: None,
             mtp: None,
             spec_logits: None,
             spec_top1: None,
@@ -922,6 +925,49 @@ impl Qwen4Bundle {
             npu_model_index: None,
             cpu_d1_storage_rows: 0,
         })
+    }
+
+    /// Bind the loader's cache placement before the forward can capture it.
+    pub fn set_expert_cache(
+        &mut self,
+        config: crate::expert_cache_config::ExpertCacheConfig,
+        warm_rank: Vec<u32>,
+    ) -> Result<(), BundleError> {
+        if self.execution.is_some() || self.expert_cache.is_some() {
+            return Err(BundleError::Forward(
+                "exact expert cache must be bound once before forward attachment".into(),
+            ));
+        }
+        if !self.config.profile.is_flash_next()
+            || !self
+                .weights
+                .expert_tiers()
+                .is_some_and(|lease| lease.expert_cache_ranges().is_some())
+        {
+            return Err(BundleError::Forward(
+                "exact expert cache needs a materialized Flash-Next cache tail".into(),
+            ));
+        }
+        let total = self
+            .config
+            .num_hidden_layers
+            .checked_mul(self.config.num_experts)
+            .ok_or_else(|| BundleError::Forward("expert-cache rank geometry overflows".into()))?;
+        let mut seen = vec![false; total];
+        if warm_rank.len() != total
+            || warm_rank.iter().any(|&id| {
+                let Some(seen) = seen.get_mut(id as usize) else {
+                    return true;
+                };
+                std::mem::replace(seen, true)
+            })
+        {
+            return Err(BundleError::Forward(
+                "exact expert cache needs a complete unique global expert rank".into(),
+            ));
+        }
+        self.expert_cache = Some(crate::expert_cache_config::ExpertCacheLoad { config, warm_rank });
+        Ok(())
     }
 
     pub fn manifest(&self) -> &Qwen4Manifest {
@@ -1611,6 +1657,19 @@ impl Qwen4Bundle {
             }
             Err(error) => return Err(BundleError::Forward(error.to_string())),
         };
+        if let Some(cache) = &self.expert_cache {
+            if let Err(error) = forward.enable_expert_cache(
+                gpu,
+                &self.weights,
+                &self.config,
+                cache.config,
+                &cache.warm_rank,
+            ) {
+                let detail = error.to_string();
+                let _ = forward.free_gpu(gpu);
+                return Err(BundleError::Forward(detail));
+            }
+        }
         if let Some(profile) = self.slowlink.profile {
             forward.set_slowlink_profile(profile);
         }
@@ -1670,6 +1729,11 @@ impl Qwen4Bundle {
     }
     /// Attach the reusable native MTP head and its bounded GPU state.
     pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
+        if self.expert_cache.is_some() {
+            return Err(BundleError::Forward(
+                "exact expert cache requires native MTP off".into(),
+            ));
+        }
         self.ep_refuse("native MTP")?;
         Self::require_mtp_head(self.config.profile.id(), self.weights.mtp.is_some())?;
         if self.mtp.is_some() {
@@ -4476,6 +4540,11 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
+        if self.expert_cache.is_some() {
+            return Err(BundleError::Forward(
+                "exact expert cache does not support continuous-batch lanes".into(),
+            ));
+        }
         self.pp_refuse("continuous-batch lanes")?;
         if self.ep.is_some() {
             return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec);
@@ -5179,6 +5248,18 @@ impl Qwen4Bundle {
         if self.pp.is_some() {
             std::mem::forget(self);
             return Err(pp_owner_required());
+        }
+        // A cache token can outlive an unsuccessful independent PM4 submit.
+        // Prove retirement before releasing any state, output, non-expert
+        // weight or transaction owner; retaining only the expert lease would
+        // leave the rest of that token's recorded pointers dangling.
+        if let Some(Err(error)) = self
+            .execution
+            .as_mut()
+            .map(|forward| forward.preflight_free_gpu(gpu))
+        {
+            std::mem::forget(self);
+            return Err(BundleError::Hip(error));
         }
         // Peers drain and free first: their gather events and P2P reads end
         // before rank 0's buffers go.

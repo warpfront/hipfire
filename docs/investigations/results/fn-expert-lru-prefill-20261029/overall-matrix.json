@@ -1,0 +1,32 @@
+[
+  {
+    "case": "A1",
+    "cache": "0",
+    "exit_code": 0
+  },
+  {
+    "case": "B1",
+    "cache": "1",
+    "exit_code": 0
+  },
+  {
+    "case": "B2",
+    "cache": "1",
+    "exit_code": 0
+  },
+  {
+    "case": "A2",
+    "cache": "0",
+    "exit_code": 0
+  },
+  {
+    "case": "A3",
+    "cache": "0",
+    "exit_code": 0
+  },
+  {
+    "case": "B3",
+    "cache": "1",
+    "exit_code": 0
+  }
+]
