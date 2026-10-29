@@ -1424,7 +1424,7 @@ impl Qwen4ExpertStage {
             full_keys: Vec::new(),
             compact_bound: Vec::new(),
             first_host,
-            placement: None,
+            ep_slots: None,
             bytes: lent.map_or([0, 0], |(window, _)| window),
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
@@ -1738,7 +1738,7 @@ impl Qwen4ExpertStage {
             full_keys: Vec::new(),
             compact_bound: Vec::new(),
             first_host,
-            placement: None,
+            ep_slots: None,
             bytes: [0, 0],
             copy_stream,
             ready: Vec::with_capacity(2),
@@ -2220,7 +2220,9 @@ impl Qwen4ExpertStage {
             full_keys: Vec::new(),
             compact_bound: Vec::new(),
             first_host,
-            placement: Some(placement),
+            // EP marker only (compact-route gate): a unit stage rebases its own
+            // slab tables and never redirects through sealed donor slots.
+            ep_slots: Some(Vec::new()),
             bytes: if borrow.is_some() { lent_bytes } else { [0, 0] },
             copy_stream,
             ready: Vec::with_capacity(2),
