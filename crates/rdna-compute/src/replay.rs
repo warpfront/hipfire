@@ -395,7 +395,8 @@ impl Pm4Commands {
                 }
                 .with_dispatch_initiator_policy(dispatch_initiator_policy)
                 .with_dispatch_interleave(dispatch_interleave)
-                .with_resource_limits_policy(resource_limits_policy);
+                .with_resource_limits_policy(resource_limits_policy)
+                .with_gfx11_cwsr_priv(gfx11_cwsr_priv(architecture));
                 Self::Legacy {
                     architecture,
                     commands,
@@ -3469,6 +3470,15 @@ fn gfx1100_experiment_alias(architecture: Pm4Architecture, device_name: &str) ->
     } else {
         device_name
     }
+}
+
+/// GFX11 raw-PM4 dispatches must set `COMPUTE_PGM_RSRC1.PRIV` (bit 20) for
+/// CWSR. The AQL dispatch microcode sets it implicitly; without it a queue
+/// preemption (CWSR save/restore) during a retained PM4 dispatch faulted on
+/// gfx1100 with an SQC page-0 read (see
+/// docs/investigations/2026-10-29-gfx11-pm4-cwsr-priv.md).
+fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
+    architecture == Pm4Architecture::Gfx11
 }
 
 fn gfx10_dispatch_initiator_policy(
