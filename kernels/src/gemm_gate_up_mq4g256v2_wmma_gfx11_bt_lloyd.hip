@@ -173,5 +173,6 @@ __syncthreads(); \
     } \
 }
 
+GEN_GATE_UP_BT_LUT(1)
 GEN_GATE_UP_BT_LUT(6)
 GEN_GATE_UP_BT_LUT(12)

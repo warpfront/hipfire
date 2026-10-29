@@ -114,6 +114,7 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_mq4g256v2_residual_wmma
     } \
 }
 
+GEN_RESID_BT_LUT(1)
 GEN_RESID_BT_LUT(4)
 GEN_RESID_BT_LUT(6)
 GEN_RESID_BT_LUT(8)

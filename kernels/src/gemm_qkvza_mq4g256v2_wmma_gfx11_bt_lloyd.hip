@@ -205,5 +205,6 @@ __syncthreads(); \
     } \
 }
 
+GEN_QKVZA_BT_LUT(1)
 GEN_QKVZA_BT_LUT(4)
 GEN_QKVZA_BT_LUT(12)
