@@ -188,5 +188,6 @@ __syncthreads(); \
     } \
 }
 
+GEN_QKV_BT_LUT(1)
 GEN_QKV_BT_LUT(4)
 GEN_QKV_BT_LUT(12)

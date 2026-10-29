@@ -32,8 +32,8 @@ fn identity_lut() -> [u32; 8] {
 }
 
 /// Synthetic uniform MQ4V2 weight: sc=1, zp=0 both halves, random nibbles.
-fn synth_weight(gpu: &mut Gpu, rows: usize, seed: u64) -> rdna_compute::GpuTensor {
-    let groups = K / 256;
+fn synth_weight(gpu: &mut Gpu, rows: usize, kk: usize, seed: u64) -> rdna_compute::GpuTensor {
+    let groups = kk / 256;
     let row_bytes = groups * 136;
     let mut w = vec![0u8; rows * row_bytes];
     let sc_bits = f16_bits(1.0);
@@ -63,17 +63,17 @@ fn synth_weight(gpu: &mut Gpu, rows: usize, seed: u64) -> rdna_compute::GpuTenso
     t
 }
 
-fn f32_input(gpu: &mut Gpu, n: usize, seed: u64) -> rdna_compute::GpuTensor {
-    let mut xb = Vec::with_capacity(n * K * 4);
+fn f32_input(gpu: &mut Gpu, n: usize, kk: usize, seed: u64) -> rdna_compute::GpuTensor {
+    let mut xb = Vec::with_capacity(n * kk * 4);
     let mut s = seed;
-    for _ in 0..n * K {
+    for _ in 0..n * kk {
         s = s
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let v = ((s >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0;
         xb.extend_from_slice(&v.to_le_bytes());
     }
-    let t = gpu.alloc_tensor(&[n * K], DType::F32).expect("alloc x");
+    let t = gpu.alloc_tensor(&[n * kk], DType::F32).expect("alloc x");
     gpu.hip.memcpy_htod(&t.buf, &xb).expect("upload x");
     t
 }
@@ -137,189 +137,280 @@ fn main() {
     let lut = identity_lut();
     let luts3 = [lut; 3];
     let luts4 = [lut; 4];
+    let only_small = std::env::var_os("HIPFIRE_T0_ONLY_SMALL").is_some();
 
     // Residual: M=5120.
+    if !only_small {
+        {
+            const M: usize = 5120;
+            let w = synth_weight(&mut gpu, M, K, 0x12345678);
+            for &n in &[384usize, 511, 512] {
+                let x = f32_input(&mut gpu, n, K, 0xdeadbeef);
+                for &bt in &[4usize, 6, 8] {
+                    let yu = zero_f32(&mut gpu, n * M);
+                    let yl = zero_f32(&mut gpu, n * M);
+                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt(&w, &x, &yu, M, K, n, bt)
+                        .expect("uniform warmup");
+                    gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(
+                        &w, &x, &yl, M, K, n, bt, lut,
+                    )
+                    .expect("lloyd warmup");
+                    gpu.hip.device_synchronize().expect("sync");
+                    let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
+                        if is_lloyd {
+                            gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(
+                                &w, &x, &yl, M, K, n, bt, lut,
+                            )
+                            .expect("lloyd");
+                            gpu.hip.device_synchronize().expect("iter sync");
+                        } else {
+                            gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt(&w, &x, &yu, M, K, n, bt)
+                                .expect("uniform");
+                            gpu.hip.device_synchronize().expect("iter sync");
+                        }
+                    });
+                    let a = gpu.download_f32(&yu).expect("dl u");
+                    let b = gpu.download_f32(&yl).expect("dl l");
+                    report(&gpu, ("residual", n, bt), tu, tl, (&a, &b));
+                }
+            }
+        }
+
+        // Gate/up: gate=up=5120.
+        {
+            const G: usize = 5120;
+            const U: usize = 5120;
+            let wg = synth_weight(&mut gpu, G, K, 0x1111);
+            let wu = synth_weight(&mut gpu, U, K, 0x2222);
+            for &n in &[384usize, 511, 512] {
+                let x = f32_input(&mut gpu, n, K, 0xdeadbeef);
+                for &bt in &[6usize, 12] {
+                    let yg = zero_f32(&mut gpu, n * G);
+                    let yu = zero_f32(&mut gpu, n * U);
+                    let lg = zero_f32(&mut gpu, n * G);
+                    let lu = zero_f32(&mut gpu, n * U);
+                    gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt(
+                        &wg, &wu, &x, &yg, &yu, G, U, K, n, bt,
+                    )
+                    .expect("uniform warmup");
+                    gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt_lloyd(
+                        &wg, &wu, &x, &lg, &lu, G, U, K, n, bt, lut, lut,
+                    )
+                    .expect("lloyd warmup");
+                    gpu.hip.device_synchronize().expect("sync");
+                    let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
+                        if is_lloyd {
+                            gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt_lloyd(
+                                &wg, &wu, &x, &lg, &lu, G, U, K, n, bt, lut, lut,
+                            )
+                            .expect("lloyd");
+                            gpu.hip.device_synchronize().expect("iter sync");
+                        } else {
+                            gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt(
+                                &wg, &wu, &x, &yg, &yu, G, U, K, n, bt,
+                            )
+                            .expect("uniform");
+                            gpu.hip.device_synchronize().expect("iter sync");
+                        }
+                    });
+                    let mut a = gpu.download_f32(&yg).expect("dl ug");
+                    a.extend_from_slice(&gpu.download_f32(&yu).expect("dl uu"));
+                    let mut b = gpu.download_f32(&lg).expect("dl lg");
+                    b.extend_from_slice(&gpu.download_f32(&lu).expect("dl lu"));
+                    report(&gpu, ("gate_up", n, bt), tu, tl, (&a, &b));
+                }
+            }
+        }
+
+        // QKV: q=k=v=1024 (small, keeps the harness fast; shape-agnostic check).
+        {
+            const Q: usize = 1024;
+            let wq = synth_weight(&mut gpu, Q, K, 0x3333);
+            let wk = synth_weight(&mut gpu, Q, K, 0x4444);
+            let wv = synth_weight(&mut gpu, Q, K, 0x5555);
+            for &n in &[384usize, 511, 512] {
+                let x = f32_input(&mut gpu, n, K, 0xdeadbeef);
+                for &bt in &[4usize, 12] {
+                    let yq = zero_f32(&mut gpu, n * Q);
+                    let yk = zero_f32(&mut gpu, n * Q);
+                    let yv = zero_f32(&mut gpu, n * Q);
+                    let lq = zero_f32(&mut gpu, n * Q);
+                    let lk = zero_f32(&mut gpu, n * Q);
+                    let lv = zero_f32(&mut gpu, n * Q);
+                    gpu.gemm_qkv_mq4g256v2_wmma_gfx1100_bt(
+                        &wq, &wk, &wv, &x, &yq, &yk, &yv, Q, Q, Q, K, n, bt,
+                    )
+                    .expect("uniform warmup");
+                    gpu.gemm_qkv_mq4g256v2_wmma_gfx1100_bt_lloyd(
+                        &wq, &wk, &wv, &x, &lq, &lk, &lv, Q, Q, Q, K, n, bt, luts3,
+                    )
+                    .expect("lloyd warmup");
+                    gpu.hip.device_synchronize().expect("sync");
+                    let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
+                        if is_lloyd {
+                            gpu.gemm_qkv_mq4g256v2_wmma_gfx1100_bt_lloyd(
+                                &wq, &wk, &wv, &x, &lq, &lk, &lv, Q, Q, Q, K, n, bt, luts3,
+                            )
+                            .expect("lloyd");
+                            gpu.hip.device_synchronize().expect("iter sync");
+                        } else {
+                            gpu.gemm_qkv_mq4g256v2_wmma_gfx1100_bt(
+                                &wq, &wk, &wv, &x, &yq, &yk, &yv, Q, Q, Q, K, n, bt,
+                            )
+                            .expect("uniform");
+                            gpu.hip.device_synchronize().expect("iter sync");
+                        }
+                    });
+                    let mut a = gpu.download_f32(&yq).expect("dl");
+                    a.extend_from_slice(&gpu.download_f32(&yk).expect("dl"));
+                    a.extend_from_slice(&gpu.download_f32(&yv).expect("dl"));
+                    let mut b = gpu.download_f32(&lq).expect("dl");
+                    b.extend_from_slice(&gpu.download_f32(&lk).expect("dl"));
+                    b.extend_from_slice(&gpu.download_f32(&lv).expect("dl"));
+                    report(&gpu, ("qkv", n, bt), tu, tl, (&a, &b));
+                }
+            }
+        }
+
+        // QKVZA: qkv=1024, z=beta=alpha=256.
+        {
+            const QM: usize = 1024;
+            const Z: usize = 256;
+            let wq = synth_weight(&mut gpu, QM, K, 0x6666);
+            let wz = synth_weight(&mut gpu, Z, K, 0x7777);
+            let wb = synth_weight(&mut gpu, Z, K, 0x8888);
+            let wa = synth_weight(&mut gpu, Z, K, 0x9999);
+            for &n in &[384usize, 511, 512] {
+                let x = f32_input(&mut gpu, n, K, 0xdeadbeef);
+                for &bt in &[4usize, 12] {
+                    let yq = zero_f32(&mut gpu, n * QM);
+                    let yz = zero_f32(&mut gpu, n * Z);
+                    let yb = zero_f32(&mut gpu, n * Z);
+                    let ya = zero_f32(&mut gpu, n * Z);
+                    let lq = zero_f32(&mut gpu, n * QM);
+                    let lz = zero_f32(&mut gpu, n * Z);
+                    let lb = zero_f32(&mut gpu, n * Z);
+                    let la = zero_f32(&mut gpu, n * Z);
+                    gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt(
+                        &wq, &wz, &wb, &wa, &x, &yq, &yz, &yb, &ya, QM, Z, Z, Z, K, n, bt,
+                    )
+                    .expect("uniform warmup");
+                    gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt_lloyd(
+                        &wq, &wz, &wb, &wa, &x, &lq, &lz, &lb, &la, QM, Z, Z, Z, K, n, bt, luts4,
+                    )
+                    .expect("lloyd warmup");
+                    gpu.hip.device_synchronize().expect("sync");
+                    let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
+                        if is_lloyd {
+                            gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt_lloyd(
+                                &wq, &wz, &wb, &wa, &x, &lq, &lz, &lb, &la, QM, Z, Z, Z, K, n, bt,
+                                luts4,
+                            )
+                            .expect("lloyd");
+                            gpu.hip.device_synchronize().expect("iter sync");
+                        } else {
+                            gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt(
+                                &wq, &wz, &wb, &wa, &x, &yq, &yz, &yb, &ya, QM, Z, Z, Z, K, n, bt,
+                            )
+                            .expect("uniform");
+                            gpu.hip.device_synchronize().expect("iter sync");
+                        }
+                    });
+                    let mut a = gpu.download_f32(&yq).expect("dl");
+                    a.extend_from_slice(&gpu.download_f32(&yz).expect("dl"));
+                    a.extend_from_slice(&gpu.download_f32(&yb).expect("dl"));
+                    a.extend_from_slice(&gpu.download_f32(&ya).expect("dl"));
+                    let mut b = gpu.download_f32(&lq).expect("dl");
+                    b.extend_from_slice(&gpu.download_f32(&lz).expect("dl"));
+                    b.extend_from_slice(&gpu.download_f32(&lb).expect("dl"));
+                    b.extend_from_slice(&gpu.download_f32(&la).expect("dl"));
+                    report(&gpu, ("qkvza", n, bt), tu, tl, (&a, &b));
+                }
+            }
+        }
+    } // end if !only_small
+
+    // Small-N decider (real dense dims): uniform base vs uniform BT4 vs
+    // Lloyd BT1 at N=24. Settles whether the F16-BT structure (masking,
+    // sb-indirection) or the LUT itself costs the end-to-end gap.
     {
         const M: usize = 5120;
-        let w = synth_weight(&mut gpu, M, 0x12345678);
-        for &n in &[384usize, 511, 512] {
-            let x = f32_input(&mut gpu, n, 0xdeadbeef);
-            for &bt in &[4usize, 6, 8] {
-                let yu = zero_f32(&mut gpu, n * M);
-                let yl = zero_f32(&mut gpu, n * M);
-                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt(&w, &x, &yu, M, K, n, bt)
-                    .expect("uniform warmup");
-                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(&w, &x, &yl, M, K, n, bt, lut)
-                    .expect("lloyd warmup");
-                gpu.hip.device_synchronize().expect("sync");
-                let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
-                    if is_lloyd {
-                        gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(
-                            &w, &x, &yl, M, K, n, bt, lut,
-                        )
-                        .expect("lloyd");
-                        gpu.hip.device_synchronize().expect("iter sync");
-                    } else {
-                        gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt(&w, &x, &yu, M, K, n, bt)
-                            .expect("uniform");
-                        gpu.hip.device_synchronize().expect("iter sync");
-                    }
-                });
-                let a = gpu.download_f32(&yu).expect("dl u");
-                let b = gpu.download_f32(&yl).expect("dl l");
-                report(&gpu, ("residual", n, bt), tu, tl, (&a, &b));
+        const KK: usize = 5120;
+        const N: usize = 24;
+        let lut1 = identity_lut();
+        let w = synth_weight(&mut gpu, M, KK, 0xabcd);
+        let x = f32_input(&mut gpu, N, KK, 0xdcba);
+        // Zero all outputs (residual add accumulates). Correctness first:
+        // one timed shot each is compared bit-wise below after the perf loop.
+        let yu = zero_f32(&mut gpu, N * M);
+        let yl = zero_f32(&mut gpu, N * M);
+        let yb = zero_f32(&mut gpu, N * M);
+        gpu.gemm_mq4g256v2_residual_wmma_base(&w, &x, &yu, M, KK, N)
+            .expect("uniform warmup");
+        gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(&w, &x, &yl, M, KK, N, 1, lut1)
+            .expect("lloyd warmup");
+        gpu.gemm_mq4g256v2_residual_wmma_base(&w, &x, &yb, M, KK, N)
+            .expect("base warmup");
+        gpu.hip.device_synchronize().expect("sync");
+        let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
+            if is_lloyd {
+                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(&w, &x, &yl, M, KK, N, 1, lut1)
+                    .expect("lloyd");
+                gpu.hip.device_synchronize().expect("iter sync");
+            } else {
+                gpu.gemm_mq4g256v2_residual_wmma_base(&w, &x, &yu, M, KK, N)
+                    .expect("uniform");
+                gpu.hip.device_synchronize().expect("iter sync");
             }
-        }
-    }
-
-    // Gate/up: gate=up=5120.
-    {
-        const G: usize = 5120;
-        const U: usize = 5120;
-        let wg = synth_weight(&mut gpu, G, 0x1111);
-        let wu = synth_weight(&mut gpu, U, 0x2222);
-        for &n in &[384usize, 511, 512] {
-            let x = f32_input(&mut gpu, n, 0xdeadbeef);
-            for &bt in &[6usize, 12] {
-                let yg = zero_f32(&mut gpu, n * G);
-                let yu = zero_f32(&mut gpu, n * U);
-                let lg = zero_f32(&mut gpu, n * G);
-                let lu = zero_f32(&mut gpu, n * U);
-                gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt(&wg, &wu, &x, &yg, &yu, G, U, K, n, bt)
-                    .expect("uniform warmup");
-                gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt_lloyd(
-                    &wg, &wu, &x, &lg, &lu, G, U, K, n, bt, lut, lut,
-                )
-                .expect("lloyd warmup");
-                gpu.hip.device_synchronize().expect("sync");
-                let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
-                    if is_lloyd {
-                        gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt_lloyd(
-                            &wg, &wu, &x, &lg, &lu, G, U, K, n, bt, lut, lut,
-                        )
-                        .expect("lloyd");
-                        gpu.hip.device_synchronize().expect("iter sync");
-                    } else {
-                        gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_bt(
-                            &wg, &wu, &x, &yg, &yu, G, U, K, n, bt,
-                        )
-                        .expect("uniform");
-                        gpu.hip.device_synchronize().expect("iter sync");
-                    }
-                });
-                let mut a = gpu.download_f32(&yg).expect("dl ug");
-                a.extend_from_slice(&gpu.download_f32(&yu).expect("dl uu"));
-                let mut b = gpu.download_f32(&lg).expect("dl lg");
-                b.extend_from_slice(&gpu.download_f32(&lu).expect("dl lu"));
-                report(&gpu, ("gate_up", n, bt), tu, tl, (&a, &b));
+        });
+        let a = gpu.download_f32(&yu).expect("dl u");
+        let b = gpu.download_f32(&yl).expect("dl l");
+        report(&gpu, ("resid24-base", N, 1), tu, tl, (&a, &b));
+        // Same grid, uniform arithmetic both arms: isolates BT structure cost.
+        let ybt = zero_f32(&mut gpu, N * M);
+        let ybu = zero_f32(&mut gpu, N * M);
+        gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt(&w, &x, &ybt, M, KK, N, 4)
+            .expect("bt warmup");
+        gpu.gemm_mq4g256v2_residual_wmma_base(&w, &x, &ybu, M, KK, N)
+            .expect("base warmup");
+        gpu.hip.device_synchronize().expect("sync");
+        let (tt, tb2) = time_paired(ITERS, |is_bt: bool| {
+            if is_bt {
+                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt(&w, &x, &ybt, M, KK, N, 4)
+                    .expect("bt");
+                gpu.hip.device_synchronize().expect("iter sync");
+            } else {
+                gpu.gemm_mq4g256v2_residual_wmma_base(&w, &x, &ybu, M, KK, N)
+                    .expect("base");
+                gpu.hip.device_synchronize().expect("iter sync");
             }
-        }
-    }
-
-    // QKV: q=k=v=1024 (small, keeps the harness fast; shape-agnostic check).
-    {
-        const Q: usize = 1024;
-        let wq = synth_weight(&mut gpu, Q, 0x3333);
-        let wk = synth_weight(&mut gpu, Q, 0x4444);
-        let wv = synth_weight(&mut gpu, Q, 0x5555);
-        for &n in &[384usize, 511, 512] {
-            let x = f32_input(&mut gpu, n, 0xdeadbeef);
-            for &bt in &[4usize, 12] {
-                let yq = zero_f32(&mut gpu, n * Q);
-                let yk = zero_f32(&mut gpu, n * Q);
-                let yv = zero_f32(&mut gpu, n * Q);
-                let lq = zero_f32(&mut gpu, n * Q);
-                let lk = zero_f32(&mut gpu, n * Q);
-                let lv = zero_f32(&mut gpu, n * Q);
-                gpu.gemm_qkv_mq4g256v2_wmma_gfx1100_bt(
-                    &wq, &wk, &wv, &x, &yq, &yk, &yv, Q, Q, Q, K, n, bt,
-                )
-                .expect("uniform warmup");
-                gpu.gemm_qkv_mq4g256v2_wmma_gfx1100_bt_lloyd(
-                    &wq, &wk, &wv, &x, &lq, &lk, &lv, Q, Q, Q, K, n, bt, luts3,
-                )
-                .expect("lloyd warmup");
-                gpu.hip.device_synchronize().expect("sync");
-                let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
-                    if is_lloyd {
-                        gpu.gemm_qkv_mq4g256v2_wmma_gfx1100_bt_lloyd(
-                            &wq, &wk, &wv, &x, &lq, &lk, &lv, Q, Q, Q, K, n, bt, luts3,
-                        )
-                        .expect("lloyd");
-                        gpu.hip.device_synchronize().expect("iter sync");
-                    } else {
-                        gpu.gemm_qkv_mq4g256v2_wmma_gfx1100_bt(
-                            &wq, &wk, &wv, &x, &yq, &yk, &yv, Q, Q, Q, K, n, bt,
-                        )
-                        .expect("uniform");
-                        gpu.hip.device_synchronize().expect("iter sync");
-                    }
-                });
-                let mut a = gpu.download_f32(&yq).expect("dl");
-                a.extend_from_slice(&gpu.download_f32(&yk).expect("dl"));
-                a.extend_from_slice(&gpu.download_f32(&yv).expect("dl"));
-                let mut b = gpu.download_f32(&lq).expect("dl");
-                b.extend_from_slice(&gpu.download_f32(&lk).expect("dl"));
-                b.extend_from_slice(&gpu.download_f32(&lv).expect("dl"));
-                report(&gpu, ("qkv", n, bt), tu, tl, (&a, &b));
+        });
+        let _ = (tt, tb2);
+        eprintln!("residual N=24 structure check: uniform-bt4 {tt:.6}s uniform-base {tb2:.6}s");
+        // Same BT4 tile both arms: isolates the LUT path cost at small N.
+        let yl4 = zero_f32(&mut gpu, N * M);
+        let yu4 = zero_f32(&mut gpu, N * M);
+        gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(&w, &x, &yl4, M, KK, N, 4, lut1)
+            .expect("lloyd-bt4 warmup");
+        gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt(&w, &x, &yu4, M, KK, N, 4)
+            .expect("uniform-bt4 warmup");
+        gpu.hip.device_synchronize().expect("sync");
+        let (tu4, tl4) = time_paired(ITERS, |is_lloyd: bool| {
+            if is_lloyd {
+                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt_lloyd(&w, &x, &yl4, M, KK, N, 4, lut1)
+                    .expect("lloyd");
+                gpu.hip.device_synchronize().expect("iter sync");
+            } else {
+                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_bt(&w, &x, &yu4, M, KK, N, 4)
+                    .expect("uniform");
+                gpu.hip.device_synchronize().expect("iter sync");
             }
-        }
-    }
-
-    // QKVZA: qkv=1024, z=beta=alpha=256.
-    {
-        const QM: usize = 1024;
-        const Z: usize = 256;
-        let wq = synth_weight(&mut gpu, QM, 0x6666);
-        let wz = synth_weight(&mut gpu, Z, 0x7777);
-        let wb = synth_weight(&mut gpu, Z, 0x8888);
-        let wa = synth_weight(&mut gpu, Z, 0x9999);
-        for &n in &[384usize, 511, 512] {
-            let x = f32_input(&mut gpu, n, 0xdeadbeef);
-            for &bt in &[4usize, 12] {
-                let yq = zero_f32(&mut gpu, n * QM);
-                let yz = zero_f32(&mut gpu, n * Z);
-                let yb = zero_f32(&mut gpu, n * Z);
-                let ya = zero_f32(&mut gpu, n * Z);
-                let lq = zero_f32(&mut gpu, n * QM);
-                let lz = zero_f32(&mut gpu, n * Z);
-                let lb = zero_f32(&mut gpu, n * Z);
-                let la = zero_f32(&mut gpu, n * Z);
-                gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt(
-                    &wq, &wz, &wb, &wa, &x, &yq, &yz, &yb, &ya, QM, Z, Z, Z, K, n, bt,
-                )
-                .expect("uniform warmup");
-                gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt_lloyd(
-                    &wq, &wz, &wb, &wa, &x, &lq, &lz, &lb, &la, QM, Z, Z, Z, K, n, bt, luts4,
-                )
-                .expect("lloyd warmup");
-                gpu.hip.device_synchronize().expect("sync");
-                let (tu, tl) = time_paired(ITERS, |is_lloyd: bool| {
-                    if is_lloyd {
-                        gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt_lloyd(
-                            &wq, &wz, &wb, &wa, &x, &lq, &lz, &lb, &la, QM, Z, Z, Z, K, n, bt,
-                            luts4,
-                        )
-                        .expect("lloyd");
-                        gpu.hip.device_synchronize().expect("iter sync");
-                    } else {
-                        gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt(
-                            &wq, &wz, &wb, &wa, &x, &yq, &yz, &yb, &ya, QM, Z, Z, Z, K, n, bt,
-                        )
-                        .expect("uniform");
-                        gpu.hip.device_synchronize().expect("iter sync");
-                    }
-                });
-                let mut a = gpu.download_f32(&yq).expect("dl");
-                a.extend_from_slice(&gpu.download_f32(&yz).expect("dl"));
-                a.extend_from_slice(&gpu.download_f32(&yb).expect("dl"));
-                a.extend_from_slice(&gpu.download_f32(&ya).expect("dl"));
-                let mut b = gpu.download_f32(&lq).expect("dl");
-                b.extend_from_slice(&gpu.download_f32(&lz).expect("dl"));
-                b.extend_from_slice(&gpu.download_f32(&lb).expect("dl"));
-                b.extend_from_slice(&gpu.download_f32(&la).expect("dl"));
-                report(&gpu, ("qkvza", n, bt), tu, tl, (&a, &b));
-            }
-        }
+        });
+        let e = gpu.download_f32(&yl4).expect("dl l4");
+        let f = gpu.download_f32(&yu4).expect("dl u4");
+        let same4 = e == f;
+        eprintln!(
+            "residual N=24 bt4-vs-bt4: uniform {tu4:.6}s lloyd {tl4:.6}s bit-identical {same4}"
+        );
     }
 }
