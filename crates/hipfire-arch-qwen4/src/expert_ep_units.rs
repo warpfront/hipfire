@@ -3281,7 +3281,21 @@ mod loader_support_tests {
                 .unwrap();
                 assert_eq!(
                     ep_unit_host_bytes_ranks(&weights, bytes_of, &plan).unwrap(),
-                    host_mapped_bytes_ranks(&weights, bytes_of, ranks).unwrap(),
+                    host_mapped_bytes_ranks(
+                        &weights,
+                        bytes_of,
+                        &crate::expert_residency::EpExpertSpans::new(
+                            512,
+                            (0..ranks)
+                                .map(|rank| {
+                                    crate::weights::Qwen4EpPlacement { rank, ranks }
+                                        .local_count(512)
+                                })
+                                .collect(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
                     "ranks {ranks} vram_layers {vram_layers}"
                 );
             }
