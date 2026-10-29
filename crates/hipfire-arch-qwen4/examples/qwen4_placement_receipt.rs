@@ -563,9 +563,8 @@ fn real_main() -> R<bool> {
             .map(|(_, bytes)| bytes.len() as u64)
     };
     let weights = receipt.manifest.weights.clone();
-    let (non_expert, layer_experts) =
-        residency::resident_split_ranks(&weights, &bytes_of, 1).map_err(e)?;
-    let routed = residency::routed_expert_bytes_ranks(&weights, &bytes_of, 1).map_err(e)?;
+    let (non_expert, layer_experts) = residency::resident_split(&weights, &bytes_of).map_err(e)?;
+    let routed = residency::routed_expert_bytes(&weights, &bytes_of).map_err(e)?;
     let fixture = Fixture {
         config: &receipt.config,
         weights: &weights,

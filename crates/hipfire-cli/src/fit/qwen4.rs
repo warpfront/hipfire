@@ -75,8 +75,8 @@ fn analyze_inventory(req: &Qwen4Request<'_>) -> Result<ArchFit, String> {
             .map(|info| info.data_size as u64)
     };
     let (non_expert, layer_experts) =
-        residency::resident_split_ranks(&receipt.manifest.weights, bytes_of, 1)?;
-    let experts = residency::routed_expert_bytes_ranks(&receipt.manifest.weights, bytes_of, 1)?;
+        residency::resident_split(&receipt.manifest.weights, bytes_of)?;
+    let experts = residency::routed_expert_bytes(&receipt.manifest.weights, bytes_of)?;
     let explicit = residency::expert_vram_layers_from_env()?;
     // This invokes the same pin-wins policy without pretending to know whether
     // a lower-bound resident fit is the final resident fit.
@@ -140,13 +140,16 @@ fn analyze_inventory(req: &Qwen4Request<'_>) -> Result<ArchFit, String> {
     // expert payload alone is not a sound upper bound for a host-side FITS.
     let pinned_host = if let Some(layers) = pinned {
         residency::place_routed_experts(&mut receipt.manifest.weights, layers);
-        Some(residency::host_mapped_bytes_ranks(&receipt.manifest.weights, bytes_of, 1)?[0])
+        Some(residency::host_mapped_bytes(
+            &receipt.manifest.weights,
+            bytes_of,
+        )?)
     } else {
         None
     };
     residency::place_routed_experts(&mut receipt.manifest.weights, 0);
-    let all_host = residency::host_mapped_bytes_ranks(&receipt.manifest.weights, bytes_of, 1)?[0];
-    details.push("Host upper bound and pinned charges use place_routed_experts + host_mapped_bytes_ranks, including the engine's per-entry allocation padding; automatic host lower bounds omit padding and donor restore mirrors (expert_residency.rs:2044-2057,2125-2143,2146-2154).".into());
+    let all_host = residency::host_mapped_bytes(&receipt.manifest.weights, bytes_of)?;
+    details.push("Host upper bound and pinned charges use place_routed_experts + host_mapped_bytes, including the engine's per-entry allocation padding; automatic host lower bounds omit padding and donor restore mirrors (expert_residency.rs:2044-2057,2125-2143,2146-2154).".into());
     let inv = Inventory {
         non_expert,
         experts,
