@@ -83,6 +83,7 @@ pub(crate) mod projection;
 pub mod reference_forward;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod reference_mtp;
+pub mod sampled_lane;
 pub mod slowlink_admission;
 /// Admission-first single-device load shared by the S1 validation tools ONLY
 /// (gated `test` / `lab` / `reference-parity`): the product carrier never
