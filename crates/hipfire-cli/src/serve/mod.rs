@@ -182,6 +182,14 @@ pub(crate) struct RequestModelPolicy {
     pub(crate) allow_paths: bool,
     /// The operator's pre-warm model, which requests may always name.
     pub(crate) operator_model: Option<String>,
+    /// That model resolved the way the prewarm resolved it. `operator_model`
+    /// alone is not enough: a name that resolves only relative to the serve's
+    /// CWD (a bind-mounted HF snapshot directory, as the deploy container
+    /// mounts one at `/`), or an out-of-tree path, is invisible to
+    /// `find_local_model_path` — so the idle-unload reload of such an operator
+    /// model was refused ("a request may name only installed models") until
+    /// this path was carried next to it.
+    pub(crate) operator_path: Option<PathBuf>,
 }
 
 pub(crate) fn finish_prewarm(meta: &mut ServeMeta, succeeded: bool) {
@@ -219,6 +227,52 @@ pub(crate) fn prewarm(
         Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
     }
     Ok(())
+}
+
+/// Resolve the idle eviction timeout: `--idle-timeout` wins over
+/// `serve.idle_timeout_seconds` (`HIPFIRE_IDLE_TIMEOUT`, default 300 s), and
+/// `0` means the resident model is never unloaded.
+///
+/// Returns the timeout and the startup lines to print. The flag bypasses the
+/// schema's `0..=86400` rule, so it is validated here; and because `0` on the
+/// flag silently overrides an explicitly configured (or env-supplied) timeout,
+/// that case says so out loud — an operator who sets `HIPFIRE_IDLE_TIMEOUT=900`
+/// while the service command still carries `--idle-timeout=0` otherwise sees a
+/// serve that never evicts with nothing in the log to explain it. `configured`
+/// being explicit is what separates that mistake from a deliberate `0` over the
+/// built-in 300 s default.
+fn resolve_idle_timeout(
+    flag: Option<u64>,
+    configured: u64,
+    configured_explicit: bool,
+) -> Result<(u64, Vec<String>)> {
+    if let Some(seconds) = flag {
+        if seconds > 86_400 {
+            bail!("--idle-timeout must be 0..=86400 seconds (0 disables eviction), got {seconds}");
+        }
+    }
+    let seconds = flag.unwrap_or(configured);
+    let mut notices = Vec::new();
+    if flag == Some(0) && configured != 0 && configured_explicit {
+        notices.push(format!(
+            "[hipfire] --idle-timeout=0 disables idle eviction and overrides \
+             serve.idle_timeout_seconds={configured} (config.toml or HIPFIRE_IDLE_TIMEOUT); \
+             drop the flag to use {configured}s"
+        ));
+    }
+    // Name where the value came from: a serve that never unloads is a policy,
+    // and the next sighting of "it unloaded anyway" must not need a code read.
+    let source = if flag.is_some() {
+        "--idle-timeout"
+    } else {
+        "serve.idle_timeout_seconds"
+    };
+    notices.push(if seconds == 0 {
+        format!("[hipfire] idle eviction: off ({source}=0; the resident model is never unloaded)")
+    } else {
+        format!("[hipfire] idle eviction: {seconds}s ({source})")
+    });
+    Ok((seconds, notices))
 }
 
 pub(crate) fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bool {
@@ -1834,11 +1888,22 @@ pub(crate) fn serve_foreground(
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
     // Started for the pre-warm model, when it is on disk.
-    let prewarm_path = if args.no_prewarm {
+    // Resolved once for both the prewarm and the request policy: a request
+    // that names the operator model reloads exactly this artifact after an
+    // idle unload (`request_may_load`).
+    //
+    // `--no-prewarm` starts no model, so startup must not depend on resolving
+    // one: a retired tag or an absent file is not this serve's problem until a
+    // request names it (the request-time answer stays "a request may name only
+    // installed models"). Resolving at startup would also run the Flash-Next /
+    // split-base migration and its sha verification, which a no-prewarm start
+    // must not do.
+    let operator_path: Option<PathBuf> = if args.no_prewarm {
         None
     } else {
         crate::resolve_model_path(paths, &registry, &default_model)?
     };
+    let prewarm_path = operator_path.clone();
     let engine = spawner.spawn(prewarm_path.as_deref())?;
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
     let max_queue = config_u64(&global, "serve.max_queue")? as usize;
@@ -1962,14 +2027,24 @@ pub(crate) fn serve_foreground(
     }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
     let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
-    let idle_timeout = Duration::from_secs(
-        args.idle_timeout
-            .unwrap_or(config_u64(&global, "serve.idle_timeout_seconds")?),
-    );
+    let configured_idle = config_u64(&global, "serve.idle_timeout_seconds")?;
+    // Only an *explicit* configured timeout is worth overriding out loud; the
+    // built-in 300 s default is not a choice anyone made, and a deployment
+    // that turns eviction off on purpose must not log a warning per start.
+    let configured_idle_explicit = global
+        .get("serve.idle_timeout_seconds")
+        .is_some_and(|entry| !matches!(entry.source, ConfigSource::BuiltIn));
+    let (idle_seconds, idle_notices) =
+        resolve_idle_timeout(args.idle_timeout, configured_idle, configured_idle_explicit)?;
+    for notice in &idle_notices {
+        eprintln!("{notice}");
+    }
+    let idle_timeout = Duration::from_secs(idle_seconds);
     let request_policy = RequestModelPolicy {
         allow_pull: config_bool(&global, "serve.allow_request_pull")?,
         allow_paths: config_bool(&global, "serve.allow_request_paths")?,
         operator_model: Some(default_model.clone()),
+        operator_path,
     };
     // `--open` implies `--ui`: the launcher promise is meaningless without
     // the route. Config/env (`serve.ui` / HIPFIRE_SERVE_UI) also enables it.
@@ -2659,20 +2734,38 @@ impl ServeRuntime {
     /// included), the resolved registry artifact, paths registered in the
     /// model catalog, and the pre-warm model.
     fn request_may_load(&self, path: &Path, entry: Option<&hipfire_registry::ModelEntry>) -> bool {
-        if self.request_policy.allow_paths {
+        Self::allowed_request_load(
+            &self.request_policy,
+            &self.paths,
+            &self.registry,
+            path,
+            entry,
+        )
+    }
+
+    /// [`ServeRuntime::request_may_load`] without the runtime, so the
+    /// operator-model exemption is testable on its own.
+    fn allowed_request_load(
+        policy: &RequestModelPolicy,
+        paths: &Paths,
+        registry: &RegistryV1,
+        path: &Path,
+        entry: Option<&hipfire_registry::ModelEntry>,
+    ) -> bool {
+        if policy.allow_paths {
             return true;
         }
         let Ok(target) = fs::canonicalize(path) else {
             return false;
         };
         let same = |candidate: &Path| crate::same_installed_file(candidate, &target);
-        fs::canonicalize(&self.paths.models).is_ok_and(|models| target.starts_with(models))
-            || entry.is_some_and(|entry| same(&self.paths.models.join(&entry.file)))
-            || crate::local_model_paths(&self.paths, &self.registry)
+        fs::canonicalize(&paths.models).is_ok_and(|models| target.starts_with(models))
+            || entry.is_some_and(|entry| same(&paths.models.join(&entry.file)))
+            || crate::local_model_paths(paths, registry)
                 .unwrap_or_default()
                 .iter()
                 .any(|candidate| same(candidate))
-            || load_catalog(&self.paths.config).is_ok_and(|catalog| {
+            || load_catalog(&paths.config).is_ok_and(|catalog| {
                 catalog
                     .catalog
                     .models
@@ -2680,11 +2773,14 @@ impl ServeRuntime {
                     .filter_map(|record| record.path.as_deref())
                     .any(same)
             })
-            || self
-                .request_policy
+            || policy
+                .operator_path
+                .as_deref()
+                .is_some_and(|operator| same(operator))
+            || policy
                 .operator_model
                 .as_deref()
-                .and_then(|model| crate::find_local_model_path(&self.paths, &self.registry, model))
+                .and_then(|model| crate::find_local_model_path(paths, registry, model))
                 .is_some_and(|operator| same(&operator))
     }
 
@@ -3242,6 +3338,111 @@ mod tests {
             last_activity: Instant::now() - Duration::from_secs(600),
             ..ServeMeta::new("test".to_owned())
         }
+    }
+
+    /// A request may reload the operator's model only if it may *load* it, and
+    /// the operator exemption must use the path the prewarm resolved: a model
+    /// the operator named relative to the serve CWD (the deploy container
+    /// bind-mounts an HF snapshot directory at `/` and serves it as
+    /// `pplx-embed-v2-late`) is invisible to `find_local_model_path`, so an
+    /// idle unload made the model unreachable for every later request.
+    #[test]
+    fn operator_model_reload_is_allowed_outside_the_models_directory() {
+        let paths = test_paths("request-load-operator-path");
+        fs::create_dir_all(&paths.models).unwrap();
+        let outside = paths.root.join("bind-mounted-model");
+        let other = paths.root.join("another-model");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+        let policy = |operator: Option<&Path>, allow_paths: bool| RequestModelPolicy {
+            allow_pull: false,
+            allow_paths,
+            operator_model: operator.map(|_| "bind-mounted-model".to_owned()),
+            operator_path: operator.map(Path::to_path_buf),
+        };
+
+        // Without the resolved operator path the out-of-tree directory is
+        // refused; with it, the same path is the operator's own model.
+        assert!(!ServeRuntime::allowed_request_load(
+            &policy(None, false),
+            &paths,
+            &registry,
+            &outside,
+            None
+        ));
+        assert!(ServeRuntime::allowed_request_load(
+            &policy(Some(&fs::canonicalize(&outside).unwrap()), false),
+            &paths,
+            &registry,
+            &outside,
+            None
+        ));
+        // A different out-of-tree directory stays refused.
+        assert!(!ServeRuntime::allowed_request_load(
+            &policy(Some(&fs::canonicalize(&outside).unwrap()), false),
+            &paths,
+            &registry,
+            &other,
+            None
+        ));
+        // `serve.allow_request_paths` still permits anything readable.
+        assert!(ServeRuntime::allowed_request_load(
+            &policy(None, true),
+            &paths,
+            &registry,
+            &other,
+            None
+        ));
+    }
+
+    /// The flag wins, `0` disables, an out-of-range flag names its bound, and
+    /// a flag `0` over a configured timeout is never silent.
+    #[test]
+    fn idle_timeout_resolution_explains_the_effective_value() {
+        let (seconds, notes) = super::resolve_idle_timeout(None, 300, false).unwrap();
+        assert_eq!(seconds, 300);
+        assert_eq!(
+            notes,
+            vec!["[hipfire] idle eviction: 300s (serve.idle_timeout_seconds)".to_string()]
+        );
+
+        let (seconds, notes) = super::resolve_idle_timeout(Some(45), 300, false).unwrap();
+        assert_eq!(seconds, 45);
+        assert_eq!(
+            notes,
+            vec!["[hipfire] idle eviction: 45s (--idle-timeout)".to_string()]
+        );
+
+        let (seconds, notes) = super::resolve_idle_timeout(None, 0, true).unwrap();
+        assert_eq!(seconds, 0);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("off"), "{notes:?}");
+
+        // An explicit `0` over the *built-in* 300 s default is a policy, not a
+        // mistake: one informational line, no warning.
+        let (seconds, notes) = super::resolve_idle_timeout(Some(0), 300, false).unwrap();
+        assert_eq!(seconds, 0);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(!notes[0].contains("overrides"), "{notes:?}");
+        assert!(notes[0].contains("off"), "{notes:?}");
+        assert!(notes[0].contains("--idle-timeout=0"), "{notes:?}");
+
+        // An explicit `0` over an explicitly configured timeout says so.
+        let (seconds, notes) = super::resolve_idle_timeout(Some(0), 900, true).unwrap();
+        assert_eq!(seconds, 0);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("--idle-timeout=0"), "{notes:?}");
+        assert!(notes[0].contains("HIPFIRE_IDLE_TIMEOUT"), "{notes:?}");
+        assert!(notes[0].contains("900"), "{notes:?}");
+        assert!(notes[1].contains("off"), "{notes:?}");
+
+        // `--idle-timeout=0` over a config that is already 0 is not a conflict.
+        let (_, notes) = super::resolve_idle_timeout(Some(0), 0, true).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+
+        let error = super::resolve_idle_timeout(Some(86_401), 300, false).unwrap_err();
+        assert!(error.to_string().contains("86400"), "{error}");
     }
 
     #[test]
@@ -4355,6 +4556,7 @@ mod tests {
                 allow_pull: false,
                 allow_paths: false,
                 operator_model: None,
+                operator_path: None,
             },
             max_batch_tokens: 4096,
         };
