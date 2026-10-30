@@ -67,6 +67,8 @@ pub(crate) mod lane_token_ring;
 pub mod measured_identity;
 pub mod measured_resources;
 pub mod mesh_bindings;
+/// Root-side copy lane and head-lag bookkeeping of the multicard lanes.
+pub mod mesh_lane_copy;
 /// Host-only speculative-window transaction of the multicard lanes (EP2/PP2).
 pub mod mesh_lane_protocol;
 pub mod mesh_tp;

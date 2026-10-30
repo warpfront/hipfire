@@ -89,6 +89,9 @@ pub(crate) struct LaneFlight {
     naive: Vec<Option<GreedyAccept>>,
     /// Row groups the forward executed.
     row_groups: usize,
+    /// Owed plus retained head rows the rank appended (the session's
+    /// accounting of the decision).
+    head_append_rows: usize,
     pub(crate) decision: Option<CommitDecision>,
     /// The rank's receipt and the controller interval of the step.
     pub(crate) evidence: Option<(RankCostEvidence, ControllerInterval)>,
@@ -171,6 +174,9 @@ impl LaneProto {
             } else {
                 crate::mesh_lane_protocol::HeadState::Aligned
             },
+            // Copy stays off on the single-card lanes.
+            copy: false,
+            head_lag: Vec::new(),
         };
         let admit = match a.promoted {
             Some((agreement, retired)) => self.root.admit_promoted(admission, agreement, retired),
@@ -495,6 +501,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                 picks: Vec::new(),
                 naive: Vec::new(),
                 row_groups: 0,
+                head_append_rows: 0,
                 decision: None,
                 evidence: None,
                 publish_error: None,
@@ -726,6 +733,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
             first += rows;
         }
         flight.decision = Some(decision.clone());
+        flight.head_append_rows = receipt.head_append_rows;
         Ok(receipt)
     }
 
@@ -776,13 +784,7 @@ impl LaneFlight {
     /// The rank's counts of a prepared step, from what it executed and the
     /// root's decision.
     pub(crate) fn counts(&self, decision: &CommitDecision) -> OpCounts {
-        let head_append_rows = decision
-            .lanes
-            .iter()
-            .zip(&self.start.lanes)
-            .filter(|(_, l)| l.head != crate::mesh_lane_protocol::HeadState::Free)
-            .map(|(d, _)| d.consumed_rows)
-            .sum();
+        let head_append_rows = self.head_append_rows;
         OpCounts {
             target_exchanges: 0,
             gather_bytes: 0,
@@ -885,7 +887,6 @@ fn plan_and_draft_with(
             epoch,
             remaining: budget + 1,
             context_left: budget + 1,
-            copy_candidates: Vec::new(),
             forced: None,
             sampling,
         })
@@ -897,6 +898,7 @@ fn plan_and_draft_with(
         copy_take_cap: 0,
         lab: store.routes(),
         pp_microbatch_lanes: None,
+        head_lag_rows: 0,
     };
     let LaneProto { root, rank, flight } = &mut *proto;
     let start = root
@@ -1030,6 +1032,7 @@ mod tests {
             copy_take_cap: 0,
             lab,
             pp_microbatch_lanes: None,
+            head_lag_rows: 0,
         }
     }
 
@@ -1066,6 +1069,8 @@ mod tests {
                     prompt: vec![1, 2, 3],
                     spec_k,
                     head: HeadState::Aligned,
+                    copy: false,
+                    head_lag: Vec::new(),
                 })
                 .unwrap();
             self.rank.admit_lane(&admit).unwrap();
@@ -1076,7 +1081,6 @@ mod tests {
                 epoch: epoch(tag),
                 remaining: budget + 1,
                 context_left: budget + 1,
-                copy_candidates: Vec::new(),
                 forced: None,
                 sampling: SamplingMode::Greedy,
             }
@@ -1556,6 +1560,8 @@ mod tests {
                     prompt: vec![1, 2],
                     spec_k: Some(K),
                     head: HeadState::Free,
+                    copy: false,
+                    head_lag: Vec::new(),
                 },
                 &[(0.5, 4.0); K],
                 true,

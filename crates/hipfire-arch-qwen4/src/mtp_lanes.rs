@@ -361,6 +361,86 @@ impl LaneSpecPolicy {
     }
 }
 
+/// The copy lane's view of the lane's own floor (`crate::mesh_lane_copy`):
+/// the same measured prices and AR comparator the singleton's copy chooser
+/// reads, in AR-row units. The native chooser and copy chooser stay
+/// distinct; copy windows are priced as external windows
+/// ([`Qwen4Floor::observe_external_copy`]) and never un-retire the lane.
+impl LaneSpecPolicy {
+    /// The floor's AR calibration (or a retirement probe) still has to run,
+    /// so the copy source must not take the window. A retired lane is past
+    /// calibration by definition (a promoted retired lane's floor is fresh
+    /// but its verdict is not). Lab route modes bypass the floor, as the
+    /// singleton's developer-forced route does.
+    pub(crate) fn copy_blocked(&self, lab: LabRoutes) -> bool {
+        self.floor_enabled
+            && lab == LabRoutes::Floor
+            && !self.retired()
+            && self.floor.needs_ar_sample()
+    }
+
+    /// Native window cost at `depth` drafts in AR-row units: the floor's
+    /// measurement/fit once probing finished, else the static table.
+    fn window_cost(&self, depth: usize) -> f32 {
+        if self.floor_enabled {
+            if let Some(cost) = self.floor.batched_cost(depth) {
+                return cost;
+            }
+        }
+        MTP_WINDOW_COST.get(depth).copied().unwrap_or(f32::INFINITY)
+    }
+
+    /// Best expected emitted tokens per unit of window cost the native
+    /// route offers within `k` drafts at the current agreement (the
+    /// interleaved route is 1.0).
+    pub(crate) fn native_rate(&self, k: usize) -> f32 {
+        let depths = k.min(self.max_k).min(self.agreement.len());
+        if self.floor_enabled {
+            if let Some(rate) = self.floor.candidate_rate(&self.agreement, depths) {
+                return rate;
+            }
+        }
+        let mut best = 1.0f32;
+        let mut prefix = 1.0f32;
+        let mut expected = 1.0f32;
+        for (i, &(accepted, total)) in self.agreement.iter().take(depths).enumerate() {
+            prefix *= accepted / total.max(f32::MIN_POSITIVE);
+            expected += prefix;
+            best = best.max(expected / self.window_cost(i + 1));
+        }
+        best
+    }
+
+    /// Window cost of a takeover of `d` candidates in AR-row units: this
+    /// request's measured takeover costs ([`Qwen4Floor::takeover_cost`]),
+    /// else the native window cost.
+    pub(crate) fn takeover_cost(&self, d: usize) -> f32 {
+        if self.floor_enabled {
+            if let Some(cost) = self.floor.takeover_cost(d) {
+                return cost;
+            }
+        }
+        self.window_cost(d)
+    }
+
+    /// One finished copy window (`drafts` offered, `emitted` committed,
+    /// `units` AR rows, NaN for an unpriced bind window). A retired floor
+    /// keeps pricing it and stays retired. Returns `true` when the copy
+    /// source must stop for the rest of the request (takeovers cost no less
+    /// per token than AR); never with the floor opted out.
+    pub(crate) fn observe_external_copy(
+        &mut self,
+        emitted: usize,
+        units: f32,
+        drafts: usize,
+    ) -> bool {
+        self.floor_enabled
+            && self
+                .floor
+                .observe_external_copy(emitted, units, drafts, &self.agreement)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pending window
 // ---------------------------------------------------------------------------

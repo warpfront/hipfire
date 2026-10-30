@@ -664,9 +664,9 @@ mod tests {
     use crate::lane::LabRoutes;
     use crate::lane_exec::LaneRoute;
     use crate::mesh_lane_protocol::{
-        run_mesh_step, CommitDecision, DraftRound, HeadState, LaneAdmission, LaneAdmit, LaneKind,
-        LaneMeshExecutor, LaneOutput, LaneRequest, MeshKind, MeshRoot, MeshStepKey,
-        PreparedReceipt, ProtocolError, RankCostEvidence, RankDraftResult, RankError,
+        run_mesh_step, CommitDecision, ConfirmOutcome, DraftRound, HeadState, LaneAdmission,
+        LaneAdmit, LaneKind, LaneMeshExecutor, LaneOutput, LaneRequest, MeshKind, MeshRoot,
+        MeshStepKey, PreparedReceipt, ProtocolError, RankCostEvidence, RankDraftResult, RankError,
         RankOwnership, RankReady, RankSession, RankVerifyResult, RootConfig, SourceAccounting,
         StagePolicy, StepPhase, VerifyPlan, WindowBudgets, WindowStart,
     };
@@ -754,6 +754,9 @@ mod tests {
             source,
             max_depth: 3,
             copy_drafts: Vec::new(),
+            copy_confirm: false,
+            native_depth: 3,
+            catch_up: None,
             sampling,
             eos,
             remaining: 1_000_000,
@@ -1471,6 +1474,7 @@ mod tests {
                         source: ProposalSource::Native,
                         offered: k,
                         accepted: acc.accepted,
+                        confirm: ConfirmOutcome::NotAsked,
                     },
                 }],
             };
@@ -1648,6 +1652,8 @@ mod tests {
         root: MeshRoot,
         ranks: Vec<SynthExec>,
         sampler: LaneSampler,
+        /// The root copy lane is armed on admitted lanes.
+        copy: bool,
     }
 
     #[derive(Clone)]
@@ -1698,7 +1704,24 @@ mod tests {
                 root,
                 ranks,
                 sampler,
+                copy: false,
             }
+        }
+
+        /// Arm the root's own copy lane (request-local copy contexts; the
+        /// driver supplies no candidates) on every lane admitted later.
+        fn with_copy(mut self) -> Self {
+            self.root = self
+                .root
+                .with_copy_lane(hipfire_runtime::ngram_mod::NgramModConfig {
+                    capacity: 1 << 10,
+                    n_match: 1,
+                    n_min: 1,
+                    n_max: 7,
+                })
+                .unwrap();
+            self.copy = true;
+            self
         }
 
         fn admit(
@@ -1720,6 +1743,8 @@ mod tests {
                     prompt: prompt.clone(),
                     spec_k,
                     head: HeadState::Aligned,
+                    copy: self.copy,
+                    head_lag: Vec::new(),
                 })
                 .unwrap();
             for r in &mut self.ranks {
@@ -1749,6 +1774,7 @@ mod tests {
                 copy_take_cap: 7,
                 lab: arm.lab,
                 pp_microbatch_lanes: None,
+                head_lag_rows: 4,
             };
             let reqs: Vec<LaneRequest> = lanes
                 .iter()
@@ -1756,7 +1782,6 @@ mod tests {
                     epoch: epoch(t),
                     remaining: 1_000_000,
                     context_left: 1_000_000,
-                    copy_candidates: arm.copy.clone(),
                     forced: None,
                     sampling: mode,
                 })
@@ -1786,6 +1811,9 @@ mod tests {
 
     fn run_arm(kind: MeshKind, arm: &Arm, tags: &[u64], steps: usize, order: &[u64]) -> ArmRun {
         let mut m = Mesh::with_floor(kind, tags, arm.lab == LabRoutes::Floor);
+        if !arm.copy.is_empty() {
+            m = m.with_copy();
+        }
         for &t in tags {
             m.admit(
                 t,
@@ -1955,12 +1983,12 @@ mod tests {
                 copy_take_cap: 7,
                 lab: arm.lab,
                 pp_microbatch_lanes: None,
+                head_lag_rows: 4,
             };
             let reqs = [LaneRequest {
                 epoch: epoch(1),
                 remaining: 1_000_000,
                 context_left: 1_000_000,
-                copy_candidates: Vec::new(),
                 forced: None,
                 sampling: SamplingMode::Greedy,
             }];
