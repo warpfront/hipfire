@@ -1117,9 +1117,25 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   stage policy. Every `G` and every policy must keep lane outputs
   byte-identical; the choice is a scheduling decision, not a numerical one,
   and no measured gain is claimed on this page.
-- **AR lanes only.** Native-MTP lanes are not staged under PP/EP
-  (`continuous_batch_spec = false`, `continuous_batch_spec_mode = "off"`),
-  whatever `speculation.mtp` requests.
+- **Native-MTP lanes: EP yes (explicit `--spec mtp`), PP no.** Under PP the
+  lanes are AR lanes (`continuous_batch_spec = false`,
+  `continuous_batch_spec_mode = "off"`), whatever `speculation.mtp` requests.
+  Under EP, with `serve.vmm_batch`, `serve.batch_spec` and the MTP head
+  attached (`--spec mtp`), concurrent greedy requests run as native-MTP lanes
+  with the singleton's default n-gram copy lane
+  (`speculation.mtp_ngram_copy`): rank 0 is the root and alone chooses every
+  window's route, depth and proposal source, reads the head's drafts and the
+  target picks and decides the accepted prefix; every rank replays the root's
+  ordered messages on its replicated lane store (`ep_mesh_lanes`), so each row
+  gather has a peer. The load reserves the spec lane store before it splits
+  the experts. The stage line reports `spec=mtp K=.. executor=ep-mesh
+  copy=on|off`; a store that does not fit is a labeled refusal and AR lanes
+  (`spec=off (...)`), never a narrower MTP store. `HIPFIRE_EP_MTP_LANES=0` is
+  the kill switch (EP lanes are AR lanes, as before) and `serve.batch_sampled`
+  keeps EP on AR lanes until the lane sampled oracle (>= 2000 trials) passes.
+  A lone request keeps the singleton MTP route; the floor retires a lane to AR
+  windows when native drafts do not pay (high concurrency). The daemon logs
+  each lane drive's route mix by step concurrency (`[fn-lane-mesh-mix]`).
 - **No promotion.** A running singleton request is never promoted into a lane
   under PP/EP (`continuous_batch_promotion = false`); on one card it is `true`.
 - **Stage-policy admission is per-stage proof rows.** Sharing is decided per

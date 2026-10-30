@@ -221,6 +221,11 @@ pub struct Qwen4Bundle {
     /// decode runs through the mesh protocol instead of the per-rank
     /// executor. Always `None` outside EP and for AR lane stores.
     pub(crate) mesh_lanes: Option<Box<crate::ep_mesh_lanes::EpMeshLanes>>,
+    /// When the last mesh decode step returned: a gap before the next step
+    /// longer than [`crate::ep_mesh_serve::MESH_PRICE_GAP`] (an idle serve
+    /// loop, not host emission work) makes that step's interval unusable as a
+    /// price.
+    pub(crate) mesh_last_end: Option<std::time::Instant>,
     /// Expert-parallel mesh (`attach_ep_mesh`): this bundle is rank 0 and every
     /// daemon-facing call is replicated on the peer ranks. `None` = single
     /// device (the default; no behaviour change).
@@ -918,6 +923,7 @@ impl Qwen4Bundle {
             state_format,
             lanes: None,
             mesh_lanes: None,
+            mesh_last_end: None,
             ep: None,
             pp: None,
             pp_band: None,

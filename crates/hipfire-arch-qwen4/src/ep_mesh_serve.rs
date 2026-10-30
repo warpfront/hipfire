@@ -31,6 +31,12 @@ use crate::mesh_lane_protocol::{
 };
 use hipfire_runtime::slot_batch::{RequestAdvance, RequestEpoch};
 use rdna_compute::Gpu;
+use std::time::{Duration, Instant};
+
+/// The longest host gap between two mesh decode steps that still counts as
+/// part of the step's price (emission, scheduling and admission work of one
+/// tick, not an idle loop).
+pub const MESH_PRICE_GAP: Duration = Duration::from_millis(100);
 
 /// One decoding lane of a mesh step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,7 +181,18 @@ impl Qwen4Bundle {
             .mesh_lanes
             .take()
             .ok_or_else(|| "EP mesh lanes are not armed".to_string())?;
+        // The previous step's price is the wall from its start to this
+        // step's plan. A serve loop that idled between the two (no decoding
+        // lane, a long admission) would train the cost model on that stall:
+        // such an interval is flagged like a prefill interval (unpriced).
+        if self
+            .mesh_last_end
+            .is_some_and(|end| end.elapsed() > MESH_PRICE_GAP)
+        {
+            mesh.note_prefill();
+        }
         let result = self.mesh_decode_step_with(&mut mesh, gpu, requests);
+        self.mesh_last_end = Some(Instant::now());
         self.mesh_lanes = Some(mesh);
         if result.is_err() {
             for request in requests {
