@@ -11295,6 +11295,17 @@ pub fn argmax_f32(gpu: &mut Gpu, p: &ArgmaxF32<'_>) -> HipResult<()> {
 /// [`argmax_f32`] of one logits row, read back: `llama::argmax(logits)`
 /// without downloading the row. Uses a lazily allocated 4-byte scratch.
 pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
+    argmax_f32_host_impl(gpu, logits, false)
+}
+
+/// [`argmax_f32_host`] for a decode loop that replays a graph on
+/// `Gpu::active_stream`: the 4-byte result is read back ordered on that stream
+/// ([`Gpu::download_f32_stream_ordered`]) instead of a blocking null-stream copy.
+pub fn argmax_f32_host_stream_ordered(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
+    argmax_f32_host_impl(gpu, logits, true)
+}
+
+fn argmax_f32_host_impl(gpu: &mut Gpu, logits: &GpuTensor, ordered: bool) -> HipResult<u32> {
     if gpu.scratch.argmax_host.is_none() {
         gpu.scratch.argmax_host = Some(gpu.alloc_tensor(&[1], DType::F32)?);
     }
@@ -11311,7 +11322,12 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
             vocab: logits.numel(),
         },
     )?;
-    Ok(gpu.download_f32(&result)?[0].to_bits())
+    let row = if ordered {
+        gpu.download_f32_stream_ordered(&result)?
+    } else {
+        gpu.download_f32(&result)?
+    };
+    Ok(row[0].to_bits())
 }
 
 #[cfg(test)]

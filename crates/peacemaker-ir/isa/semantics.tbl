@@ -479,6 +479,7 @@ v_bcnt_u32_b32	alu
 v_min3_i32	alu
 v_med3_i32	alu
 v_movrels_b32_e32	alu
+v_movreld_b32_e32	alu
 # 16-bit and conversion VALU.
 v_lshlrev_b16	alu
 v_or_b16	alu

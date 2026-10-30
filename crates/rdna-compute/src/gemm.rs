@@ -15906,7 +15906,17 @@ impl Gpu {
                 ))
             }
         };
-        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        // gfx1100 PM twin (`moe_grouped_k2_pm`): the F32 entry only, same kernargs.
+        let pm = self.moe_grouped_k2_pm_admitted(gfx11_entry.is_some(), rows_per_block, m, k);
+        if pm {
+            self.ensure_embedded_kernel(
+                crate::moe_grouped_k2_pm::MODULE,
+                crate::moe_grouped_k2_pm::IMAGE,
+                crate::moe_grouped_k2_pm::SYMBOL,
+            )?;
+        } else {
+            self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        }
         // UNCACHED conversion is mandatory here. `ensure_fp16_x` is pointer-keyed,
         // and MoE prefill reuses the SAME x_rot_batch tensor for every layer with
         // different contents each time — so the cached variant hands every layer
@@ -15945,32 +15955,41 @@ impl Gpu {
             &n_experts_val as *const _ as *mut c_void,
         ];
 
-        let row_tiles = m.div_ceil(rows_per_block) as u32;
-        let slot_tiles = ((m_total + 15) / 16) as u32;
+        // gfx1100 PM twin: 64 rows per 128-lane block, tile_run 2, static LDS (dynamic 0).
+        let (func, grid, block) = if pm {
+            (
+                crate::moe_grouped_k2_pm::SYMBOL,
+                crate::moe_grouped_k2_pm::grid(m, m_total),
+                [crate::moe_grouped_k2_pm::BLOCK, 1, 1],
+            )
+        } else {
+            (
+                kernel_name,
+                [
+                    m.div_ceil(rows_per_block) as u32,
+                    ((m_total + 15) / 16) as u32,
+                    1,
+                ],
+                [(2 * rows_per_block) as u32, 1, 1],
+            )
+        };
         let bytes =
             m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
-            kernel_name,
-            [row_tiles, slot_tiles, 1],
-            [(2 * rows_per_block) as u32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b.push_i32(n_experts_val);
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(func, grid, block, 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ep);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(xrd_val);
+            b.push_i32(mt_val);
+            b.push_i32(n_experts_val);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

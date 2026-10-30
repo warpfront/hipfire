@@ -324,9 +324,14 @@ pub fn generate_raon(
         |model, device, token, logits| {
             let token = match token {
                 Some(t) => t,
-                None => device
-                    .argmax_f32(logits, vocab)
-                    .map_err(|e| format!("raon logits argmax failed: {e}"))?,
+                // Greedy token: argmax kernel on the decode stream and a 4-byte
+                // readback ordered on it (no per-token null-stream hop, no
+                // per-token malloc/free).
+                None => rdna_compute::tensor_ops::argmax_f32_host_stream_ordered(
+                    device,
+                    &logits.sub_offset(0, vocab),
+                )
+                .map_err(|e| format!("raon logits argmax failed: {e}"))?,
             };
             let bundle = model
                 .raon_mut()

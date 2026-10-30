@@ -97,6 +97,8 @@ const V_MIN3_I32: &[u32] = &[0xd61a0001, 0x04040a04];
 const V_MED3_I32: &[u32] = &[0xd6200001, 0x03fd0209, 0x00000100];
 /// `v_movrels_b32_e32 v4, v9`
 const V_MOVRELS: &[u32] = &[0x7e088709];
+/// `v_movreld_b32_e32 v4, v9`
+const V_MOVRELD: &[u32] = &[0x7e088509];
 /// `v_lshlrev_b16 v8.l, 5, v8.l`
 const V_LSHLREV_B16_IMM: &[u32] = &[0xd7380008, 0x02021085];
 /// `v_lshlrev_b16 v8.h, v2.l, v3.h`
@@ -419,6 +421,25 @@ fn v_movrels_b32_reads_the_vgpr_offset_by_m0() {
     // Past the end of the VGPR file: refused.
     st.m0 = 250;
     assert!(run(V_MOVRELS, &mut st).is_err());
+}
+
+/// RDNA3 ISA V_MOVRELD_B32: `VGPR[laneId][DST + M0] = SRC0`.
+#[test]
+fn v_movreld_b32_writes_the_vgpr_offset_by_m0() {
+    let mut st = state();
+    st.exec = 0b01;
+    setv(&mut st, 9, &[0x9, 0x99]);
+    setv(&mut st, 7, &[0x1, 0x2]);
+    st.m0 = 3;
+    run(V_MOVRELD, &mut st).unwrap();
+    assert_eq!(
+        getv(&st, 7, 2),
+        vec![0x9, 0x2],
+        "v4 + M0=3 = v7, active lane 0 only"
+    );
+    assert_eq!(getv(&st, 4, 1), vec![0], "v4 itself is untouched");
+    st.m0 = 252;
+    assert!(run(V_MOVRELD, &mut st).is_err());
 }
 
 /// RDNA3 ISA V_ADD_NC_U32 through its VOP3 spelling (literal + inline zero).
@@ -1203,6 +1224,7 @@ fn buffer_gl1_inv_is_a_wait_class_no_op_and_every_new_row_is_in_the_table() {
         V_MIN3_I32,
         V_MED3_I32,
         V_MOVRELS,
+        V_MOVRELD,
         V_LSHLREV_B16_IMM,
         V_OR_B16,
         V_CNDMASK_B16,

@@ -8,7 +8,7 @@ use rdna_compute::{Gpu, GpuTensor};
 use crate::config::RaonConfig;
 use crate::forward::{
     admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
-    stage_decode_token, RaonWork,
+    stage_decode_token, stage_decode_token_on_stream, RaonWork,
 };
 use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
 use crate::weights::RaonWeights;
@@ -292,6 +292,15 @@ impl RaonBundle {
         &self.scratch.logits
     }
 
+    /// Host copy of [`logits`](Self::logits) for a per-token reader. Once the
+    /// graph route owns a decode stream the copy is ordered on it and the host
+    /// waits on that stream alone ([`Gpu::download_f32_stream_ordered`]); the
+    /// plain `download_f32` would put a null-stream hop in every token.
+    pub fn download_logits(&self, gpu: &Gpu) -> Result<Vec<f32>, String> {
+        gpu.download_f32_stream_ordered(&self.scratch.logits)
+            .map_err(|e| format!("raon1_mini: download logits: {e:?}"))
+    }
+
     /// Append `tokens` to the slot starting at `n_tokens()`, in chunks of at
     /// most `scratch.rows`; the logits of the final token are left in
     /// [`logits`](Self::logits). A failure leaves the slot partially advanced:
@@ -399,8 +408,8 @@ impl RaonBundle {
             gpu,
             end,
         )?;
-        stage_decode_token(&self.config, &self.scratch, gpu, token)?;
         if !self.graph.warmed {
+            stage_decode_token(&self.config, &self.scratch, gpu, token)?;
             decode_body(
                 &self.config,
                 &self.weights,
@@ -420,6 +429,8 @@ impl RaonBundle {
                 .map_err(|e| format!("raon1_mini: decode graph stream: {e:?}"))?;
             gpu.active_stream = Some(stream);
         }
+        // The token id rides the decode stream (one queue, no null-stream hop).
+        stage_decode_token_on_stream(&self.config, &self.scratch, gpu, token)?;
         let binding = decode_binding(&self.weights, &self.state, &self.scratch, &self.work);
         let recorded = gpu.graphs.graph_exec.is_some()
             && self.graph.binding == binding

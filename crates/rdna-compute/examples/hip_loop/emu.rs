@@ -108,6 +108,7 @@ fn kernarg_bytes(
             EmuArg::Null => 0u64.to_le_bytes().to_vec(),
             EmuArg::I32(x) => x.to_le_bytes().to_vec(),
             EmuArg::U32(x) => x.to_le_bytes().to_vec(),
+            EmuArg::U64(x) => x.to_le_bytes().to_vec(),
             EmuArg::F32(x) => x.to_le_bytes().to_vec(),
         };
         if bytes.len() != size {
@@ -635,18 +636,57 @@ pub fn gate(
             json!("the baseline left the output buffer unchanged: the launch is not exercised");
         return (false, rec);
     }
-    match diff(&b.out, &c.out) {
-        None => {
-            rec["identical_to_baseline"] = json!(true);
+    if let Some((first, n)) = diff(&b.out, &c.out) {
+        rec["identical_to_baseline"] = json!(false);
+        rec["reason"] = json!(format!(
+            "output differs from the emulated incumbent: first differing byte {first}, {n} differing byte(s) of {}",
+            b.out.len()
+        ));
+        return (false, rec);
+    }
+    rec["identical_to_baseline"] = json!(true);
+    // Cross-workgroup order independence: the workgroups of one launch have no defined order, but the emulator
+    // runs them sequentially, so a dependence between workgroups (one reads what another writes, e.g. an in-place
+    // buffer) is invisible to a single pass. Re-run the candidate with the workgroup order reversed: both orders
+    // must store the same bytes.
+    let mut order: Vec<[u32; 3]> = Vec::new();
+    for z in 0..cand.1.grid[2] {
+        for y in 0..cand.1.grid[1] {
+            for x in 0..cand.1.grid[0] {
+                order.push([x, y, z]);
+            }
+        }
+    }
+    order.reverse();
+    let r = run_arm(
+        "candidate-reversed",
+        cand.0,
+        symbol,
+        cand.1,
+        case,
+        &WgSel::List(&order),
+    );
+    let verdict = match &r {
+        Err(f) => Err(format!("candidate with reversed workgroup order: {}", f.reason)),
+        Ok(a) => match diff(&c.out, &a.out) {
+            None => Ok(()),
+            Some((first, n)) => Err(format!(
+                "candidate output depends on workgroup order (reversed order: first differing byte {first}, {n} \
+                 differing byte(s)): workgroups communicate through memory"
+            )),
+        },
+    };
+    rec["wg_order_reversed"] = json!({
+        "pass": verdict.is_ok(),
+        "output_sha256": r.as_ref().ok().map(|a| sha256_hex(&a.out)),
+    });
+    match verdict {
+        Ok(()) => {
             rec["pass"] = json!(true);
             (true, rec)
         }
-        Some((first, n)) => {
-            rec["identical_to_baseline"] = json!(false);
-            rec["reason"] = json!(format!(
-                "output differs from the emulated incumbent: first differing byte {first}, {n} differing byte(s) of {}",
-                b.out.len()
-            ));
+        Err(why) => {
+            rec["reason"] = json!(why);
             (false, rec)
         }
     }

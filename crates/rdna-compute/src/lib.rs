@@ -42,6 +42,8 @@ pub mod fp8_e4m3;
 pub mod gap_timing;
 #[cfg(feature = "deltanet")]
 pub mod gated_delta_vector;
+#[cfg(feature = "deltanet")]
+pub mod gated_delta_vector_pm;
 pub mod gdn_chunk_prep_pm;
 #[cfg(test)]
 mod gdn_q8ef_reference;
@@ -83,6 +85,7 @@ mod loaded_code_check;
 pub mod moe;
 pub mod moe_decode_lanes;
 mod moe_few;
+pub mod moe_grouped_k2_pm;
 pub mod moe_rotate_i4_pm;
 pub mod moe_slot_ops;
 pub mod norm_fold;

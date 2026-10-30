@@ -13,6 +13,10 @@ path = "src/bin/peacemaker.rs"
 required-features = ["toolchain"]
 
 [[example]]
+name = "hip_twin"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_r4_screen"
 required-features = ["toolchain"]
 

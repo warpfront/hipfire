@@ -321,7 +321,7 @@ fn cold(bundle: &mut RaonBundle, gpu: &mut Gpu) -> Result<(), String> {
 
 /// Download the logits and return `(argmax, finite)`.
 fn read_top1(bundle: &RaonBundle, gpu: &Gpu) -> Result<(usize, bool), String> {
-    let l = hip(gpu.download_f32(bundle.logits()), "download logits")?;
+    let l = bundle.download_logits(gpu)?;
     Ok((argmax(&l), l.iter().all(|x| x.is_finite())))
 }
 

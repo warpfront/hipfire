@@ -284,6 +284,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         _ if name.starts_with("v_dot") => super::dot::execute(arch, name, i, s),
         _ if super::wide::handles(name) => super::wide::execute(arch, name, i, s),
         "v_permlane16_b32" | "v_permlanex16_b32" => permlane(name, i, s),
+        "v_movreld_b32_e32" => movreld(i, s),
         "v_div_scale_f32" => div_scale(arch, i, s),
         "v_s_rcp_f32" => udiv_scalar_rcp(arch, i, s),
         "v_add_co_u32" | "v_add_co_ci_u32_e64" | "v_add_co_ci_u32_e32" => add_carry(name, i, s),
@@ -1644,6 +1645,34 @@ fn vector(
         "v_fma_mixhi_f16" => Val::High16(value),
         _ => Val::Dword(value),
     })
+}
+
+/// `v_movreld_b32`: `VGPR[laneId][DST + M0] = SRC0` for every active lane (RDNA3 ISA V_MOVRELD_B32; the
+/// indexed-VGPR store the compiler emits for a runtime-indexed private array held in registers).
+fn movreld(i: &Inst, s: &mut State) -> Result<()> {
+    let o = &i.operands;
+    plain(i)?;
+    let Some(Operand::Reg(d)) = o.first() else {
+        return Err("v_movreld_b32: DST must be a VGPR".into());
+    };
+    if d.kind != crate::reg::Kind::V {
+        return Err("v_movreld_b32: DST must be a VGPR".into());
+    }
+    let idx = u64::from(d.base) + u64::from(s.m0);
+    if idx >= 256 {
+        return Err(format!("v_movreld_b32: v{idx} is outside the VGPR file"));
+    }
+    let src = o.get(1).ok_or("missing vector operand")?;
+    let mut vals = [None; 64];
+    for lane in active(s) {
+        vals[lane] = Some(s.read(src, lane, 0)?);
+    }
+    for (lane, v) in vals.into_iter().enumerate() {
+        if let Some(v) = v {
+            s.v[idx as usize][lane] = v;
+        }
+    }
+    Ok(())
 }
 
 fn cvt_pk_f32_fp8(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {

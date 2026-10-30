@@ -11047,11 +11047,30 @@ mod tests {
             out.display().to_string(),
         ];
         argv.extend(extra.iter().map(|s| s.to_string()));
-        let cli = Cli::try_parse_from(argv)?;
-        let Some(Commands::Quantize(args)) = cli.command else {
-            panic!("expected quantize subcommand");
-        };
-        quantize_command(&paths, args)?;
+        // The script was just written: a sibling test's fork may still hold its
+        // write fd, so exec can fail ETXTBSY. Bounded retry like the fake-daemon
+        // spawns.
+        let mut attempt = 0u64;
+        loop {
+            let cli = Cli::try_parse_from(&argv)?;
+            let Some(Commands::Quantize(args)) = cli.command else {
+                panic!("expected quantize subcommand");
+            };
+            match quantize_command(&paths, args) {
+                Err(error)
+                    if attempt < 8
+                        && error
+                            .root_cause()
+                            .downcast_ref::<io::Error>()
+                            .and_then(io::Error::raw_os_error)
+                            == Some(libc::ETXTBSY) =>
+                {
+                    attempt += 1;
+                    thread::sleep(Duration::from_millis(5 * attempt));
+                }
+                other => break other?,
+            }
+        }
         let lines = fs::read_to_string(&record)?
             .lines()
             .map(str::to_owned)

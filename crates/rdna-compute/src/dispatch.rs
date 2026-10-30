@@ -8419,6 +8419,47 @@ impl Gpu {
         Ok(data)
     }
 
+    /// [`Self::download_f32`] for a decode loop that replays a graph on
+    /// [`Self::active_stream`]: the copy is ordered on that stream and the host
+    /// waits on that stream alone. The plain readback is a blocking copy on the
+    /// legacy null stream, which makes the runtime synchronize the null queue
+    /// with the decode stream's queue before every token; that cross-queue hop
+    /// costs a few percent in the good case and doubles the per-token time in
+    /// the bad one (R9700: queue placement / a second context on the card).
+    /// With no active stream this is exactly [`Self::download_f32`].
+    pub fn download_f32_stream_ordered(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
+        let Some(stream) = self.active_stream.as_ref() else {
+            return self.download_f32(tensor);
+        };
+        self.bind_thread()?;
+        let numel = tensor.numel();
+        let mut data = vec![0.0f32; numel];
+        // SAFETY: `data` holds exactly `numel` f32s; any byte pattern is a valid f32.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4) };
+        self.hip
+            .memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?;
+        self.hip.stream_synchronize(stream)?;
+        self.take_device_wait_error()?;
+        Ok(data)
+    }
+
+    /// Write one `u32` into the first word of `buf`, ordered on
+    /// [`Self::active_stream`] (the legacy stream when none is set) without
+    /// blocking the host: the value is the immediate of a `hipMemsetD32Async`,
+    /// so a decode loop restages its token id through the queue that replays
+    /// the graph instead of a blocking null-stream copy
+    /// (see [`Self::download_f32_stream_ordered`]).
+    pub fn write_u32_stream_ordered(
+        &self,
+        buf: &hip_bridge::DeviceBuffer,
+        value: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.hip
+            .memset_d32_async(buf, value as i32, 1, self.active_stream.as_ref())
+    }
+
     /// [`Self::download_f32`] into a caller-owned buffer (resized to the
     /// tensor), so a per-row reader reuses one host allocation.
     pub fn download_f32_into(&self, tensor: &GpuTensor, out: &mut Vec<f32>) -> HipResult<()> {

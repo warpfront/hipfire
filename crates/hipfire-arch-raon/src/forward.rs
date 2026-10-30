@@ -907,6 +907,30 @@ pub fn stage_decode_token(
     stage_tokens(cfg, scratch, gpu, &[token])
 }
 
+/// Stream-ordered [`stage_decode_token`] for the graph decode route: the id is
+/// the immediate of one asynchronous memset on the decode stream
+/// ([`Gpu::write_u32_stream_ordered`]), so the token reaches the stable id
+/// buffer through the queue that then replays the graph. The plain staging is
+/// a blocking copy on the legacy null stream: before every replay the runtime
+/// synchronizes the null queue with the decode queue, and on R9700 that hop
+/// doubles the per-token time whenever the two queues share a command-processor
+/// pipe or another process holds a context on the card.
+pub fn stage_decode_token_on_stream(
+    cfg: &RaonConfig,
+    scratch: &RaonPrefillScratch,
+    gpu: &Gpu,
+    token: u32,
+) -> Result<(), String> {
+    if token as usize >= cfg.vocab {
+        return Err(format!(
+            "raon1_mini: token id {token} outside vocab {}",
+            cfg.vocab
+        ));
+    }
+    gpu.write_u32_stream_ordered(&scratch.token_ids.buf, token)
+        .map_err(|e| format!("raon1_mini: stage decode token on stream: {e:?}"))
+}
+
 /// Device-only decode step (`rows == 1`, logits wanted, no tap): embedding of
 /// the staged token id, all layers, head, then a device-side `seq_len += 1`
 /// after every kernel that reads it. Issues kernel launches that read and write

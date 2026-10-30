@@ -133,9 +133,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         let mut stop = "length";
         let t1 = Instant::now();
         loop {
-            let logits = gpu
-                .download_f32(bundle.logits())
-                .map_err(|e| format!("download logits: {e:?}"))?;
+            let logits = bundle.download_logits(&gpu)?;
             if logits.iter().any(|x| !x.is_finite()) {
                 return Err(format!(
                     "non-finite logits at generated token {}",

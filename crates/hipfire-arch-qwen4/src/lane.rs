@@ -118,6 +118,8 @@ struct OwnedLayerExperts {
     host_mapped: bool,
     /// E8P experts of a slab arena (0 for a packed layer).
     e8p_experts: usize,
+    /// MQ3-I4 (W3) experts of a slab arena (0 for a packed layer).
+    mq3_experts: usize,
 }
 
 /// Classify every layer of the owned band. Any host-mapped expert storage
@@ -133,12 +135,14 @@ fn classify_owned_experts(weights: &Qwen4Weights, config: &Qwen4Config) -> LaneE
         Qwen4TierRecipe::FlashNextPacked { .. } => None,
         _ => return LaneExpertRoute::Unclassified,
     };
-    let (mut host_mapped, mut refused, mut e8p_experts) = (false, false, 0usize);
+    let (mut host_mapped, mut refused, mut e8p_experts, mut mq3_experts) =
+        (false, false, 0usize, 0usize);
     for absolute in band {
         match classify_owned_layer(weights, config, arenas, absolute) {
             Ok(layer) => {
                 host_mapped |= layer.host_mapped;
                 e8p_experts += layer.e8p_experts;
+                mq3_experts += layer.mq3_experts;
             }
             Err(_) => refused = true,
         }
@@ -149,9 +153,12 @@ fn classify_owned_experts(weights: &Qwen4Weights, config: &Qwen4Config) -> LaneE
         LaneExpertRoute::Unclassified
     } else if arenas.is_none() {
         LaneExpertRoute::ResidentPacked
-    } else if e8p_experts > 0 {
+    } else if e8p_experts > 0 && mq3_experts == 0 {
         // The strict mq2 family: MQ4-XTS plus E8P experts, at least one E8P.
         LaneExpertRoute::ResidentMq2Slab
+    } else if mq3_experts > 0 && e8p_experts == 0 {
+        // The strict mq3 family: MQ4-XTS plus MQ3-I4 experts, at least one MQ3-I4.
+        LaneExpertRoute::ResidentMq3Slab
     } else {
         LaneExpertRoute::Unclassified
     }
@@ -277,15 +284,19 @@ fn classify_owned_layer(
                 return Ok(OwnedLayerExperts {
                     host_mapped: true,
                     e8p_experts: 0,
+                    mq3_experts: 0,
                 });
             }
             let planned = plan
                 .layer(absolute)
                 .ok_or_else(|| format!("layer {absolute}: the arena plan has no such layer"))?;
+            let (e8p_experts, mq3_experts) =
+                slab_layer_cold_experts(planned, config.num_experts)
+                    .map_err(|error| format!("layer {absolute}: {error}"))?;
             Ok(OwnedLayerExperts {
                 host_mapped: false,
-                e8p_experts: slab_layer_e8p_experts(planned, config.num_experts)
-                    .map_err(|error| format!("layer {absolute}: {error}"))?,
+                e8p_experts,
+                mq3_experts,
             })
         }
         (None, None) => {
@@ -302,6 +313,7 @@ fn classify_owned_layer(
             Ok(OwnedLayerExperts {
                 host_mapped,
                 e8p_experts: 0,
+                mq3_experts: 0,
             })
         }
         _ => Err(format!(
@@ -310,18 +322,22 @@ fn classify_owned_layer(
     }
 }
 
-/// The E8P expert count of a slab layer whose plan is exactly `num_experts`
-/// present MQ4-XTS / E8P experts. An absent (pruned) expert, a W3 or W2 expert,
-/// or any other expert count is refused: the lane proof covers complete
-/// layers of MQ4-XTS and E8P only.
-fn slab_layer_e8p_experts(layer: &ExpertArenaLayer, num_experts: usize) -> Result<usize, String> {
+/// The `(E8P, MQ3-I4)` expert counts of a slab layer whose plan is exactly
+/// `num_experts` present MQ4-XTS experts plus either E8P or MQ3-I4 experts
+/// (never both in one layer). An absent (pruned) expert, a W2 expert, an
+/// E8P/W3 mix, or any other expert count is refused: the lane proofs cover
+/// complete layers of MQ4-XTS with one cold format only.
+fn slab_layer_cold_experts(
+    layer: &ExpertArenaLayer,
+    num_experts: usize,
+) -> Result<(usize, usize), String> {
     if num_experts == 0 || layer.experts.len() != num_experts {
         return Err(format!(
             "the arena plans {} experts, the model has {num_experts}",
             layer.experts.len()
         ));
     }
-    let mut e8p = 0usize;
+    let (mut e8p, mut mq3) = (0usize, 0usize);
     for (expert, entry) in layer.experts.iter().enumerate() {
         if entry.is_absent() {
             return Err(format!("expert {expert} is absent"));
@@ -329,14 +345,18 @@ fn slab_layer_e8p_experts(layer: &ExpertArenaLayer, num_experts: usize) -> Resul
         match entry.format {
             ExpertFormat::Mq4Xts => {}
             ExpertFormat::E8pI4 => e8p += 1,
+            ExpertFormat::Mq3I4 => mq3 += 1,
             other => {
                 return Err(format!(
-                    "expert {expert} is {other:?}, not MQ4-XTS or E8P-I4"
+                    "expert {expert} is {other:?}, not MQ4-XTS, MQ3-I4 or E8P-I4"
                 ))
             }
         }
     }
-    Ok(e8p)
+    if e8p > 0 && mq3 > 0 {
+        return Err("the layer mixes E8P-I4 and MQ3-I4 experts".to_string());
+    }
+    Ok((e8p, mq3))
 }
 
 /// Dtype one projection or tensor binds in the lane forward; `None` when its
@@ -3001,44 +3021,61 @@ mod tests {
         let mut formats = vec![ExpertFormat::Mq4Xts; 6];
         formats[1] = ExpertFormat::E8pI4;
         formats[4] = ExpertFormat::E8pI4;
-        assert_eq!(slab_layer_e8p_experts(&arena_layer(&formats), 6), Ok(2));
         assert_eq!(
-            slab_layer_e8p_experts(&arena_layer(&[ExpertFormat::Mq4Xts; 3]), 3),
-            Ok(0)
+            slab_layer_cold_experts(&arena_layer(&formats), 6),
+            Ok((2, 0))
         );
         assert_eq!(
-            slab_layer_e8p_experts(&arena_layer(&[ExpertFormat::E8pI4; 3]), 3),
-            Ok(3)
+            slab_layer_cold_experts(&arena_layer(&[ExpertFormat::Mq4Xts; 3]), 3),
+            Ok((0, 0))
+        );
+        assert_eq!(
+            slab_layer_cold_experts(&arena_layer(&[ExpertFormat::E8pI4; 3]), 3),
+            Ok((3, 0))
         );
     }
 
     #[test]
-    fn slab_layer_refuses_w3_w2_and_mixed_cold_groups() {
-        for cold in [ExpertFormat::Mq3I4, ExpertFormat::Mq2I4] {
-            let mut formats = vec![ExpertFormat::Mq4Xts; 4];
-            formats[2] = cold;
-            let error = slab_layer_e8p_experts(&arena_layer(&formats), 4).unwrap_err();
-            assert!(error.contains("expert 2"), "{cold:?}: {error}");
-            assert!(error.contains(&format!("{cold:?}")), "{cold:?}: {error}");
-        }
+    fn slab_layer_counts_mq3_in_a_mixed_mq4_mq3_group() {
+        let mut formats = vec![ExpertFormat::Mq4Xts; 6];
+        formats[0] = ExpertFormat::Mq3I4;
+        formats[3] = ExpertFormat::Mq3I4;
+        formats[5] = ExpertFormat::Mq3I4;
+        assert_eq!(
+            slab_layer_cold_experts(&arena_layer(&formats), 6),
+            Ok((0, 3))
+        );
+        assert_eq!(
+            slab_layer_cold_experts(&arena_layer(&[ExpertFormat::Mq3I4; 3]), 3),
+            Ok((0, 3))
+        );
+    }
+
+    #[test]
+    fn slab_layer_refuses_w2_and_mixed_cold_groups() {
+        let mut formats = vec![ExpertFormat::Mq4Xts; 4];
+        formats[2] = ExpertFormat::Mq2I4;
+        let error = slab_layer_cold_experts(&arena_layer(&formats), 4).unwrap_err();
+        assert!(error.contains("expert 2"), "{error}");
+        assert!(error.contains("Mq2I4"), "{error}");
         // E8P with a W3 expert in the same layer is refused too.
         let mixed = [
             ExpertFormat::E8pI4,
             ExpertFormat::Mq3I4,
             ExpertFormat::Mq4Xts,
         ];
-        assert!(slab_layer_e8p_experts(&arena_layer(&mixed), 3).is_err());
+        assert!(slab_layer_cold_experts(&arena_layer(&mixed), 3).is_err());
     }
 
     #[test]
     fn slab_layer_refuses_absent_experts_and_a_wrong_expert_count() {
         let mut layer = arena_layer(&[ExpertFormat::E8pI4; 4]);
         layer.experts[3].down_offset = layer.experts[3].gate_up_offset;
-        let error = slab_layer_e8p_experts(&layer, 4).unwrap_err();
+        let error = slab_layer_cold_experts(&layer, 4).unwrap_err();
         assert!(error.contains("expert 3 is absent"), "{error}");
         let layer = arena_layer(&[ExpertFormat::E8pI4; 4]);
-        assert!(slab_layer_e8p_experts(&layer, 5).is_err());
-        assert!(slab_layer_e8p_experts(&arena_layer(&[]), 0).is_err());
+        assert!(slab_layer_cold_experts(&layer, 5).is_err());
+        assert!(slab_layer_cold_experts(&arena_layer(&[]), 0).is_err());
     }
 
     const MQ6: DType = DType::MQ6G256V2;
@@ -3411,6 +3448,7 @@ mod tests {
         // Every other class stays unproven under EP.
         for experts in [
             LaneExpertRoute::ResidentMq2Slab,
+            LaneExpertRoute::ResidentMq3Slab,
             LaneExpertRoute::ResidentPacked,
             LaneExpertRoute::HostMapped,
             LaneExpertRoute::CpuDeferred,

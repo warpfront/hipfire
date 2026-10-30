@@ -269,6 +269,15 @@ pub const GFX1151_LANE_RECEIPT: &str = "g0 fn-batch-s3/j2-g0 2026-10-09 gfx1151"
 pub const GFX1201_PP2_MQ2_RECEIPT: &str =
     "g0 mcb-notes/runs/thin-pp-a1bab39d7-1 j1574 2026-10-18 gfx1201 pp2 mq2-xts";
 
+/// G0 oracle receipt behind the gfx1201 pipeline-parallel resident-slab
+/// MQ4-XTS + MQ3-I4 MoE row-twin proof (`fn_mesh_lane_oracle`, PP2 mq3-xts
+/// 25/23 at prefill chunk 1024, 2x R9700): with every stage per lane, with
+/// only the MoE stage shared and with the full shared-stage policy, every
+/// lane's ids and every logits row were byte-identical to the serialized PP
+/// singleton at K=1..8, 8 prompts x 64 tokens.
+pub const GFX1201_PP2_MQ3_RECEIPT: &str =
+    "g0 mgmtp/pponce-runs/proof-pp2-mq3 2026-10-30 gfx1201 pp2 mq3-xts 25/23 k1-8";
+
 /// G0 evidence behind the gfx1201 expert-parallel (EP2, mq4-xts) row-twin
 /// proofs (hold j1570, production PASS): every lane's ids and logits bytes
 /// were identical to the singleton at K=1, 2, 4 and 8 over 64 steps. The
@@ -291,6 +300,10 @@ pub enum LaneTopology {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaneExpertRoute {
     ResidentMq2Slab,
+    /// Resident expert-slab arenas of complete layers of MQ4-XTS plus MQ3-I4
+    /// experts (at least one MQ3-I4, no E8P, W2, absent or host-mapped
+    /// expert), the mq3-xts Flash-Next family.
+    ResidentMq3Slab,
     ResidentPacked,
     HostMapped,
     CpuDeferred,
@@ -533,6 +546,17 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         },
         LANE_PP_ONLY,
         GFX1201_PP2_MQ2_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::Moe,
+        StageRoute::Moe {
+            experts: LaneExpertRoute::ResidentMq3Slab,
+            dense: [DType::BF16; 5],
+            decode_admitted: true,
+        },
+        LANE_PP_ONLY,
+        GFX1201_PP2_MQ3_RECEIPT,
     ),
     proof(
         "gfx1201",
@@ -2892,8 +2916,9 @@ mod tests {
         let shared = shared_stages();
         assert_eq!(shared.len(), 12);
         // gfx1151: one all-topology row per shared stage. gfx1201: one PP row
-        // and one EP row per shared stage.
-        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 3 * shared.len());
+        // and one EP row per shared stage, plus the second PP MoE row (the
+        // mq3 slab class).
+        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 3 * shared.len() + 1);
         for arch in ["gfx1151", "gfx1201"] {
             for stage in StageName::ALL {
                 for topology in ALL_TOPOLOGIES {
@@ -2911,12 +2936,15 @@ mod tests {
                         ("gfx1201", LaneTopology::Ep) => shared.contains(&stage),
                         _ => false,
                     };
-                    assert_eq!(
-                        rows.len(),
-                        usize::from(expected),
-                        "{arch} {topology:?} {}",
-                        stage.key()
-                    );
+                    // The PP MoE stage carries the mq2 and the mq3 slab rows.
+                    let count = usize::from(expected)
+                        + usize::from(
+                            expected
+                                && arch == "gfx1201"
+                                && topology == LaneTopology::Pp
+                                && stage == StageName::Moe,
+                        );
+                    assert_eq!(rows.len(), count, "{arch} {topology:?} {}", stage.key());
                     for proof in rows {
                         assert!(!proof.receipt.is_empty());
                         match (arch, topology) {
@@ -2929,7 +2957,19 @@ mod tests {
                                 assert_ne!(proof.route, StageRoute::Any);
                                 assert_ne!(proof.route, StageRoute::Unclassified);
                                 assert_eq!(proof.domain, [LaneTopology::Pp]);
-                                assert_eq!(proof.receipt, GFX1201_PP2_MQ2_RECEIPT);
+                                if stage == StageName::Moe
+                                    && matches!(
+                                        proof.route,
+                                        StageRoute::Moe {
+                                            experts: LaneExpertRoute::ResidentMq3Slab,
+                                            ..
+                                        }
+                                    )
+                                {
+                                    assert_eq!(proof.receipt, GFX1201_PP2_MQ3_RECEIPT);
+                                } else {
+                                    assert_eq!(proof.receipt, GFX1201_PP2_MQ2_RECEIPT);
+                                }
                             }
                             _ => {
                                 assert_ne!(proof.route, StageRoute::Any);
@@ -3006,9 +3046,13 @@ mod tests {
     #[test]
     fn gfx1201_pp_resident_mq2_is_production() {
         // The bound routes of the PP2 mq2 artifact, spelled out independently
-        // of the proof table, which must carry exactly these signatures.
+        // of the proof table, which must carry exactly these signatures (its
+        // PP MoE stage lists the mq2 slab class and then the mq3 slab class).
         let routes = pp2_mq2_routes();
-        assert_eq!(routes, table_routes("gfx1201", LaneTopology::Pp));
+        let mut table = table_routes("gfx1201", LaneTopology::Pp);
+        assert_eq!(table[StageName::Moe.index()].len(), 2);
+        table[StageName::Moe.index()].truncate(1);
+        assert_eq!(routes, table);
         assert!(matches!(
             routes[StageName::Moe.index()].as_slice(),
             [StageRoute::Moe {
@@ -3033,6 +3077,52 @@ mod tests {
         assert_eq!(empty.policy, LaneStagePolicy::production());
         assert!(empty.receipts.is_empty());
         assert!(fallback_stages(&empty).is_empty());
+    }
+
+    #[test]
+    fn gfx1201_pp_resident_mq3_slab_is_production() {
+        // The bound routes of the PP2 mq3-xts artifact (MQ4-XTS + MQ3-I4 slab
+        // arenas, the same non-MoE tensors as the mq2 artifact), spelled out
+        // independently of the proof table.
+        let mut routes = pp2_mq2_routes();
+        routes[StageName::Moe.index()] = vec![StageRoute::Moe {
+            experts: LaneExpertRoute::ResidentMq3Slab,
+            dense: [DType::BF16; 5],
+            decode_admitted: true,
+        }];
+        let table = table_routes("gfx1201", LaneTopology::Pp);
+        assert_eq!(
+            table[StageName::Moe.index()][1],
+            routes[StageName::Moe.index()][0]
+        );
+        let resolution = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Pp, &routes);
+        assert_eq!(resolution.policy, LaneStagePolicy::production());
+        assert_eq!(
+            resolution.receipts,
+            [GFX1201_PP2_MQ2_RECEIPT, GFX1201_PP2_MQ3_RECEIPT]
+        );
+        assert!(fallback_stages(&resolution).is_empty());
+        assert_stateful_reasons(&resolution);
+
+        // Only the PP domain and only the decode-admitted slab class: every
+        // other shape of the mq3 class keeps just the MoE stage per lane.
+        for (topology, decode_admitted) in [
+            (LaneTopology::Pp, false),
+            (LaneTopology::Ep, true),
+            (LaneTopology::Single, true),
+        ] {
+            let mut other = routes.clone();
+            other[StageName::Moe.index()] =
+                vec![moe_route(LaneExpertRoute::ResidentMq3Slab, decode_admitted)];
+            let resolution = LaneStagePolicy::for_bound_routes("gfx1201", topology, &other);
+            assert!(
+                fallback_stages(&resolution).contains(&StageName::Moe),
+                "{topology:?} {decode_admitted}"
+            );
+        }
+        // gfx1151 keeps its own Any rows; an unproven arch never inherits.
+        let other_arch = LaneStagePolicy::for_bound_routes("gfx1100", LaneTopology::Pp, &routes);
+        assert_eq!(other_arch.policy, LaneStagePolicy::all_per_lane());
     }
 
     #[test]
@@ -3161,6 +3251,7 @@ mod tests {
         let cases: Vec<Vec<StageRoute>> = vec![
             vec![StageRoute::Unclassified],
             vec![moe_route(LaneExpertRoute::ResidentMq2Slab, true)],
+            vec![moe_route(LaneExpertRoute::ResidentMq3Slab, true)],
             vec![moe_route(LaneExpertRoute::ResidentPacked, true)],
             vec![moe_route(LaneExpertRoute::Split, true)],
             vec![moe_route(LaneExpertRoute::HostMapped, true)],

@@ -976,6 +976,14 @@ fn decode_wavefront(stages: usize, groups: usize) -> impl Iterator<Item = (usize
     })
 }
 
+/// `HIPFIRE_PP_LANE_EDGE_HOST_WAIT=1` restores the host-side
+/// `hipEventSynchronize` on every sender edge event (the receiver upload is
+/// then enqueued only after the sender's group completes). Any other value or
+/// unset: the receiver's stream waits on the sender event on the device.
+fn edge_host_wait_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 fn decode_overlap_enabled(value: Option<&str>) -> bool {
     value != Some("0")
 }
@@ -1084,10 +1092,15 @@ fn decode_run_overlap(
     let int = std::mem::size_of::<i32>();
     let row_bytes = call.bytes / call.n_dec;
     let mut launched = false;
+    let host_edge_wait = edge_host_wait_enabled(
+        hipfire_config::developer_var("HIPFIRE_PP_LANE_EDGE_HOST_WAIT")
+            .ok()
+            .as_deref(),
+    );
     for (index, group) in decode_wavefront(stages, batches.len()) {
         let batch = &batches[group];
         let edge = batch.bounce_range(row_bytes);
-        if index > 0 {
+        if index > 0 && host_edge_wait {
             let sender = &mut gpus.devices[index - 1];
             sender
                 .bind_thread()
@@ -1108,6 +1121,17 @@ fn decode_run_overlap(
                 .lane_edge_streams()
                 .map_err(|e| StepFailure::new(e, launched))?;
             launched = true;
+            if !host_edge_wait {
+                // Device-side edge fence: this band's stream holds the upload
+                // (and every later launch) until the sender's group event
+                // fires, so the single host thread never blocks on a sender
+                // and can enqueue the next group's launches immediately.
+                gpu.hip
+                    .stream_wait_event_on(gpu.active_stream.as_ref(), &events[index - 1][group])
+                    .map_err(|e| {
+                        StepFailure::new(format!("band {index} edge fence wait: {e}"), true)
+                    })?;
+            }
             gpu.hip
                 .memcpy_htod_async(
                     &streams.buf,
@@ -1521,7 +1545,9 @@ impl Qwen4Bundle {
 
 #[cfg(test)]
 mod pp_lane_tests {
-    use super::{decode_micro_batches, decode_overlap_enabled, decode_wavefront};
+    use super::{
+        decode_micro_batches, decode_overlap_enabled, decode_wavefront, edge_host_wait_enabled,
+    };
     use crate::lane::groups::max_groups;
 
     #[test]
@@ -1687,6 +1713,21 @@ mod pp_lane_tests {
             Some("0 "),
         ] {
             assert!(decode_overlap_enabled(value));
+        }
+    }
+
+    #[test]
+    fn pp_lane_edge_host_wait_switch_parse() {
+        assert!(edge_host_wait_enabled(Some("1")));
+        for value in [
+            None,
+            Some("0"),
+            Some(""),
+            Some("true"),
+            Some(" 1"),
+            Some("1 "),
+        ] {
+            assert!(!edge_host_wait_enabled(value));
         }
     }
 }

@@ -157,11 +157,22 @@ impl Gpu {
         )?;
 
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gated_delta_net_vector_serial",
-            GATED_DELTA_NET_VECTOR_SERIAL_SRC,
-            "gated_delta_net_vector_serial_f32",
-        )?;
+        // gfx1100 PM twin (`gated_delta_vector_pm`): same kernargs, grid and block.
+        let func = if self.gated_delta_vector_pm_rda_admitted(p.head_dim) {
+            self.ensure_embedded_kernel(
+                crate::gated_delta_vector_pm::MODULE,
+                crate::gated_delta_vector_pm::IMAGE,
+                crate::gated_delta_vector_pm::RDA_SYMBOL,
+            )?;
+            crate::gated_delta_vector_pm::RDA_SYMBOL
+        } else {
+            self.ensure_kernel(
+                "gated_delta_net_vector_serial",
+                GATED_DELTA_NET_VECTOR_SERIAL_SRC,
+                "gated_delta_net_vector_serial_f32",
+            )?;
+            "gated_delta_net_vector_serial_f32"
+        };
         let qp = p.query.buf.as_ptr();
         let kp = p.key.buf.as_ptr();
         let vp = p.value.buf.as_ptr();
@@ -212,7 +223,7 @@ impl Gpu {
             &srs as *const _ as *mut c_void,
             &sss as *const _ as *mut c_void,
         ];
-        // GDV_TV = 8 value rows per workgroup.
+        // GDV_TV = 8 value rows per workgroup (same grid for the PM twin).
         let grid = [p.n_heads as u32, (d / 8) as u32, 1];
         let bytes = p.n_heads * d * d * 4 * 2;
         let timer = profile::begin_timer(
@@ -221,41 +232,34 @@ impl Gpu {
             "gated_delta_net_vector_serial_f32",
             bytes,
         );
-        let result = self.launch_maybe_blob(
-            "gated_delta_net_vector_serial_f32",
-            grid,
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(lp);
-                b.push_ptr(bp);
-                b.push_ptr(sp);
-                b.push_ptr(op);
-                b.push_ptr(sip);
-                b.push_ptr(ndp);
-                b.push_i32(n_tokens);
-                b.push_i32(n_heads);
-                b.push_i32(qk_group);
-                b.push_i32(per_key);
-                b.push_i32(round);
-                b.push_i32(slot);
-                b.push_i32(qrs);
-                b.push_i32(krs);
-                b.push_i32(vrs);
-                b.push_i32(drs);
-                b.push_i32(brs);
-                b.push_i32(ors);
-                b.push_i32(shs);
-                b.push_i32(srs);
-                b.push_u64(sss);
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(func, grid, [32, 1, 1], 0, &mut params, || {
+            let mut b = KernargBlob::new();
+            b.push_ptr(qp);
+            b.push_ptr(kp);
+            b.push_ptr(vp);
+            b.push_ptr(lp);
+            b.push_ptr(bp);
+            b.push_ptr(sp);
+            b.push_ptr(op);
+            b.push_ptr(sip);
+            b.push_ptr(ndp);
+            b.push_i32(n_tokens);
+            b.push_i32(n_heads);
+            b.push_i32(qk_group);
+            b.push_i32(per_key);
+            b.push_i32(round);
+            b.push_i32(slot);
+            b.push_i32(qrs);
+            b.push_i32(krs);
+            b.push_i32(vrs);
+            b.push_i32(drs);
+            b.push_i32(brs);
+            b.push_i32(ors);
+            b.push_i32(shs);
+            b.push_i32(srs);
+            b.push_u64(sss);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -331,11 +335,24 @@ impl Gpu {
         )?;
 
         self.bind_thread()?;
-        self.ensure_kernel(
-            "causal_conv_depthwise_rows",
-            CAUSAL_CONV_DEPTHWISE_ROWS_SRC,
-            "causal_conv_depthwise_silu_rows_f32",
-        )?;
+        // gfx1100 PM twin (`gated_delta_vector_pm`): same kernargs and block; row slice 0 alone
+        // touches the history, so it is correct in place and not.
+        let twin = self.gated_delta_vector_pm_conv_admitted(g.ksize);
+        let func = if twin {
+            self.ensure_embedded_kernel(
+                crate::gated_delta_vector_pm::MODULE,
+                crate::gated_delta_vector_pm::IMAGE,
+                crate::gated_delta_vector_pm::CONV_SYMBOL,
+            )?;
+            crate::gated_delta_vector_pm::CONV_SYMBOL
+        } else {
+            self.ensure_kernel(
+                "causal_conv_depthwise_rows",
+                CAUSAL_CONV_DEPTHWISE_ROWS_SRC,
+                "causal_conv_depthwise_silu_rows_f32",
+            )?;
+            "causal_conv_depthwise_silu_rows_f32"
+        };
         let op = out.buf.as_ptr();
         let ip = input.buf.as_ptr();
         let wp = weight.buf.as_ptr();
@@ -378,11 +395,16 @@ impl Gpu {
             &round as *const _ as *mut c_void,
         ];
         let block = 128u32;
-        let grid = [
-            ((g.n_channels as u32) + block - 1) / block,
-            chunks as u32,
-            1,
-        ];
+        let grid = if twin {
+            // 32 rows per workgroup regardless of `rows_per_chunk`.
+            crate::gated_delta_vector_pm::conv_grid(g.n_channels, g.n_rows)
+        } else {
+            [
+                ((g.n_channels as u32) + block - 1) / block,
+                chunks as u32,
+                1,
+            ]
+        };
         let bytes = g.n_rows * g.n_channels * 4 * 2;
         let timer = profile::begin_timer(
             &self.hip,
@@ -390,25 +412,18 @@ impl Gpu {
             "causal_conv_depthwise_silu_rows_f32",
             bytes,
         );
-        let result = self.launch_maybe_blob(
-            "causal_conv_depthwise_silu_rows_f32",
-            grid,
-            [block, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = KernargBlob::new();
-                b.push_ptr(op);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(hip_);
-                b.push_ptr(hop);
-                for v in [n_rows, n_ch, ks, rpc, irs, ors, wcs, wts, hts, silu, round] {
-                    b.push_i32(v);
-                }
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(func, grid, [block, 1, 1], 0, &mut params, || {
+            let mut b = KernargBlob::new();
+            b.push_ptr(op);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_ptr(hip_);
+            b.push_ptr(hop);
+            for v in [n_rows, n_ch, ks, rpc, irs, ors, wcs, wts, hts, silu, round] {
+                b.push_i32(v);
+            }
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

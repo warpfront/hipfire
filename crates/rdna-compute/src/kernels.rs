@@ -5378,6 +5378,25 @@ pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100: &[u8] =
 /// Bare lowercase SHA-256 of [`GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100`], without a newline.
 pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256: &str =
     include_str!("../../../kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco.sha256");
+/// gfx1100 PM twins of the generic gated-delta ops (two kernels, one module):
+/// `gated_delta_net_vector_serial_f32_pm_gfx1100` and `causal_conv_depthwise_silu_rows_f32_pm_gfx1100`,
+/// the card-judged hipcc candidates `R2Rda-05-rs-tv8-prio` / `R1Conv-04-rpw32-k4` sealed by
+/// route A (`scripts/pm-hip-twin.sh`); incumbent kernargs, bit-identical output. Selected by
+/// `gated_delta_vector_pm` (`HIPFIRE_GATED_DELTA_VECTOR_PM=0` restores hipcc).
+pub const GATED_DELTA_VECTOR_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/gated_delta_vector_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of [`GATED_DELTA_VECTOR_PM_GFX1100`], without a newline.
+pub const GATED_DELTA_VECTOR_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/gated_delta_vector_pm_gfx1100.hxaco.sha256");
+/// gfx1100 PM twin of `gemm_mq4g256v2_moe_grouped_wmma_k2` (F32 entry):
+/// `gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100`, the card-judged `R1Moe-04-xlds-w4-t2` candidate
+/// (64 rows per 128-lane block, tile_run 2, X through LDS) sealed by route A; same kernargs,
+/// bit-identical. Selected by `moe_grouped_k2_pm` (`HIPFIRE_MOE_GROUPED_K2_PM=0` restores hipcc).
+pub const GEMM_MQ4G256V2_MOE_GROUPED_K2_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of [`GEMM_MQ4G256V2_MOE_GROUPED_K2_PM_GFX1100`], without a newline.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_K2_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco.sha256");
 /// Exact-gfx1100 MQ6 residual hipcc "pk twin" ports `gemm_mq6g256v2_residual_gfx1100_port_w8n256`
 /// (tile 128x256, block 256) and `..._w4n128` (tile 64x128, block 128): the card-proven
 /// `R2Mq6-01-pk-w8n256` / `R2Mq6-04-pk-w4n128` candidates, same `A,X,Y,M,K,N` kernargs and bytes

@@ -1329,7 +1329,10 @@ impl Qwen4Bundle {
                     for _ in 0..per_band {
                         let event = gpu
                             .hip
-                            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+                            .event_create_with_flags(
+                                hip_bridge::HIP_EVENT_DISABLE_TIMING
+                                    | hip_bridge::HIP_EVENT_RELEASE_TO_SYSTEM,
+                            )
                             .map_err(|e| pp_error(e.to_string()))?;
                         events[index].push(event);
                     }

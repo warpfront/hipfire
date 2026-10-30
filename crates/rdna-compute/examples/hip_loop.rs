@@ -7,7 +7,7 @@
 //! object (schema 1) on stdout.
 //!
 //! ```text
-//! hip_loop --node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo [--shape k=v,...] --cand FILE.hip
+//! hip_loop --node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo|rda_serial|conv_rows|moe_k2 [--shape k=v,...] --cand FILE.hip
 //!          [--offline] [--null-control aa] [--time N] [--rounds R] [--seed S] [--out DIR]
 //! ```
 //!
@@ -116,6 +116,30 @@
 //!   `peacemaker_ir::passes::hazards::analyze`) are part of the gate: any Required/Unchecked finding, any
 //!   PM-IR obligation or an analysis error fails it (`emu_gate.hazards`).
 //!
+//! * `rda_serial` (`gated_delta_net_vector_serial_f32`, the generic gated delta rule kernel of the Raon RDA
+//!   layers; `hip_loop/rda.rs` has the production launch, shape grammar `pp512|pp2048|tg|emu` +
+//!   `t h qk_group per_key round slot slots dev arch=gfx1100|gfx1201`, header keys `rows_per_wg block
+//!   lds_dynamic`). Judged on gfx1100 (7900 XTX) by default, `arch=gfx1201` (R9700) in the shape. The mutable
+//!   outputs are the output AND the in-place state: identity compares both. `--emu` packs output, all state
+//!   slots and poison pads into one region (a store into a pad or an untouched slot fails), runs the small
+//!   `emu` shape over the full grid, then `pp512`, `pp512,dev=1` and a short slot-1/per-head-decay/no-round
+//!   case (`t=64,slot=1,slots=2,per_key=0,round=0`) at sampled workgroups (`t=2048` costs ~9 min of emulation and
+//!   `t=16384` hours, and neither reaches a 32-bit overflow: they are not in the default gate), plus
+//!   the static hazard checks. E.g. `hip_loop --node rda_serial --shape pp512,arch=gfx1201 --emu --cand X.hip`.
+//!
+//! * `conv_rows` (`causal_conv_depthwise_silu_rows_f32`, the Raon depthwise causal short conv; `hip_loop/conv.rs`
+//!   has the production launch, shape grammar `pp512|pp2048|tg|emu` + `n c k inplace silu round arch=gfx1100|gfx1201`,
+//!   header keys `block ch_per_wg rows_per_wg lds_dynamic`). Outputs: `out` AND the (in-place) history; `--emu` packs
+//!   both with poison pads into one region, `emu` shape over the full grid, then `pp512`, `n=4096,c=200` and
+//!   `pp512,inplace=0` sampled, plus the static hazard checks.
+//!
+//! * `moe_k2` (`gemm_mq4g256v2_moe_grouped_wmma_k2`, Raon's hottest gfx1100 prefill kernel; `hip_loop/moe.rs` has the
+//!   production call table, shape grammar `gu512|dn512|gu2048|dn2048|sg512|sd512|dg512|dd512|emu` + `tokens experts top_k
+//!   M K route=uniform|skew skew route_seed`, header keys `rows_per_block slots_per_tile block lds_dynamic`). Seeded qt44
+//!   experts behind a device pointer table, a seed-independent skewed top-k routing scattered like the product; one
+//!   weight set per timing pool above the cold threshold. `--emu`: `emu` over the full grid, then the eight production
+//!   shapes sampled (dead tiles are `PAD_OWNER`), plus the static hazard checks.
+//!
 //! Exit status: 0 ok; 1 identity failure (record still printed); 2 usage; 3 the
 //! candidate (or the device) could not compile/launch (record printed with `error`).
 //!
@@ -132,6 +156,8 @@
 mod abba;
 #[path = "support/cold.rs"]
 mod cold;
+#[path = "hip_loop/conv.rs"]
+mod conv;
 #[path = "hip_loop/elf.rs"]
 mod elf;
 #[path = "hip_loop/emu.rs"]
@@ -148,12 +174,16 @@ mod lane_proj;
 mod lane_ref;
 #[path = "hip_loop/lane_wo.rs"]
 mod lane_wo;
+#[path = "hip_loop/moe.rs"]
+mod moe;
 #[path = "hip_loop/mq6.rs"]
 mod mq6;
 #[path = "hip_loop/node.rs"]
 mod node;
 #[path = "hip_loop/qsa.rs"]
 mod qsa;
+#[path = "hip_loop/rda.rs"]
+mod rda;
 
 use node::{err, Geometry, Header, Incumbent, Node, Result, ShapeSpec, ARCH};
 use serde_json::{json, Value};
@@ -162,8 +192,17 @@ use std::path::{Path, PathBuf};
 const SCHEMA: u32 = 1;
 const DEFAULT_TIME: usize = 50;
 const DEFAULT_ROUNDS: usize = 12;
-const NODES: [&str; 5] = ["mq6_res", "hc_mix", "qsa_hg4", "lane_proj", "lane_wo"];
-const USAGE: &str = "--node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo [--shape k=v,...] \
+const NODES: [&str; 8] = [
+    "mq6_res",
+    "hc_mix",
+    "qsa_hg4",
+    "lane_proj",
+    "lane_wo",
+    "rda_serial",
+    "conv_rows",
+    "moe_k2",
+];
+const USAGE: &str = "--node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo|rda_serial|conv_rows|moe_k2 [--shape k=v,...] \
 (--cand FILE.hip | --cand-object FILE.co [--cand-geometry \"tile_m=.. tile_n=.. block=.. lds_dynamic=..\"] | --null-control aa) \
 [--base-object FILE.co] [--offline] [--emu [--no-extent] [--emu-extent full|sampled]] [--flush] \
 [--identity full|smoke|skip | --identity-only] [--time N] [--rounds R] [--seed S] [--out DIR]";
@@ -303,6 +342,9 @@ fn build_node(name: &str, shape: Option<&str>) -> Result<Box<dyn Node>> {
         "qsa_hg4" => Ok(Box::new(qsa::QsaHg4::new(&spec)?)),
         "lane_proj" => Ok(Box::new(lane_proj::LaneProj::new(&spec)?)),
         "lane_wo" => Ok(Box::new(lane_wo::LaneWo::new(&spec)?)),
+        "rda_serial" => Ok(Box::new(rda::Rda::new(&spec)?)),
+        "conv_rows" => Ok(Box::new(conv::ConvRows::new(&spec)?)),
+        "moe_k2" => Ok(Box::new(moe::MoeK2::new(&spec)?)),
         other => Err(format!("unknown node `{other}`")),
     }
 }
@@ -1676,6 +1718,33 @@ mod tests {
             rec["baseline"]["source_path"],
             rec["candidate"]["source_path"]
         );
+    }
+
+    #[test]
+    fn offline_record_for_conv_rows_on_both_arches() {
+        if !jit::hipcc_available() {
+            eprintln!("SKIP: no hipcc");
+            return;
+        }
+        for (shape, arch, tag) in [
+            ("pp512", "gfx1100", "conv-a"),
+            ("pp512,arch=gfx1201", "gfx1201", "conv-b"),
+        ] {
+            let rec = &offline("conv_rows", shape, None, tag);
+            assert_eq!(rec["symbol"], "causal_conv_depthwise_silu_rows_f32");
+            assert_eq!(rec["identical_code"], true, "{arch}");
+            assert_eq!(
+                rec["baseline"]["geometry"]["grid_work_items"],
+                json!([5120, 1, 1])
+            );
+            assert_eq!(rec["baseline"]["max_flat_workgroup_size"], 1024);
+            assert_eq!(rec["baseline"]["spill"], 0);
+            assert_eq!(
+                rec["baseline"]["code_sha256"],
+                rec["candidate"]["code_sha256"]
+            );
+            assert_eq!(rec["baseline"]["code_sha256"].as_str().unwrap().len(), 64);
+        }
     }
 
     #[test]

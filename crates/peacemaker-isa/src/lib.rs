@@ -20,6 +20,7 @@ pub mod author;
 pub mod cdna;
 pub mod emit;
 pub mod hazard;
+pub mod hip_twin;
 pub mod insn;
 pub mod lds;
 pub mod ledger;
