@@ -596,6 +596,11 @@ pub struct DraftProposal {
     /// The head's own hint that deeper drafting is worthwhile; the root
     /// combines it with depth/EOS and may still stop.
     pub keep_going: bool,
+    /// The singleton rule: a token after the first whose prefix acceptance
+    /// fell below the row worth was drafted (the head step ran and counts in
+    /// the ledger) but is NOT kept; drafting ends. Never set on the first
+    /// draft of a lane.
+    pub drop_last: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2027,6 +2032,22 @@ impl MeshRoot {
                 "proposals do not match the scheduled ops".into(),
             ));
         }
+        let first_dropped = proposals.iter().any(|p| {
+            p.drop_last
+                && self
+                    .step_ref()
+                    .start
+                    .lanes
+                    .iter()
+                    .position(|l| l.key == p.key)
+                    .is_some_and(|i| self.step_ref().draft[i].drafts.is_empty())
+        });
+        if first_dropped {
+            return Err(self.fail(
+                Some(sampler.rank),
+                "the first draft of a lane cannot be dropped".into(),
+            ));
+        }
         let n_ops = round.ops.len();
         let s = self.step_mut();
         for p in &proposals {
@@ -2039,8 +2060,13 @@ impl MeshRoot {
             let max_depth = s.start.lanes[i].max_depth;
             let eos = s.start.lanes[i].eos;
             let d = &mut s.draft[i];
-            d.drafts.push(p.token);
-            d.active = p.keep_going && d.drafts.len() < max_depth && eos != Some(p.token);
+            if p.drop_last {
+                // A dropped token never enters the window.
+                d.active = false;
+            } else {
+                d.drafts.push(p.token);
+                d.active = p.keep_going && d.drafts.len() < max_depth && eos != Some(p.token);
+            }
         }
         s.round += 1;
         s.head_calls += n_ops;
@@ -3174,6 +3200,9 @@ pub(crate) mod scripted {
         pub picks: Vec<u32>,
         /// Head's `keep_going` per draft step (default `true`).
         pub keep_going: Vec<bool>,
+        /// Head step `j` drafted a token that the singleton rule drops
+        /// (default `false`).
+        pub drop_last: Vec<bool>,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -3309,6 +3338,7 @@ pub(crate) mod scripted {
                         key: op.key,
                         token,
                         keep_going: w.keep_going.get(j).copied().unwrap_or(true),
+                        drop_last: w.drop_last.get(j).copied().unwrap_or(false),
                     });
                 }
                 res.proposals = Some(props);
@@ -3547,6 +3577,7 @@ mod tests {
                     drafts: drafts.to_vec(),
                     picks: picks.to_vec(),
                     keep_going: Vec::new(),
+                    drop_last: Vec::new(),
                 },
             );
         }
@@ -4047,6 +4078,50 @@ mod tests {
             } else {
                 assert_eq!(m.ranks[0].calls, m.ranks[1].calls);
             }
+        }
+    }
+
+    #[test]
+    fn mesh_lane_protocol_dropped_draft_runs_its_head_step_but_is_not_kept() {
+        for kind in BOTH {
+            let mut m = Mesh::new(kind, false);
+            m.admit(1, 10, 7, None, Some(3));
+            script_matching(&m, 1, 0, 8);
+            // Head step 2 drafts a token the singleton rule drops.
+            m.script
+                .borrow_mut()
+                .windows
+                .get_mut(&(1, 0))
+                .unwrap()
+                .drop_last = vec![false, false, true];
+            let out = m
+                .run_greedy(&[req(1, 99)], &budgets(LabRoutes::Batched, 3))
+                .unwrap();
+            let l = lane_out(&out, 1);
+            assert_eq!(l.source.offered, 2, "{kind:?}: two kept drafts");
+            let ev = m.evidence(&out.key);
+            let head = ev.iter().find(|e| e.counts.head_draft_calls > 0).unwrap();
+            assert_eq!(
+                head.counts.head_draft_calls, 3,
+                "the dropped step still ran"
+            );
+            // A drop on a lane's first draft is a protocol violation.
+            let mut m = Mesh::new(kind, false);
+            m.admit(1, 10, 7, None, Some(3));
+            script_matching(&m, 1, 0, 8);
+            m.script
+                .borrow_mut()
+                .windows
+                .get_mut(&(1, 0))
+                .unwrap()
+                .drop_last = vec![true];
+            let err = m
+                .run_greedy(&[req(1, 99)], &budgets(LabRoutes::Batched, 3))
+                .unwrap_err();
+            assert!(
+                matches!(&err, ProtocolError::Aborted(r) if r.reason.contains("cannot be dropped")),
+                "{err:?}"
+            );
         }
     }
 
