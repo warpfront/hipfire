@@ -886,7 +886,10 @@ impl Carrier for Qwen4Carrier {
             let split = qwen4_ep_vram_layers(
                 ctx.gpu,
                 &shared,
-                plan.seal.ranks(),
+                &plan
+                    .seal
+                    .expert_spans()
+                    .map_err(|error| format!("qwen4: {error}"))?,
                 &free,
                 &src,
                 &ctx.batch_request,
@@ -2320,7 +2323,7 @@ fn qwen4_placement_inputs(
     routed_experts: bool,
     state_format: hipfire_arch_qwen4::Qwen4StateFormat,
     scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
-    ranks: usize,
+    spans: &hipfire_arch_qwen4::expert_residency::EpExpertSpans,
     chunk_rows: usize,
     share: Option<hipfire_arch_qwen4::expert_residency::DecodeShareForward>,
 ) -> Result<
@@ -2358,7 +2361,7 @@ fn qwen4_placement_inputs(
             routed_experts,
             state_format,
             scratch_mode,
-            ranks,
+            spans,
             chunk_rows,
         },
         share,
@@ -2801,7 +2804,7 @@ pub fn qwen4_ep_alias_free(devices: &[i32], free: &[u64]) -> Vec<u64> {
 pub fn qwen4_ep_vram_layers(
     gpu: &rdna_compute::Gpu,
     shared: &Qwen4RankShared,
-    ranks: usize,
+    spans: &hipfire_arch_qwen4::expert_residency::EpExpertSpans,
     free_per_rank: &[u64],
     src: &ModelSource,
     batch: &hipfire_runtime::loader_api::BatchLoadRequest,
@@ -2820,7 +2823,10 @@ pub fn qwen4_ep_vram_layers(
     let config = receipt.config;
     let manifest = receipt
         .manifest
-        .with_expert_parallel(hipfire_arch_qwen4::weights::Qwen4EpPlacement { rank: 0, ranks })
+        .with_expert_parallel(hipfire_arch_qwen4::weights::Qwen4EpPlacement {
+            rank: 0,
+            ranks: spans.ranks(),
+        })
         .map_err(|error| format!("qwen4: {error}"))?;
     let state_format = hipfire_arch_qwen4::resolve_state_format(
         &shared.kv_mode,
@@ -2858,7 +2864,7 @@ pub fn qwen4_ep_vram_layers(
         !config.ffn.is_dense(),
         state_format,
         scratch_mode,
-        ranks,
+        spans,
         chunk_rows,
         None,
     )?;
@@ -3059,7 +3065,7 @@ pub fn qwen4_preload_resource_plan(
         routed_experts,
         state_format,
         scratch_mode: Qwen4ForwardScratchMode::Full,
-        ranks: 1,
+        spans: &residency::EpExpertSpans::single(),
         chunk_rows,
     })
     .map_err(|error| format!("qwen4 preload plan: placement census: {error}"))?;
@@ -3345,7 +3351,7 @@ pub fn qwen4_preload_resource_plan(
             ),
         },
         || {
-            residency::routed_expert_bytes_ranks(&manifest.weights, &bytes_of, 1)
+            residency::routed_expert_bytes(&manifest.weights, &bytes_of)
                 .map_err(|error| format!("qwen4: {error}"))
         },
         &auto_inputs_for_plan,
@@ -3643,7 +3649,7 @@ pub fn qwen4_preload_resource_plan(
             routed_experts,
             state_format,
             scratch_mode: Qwen4ForwardScratchMode::Full,
-            ranks: 1,
+            spans: &residency::EpExpertSpans::single(),
             chunk_rows,
         },
         charges,
@@ -4224,7 +4230,14 @@ fn load_qwen4_rank_scoped(
         ),
         None => None,
     };
-    let ep_ranks = ep.map_or(1, |placement| placement.ranks);
+    // Every rank's routed-expert span, read from the seal (one rank: whole stacks).
+    let ep_spans = match &ep_seal {
+        Some(bound) => bound
+            .seal
+            .expert_spans()
+            .map_err(|error| format!("qwen4: {error}"))?,
+        None => hipfire_arch_qwen4::expert_residency::EpExpertSpans::single(),
+    };
     // A band carries a session cache (`session`) like a Single load (except
     // under native MTP) and the output band the native MTP head; the other
     // Single-only features stay refused.
@@ -4675,7 +4688,7 @@ fn load_qwen4_rank_scoped(
             routed_experts,
             state_format,
             scratch_mode,
-            ep_ranks,
+            &ep_spans,
             placement_chunk,
             None,
         )?)
@@ -4766,7 +4779,7 @@ fn load_qwen4_rank_scoped(
                 routed_experts,
                 state_format,
                 scratch_mode,
-                ep_ranks,
+                &ep_spans,
                 placement_chunk,
                 Some(hipfire_arch_qwen4::expert_residency::DecodeShareForward {
                     dedicated,
@@ -5412,7 +5425,7 @@ fn load_qwen4_rank_scoped(
             ),
         },
         || {
-            residency::routed_expert_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
+            residency::routed_expert_bytes_ranks(&manifest.weights, bytes_of, &ep_spans)
                 .map_err(|error| format!("qwen4: {error}"))
         },
         &auto_inputs,
@@ -5654,7 +5667,7 @@ fn load_qwen4_rank_scoped(
         // has not pinned yet (this one and the later ranks), each at its own
         // share (an uneven split gives the low ranks one more expert).
         let rank_host_bytes =
-            residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
+            residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, &ep_spans)
                 .map_err(|error| format!("qwen4: {error}"))?;
         let own_rank = ep.map_or(0, |placement| placement.rank);
         let host_bytes = rank_host_bytes[own_rank];
@@ -5853,7 +5866,7 @@ fn load_qwen4_rank_scoped(
     let host_expert_bytes: u64 = if use_ranges || (rank_table.is_none() && q4_prewarm.is_none()) {
         0
     } else {
-        residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
+        residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, &ep_spans)
             .map(|per_rank| {
                 per_rank[ep.map_or(0, |placement| placement.rank)]
                     + hotset_plan.as_ref().map_or(0, |(plan, _)| {

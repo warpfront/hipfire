@@ -2793,7 +2793,7 @@ fn single_device_reserve(
         routed_experts: !load.config.ffn.is_dense(),
         state_format: load.state_format,
         scratch_mode: load.scratch_mode,
-        ranks: 1,
+        spans: &crate::expert_residency::EpExpertSpans::single(),
         chunk_rows,
     })
     .map(|inputs| inputs.reserve)

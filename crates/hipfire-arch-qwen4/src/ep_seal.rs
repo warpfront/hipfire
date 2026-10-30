@@ -215,6 +215,38 @@ impl Qwen4EpSeal {
             .map(|expert| plan.owner_rank(expert).expect("sealed owner"))
             .collect()
     }
+
+    /// Routed experts every rank holds, read from the sealed plans. Every
+    /// group must give each rank the same count: one layer's residency and
+    /// stage budget covers all of them.
+    pub fn expert_spans(&self) -> Result<crate::expert_residency::EpExpertSpans, String> {
+        let count = |plan: &ExpertExecutionPlan, rank: usize| {
+            (0..plan.n_experts())
+                .filter(|&expert| plan.local_slot(rank, expert).is_some())
+                .count()
+        };
+        let first = &self.plans[0];
+        let local: Vec<usize> = (0..self.ranks()).map(|rank| count(first, rank)).collect();
+        if let Some(plan) = self
+            .plans
+            .iter()
+            .find(|plan| (0..self.ranks()).any(|rank| count(plan, rank) != local[rank]))
+        {
+            return Err(format!(
+                "qwen4 EP seal: {} gives the ranks other expert counts than {}",
+                plan.group(),
+                first.group()
+            ));
+        }
+        crate::expert_residency::EpExpertSpans::new(first.n_experts(), local)
+    }
+
+    fn plan(&self, group: usize) -> Result<&ExpertExecutionPlan, String> {
+        self.plans
+            .iter()
+            .find(|plan| plan.layer() == Some(group))
+            .ok_or_else(|| format!("qwen4 EP: the seal has no expert group {group}"))
+    }
 }
 
 /// A rank's binding to its load's seal (`Qwen4Bundle::bind_ep_seal`).
@@ -246,12 +278,7 @@ impl Qwen4EpRankSeal {
                 "qwen4 EP binding: placement {placement:?} is not the sealed rank {sealed:?}"
             ));
         }
-        let plan = self
-            .seal
-            .plans
-            .iter()
-            .find(|plan| plan.layer() == Some(group))
-            .ok_or_else(|| format!("qwen4 EP binding: the seal has no expert group {group}"))?;
+        let plan = self.seal.plan(group)?;
         let (table, cache) = adapt_expert_execution_plan(plan, self.rank)?;
         let contract = table
             .execution_contract()
@@ -280,6 +307,15 @@ impl Qwen4EpRankSeal {
             ));
         }
         Ok((table, cache))
+    }
+
+    /// This rank's compact slot of every global expert of routed group
+    /// `group` (`None`: another rank owns it), read from the sealed plan.
+    pub(crate) fn local_slots(&self, group: usize) -> Result<Vec<Option<usize>>, String> {
+        let plan = self.seal.plan(group)?;
+        Ok((0..plan.n_experts())
+            .map(|expert| plan.local_slot(self.rank, expert))
+            .collect())
     }
 }
 
@@ -383,6 +419,25 @@ mod tests {
                     (rank, devices[rank])
                 );
             }
+            // The residency and stage spans are the seal's own compact slots.
+            let spans = seal.expert_spans().unwrap();
+            let seal = Arc::new(seal);
+            for rank in 0..ranks {
+                let placement = Qwen4EpPlacement { rank, ranks };
+                assert_eq!(spans.local(rank), Some(placement.local_count(512)));
+                let bound = Qwen4EpRankSeal {
+                    seal: seal.clone(),
+                    rank,
+                };
+                let slots = bound.local_slots(48).unwrap();
+                assert!((0..512).all(|e| slots[e] == placement.owns(e).then(|| e / ranks)));
+            }
+            assert!(Qwen4EpRankSeal {
+                seal: seal.clone(),
+                rank: 0
+            }
+            .local_slots(49)
+            .is_err());
             assert!(seal.placement(ranks).is_err());
             assert_eq!(seal.origin(ranks), None);
             seal.check_source("g1").unwrap();
