@@ -153,10 +153,10 @@ p 'ratio (+dispatchers)' "$(r $((c+k_gen+sub_clean+sub_disp)) $((a+k_arch)))   <
 ungated_examples() {
   python3 - <<'PYEOF'
 import glob, os, re
-total = {(p.split("/")[1], os.path.basename(p)[:-3]) for p in glob.glob("crates/*/examples/*.rs")}
+total = {(p.replace(chr(92),"/").split("/")[1], os.path.basename(p)[:-3]) for p in glob.glob("crates/*/examples/*.rs")}
 gated = set()
 for tm in glob.glob("crates/*/Cargo.toml"):
-    crate = tm.split("/")[1]
+    crate = tm.replace(chr(92),"/").split("/")[1]
     for blk in re.split(r'(?=\[\[example\]\])', open(tm, encoding='utf8').read()):
         if not blk.startswith("[[example]]"):
             continue

@@ -5943,6 +5943,13 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_T256_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
+/// gfx1100 Lloyd A8 twin: the i8 schedule with publish-time v_perm codebook
+/// expansion (amortized like the X128 pack stage), signed-B codes and the zp'
+/// analytic correction. Tile128-only (36864 B LDS = 1 CTA/WGP).
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_LLOYD_GFX11_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8_lloyd.gfx11.hip")
+);
 /// gfx1100/gfx1151 exact-INT8 MQ6G256V2 prefill GEMM (`gemm_mq6g256v2_mmq_i8_set{,_bf16}_gfx11`,
 /// 128x128 tile, 512 threads; dynamic LDS `MQ6_I8_GFX11_LDS_BYTES` = 32768): the `block_i8_128`
 /// prelude without its standalone quantizer, then the kernel.

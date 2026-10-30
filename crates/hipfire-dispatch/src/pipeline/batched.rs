@@ -505,6 +505,11 @@ enum FfnGateOutput {
     Iu4H,
     Fp8H,
     A8H,
+    /// Lloyd A8 twin (opt-in `HIPFIRE_LLOYD_MMQ_A4=1`, exact gfx1100): the
+    /// gate/up epilogue wrote fused h into `gate_ffn_batch`, same contract
+    /// as A8H but carrying Lloyd codebook weights. The down arm consumes h
+    /// through the twin residual worker (never the uniform i8 path).
+    LloydA8H,
 }
 
 fn packed_mq4_down_admitted(
@@ -1257,6 +1262,19 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     );
                 }
                 if lloyd_mmq_lut_route(gpu) {
+                    if lloyd_mmq_a4_route(gpu, n, k) {
+                        let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                        let xq = gpu.ensure_int8_mmq_x(input, n, k)?;
+                        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
+                            &w.buf,
+                            xq,
+                            &pbs.x_batch,
+                            m,
+                            k,
+                            n,
+                            c16,
+                        );
+                    }
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                     return gpu.gemm_hfq4g256_residual_mmq_lloyd(
                         &w.buf,
@@ -1638,6 +1656,26 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
             .ok()
             .as_deref()
             != Some("1")
+}
+
+/// Twin route (T3, default OFF): exact gfx1100 only (the twin TU is V2C-free
+/// and tile-pinned for gfx1100; gfx1151 keeps X128 until the V2B follow-up),
+/// K%256, N>=64, eager-only (no replay/capture — same bar as the twin
+/// worker's siblings). Explicit opt-in `HIPFIRE_LLOYD_MMQ_A4=1`; distinct
+/// from the fail-closed `HIPFIRE_LLOYD_MMQ_OFF` and the uniform
+/// `HIPFIRE_IU4_PREFILL`. qkv/qkvza have no twin entries and stay X128.
+#[inline]
+pub(crate) fn lloyd_mmq_a4_route(gpu: &Gpu, n: usize, k: usize) -> bool {
+    gpu.arch.as_str() == "gfx1100"
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_A4")
+            .ok()
+            .as_deref()
+            == Some("1")
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_recording()
+        && n >= 64
+        && k > 0
+        && k % 256 == 0
 }
 
 /// qt=52 (MQ4G256V2Lloyd) prefill: extract the per-tensor centered f16
@@ -2342,6 +2380,24 @@ fn swiglu_ffn_gate_up_batched(
                 lloyd_f16_or_fail(&layer.w_up, "swiglu_ffn_gate_up_batched")?,
             )?;
         } else if lloyd_mmq_lut_route(gpu) {
+            if lloyd_mmq_a4_route(gpu, n, layer.w_gate.k)
+                && layer.w_gate.m == layer.w_up.m
+                && layer.w_gate.m % 128 == 0
+            {
+                let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.w_gate.k)?;
+                gpu.gemm_gate_up_silu_mq4g256v2_i8_lloyd(
+                    &layer.w_gate.buf,
+                    &layer.w_up.buf,
+                    xq,
+                    &pbs.gate_ffn_batch,
+                    layer.w_gate.m,
+                    layer.w_gate.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.w_gate, "swiglu_ffn_gate_up_batched")?,
+                    lloyd_c16_or_fail(&layer.w_up, "swiglu_ffn_gate_up_batched")?,
+                )?;
+                return Ok(FfnGateOutput::LloydA8H);
+            }
             gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(
                 &layer.w_gate.buf,
                 &layer.w_up.buf,
@@ -2587,6 +2643,31 @@ fn swiglu_ffn_down_batched(
             layer.w_down.m,
             hidden_dim,
             n,
+        );
+    }
+    if h_source == FfnGateOutput::LloydA8H
+        && matches!(&epilogue, BatchEpilogue::Residual)
+        && layer.w_down.dtype == DType::MQ4G256V2Lloyd
+        && lloyd_mmq_a4_route(gpu, n, hidden_dim)
+    {
+        let c16 = lloyd_c16_or_fail(&layer.w_down, "swiglu_ffn_down_batched")?;
+        rotate_x_mq_batched_for(
+            gpu,
+            &layer.w_down,
+            &pbs.gate_ffn_batch,
+            &pbs.ffn_hidden_batch,
+            hidden_dim,
+            n,
+        )?;
+        let xq = gpu.ensure_int8_mmq_x(&pbs.ffn_hidden_batch, n, hidden_dim)?;
+        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
+            &layer.w_down.buf,
+            xq,
+            &pbs.x_batch,
+            layer.w_down.m,
+            hidden_dim,
+            n,
+            c16,
         );
     }
     if let FfnGateOutput::Iu4A4(prep) = h_source {

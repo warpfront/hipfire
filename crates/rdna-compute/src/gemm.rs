@@ -22854,6 +22854,257 @@ impl Gpu {
         self.gemm_mq4g256v2_mmq_prequant_i8(a, xq, y, m, k, n, true)
     }
 
+    /// Lloyd A8 twin of `gemm_mq4g256v2_mmq_prequant_i8` (T2, residual only;
+    /// T3 adds families): same grid/tiles/producers, LDS pairtab codebook
+    /// expansion, signed-B codes, zp' correction. Admission mirrors
+    /// `a8_prefill_active` with LUT presence replacing `mq4v2_symmetric`;
+    /// exact gfx1100|gfx1151, K%256, eager-only. No dispatch changes in T2 —
+    /// callers are the T2 differential harness, then T3 arms.
+    fn gemm_mq4g256v2_mmq_prequant_i8_lloyd(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+        c16: [u32; 4],
+    ) -> HipResult<()> {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "A8-Lloyd MMQ requires exact gfx1100/gfx1151 (arch={} m={m} k={k} n={n})",
+                    self.arch
+                ),
+            ));
+        }
+        if k == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("A8-Lloyd MMQ requires K divisible by 256 (m={m} k={k} n={n})"),
+            ));
+        }
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        // Single staged variant: tile128, 36864 B LDS = 1 CTA/WGP.
+        let (module, source, threads, lds, tile) = (
+            "gemm_mq4g256v2_residual_mmq_i8_lloyd_gfx11",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_LLOYD_GFX11_SRC,
+            512u32,
+            36864u32,
+            128usize,
+        );
+        // NOTE: a single staged module/TU; entry names have no tile suffix.
+        let kernel = if add {
+            "gemm_mq4g256v2_residual_mmq_i8_lloyd_full_add"
+        } else {
+            "gemm_mq4g256v2_residual_mmq_i8_lloyd_full_set"
+        };
+        self.ensure_kernel(module, source, kernel)?;
+        let mut ap = a.buf.as_ptr();
+        let mut xp = xq;
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut nv = n as i32;
+        let mut av = i32::from(add);
+        let mut c0 = c16[0];
+        let mut c1 = c16[1];
+        let mut c2 = c16[2];
+        let mut c3 = c16[3];
+        // Residual reuses its codebook for both tables (SILU-only D* path).
+        let mut d0 = c0;
+        let mut d1 = c1;
+        let mut d2 = c2;
+        let mut d3 = c3;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut c0 as *mut _ as *mut c_void,
+            &mut c1 as *mut _ as *mut c_void,
+            &mut c2 as *mut _ as *mut c_void,
+            &mut c3 as *mut _ as *mut c_void,
+            &mut d0 as *mut _ as *mut c_void,
+            &mut d1 as *mut _ as *mut c_void,
+            &mut d2 as *mut _ as *mut c_void,
+            &mut d3 as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [m.div_ceil(tile) as u32, n.div_ceil(tile) as u32, 1],
+            [threads, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b.push_i32(av);
+                b.push_u32(c0);
+                b.push_u32(c1);
+                b.push_u32(c2);
+                b.push_u32(c3);
+                b.push_u32(d0);
+                b.push_u32(d1);
+                b.push_u32(d2);
+                b.push_u32(d3);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    pub fn gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        c16: [u32; 4],
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_i8_lloyd(a, xq, y, m, k, n, false, c16)
+    }
+
+    pub fn gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        c16: [u32; 4],
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_i8_lloyd(a, xq, y, m, k, n, true, c16)
+    }
+
+    /// Gate/up SiLU twin of `gemm_gate_up_silu_mq4g256v2_i8_prequant` (T3):
+    /// same grid/tiles/producers, dual codebooks (gate C*, up D*). Exact
+    /// gfx1100|gfx1151, M%128, K%256, eager-only. No dispatch changes yet —
+    /// callers are the T3 differential harness, then the T3 arms.
+    pub fn gemm_gate_up_silu_mq4g256v2_i8_lloyd(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        xq: *mut c_void,
+        h: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        c16_gate: [u32; 4],
+        c16_up: [u32; 4],
+    ) -> HipResult<()> {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "A8-Lloyd gate/up requires exact gfx1100/gfx1151 (arch={} m={m} k={k} n={n})",
+                    self.arch
+                ),
+            ));
+        }
+        if m == 0 || m % 128 != 0 || k == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("A8-Lloyd gate/up requires M%128==0, K%256==0 (m={m} k={k} n={n})"),
+            ));
+        }
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        // Single staged variant: tile128, 36864 B LDS = 1 CTA/WGP.
+        let (module, source, threads, lds, tile) = (
+            "gemm_mq4g256v2_residual_mmq_i8_lloyd_gfx11",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_LLOYD_GFX11_SRC,
+            512u32,
+            36864u32,
+            128usize,
+        );
+        let kernel = "gemm_mq4g256v2_gate_up_silu_mmq_i8_lloyd";
+        self.ensure_kernel(module, source, kernel)?;
+        let mut gp = gate.buf.as_ptr();
+        let mut up = up.buf.as_ptr();
+        let mut xp = xq;
+        let mut hp = h.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut nv = n as i32;
+        let mut c0 = c16_gate[0];
+        let mut c1 = c16_gate[1];
+        let mut c2 = c16_gate[2];
+        let mut c3 = c16_gate[3];
+        let mut d0 = c16_up[0];
+        let mut d1 = c16_up[1];
+        let mut d2 = c16_up[2];
+        let mut d3 = c16_up[3];
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut hp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut c0 as *mut _ as *mut c_void,
+            &mut c1 as *mut _ as *mut c_void,
+            &mut c2 as *mut _ as *mut c_void,
+            &mut c3 as *mut _ as *mut c_void,
+            &mut d0 as *mut _ as *mut c_void,
+            &mut d1 as *mut _ as *mut c_void,
+            &mut d2 as *mut _ as *mut c_void,
+            &mut d3 as *mut _ as *mut c_void,
+        ];
+        let bytes = 2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [(2 * m).div_ceil(tile) as u32, n.div_ceil(tile) as u32, 1],
+            [threads, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_ptr(xp);
+                b.push_ptr(hp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b.push_u32(c0);
+                b.push_u32(c1);
+                b.push_u32(c2);
+                b.push_u32(c3);
+                b.push_u32(d0);
+                b.push_u32(d1);
+                b.push_u32(d2);
+                b.push_u32(d3);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn gemm_mq4g256v2_residual_wmma_i8_prepared(
         &mut self,
         a: &GpuTensor,

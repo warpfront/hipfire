@@ -2250,6 +2250,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs | experimental |
 | `HIPFIRE_LLOYD_K3` | crates/hipfire-quantize/src/pipeline.rs, crates/hipfire-quantize/src/quant_mq.rs | developer |
 | `HIPFIRE_LLOYD_MB4` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs | experimental |
+| `HIPFIRE_LLOYD_MMQ_A4` | crates/hipfire-dispatch/src/pipeline/batched.rs | developer |
 | `HIPFIRE_LLOYD_MMQ_OFF` | crates/hipfire-dispatch/src/pipeline/batched.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_LM_HEAD_F16` | crates/hipfire-arch-qwen35/src/shared_weights.rs, crates/hipfire-cli/src/serve/complete.rs | stable |
 | `HIPFIRE_LM_HEAD_HFQ2` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-runtime/src/weight_backend.rs | developer |
@@ -3245,6 +3246,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TP_PEER_PUSH` | crates/hipfire-runtime/src/multi_gpu.rs, crates/hipfire-runtime/src/multi_gpu/tp_peer_push.rs | developer |
 | `HIPFIRE_TP_PEER_PUSH_FAULT` | crates/hipfire-runtime/src/multi_gpu/tp_peer_push.rs, crates/rdna-compute/src/tp_peer_push.rs | developer |
 | `HIPFIRE_TP_USE_RCCL` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
+| `HIPFIRE_T0_ONLY_SMALL` | crates/rdna-compute/examples/tmp_lloyd_gfx11_t0.rs | harness |
 | `HIPFIRE_TQ2G128_XBATCH` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_TQ2G128_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_TQ2G128_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
