@@ -695,21 +695,42 @@ impl ResidentKvDiag {
         }
     }
 
-    /// Fixed Q8 slot arena always admits legacy storage.
-    fn for_slot(explicit: bool) -> Self {
+    /// The slot engine's own KV backend. `None` = the load request did not
+    /// name one, and the route's documented default (legacy arenas) applies;
+    /// `Some` is the operator's choice (`legacy` or per-slot `vmm`).
+    /// The shared paged pool is backed by VMM. This is a different storage
+    /// route from the per-slot KV backend; reporting it as the per-slot
+    /// automatic-legacy default emitted a warning that contradicted the
+    /// active `paged KV backend=vmm`.
+    fn for_paged_vmm() -> Self {
+        Self {
+            request: "automatic".to_string(),
+            backend: "vmm".to_string(),
+            reason: Some(
+                "shared paged pool physical backend (serve.multi_slot_paged_backend=vmm)"
+                    .to_string(),
+            ),
+            legacy: false,
+            warning: None,
+            mode: None,
+        }
+    }
+
+    fn for_slot(requested: Option<hipfire_runtime::kv_backend::KvBackend>) -> Self {
         use hipfire_loader::admission::KvBackendRequest;
         use hipfire_runtime::kv_backend::KvBackend;
-        let request = if explicit {
-            KvBackendRequest::Explicit(KvBackend::Legacy)
-        } else {
-            KvBackendRequest::Automatic
-        };
-        let automatic_reason = if explicit {
-            None
-        } else {
-            Some("fixed Q8 slot arena has no VMM owner")
-        };
-        Self::from_admission(request, KvBackend::Legacy, automatic_reason)
+        match requested {
+            Some(backend) => {
+                Self::from_admission(KvBackendRequest::Explicit(backend), backend, None)
+            }
+            None => Self::from_admission(
+                KvBackendRequest::Automatic,
+                KvBackend::Legacy,
+                Some(
+                    "kv_backend not requested; the slot route defaults to legacy arenas (pass --kv-backend vmm for per-slot VMM KV)",
+                ),
+            ),
+        }
     }
 }
 
@@ -1404,12 +1425,14 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    let slot_kv_explicit = msg
+                    // The slot engine's backend is its own selector, not the
+                    // sequential route's: report exactly what was requested.
+                    let slot_kv_requested: Option<hipfire_runtime::kv_backend::KvBackend> = msg
                         .get("params")
                         .and_then(|p| p.get("kv_backend"))
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
-                        .is_some();
+                        .and_then(|s| s.parse().ok());
                     // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
                     if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
                         emit_uncorrelated_error(
@@ -1458,9 +1481,6 @@ fn main() {
                             }
                         }
                     }
-                    // Fixed Q8 slot arena has no VMM owner — always legacy.
-                    // Emit once here; prior model/slot is about to be torn down.
-                    let slot_kv_diag = ResidentKvDiag::for_slot(slot_kv_explicit);
                     // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
@@ -1531,6 +1551,31 @@ fn main() {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
                     let slot_params = slots::SlotLoadParams::from_load_msg(&msg);
+                    // Emit the effective slot backend once here; prior
+                    // model/slot is about to be torn down. A paged VMM pool
+                    // is its own storage route, so it must not inherit the
+                    // per-slot route's automatic-legacy disclosure. Resolve
+                    // it with the engine's own predicate: `slot_params`
+                    // carries the CLI's fully derived pool flag (config, page
+                    // count, prefix cache and the developer aliases), and the
+                    // backend spelling must trim like the engine's.
+                    let paged_backend =
+                        hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| slot_params.multi_slot_paged_backend.clone());
+                    let paged_vmm = (slot_params.multi_slot_paged
+                        || slot_params.multi_slot_paged_pages > 0)
+                        && hipfire_config::select_paged_vmm_backend(
+                            Some(paged_backend.as_str()),
+                            &slot_params.multi_slot_paged_backend,
+                        )
+                        .unwrap_or(false);
+                    let slot_kv_diag = if paged_vmm {
+                        ResidentKvDiag::for_paged_vmm()
+                    } else {
+                        ResidentKvDiag::for_slot(slot_kv_requested)
+                    };
                     // Vision tower: the SAME ladder the ordinary arm applies
                     // (`vision_mode=off` is a hard override). The slot engine
                     // discovers the `.vl` sibling itself, so it has to be told
@@ -1546,6 +1591,9 @@ fn main() {
                         slot_params.mtp_mode,
                         &slot_params.kv_mode_raw,
                         &slot_params.kv_backend,
+                        slot_params.multi_slot_paged,
+                        slot_params.multi_slot_paged_pages,
+                        &slot_params.multi_slot_paged_backend,
                         slot_params.dflash_draft,
                         slot_params.dflash_required,
                         &slot_vision_mode,
@@ -5141,6 +5189,51 @@ mod tests {
         assert!(super::no_model_loaded_suffix(false).contains("no model loaded"));
         // Deferred tp>1: prior model survives a failed load.
         assert_eq!(super::no_model_loaded_suffix(true), "");
+    }
+
+    #[test]
+    fn paged_vmm_diag_does_not_report_legacy() {
+        let diag = super::ResidentKvDiag::for_paged_vmm();
+        assert_eq!(diag.backend, "vmm");
+        assert!(!diag.legacy);
+        assert!(diag.warning.is_none());
+        assert_eq!(diag.request, "automatic");
+        assert!(
+            diag.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("paged pool")),
+            "the paged route must name its storage: {:?}",
+            diag.reason
+        );
+    }
+
+    #[test]
+    fn slot_kv_diag_reports_the_backend_the_load_requested() {
+        use hipfire_runtime::kv_backend::KvBackend;
+        let vmm = super::ResidentKvDiag::for_slot(Some(KvBackend::Vmm));
+        assert_eq!(vmm.backend, "vmm");
+        assert!(!vmm.legacy);
+        assert_eq!(vmm.request, "explicit");
+        assert!(
+            vmm.warning.is_none(),
+            "a VMM slot load must not emit the legacy-backend disclosure: {:?}",
+            vmm.warning
+        );
+        let explicit_legacy = super::ResidentKvDiag::for_slot(Some(KvBackend::Legacy));
+        assert_eq!(explicit_legacy.backend, "legacy");
+        assert!(explicit_legacy.legacy);
+        assert!(explicit_legacy.warning.is_some());
+        let default = super::ResidentKvDiag::for_slot(None);
+        assert_eq!(default.backend, "legacy");
+        assert_eq!(default.request, "automatic");
+        assert!(
+            default
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("kv_backend not requested")),
+            "the automatic legacy warning must name the slot-route default: {:?}",
+            default.warning
+        );
     }
 
     use super::{

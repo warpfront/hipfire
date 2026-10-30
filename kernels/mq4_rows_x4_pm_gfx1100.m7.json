@@ -1,18 +1,18 @@
 {
   "gemv_mq4g256v2_rows_x4_t8_pm_gfx1100": {
-    "ambiguous_delays": 0,
+    "lift": "byte-exact",
+    "table": "gfx1100",
+    "instructions": 9711,
+    "obligations": {},
+    "wait_facts": 665,
     "barrier_pairs": 0,
     "clauses": 0,
-    "delays": 4681,
-    "instructions": 12879,
-    "lds_accesses": 360,
-    "lds_max_known_end": null,
-    "lds_unknown_addresses": 360,
-    "lift": "byte-exact",
-    "obligations": {},
-    "sgpr_high_water": 88,
-    "table": "gfx1100",
+    "delays": 3241,
+    "ambiguous_delays": 0,
     "vgpr_high_water": 121,
-    "wait_facts": 665
+    "sgpr_high_water": 80,
+    "lds_accesses": 360,
+    "lds_unknown_addresses": 360,
+    "lds_max_known_end": null
   }
 }

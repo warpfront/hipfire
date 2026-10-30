@@ -40,14 +40,17 @@
 use hip_bridge::HipResult;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::spec::accept_greedy_prefix;
+use hipfire_runtime::spec::{accept_greedy_prefix, request_rng_state};
 use rdna_compute::slot_pool::SlotId;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 use crate::forward_slots::SpecHiddenCapture;
 use crate::qwen35::{DeltaNetState, PrefillBatchScratch, Qwen35Config, Qwen35Weights};
-use crate::speculative::{DeltaNetSnapshot, GdnTape, VerifyScratch};
+use crate::speculative::{
+    dflash_sampled_accept_rows, DeltaNetSnapshot, DflashSampleCfg, DflashSampledDraft, GdnTape,
+    VerifyScratch,
+};
 
 /// Draft-side state shared by every DFlash slot: the draft weights and the
 /// resolved draft-context policy. One per engine load; `None` when DFlash
@@ -124,9 +127,24 @@ pub struct DflashSlotState {
     pub seeded_through: usize,
     /// In-flight draft output between the draft step and the verify accept.
     pub draft: Option<DflashSlotDraft>,
+    /// This request's selector/target sampling law. `temp == 0.0` is the
+    /// historical greedy path; `temp > 0.0` uses the singleton DFlash2
+    /// rejection sampler.
+    pub sampling: DflashSampleCfg,
+    /// Request-local RNG state for the sampled selector uniforms and the
+    /// acceptance/residual/bonus draws. Unused while greedy.
+    pub rng: u64,
 }
 
 impl DflashSlotState {
+    /// Install a request's sampling law and reseed its RNG. Called once per
+    /// request (admission, or lazily when prefill allocates the state), never
+    /// per window: reseeding mid-generation would repeat the draw stream.
+    pub fn configure_sampling(&mut self, cfg: DflashSampleCfg, rng_seed: u64) {
+        self.sampling = cfg;
+        self.rng = request_rng_state(rng_seed);
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.scratch.free_gpu(gpu);
         self.verify_scratch.free_gpu(gpu);
@@ -156,6 +174,9 @@ pub struct DflashSlotDraft {
     pub verify_rot: GpuTensor,
     /// Argmax scratch `[B-1]`; reused for trunk verify argmax.
     pub verify_argmax: GpuTensor,
+    /// Sampled-window receipt: selector q rows, selected probabilities and the
+    /// RNG uniforms that produced the block. `None` on the greedy path.
+    pub sampled: Option<DflashSampledDraft>,
 }
 
 impl DflashSlotDraft {
@@ -379,6 +400,13 @@ pub fn new_dflash_slot_state(
         session: None,
         seeded_through: 0,
         draft: None,
+        sampling: DflashSampleCfg {
+            temp: 0.0,
+            top_p: 1.0,
+            top_k: hipfire_runtime::llama::ar_candidate_cap(None),
+            cactus_delta: 0.0,
+        },
+        rng: request_rng_state(0),
     })
 }
 
@@ -605,10 +633,12 @@ pub fn dflash_slot_draft_step(
                 verify_logits,
                 verify_rot,
                 verify_argmax,
+                sampled: None,
             }
         }
     };
     draft.cur_pos = position;
+    draft.sampled = None;
 
     let logits_view = draft.verify_logits.sub_offset(0, batch * vocab);
     crate::mtp_spec::mtp_trunk_verify_lm_head(
@@ -623,8 +653,16 @@ pub fn dflash_slot_draft_step(
     )
     .map_err(|e| format!("draft lm_head: {e}"))?;
 
-    // Greedy selector proposal (slots path is temp==0 only — admission
-    // enforced by the caller, same gate as MTP).
+    // Selector proposal. Greedy keeps the historical argmax path; temp>0
+    // draws one uniform per proposed row and the selector returns its exact
+    // softmax(q) over the top-K support, which the verify side needs for
+    // rejection sampling.
+    let sampled = st.sampling.temp > 0.0;
+    let uniforms: Option<Vec<f32>> = sampled.then(|| {
+        (0..batch)
+            .map(|_| crate::speculative::xorshift_next_unit(&mut st.rng))
+            .collect()
+    });
     let proposal = dflash::propose_candidates_device(
         gpu,
         &shared.draft_weights,
@@ -633,8 +671,8 @@ pub fn dflash_slot_draft_step(
         &logits_view,
         batch,
         seed,
-        0.0,
-        None,
+        if sampled { st.sampling.temp } else { 0.0 },
+        uniforms.as_deref(),
     )
     .map_err(|e| format!("selector proposal: {e}"))?;
 
@@ -643,6 +681,35 @@ pub fn dflash_slot_draft_step(
     draft
         .verify_tokens
         .extend_from_slice(&proposal.tokens[..batch.min(proposal.tokens.len())]);
+    if sampled {
+        let probs = proposal
+            .probabilities
+            .as_ref()
+            .ok_or_else(|| "sampled selector proposal missing probabilities".to_string())?;
+        let selected = proposal.selected_probabilities.as_ref().ok_or_else(|| {
+            "sampled selector proposal missing selected probabilities".to_string()
+        })?;
+        let k = proposal.top_k;
+        if probs.len() < batch * k || selected.len() < batch {
+            return Err("sampled selector proposal shape mismatch".to_string());
+        }
+        let mut receipt = DflashSampledDraft::new(b, vocab);
+        receipt.block.clone_from(&draft.verify_tokens);
+        receipt.selected_q.clear();
+        receipt.selected_q.extend_from_slice(&selected[..batch]);
+        receipt.sparse = true;
+        for row in 0..batch {
+            receipt
+                .sparse_q
+                .push_row(
+                    &proposal.candidates[row * k..(row + 1) * k],
+                    &probs[row * k..(row + 1) * k],
+                    vocab,
+                )
+                .map_err(|e| format!("sampled selector q row: {e}"))?;
+        }
+        draft.sampled = Some(receipt);
+    }
     debug_assert_eq!(draft.verify_tokens.len(), b);
     Ok(draft)
 }
@@ -713,28 +780,64 @@ pub fn dflash_slot_verify_accept(
     )
     .map_err(|e| format!("verify lm_head: {e}"))?;
 
-    // Argmax per verify row, one packed D2H.
-    let argmax_v = st.verify_scratch.argmax.sub_offset(0, n_verify);
-    gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)
-        .map_err(|e| format!("verify argmax: {e}"))?;
-    let mut argmax_host: Vec<i32> = vec![0; n_verify];
+    // Greedy accept or lossless sampled rejection. The sampled receipt was
+    // built by the draft step from the selector's own q rows; the target rows
+    // are this forward's trunk logits. On rejection the bonus is drawn from
+    // (p_target − q_selector)+, so the emitted token stream follows the
+    // request's AR sampling law rather than a greedy/spec hybrid.
+    let (mut committed, mut hit_eos): (Vec<u32>, bool) = if let Some(receipt) = draft.sampled.take()
     {
-        let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
-        };
-        gpu.hip
-            .memcpy_dtoh(bytes, &argmax_v.buf)
-            .map_err(|e| format!("verify argmax dtoh: {e}"))?;
-    }
-    let target_pick: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
-
-    // Greedy accept: drafts = verify_tokens[1..] (the B−1 proposals);
-    // target_pick[i] is the trunk's pick at verify row i. committed =
-    // accepted drafts + bonus (seed excluded — it was committed last cycle).
-    let accepted =
-        accept_greedy_prefix(&draft.verify_tokens[1..], &target_pick, Some(eos_token_id));
-    let mut committed = accepted.committed;
-    let mut hit_eos = accepted.hit_eos;
+        let host_logits = gpu
+            .download_f32(&logits_view)
+            .map_err(|e| format!("sampled verify logits dtoh: {e}"))?;
+        let mut scratch = Vec::new();
+        let decision = crate::speculative::dflash_sampled_accept_rows(
+            &receipt.block,
+            &receipt,
+            None,
+            &host_logits,
+            vocab,
+            st.sampling,
+            b.saturating_sub(1),
+            &mut st.rng,
+            &mut scratch,
+        );
+        let mut committed: Vec<u32> = receipt.block[1..1 + decision.accepted_drafts].to_vec();
+        committed.push(decision.bonus_token);
+        let mut hit_eos = false;
+        if let Some(i) = committed.iter().position(|t| *t == eos_token_id) {
+            committed.truncate(i + 1);
+            hit_eos = true;
+        }
+        if crate::mtp_spec::mtp_trace_enabled() {
+            eprintln!(
+                "[dflash-trace] sampled accept slot={} pos={pos} accepted={} bonus={} hit_eos={}",
+                slot.0, decision.accepted_drafts, decision.bonus_token, hit_eos
+            );
+        }
+        (committed, hit_eos)
+    } else {
+        // Argmax per verify row, one packed D2H.
+        let argmax_v = st.verify_scratch.argmax.sub_offset(0, n_verify);
+        gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)
+            .map_err(|e| format!("verify argmax: {e}"))?;
+        let mut argmax_host: Vec<i32> = vec![0; n_verify];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
+            };
+            gpu.hip
+                .memcpy_dtoh(bytes, &argmax_v.buf)
+                .map_err(|e| format!("verify argmax dtoh: {e}"))?;
+        }
+        let target_pick: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+        // drafts = verify_tokens[1..] (the B−1 proposals); target_pick[i]
+        // is the trunk's pick at verify row i. committed = accepted drafts
+        // + bonus (seed excluded — it was committed last cycle).
+        let accepted =
+            accept_greedy_prefix(&draft.verify_tokens[1..], &target_pick, Some(eos_token_id));
+        (accepted.committed, accepted.hit_eos)
+    };
 
     // Clamp to the commit budget and truncate on an auxiliary eot inside the
     // kept prefix — mirrors mtp_batched_verify_accept_from_batch exactly so

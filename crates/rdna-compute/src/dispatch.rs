@@ -548,27 +548,43 @@ impl GpuTensor {
     /// Create a non-owning sub-view at a byte offset. For F32 tensors,
     /// `offset_elems` is the number of f32 elements to skip.
     /// The returned tensor is a view — do NOT free it.
+    ///
+    /// Panics when the view does not fit. Serve paths that must fail closed
+    /// (swap capture/restore) use [`Self::try_sub_offset`] instead.
     pub fn sub_offset(&self, offset_elems: usize, len_elems: usize) -> GpuTensor {
+        self.try_sub_offset(offset_elems, len_elems)
+            .expect("tensor sub-view exceeds accessible buffer prefix")
+    }
+
+    /// [`Self::sub_offset`] that returns the overflow or bounds failure
+    /// instead of panicking the caller.
+    pub fn try_sub_offset(
+        &self,
+        offset_elems: usize,
+        len_elems: usize,
+    ) -> Result<GpuTensor, String> {
         let element_size = self.dtype.size();
         let byte_off = offset_elems
             .checked_mul(element_size)
-            .expect("tensor sub-view offset overflow");
+            .ok_or_else(|| "tensor sub-view offset overflow".to_string())?;
         let byte_len = len_elems
             .checked_mul(element_size)
-            .expect("tensor sub-view length overflow");
+            .ok_or_else(|| "tensor sub-view length overflow".to_string())?;
         let byte_end = byte_off
             .checked_add(byte_len)
-            .expect("tensor sub-view range overflow");
-        assert!(
-            byte_end <= self.buf.size(),
-            "tensor sub-view exceeds accessible buffer prefix"
-        );
+            .ok_or_else(|| "tensor sub-view range overflow".to_string())?;
+        if byte_end > self.buf.size() {
+            return Err(format!(
+                "tensor sub-view exceeds accessible buffer prefix ({byte_end} > {})",
+                self.buf.size()
+            ));
+        }
         let ptr = unsafe { (self.buf.as_ptr() as *mut u8).add(byte_off) as *mut std::ffi::c_void };
-        GpuTensor {
+        Ok(GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, byte_len) },
             shape: vec![len_elems],
             dtype: self.dtype,
-        }
+        })
     }
 
     /// Full-buffer non-owning alias (the whole-tensor form of `sub_offset`).
@@ -4160,6 +4176,34 @@ impl Gpu {
     /// Helper: launch a kernel using the blob path during graph capture,
     /// or the normal kernelParams path otherwise. The `blob_builder` closure
     /// constructs the KernargBlob; it's only called when capturing.
+    /// `HIPFIRE_LAUNCH_DUMP=N` prints the first `N` launch names, in order,
+    /// from this funnel. Developer diagnostic only: the eager body and the
+    /// retained recorder both pass here, so two dumps of the same step diff
+    /// into the exact launch where a retained route diverges from eager.
+    /// Unset prints nothing.
+    fn launch_dump_budget() -> usize {
+        static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_LAUNCH_DUMP")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    fn launch_dump_note(func_name: &str, grid: [u32; 3], block: [u32; 3]) {
+        let budget = Self::launch_dump_budget();
+        if budget == 0 {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        let index = SEEN.fetch_add(1, Ordering::Relaxed);
+        if index < budget {
+            eprintln!("[launch-dump] {index} {func_name} grid={grid:?} block={block:?}");
+        }
+    }
+
     pub(crate) fn launch_maybe_blob(
         &mut self,
         func_name: &str,
@@ -4257,6 +4301,7 @@ impl Gpu {
         railgun_words: &[railgun::kernel::DeclaredWord],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        Self::launch_dump_note(func_name, grid, block);
         self.ensure_route_modules_preloaded()?;
         // Fail closed before the recorder / capture tapes see the launch: an
         // oversized grid.y/grid.z must never be recorded, captured, or clamped.
@@ -6638,6 +6683,49 @@ impl Gpu {
         self.f16_shadow_arena.root_capacities(DeviceBuffer::size)
     }
 
+    /// Reserve VA for a VMM-backed tensor without mapping any physical
+    /// memory. The caller maps granules with [`Self::vmm_map_at`] and must
+    /// refresh the owner's safe size with [`Self::refresh_vmm_owner_size`]
+    /// before any whole-tensor copy/read checks.
+    pub unsafe fn reserve_vmm_tensor(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        access_devices: &[i32],
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "VMM tensor element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
+        let arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        // `access_devices` is applied by the first `vmm_map_at`; reserve has
+        // no mapped range to set access on yet.
+        let _ = access_devices;
+        self.register_vmm_arena(arena, byte_size, shape, dtype)
+    }
+
+    /// Rebuild the owning descriptor after the arena's mapped prefix
+    /// changed. The base address is stable; only the safe byte length moves.
+    pub fn refresh_vmm_owner_size(&mut self, tensor: &mut GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        let logical_bytes = tensor.byte_size();
+        let arena = self.vmm_arenas.get(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        // SAFETY: exactly one owner descriptor replaces the previous owner
+        // for the same registered arena; the old descriptor never freed it.
+        tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
+        Ok(())
+    }
+
     /// Reserve a dense virtual tensor and optionally map its initial prefix.
     /// The returned tensor follows the normal kernel ABI, but its ownership is
     /// registered separately so `free_tensor` releases VMM handles instead of
@@ -7215,6 +7303,60 @@ impl Gpu {
         access_devices: &[i32],
     ) -> HipResult<usize> {
         self.grow_vmm_tensor_impl(tensor, additional_bytes, access_devices, true)
+    }
+
+    /// Map `size` fresh bytes at a granularity-aligned `offset` in a VMM
+    /// owner's reservation. Used by the multi-slot KV page pool; unlike
+    /// [`Self::grow_vmm_tensor`], it may leave holes and does not change the
+    /// tensor's logical size.
+    pub fn vmm_map_at(
+        &mut self,
+        tensor: &GpuTensor,
+        offset: usize,
+        size: usize,
+        access_devices: &[i32],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        if !self.vmm_arenas.contains_key(&key) {
+            return Err(HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            ));
+        }
+        self.vmm_pool_headroom(size);
+        let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
+        arena.map_at(&self.hip, offset, size, access_devices)
+    }
+
+    /// True when the arena registered at this tensor's base can never be
+    /// mapped again (a failed `map_at` left it `releasing`). The shared paged
+    /// mapper poisons itself on this so a permanently unmappable pool reports
+    /// a mapping fault instead of a retryable capacity refusal forever.
+    pub fn vmm_arena_unmappable(&self, tensor: &GpuTensor) -> bool {
+        let key = tensor.buf.as_ptr() as usize;
+        self.vmm_arenas
+            .get(&key)
+            .is_some_and(|arena| arena.unmappable())
+    }
+
+    /// Unmap and release one pool page previously mapped with
+    /// [`Self::vmm_map_at`]. Synchronizes every access device first.
+    pub fn vmm_unmap_at(
+        &mut self,
+        tensor: &GpuTensor,
+        offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        arena.unmap_at(&self.hip, offset, size)
     }
 
     fn grow_vmm_tensor_impl(

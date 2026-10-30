@@ -507,6 +507,87 @@ impl VmmKvSlotDesc {
     }
 }
 
+/// Byte-identical mirror of `struct KvSlotDesc` in
+/// `kernels/src/kv_slot_desc_vmm_paged.h` (the `_vmm_paged` module variant).
+/// 48 bytes, 8-byte aligned. The block table and logical page stay the same
+/// as [`KvSlotDesc`]; the last two fields add VMM granule packing.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VmmPagedKvSlotDesc {
+    /// GPU address of the physical page-index array. Zero = legacy contiguous.
+    pub block_table: u64,
+    /// Legacy slab offsets; zero for a VMM-paged descriptor.
+    pub legacy_k_base: u64,
+    pub legacy_v_base: u64,
+    /// Logical KV length in tokens.
+    pub seq_len: i32,
+    /// Tokens per logical page (128 in the paged engine); 0 = legacy.
+    pub page_tokens: i32,
+    /// VMM granule size; 0 selects the contiguous paged formula.
+    pub granule_bytes: u64,
+    /// Physical pages packed into one granule; 0 selects contiguous paged.
+    pub pages_per_granule: u32,
+    /// Explicit tail padding matching the device struct.
+    pub _pad: u32,
+}
+
+/// Packed size of [`VmmPagedKvSlotDesc`] and the `_vmm_paged` device struct.
+pub const VMM_PAGED_DESC_BYTES: usize = 48;
+
+const _: () = assert!(std::mem::size_of::<VmmPagedKvSlotDesc>() == VMM_PAGED_DESC_BYTES);
+const _: () = assert!(std::mem::align_of::<VmmPagedKvSlotDesc>() == 8);
+
+impl VmmPagedKvSlotDesc {
+    /// Validate the fields a launch depends on. A paged descriptor must carry
+    /// a real page size; the granule packing fields are both-or-neither.
+    pub fn check_paged_layout(&self) -> Result<(), String> {
+        if self.block_table == 0 {
+            return Err("VMM-paged descriptor has a null block table".into());
+        }
+        if self.page_tokens <= 0 {
+            return Err(format!(
+                "VMM-paged descriptor page_tokens {} must be positive",
+                self.page_tokens
+            ));
+        }
+        if (self.granule_bytes == 0) != (self.pages_per_granule == 0) {
+            return Err(format!(
+                "VMM-paged descriptor granule_bytes={} pages_per_granule={} must be both zero or both non-zero",
+                self.granule_bytes, self.pages_per_granule
+            ));
+        }
+        Ok(())
+    }
+
+    /// Byte offset of physical page `phys_page` in one arena.
+    ///
+    /// Mirrors `kv_vmm_paged_offset` for the page start (`page_off = 0`).
+    /// `per_pos_bytes` is the arena's per-position stride.
+    pub fn page_offset(&self, phys_page: u32, per_pos_bytes: usize) -> Option<u64> {
+        let page_tokens = u64::try_from(self.page_tokens).ok()?;
+        let stride = u64::try_from(per_pos_bytes).ok()?;
+        let page_bytes = page_tokens.checked_mul(stride)?;
+        if self.granule_bytes != 0 && self.pages_per_granule != 0 {
+            let p = u64::from(self.pages_per_granule);
+            let granule = u64::from(phys_page) / p;
+            let within = u64::from(phys_page) % p;
+            granule
+                .checked_mul(self.granule_bytes)?
+                .checked_add(within.checked_mul(page_bytes)?)
+        } else {
+            u64::from(phys_page).checked_mul(page_bytes)
+        }
+    }
+
+    /// Raw bytes for staging upload (`descs.len() * 48`).
+    pub fn as_bytes(descs: &[Self]) -> &[u8] {
+        // SAFETY: repr(C), explicit tail pad, size asserted at 48 above.
+        unsafe {
+            std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs))
+        }
+    }
+}
+
 /// Host gate run before every `_vmm` write/attention launch: each row's slot
 /// is in range, bound to the owner generation (request epoch) the planner
 /// assigned that row, and its absolute position lies in the mapped prefix.
@@ -556,6 +637,55 @@ pub fn validate_vmm_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vmm_paged_descriptor_matches_the_device_abi_and_arithmetic() {
+        assert_eq!(std::mem::size_of::<VmmPagedKvSlotDesc>(), 48);
+        assert_eq!(std::mem::align_of::<VmmPagedKvSlotDesc>(), 8);
+
+        // 15 q8 pages of 128 tokens x 1088 B fit one 2 MiB granule; page 15
+        // starts the next granule and page 29 sits at its 15th slot.
+        let desc = VmmPagedKvSlotDesc {
+            block_table: 0x1000,
+            legacy_k_base: 0,
+            legacy_v_base: 0,
+            seq_len: 4096,
+            page_tokens: 128,
+            granule_bytes: 2 << 20,
+            pages_per_granule: 15,
+            _pad: 0,
+        };
+        desc.check_paged_layout().unwrap();
+        let page_bytes = 128 * 1088u64;
+        assert_eq!(desc.page_offset(0, 1088), Some(0));
+        assert_eq!(desc.page_offset(14, 1088), Some(14 * page_bytes));
+        assert_eq!(desc.page_offset(15, 1088), Some(2 << 20));
+        assert_eq!(
+            desc.page_offset(29, 1088),
+            Some((2 << 20) + 14 * page_bytes)
+        );
+
+        // Both zero -> contiguous paged formula.
+        let contiguous = VmmPagedKvSlotDesc {
+            granule_bytes: 0,
+            pages_per_granule: 0,
+            ..desc
+        };
+        contiguous.check_paged_layout().unwrap();
+        assert_eq!(contiguous.page_offset(29, 1088), Some(29 * page_bytes));
+
+        // Half-configured packing is refused by the launch gate.
+        let half = VmmPagedKvSlotDesc {
+            pages_per_granule: 0,
+            ..desc
+        };
+        assert!(half.check_paged_layout().is_err());
+        let null = VmmPagedKvSlotDesc {
+            block_table: 0,
+            ..desc
+        };
+        assert!(null.check_paged_layout().is_err());
+    }
 
     #[test]
     fn preflight_refuses_over_target_budget() {

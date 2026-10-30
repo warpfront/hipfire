@@ -4147,6 +4147,214 @@ impl Gpu {
         result
     }
 
+    /// One launch for every live slot's Q8 GDN recurrence.
+    ///
+    /// Each table row is one independent sequence (disjoint S / scales / EF).
+    /// Q/K/V/gate/beta/output point at that slot's packed-batch rows. The
+    /// kernarg keeps the scalar `gated_delta_net_q8_fast` prefix so retained
+    /// PM4 patches the requant frame at offset 76. Lane 0 is those prefix
+    /// pointers (HIP Resource wait sees them). Lane 1 is nine explicit
+    /// pointer args at offset 96, 168 B total, inside the gfx11 256 B
+    /// preload. A by-value table hid lane-1 from alias analysis.
+    ///
+    /// All rows share `n_tokens` (decode is 1). `lanes.len()` is grid.z,
+    /// 1..=2. Byte-identical to one `gated_delta_net_q8_batch_seq` per row
+    /// over that row's views, with frames reserved once as
+    /// `n_tokens * n_lanes`.
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_q8_fast_slots(
+        &mut self,
+        lanes: &[crate::dflash_gdn_replay::GdnLayerTable],
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        const SLOTS_MAX: usize = 4;
+        if lanes.is_empty() || n_tokens == 0 {
+            return Ok(());
+        }
+        if !(1..=SLOTS_MAX).contains(&lanes.len()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gated_delta_net_q8_fast_slots: {} lanes outside 1..={SLOTS_MAX}",
+                    lanes.len()
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_delta_net_q8_fast_slots",
+            kernels::GATED_DELTA_NET_Q8_FAST_SLOTS_SRC,
+            "gated_delta_net_q8_fast_slots",
+        )?;
+        let n_tiles = (128 / 4) as u32;
+        let empty = crate::dflash_gdn_replay::GdnLayerTable {
+            q: 0,
+            k: 0,
+            v: 0,
+            gate: 0,
+            beta: 0,
+            s_q8: 0,
+            s_scales: 0,
+            output: 0,
+            ef: 0,
+        };
+        let lane0 = lanes[0];
+        let lane1 = lanes.get(1).copied().unwrap_or(empty);
+        let lane2 = lanes.get(2).copied().unwrap_or(empty);
+        let lane3 = lanes.get(3).copied().unwrap_or(empty);
+        let mut qp = lane0.q as *mut c_void;
+        let mut kp = lane0.k as *mut c_void;
+        let mut vp = lane0.v as *mut c_void;
+        let mut gp = lane0.gate as *mut c_void;
+        let mut bp = lane0.beta as *mut c_void;
+        let mut sp = lane0.s_q8 as *mut c_void;
+        let mut scp = lane0.s_scales as *mut c_void;
+        let mut op = lane0.output as *mut c_void;
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut fr = reserve_gdn_requant_frames((n_tokens * lanes.len()) as u32) as i32;
+        let mut efp = lane0.ef as *mut c_void;
+        let mut qk_ratio = 1i32;
+        let mut q1 = lane1.q as *mut c_void;
+        let mut k1 = lane1.k as *mut c_void;
+        let mut v1 = lane1.v as *mut c_void;
+        let mut g1 = lane1.gate as *mut c_void;
+        let mut b1 = lane1.beta as *mut c_void;
+        let mut s1 = lane1.s_q8 as *mut c_void;
+        let mut sc1 = lane1.s_scales as *mut c_void;
+        let mut o1 = lane1.output as *mut c_void;
+        let mut ef1 = lane1.ef as *mut c_void;
+        let mut q2 = lane2.q as *mut c_void;
+        let mut k2 = lane2.k as *mut c_void;
+        let mut v2 = lane2.v as *mut c_void;
+        let mut g2 = lane2.gate as *mut c_void;
+        let mut b2 = lane2.beta as *mut c_void;
+        let mut s2 = lane2.s_q8 as *mut c_void;
+        let mut sc2 = lane2.s_scales as *mut c_void;
+        let mut o2 = lane2.output as *mut c_void;
+        let mut ef2 = lane2.ef as *mut c_void;
+        let mut q3 = lane3.q as *mut c_void;
+        let mut k3 = lane3.k as *mut c_void;
+        let mut v3 = lane3.v as *mut c_void;
+        let mut g3 = lane3.gate as *mut c_void;
+        let mut b3 = lane3.beta as *mut c_void;
+        let mut s3 = lane3.s_q8 as *mut c_void;
+        let mut sc3 = lane3.s_scales as *mut c_void;
+        let mut o3 = lane3.output as *mut c_void;
+        let mut ef3 = lane3.ef as *mut c_void;
+        let bytes =
+            crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim) * lanes.len();
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_q8_fast_slots",
+            bytes,
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut scp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut fr as *mut _ as *mut c_void,
+            &mut efp as *mut _ as *mut c_void,
+            &mut qk_ratio as *mut _ as *mut c_void,
+            &mut q1 as *mut _ as *mut c_void,
+            &mut k1 as *mut _ as *mut c_void,
+            &mut v1 as *mut _ as *mut c_void,
+            &mut g1 as *mut _ as *mut c_void,
+            &mut b1 as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut sc1 as *mut _ as *mut c_void,
+            &mut o1 as *mut _ as *mut c_void,
+            &mut ef1 as *mut _ as *mut c_void,
+            &mut q2 as *mut _ as *mut c_void,
+            &mut k2 as *mut _ as *mut c_void,
+            &mut v2 as *mut _ as *mut c_void,
+            &mut g2 as *mut _ as *mut c_void,
+            &mut b2 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut sc2 as *mut _ as *mut c_void,
+            &mut o2 as *mut _ as *mut c_void,
+            &mut ef2 as *mut _ as *mut c_void,
+            &mut q3 as *mut _ as *mut c_void,
+            &mut k3 as *mut _ as *mut c_void,
+            &mut v3 as *mut _ as *mut c_void,
+            &mut g3 as *mut _ as *mut c_void,
+            &mut b3 as *mut _ as *mut c_void,
+            &mut s3 as *mut _ as *mut c_void,
+            &mut sc3 as *mut _ as *mut c_void,
+            &mut o3 as *mut _ as *mut c_void,
+            &mut ef3 as *mut _ as *mut c_void,
+        ];
+        let n_lanes = lanes.len() as u32;
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8_fast_slots",
+            [n_heads as u32, n_tiles, n_lanes],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(scp);
+                b.push_ptr(op);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(fr);
+                b.push_ptr(efp);
+                b.push_i32(qk_ratio);
+                b.push_ptr(q1);
+                b.push_ptr(k1);
+                b.push_ptr(v1);
+                b.push_ptr(g1);
+                b.push_ptr(b1);
+                b.push_ptr(s1);
+                b.push_ptr(sc1);
+                b.push_ptr(o1);
+                b.push_ptr(ef1);
+                b.push_ptr(q2);
+                b.push_ptr(k2);
+                b.push_ptr(v2);
+                b.push_ptr(g2);
+                b.push_ptr(b2);
+                b.push_ptr(s2);
+                b.push_ptr(sc2);
+                b.push_ptr(o2);
+                b.push_ptr(ef2);
+                b.push_ptr(q3);
+                b.push_ptr(k3);
+                b.push_ptr(v3);
+                b.push_ptr(g3);
+                b.push_ptr(b3);
+                b.push_ptr(s3);
+                b.push_ptr(sc3);
+                b.push_ptr(o3);
+                b.push_ptr(ef3);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// One-token recurrent update for several independent sequence lanes.
     /// State tensors are lane-major; the kernel uses grid.z as the lane id.
     #[cfg(feature = "deltanet")]

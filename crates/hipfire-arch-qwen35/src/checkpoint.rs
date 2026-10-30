@@ -21,6 +21,37 @@ impl CheckpointBlob for DeltaNetSnapshot {
     }
 }
 
+/// Bytes left free for the next VMM granule map. A snapshot that would
+/// consume this reserve is refused instead of being allocated.
+const CHECKPOINT_MAP_RESERVE_BYTES: u64 = 512 << 20;
+
+/// True when `bytes` can be hipMalloc'd without eating the KV map reserve.
+/// Unpinned snapshots are freed until that holds, or until none remain.
+fn checkpoint_device_room(
+    gpu: &mut Gpu,
+    pool: &mut CheckpointPool<DeltaNetSnapshot>,
+    bytes: u64,
+) -> bool {
+    let need = bytes.saturating_add(CHECKPOINT_MAP_RESERVE_BYTES);
+    loop {
+        let free = gpu
+            .device_mem_info()
+            .map(|(free, _)| free as u64)
+            .unwrap_or(0);
+        if free >= need {
+            return true;
+        }
+        let Some((_, blob)) = pool.pop_lru() else {
+            return false;
+        };
+        let freed = blob.bytes_len();
+        blob.free_gpu(gpu);
+        eprintln!(
+            "[prefix-cache] freed {freed} checkpoint bytes to leave room for a {bytes} B capture (device free {free})"
+        );
+    }
+}
+
 /// Capture a checkpoint from the live `DeltaNetState` at boundary `p`
 /// and insert it into `pool` (spec §4.5 C5).
 ///
@@ -62,8 +93,23 @@ pub fn capture_checkpoint(
     ) {
         return Ok(CheckpointId::NONE);
     }
+    // The pool ceiling is a byte counter, not device memory. Snapshots are
+    // hipMalloc'd beside the VMM page pool; allocating one the card cannot
+    // hold fails the next KV granule map. Free unpinned snapshots until the
+    // capture fits with a map reserve, or skip it.
+    if !checkpoint_device_room(gpu, pool, bytes) {
+        return Ok(CheckpointId::NONE);
+    }
 
-    let mut snap = DeltaNetSnapshot::new_for(gpu, state)?;
+    let mut snap = match DeltaNetSnapshot::new_for(gpu, state) {
+        Ok(snap) => snap,
+        Err(err) => {
+            if !checkpoint_device_room(gpu, pool, bytes) {
+                return Err(err);
+            }
+            DeltaNetSnapshot::new_for(gpu, state)?
+        }
+    };
     snap.save_from(state, gpu)?;
 
     let (id, displaced) = pool.insert(domain.clone(), p, prefix_fingerprint(boundary_tokens), snap);

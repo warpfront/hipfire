@@ -115,6 +115,7 @@ fn main() {
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
                 min_p: 0.0,
+                logprobs_top_k: None,
                 visual_data: None,
                 json_schema: None,
                 started_in_think: false,

@@ -1004,6 +1004,51 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK"),
         "Prefill tokens taken from one slot per multi-slot step; batch scratch is sized n_slots x this."
     ),
+    process_bool_field!(
+        "serve.multi_slot_paged",
+        "multi_slot_paged",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_MULTI_SLOT_PAGED",
+        "Multi-slot KV: use the shared PagePool (128-token physical pages, per-slot block tables, \
+         refcounted prefix sharing and COW) instead of fixed per-slot slabs. The pool is shared by \
+         every slot; pages are allocated as a request grows. Pair with \
+         serve.multi_slot_paged_pages=0 for automatic sizing from post-weight free VRAM."
+    ),
+    field!(
+        "serve.multi_slot_paged_pages",
+        "multi_slot_paged_pages",
+        Serve,
+        Process,
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: 1048576
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_PAGED_PAGES"),
+        "Physical pages in the shared multi-slot paged KV pool (128 tokens per page). 0 = auto-size \
+         from free VRAM after weights and prefill scratch; ignored when the paged pool is off."
+    ),
+    field!(
+        "serve.multi_slot_paged_backend",
+        "multi_slot_paged_backend",
+        Serve,
+        Process,
+        DefaultValue::String("arena"),
+        ValueRule::Enum(&["arena", "vmm"]),
+        false,
+        true,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_PAGED_BACKEND"),
+        "Physical backend for the shared paged KV pool. `vmm` is the multi-slot VMM cache: \
+         one shared pool, VA-only at load, 2 MiB granule groups mapped as pages become \
+         resident and unmapped when the request releases them. `memory.kv_backend=vmm` selects \
+         this same pool; it is not a second, per-slot VMM cache. `arena` (default) preallocates \
+         the pool and is used only with `memory.kv_backend=legacy`. `vmm` admits q8 equal-stride \
+         pools only. MoE prompt chunks are isolated single-slot steps. Not a production default."
+    ),
     field!(
         "generation.temperature",
         "temperature",
@@ -4676,6 +4721,34 @@ pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarErr
 pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
     process_value(name).map(Into::into)
 }
+
+/// Resolve the shared paged pool's physical backend.
+///
+/// `env_backend` is `HIPFIRE_SLOTS_PAGED_BACKEND` when the process snapshot
+/// has it; it overrides `configured` (`serve.multi_slot_paged_backend`).
+/// Only `arena` and `vmm` are accepted, trimmed and case-insensitively;
+/// anything else, including a padded or empty override, is an error so a typo
+/// cannot silently select arena.
+///
+/// One implementation for the engine, the CLI's startup gate and the daemon's
+/// KV diagnostic: those three used to disagree on trimming and on which flags
+/// select the pool, which let a running VMM-paged server be reported as
+/// legacy KV.
+pub fn select_paged_vmm_backend(
+    env_backend: Option<&str>,
+    configured: &str,
+) -> std::result::Result<bool, String> {
+    let override_backend = env_backend.map(str::trim).filter(|value| !value.is_empty());
+    let value = override_backend.unwrap_or(configured.trim());
+    match value.to_ascii_lowercase().as_str() {
+        "vmm" => Ok(true),
+        "arena" => Ok(false),
+        other => Err(format!(
+            "paged KV backend must be `arena` or `vmm`, got {other:?}"
+        )),
+    }
+}
+
 /// Strict process-snapshot boolean for the `HIPFIRE_*` long tail.
 /// Reads exactly one snapshot value: `"1"` is true, `"0"` is false, and
 /// anything else (absent, empty, or any other spelling) falls back to

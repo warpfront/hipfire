@@ -13,8 +13,9 @@
 //   points to the GPU-uploaded page index array, `page_tokens = PAGE_TOKENS`.
 //   Enables dynamic allocation, prefix sharing, and over-subscription.
 
-use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
+use crate::kv_slots::{preflight_alloc, KvSlotDesc, VmmPagedKvSlotDesc, R9700_VRAM_BYTES};
 use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS};
+use crate::vmm_page_pool::VmmPageLayout;
 
 /// Slab capacities round up to this, so a future page size divides them.
 /// Matches the tile size the flash path walks KV in.
@@ -69,6 +70,11 @@ pub struct SlotPool {
     /// fails `validate_generation` after a release/reacquire cycle.
     /// Initialized to 0 — legacy `acquire` callers never check it.
     slot_generations: Vec<u32>,
+    /// VMM-paged descriptor layout. `None` = arena-paged (32-byte
+    /// `KvSlotDesc`); `Some` = VMM-paged (48-byte descriptors).
+    vmm_layout: Option<VmmPageLayout>,
+    /// Parallel 48-byte descriptor table, empty until `set_vmm_layout`.
+    vmm_descs: Vec<VmmPagedKvSlotDesc>,
 }
 
 // Compile-time check that the pool and page-pool page sizes agree.
@@ -141,6 +147,8 @@ impl SlotPool {
             block_tables: vec![None; n_slots],
             block_tables_dirty: vec![false; n_slots],
             slot_generations: vec![0; n_slots],
+            vmm_layout: None,
+            vmm_descs: Vec::new(),
         })
     }
 
@@ -202,7 +210,92 @@ impl SlotPool {
             block_tables: vec![None; n_slots],
             block_tables_dirty: vec![false; n_slots],
             slot_generations: vec![0; n_slots],
+            vmm_layout: None,
+            vmm_descs: Vec::new(),
         })
+    }
+
+    /// Select VMM-paged descriptors for this paged pool. Reserved for q8/fp8
+    /// equal-stride pools; the caller builds the matching `VmmPageMapper`.
+    ///
+    /// Every field here ends up in the 48-byte device descriptor and drives
+    /// `kv_vmm_paged_offset`, so a layout that disagrees with this pool's
+    /// strides is refused rather than silently translating one logical page
+    /// two different ways.
+    pub fn set_vmm_layout(&mut self, layout: VmmPageLayout) -> Result<(), String> {
+        if self.page_pool.is_none() {
+            return Err("SlotPool: VMM layout requires a paged pool".into());
+        }
+        if layout.page_tokens != PAGE_TOKENS {
+            return Err(format!(
+                "SlotPool: VMM page_tokens {} does not match paged PAGE_TOKENS {PAGE_TOKENS}",
+                layout.page_tokens
+            ));
+        }
+        if self.k_per_pos_bytes != self.v_per_pos_bytes {
+            return Err(format!(
+                "SlotPool: VMM layout requires equal K/V strides (K {}, V {})",
+                self.k_per_pos_bytes, self.v_per_pos_bytes
+            ));
+        }
+        let want_page_bytes = PAGE_TOKENS
+            .checked_mul(self.k_per_pos_bytes)
+            .ok_or_else(|| "SlotPool: VMM page size overflow".to_string())?;
+        if layout.page_bytes != want_page_bytes {
+            return Err(format!(
+                "SlotPool: VMM page_bytes {} does not match PAGE_TOKENS {PAGE_TOKENS} x \
+                 stride {} = {want_page_bytes}",
+                layout.page_bytes, self.k_per_pos_bytes
+            ));
+        }
+        if layout.pages_per_granule == 0 || layout.granule_bytes == 0 {
+            return Err(format!(
+                "SlotPool: VMM layout granule_bytes={} pages_per_granule={} must be non-zero",
+                layout.granule_bytes, layout.pages_per_granule
+            ));
+        }
+        let packed = (layout.pages_per_granule as usize)
+            .checked_mul(layout.page_bytes)
+            .ok_or_else(|| "SlotPool: VMM granule packing overflow".to_string())?;
+        if packed > layout.granule_bytes {
+            return Err(format!(
+                "SlotPool: VMM layout packs {packed} bytes into a {} byte granule",
+                layout.granule_bytes
+            ));
+        }
+        self.vmm_descs = self
+            .descs
+            .iter()
+            .map(|desc| VmmPagedKvSlotDesc {
+                block_table: desc.block_table,
+                legacy_k_base: 0,
+                legacy_v_base: 0,
+                seq_len: desc.seq_len,
+                page_tokens: if desc.block_table != 0 {
+                    PAGE_TOKENS as i32
+                } else {
+                    0
+                },
+                granule_bytes: layout.granule_bytes as u64,
+                pages_per_granule: layout.pages_per_granule,
+                _pad: 0,
+            })
+            .collect();
+        self.vmm_layout = Some(layout);
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn is_vmm_paged(&self) -> bool {
+        self.vmm_layout.is_some()
+    }
+
+    pub fn vmm_layout(&self) -> Option<VmmPageLayout> {
+        self.vmm_layout
+    }
+
+    pub fn vmm_descriptors(&self) -> &[VmmPagedKvSlotDesc] {
+        &self.vmm_descs
     }
 
     /// Take a free slot, or `None` when the pool is full. Admission control
@@ -268,6 +361,17 @@ impl SlotPool {
             self.descs[id.0].legacy_k_base = 0;
             self.descs[id.0].legacy_v_base = 0;
         }
+        if let Some(layout) = self.vmm_layout {
+            let desc = &mut self.vmm_descs[id.0];
+            desc.block_table = 0;
+            desc.legacy_k_base = 0;
+            desc.legacy_v_base = 0;
+            desc.seq_len = 0;
+            desc.page_tokens = 0;
+            desc.granule_bytes = layout.granule_bytes as u64;
+            desc.pages_per_granule = layout.pages_per_granule;
+            self.dirty = true;
+        }
     }
 
     /// Set a slot's logical KV length. Enforces `seq_len <= cap` host-side,
@@ -308,7 +412,39 @@ impl SlotPool {
             self.descs[id.0].seq_len = seq_len as i32;
             self.dirty = true;
         }
+        self.note_vmm_live_len(id.0, seq_len);
         Ok(())
+    }
+
+    /// Keep the 48-byte VMM descriptor's `seq_len` equal to the 32-byte one.
+    ///
+    /// `set_seq_len` used to update the VMM row only when the arena row
+    /// changed. `share_prefix` / `share_published_pages` write the arena row
+    /// themselves, so a following `set_seq_len` of that same length skipped
+    /// the VMM row and left `seq_len == 0` until `activate_paged_desc`. A
+    /// pack that ran before activation would hand the kernel a zero length.
+    /// A positive length also installs `page_tokens` when the VMM layout is
+    /// selected; it does not clear `page_tokens` on a zero length, because
+    /// the block-table pointer may still be installed and a zero
+    /// `page_tokens` divides in the device offset.
+    fn note_vmm_live_len(&mut self, slot: usize, live: usize) {
+        if self.vmm_descs.is_empty() {
+            return;
+        }
+        let seq_len = live as i32;
+        let desc = &mut self.vmm_descs[slot];
+        let mut changed = false;
+        if desc.seq_len != seq_len {
+            desc.seq_len = seq_len;
+            changed = true;
+        }
+        if live > 0 && self.vmm_layout.is_some() && desc.page_tokens == 0 {
+            desc.page_tokens = PAGE_TOKENS as i32;
+            changed = true;
+        }
+        if changed {
+            self.dirty = true;
+        }
     }
 
     /// Grow `id`'s block table so it can hold `seq_len` tokens WITHOUT
@@ -362,6 +498,7 @@ impl SlotPool {
             self.descs[id.0].seq_len = seq_len as i32;
             self.dirty = true;
         }
+        self.note_vmm_live_len(id.0, seq_len);
         Ok(())
     }
 
@@ -470,6 +607,16 @@ impl SlotPool {
         self.descs[slot.0].legacy_k_base = 0;
         self.descs[slot.0].legacy_v_base = 0;
         self.descs[slot.0].seq_len = bt.live_tokens() as i32;
+        if let Some(layout) = self.vmm_layout {
+            let desc = &mut self.vmm_descs[slot.0];
+            desc.block_table = block_table_dev_addr;
+            desc.legacy_k_base = 0;
+            desc.legacy_v_base = 0;
+            desc.seq_len = bt.live_tokens() as i32;
+            desc.page_tokens = PAGE_TOKENS as i32;
+            desc.granule_bytes = layout.granule_bytes as u64;
+            desc.pages_per_granule = layout.pages_per_granule;
+        }
         self.dirty = true;
     }
 
@@ -519,6 +666,7 @@ impl SlotPool {
         // provision happened to fix it.
         dst_bt.set_live_tokens(live);
         self.descs[dst.0].seq_len = live as i32;
+        self.note_vmm_live_len(dst.0, live);
         self.block_tables_dirty[dst.0] = true;
         self.dirty = true;
         Ok(())
@@ -578,6 +726,7 @@ impl SlotPool {
         }
         bt.set_live_tokens(live);
         self.descs[dst.0].seq_len = live as i32;
+        self.note_vmm_live_len(dst.0, live);
         self.block_tables_dirty[dst.0] = true;
         self.dirty = true;
         Ok(())
@@ -765,6 +914,36 @@ mod tests {
         assert_eq!(c.0, a.0, "released slot must be reused");
         p.release(b);
         p.release(c);
+    }
+
+    #[test]
+    fn share_prefix_publishes_the_vmm_descriptor_length() {
+        let mut p = SlotPool::new_paged(2, 512, PPB, 32).unwrap();
+        p.set_vmm_layout(crate::vmm_page_pool::VmmPageLayout {
+            page_tokens: PAGE_TOKENS,
+            page_bytes: PAGE_TOKENS * PPB,
+            granule_bytes: 2 * 1024 * 1024,
+            pages_per_granule: 15,
+            n_pages: 32,
+            n_granules: 3,
+        })
+        .unwrap();
+        let src = p.acquire().unwrap();
+        let dst = p.acquire().unwrap();
+        p.set_seq_len(src, PAGE_TOKENS * 2).unwrap();
+        assert_eq!(p.vmm_descriptors()[src.0].seq_len, (PAGE_TOKENS * 2) as i32);
+        assert_eq!(p.vmm_descriptors()[src.0].page_tokens, PAGE_TOKENS as i32);
+        // The fork itself must publish the destination length. Waiting for
+        // a later set_seq_len of the same value used to leave the VMM row
+        // at seq_len 0, because that path updates VMM only when the arena
+        // row changes and share already wrote the arena row.
+        p.share_prefix(src, dst, 2).unwrap();
+        assert_eq!(p.descriptors()[dst.0].seq_len, (PAGE_TOKENS * 2) as i32);
+        assert_eq!(p.vmm_descriptors()[dst.0].seq_len, (PAGE_TOKENS * 2) as i32);
+        assert_eq!(p.vmm_descriptors()[dst.0].page_tokens, PAGE_TOKENS as i32);
+        assert_eq!(p.vmm_descriptors()[dst.0].pages_per_granule, 15);
+        p.set_seq_len(dst, PAGE_TOKENS * 2).unwrap();
+        assert_eq!(p.vmm_descriptors()[dst.0].seq_len, (PAGE_TOKENS * 2) as i32);
     }
 
     #[test]

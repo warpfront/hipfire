@@ -2763,6 +2763,14 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch_residual\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
+/// Shared-expert down fuse: `y[b] += sigmoid(c[b]) * (A . x[b])`. Same
+/// weight-once x-batch body as [`GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC`].
+pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SIGMOID_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ4G256V2_SIGMOID_RESIDUAL_EPILOGUE 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch_residual_sigmoid\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
+);
 
 /// Exact-gfx1100 int8-activation small-batch MQ4G256V2 GEMV for speculative
 /// verify (default on exact gfx1100, `HIPFIRE_GFX1100_Q8X_VERIFY=0` off; see
@@ -3761,6 +3769,18 @@ pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip")
 );
+
+/// Multi-slot gfx1100 gate/up: one wave per (token, row, krank). The token
+/// is folded into grid.x. Same FMA order as
+/// [`GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC`].
+pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_SLOTS_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100.hip");
+
+/// Multi-slot gfx1100 ninepath (RPB=8). One tile per token, token folded
+/// into grid.x. Same pairwise slots and krank-ordered fold as
+/// [`GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC`].
+pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_SLOTS_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100.hip");
 
 /// MQ6G256V2 (qt=47) sister of [`GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC`].
 /// Identical staging / warp-per-krank / LDS fold; only the 200 B dual-half
@@ -8419,6 +8439,12 @@ pub const KV_SLOT_DESC_H: &str = include_str!("../../../kernels/src/kv_slot_desc
 /// module keeps the legacy header and its exact source bytes.
 pub const KV_SLOT_DESC_PAGED_H: &str = include_str!("../../../kernels/src/kv_slot_desc_paged.h");
 
+/// VMM-backed shared paged (48-byte) KV descriptor — see
+/// `kernels/src/kv_slot_desc_vmm_paged.h`. Only `_vmm_paged` module variants
+/// compile against it; the arena-paged header and code objects are untouched.
+pub const KV_SLOT_DESC_VMM_PAGED_H: &str =
+    include_str!("../../../kernels/src/kv_slot_desc_vmm_paged.h");
+
 /// Assemble a descriptor-consuming kernel translation unit for the runtime
 /// compile (which has no `-I` to `kernels/src`): strip `body`'s
 /// `#include "kv_slot_desc.h"` and prepend the header. `paged == false`
@@ -8449,6 +8475,17 @@ pub fn kv_slot_desc_paged_source(body: &str, symbol: &str, paged_symbol: &str) -
     )
 }
 
+/// Source of the `_vmm_paged` variant of descriptor kernel `symbol` in
+/// `body`: the 48-byte VMM-paged header, with the body's symbol renamed by
+/// macro so the arena `_paged` module and its code object stay untouched.
+pub fn kv_slot_desc_vmm_paged_source(body: &str, symbol: &str, vmm_paged_symbol: &str) -> String {
+    let stripped = body
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "")
+        .replace("#include \"kv_slot_desc_vmm_paged.h\"", "");
+    format!("#define {symbol} {vmm_paged_symbol}\n{KV_SLOT_DESC_VMM_PAGED_H}\n{stripped}")
+}
+
 /// Source of the paged (slot-engine) variant of a descriptor kernel launched
 /// through the givens4/turbo assembler: `func` renamed to `paged_func` by
 /// macro, then the turbo/givens headers and the paged descriptor header in
@@ -8462,6 +8499,19 @@ pub fn kv_slot_givens4_paged_source(body: &str, func: &str, paged_func: &str) ->
         .replace("#include \"kv_slot_desc_paged.h\"", "");
     format!(
         "#define {func} {paged_func}\n{TURBO_COMMON_H}\n{GIVENS_COMMON_SRC}\n{KV_SLOT_DESC_PAGED_H}\n{stripped}"
+    )
+}
+
+/// Givens/turbo assembler variant of [`kv_slot_desc_vmm_paged_source`].
+pub fn kv_slot_givens4_vmm_paged_source(body: &str, func: &str, vmm_paged_func: &str) -> String {
+    let stripped = body
+        .replace("#include \"turbo_common.h\"", "")
+        .replace("#include \"givens_common.h\"", "")
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "")
+        .replace("#include \"kv_slot_desc_vmm_paged.h\"", "");
+    format!(
+        "#define {func} {vmm_paged_func}\n{TURBO_COMMON_H}\n{GIVENS_COMMON_SRC}\n{KV_SLOT_DESC_VMM_PAGED_H}\n{stripped}"
     )
 }
 
@@ -9578,6 +9628,21 @@ pub const GATED_DELTA_NET_Q8_SRC: &str =
 pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
     "#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_PREFETCH 1\n",
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+
+/// Multi-slot decode sibling of [`GATED_DELTA_NET_Q8_FAST_SRC`]: one launch
+/// advances up to four live slots. The scalar prefix (nt @64, frame @76) is
+/// kept so retained PM4 can patch the requant frame; lanes 1..3 are nine
+/// explicit pointer args each after that prefix so Resource wait sees every
+/// slot (312 B total). The entry lives in its own copy,
+/// `gated_delta_net_q8_fast_slots.hip` (the shipping file verbatim plus the
+/// macro-isolated slots entry): `gated_delta_net_q8_fast.hip` is a sha-pinned
+/// flagship source (tests/flagship_pack_coverage.rs) and stays byte-identical.
+pub const GATED_DELTA_NET_Q8_FAST_SLOTS_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_PREFETCH 1\n",
+    "#define HIPFIRE_GDN_SLOTS_BYVAL 1\n",
+    "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast_slots\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast_slots.hip")
 );
 
 /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).

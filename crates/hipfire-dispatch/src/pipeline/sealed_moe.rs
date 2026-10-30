@@ -2579,8 +2579,14 @@ pub(super) fn produce_prefill_route<'a>(
                     )
                 } else if Gpu::moe_router_fused_prefill_admitted(
                     // Explicit `1`/`0` wins on any wave32 arch; unset follows
-                    // `prefill_route_capabilities` qualification.
-                    moe_router_fused_prefill_on(&gpu.arch),
+                    // `prefill_route_capabilities` qualification. Decode-width
+                    // batches (1..=8) take the fused kernel on wave32 even
+                    // where gfx1201 qualification is unset: it is the same
+                    // `moe_topk_renorm_k8_batched` symbol in softmax-fuse
+                    // mode, byte-identical to softmax + topk, and it drops
+                    // the extra launch from the 4-slot PM4 tape.
+                    moe_router_fused_prefill_on(&gpu.arch)
+                        || (params.batch_size <= 8 && gpu.arch_caps.is_wave32()),
                     params.k_top,
                     params.n_exp,
                     gpu.arch_caps.is_wave32(),
@@ -2594,9 +2600,10 @@ pub(super) fn produce_prefill_route<'a>(
                     );
                     // Wave-per-row launch (unset on at exact gfx1201 by qualification), nested
                     // under the fused route's own flag and admission: top-8, 256 experts,
-                    // wave32, non-empty batch.
+                    // wave32, non-empty batch. Decode-width also takes it:
+                    // one wave32 per live slot is the right geometry.
                     if Gpu::moe_router_topk_multirow_admitted(
-                        moe_router_topk_multirow_on(&gpu.arch),
+                        moe_router_topk_multirow_on(&gpu.arch) || params.batch_size <= 8,
                         params.k_top,
                         params.n_exp,
                         params.batch_size,

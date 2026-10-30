@@ -124,7 +124,7 @@ use hipfire_runtime::llama::{
     fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
     rotate_x_mq_batched_for, EmbeddingFormat, WeightTensor,
 };
-use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
+use rdna_compute::kv_slots::{build_tiles, KvSlotDesc, VmmPagedKvSlotDesc, VMM_PAGED_DESC_BYTES};
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -153,6 +153,42 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
         out.extend_from_slice(&d.page_tokens.to_ne_bytes());
     }
     out
+}
+
+/// Pack a 48-byte VMM-paged descriptor table (the `_vmm_paged` ABI).
+fn pack_vmm_descs(descs: &[VmmPagedKvSlotDesc]) -> Vec<u8> {
+    debug_assert_eq!(
+        std::mem::size_of::<VmmPagedKvSlotDesc>(),
+        VMM_PAGED_DESC_BYTES,
+        "VmmPagedKvSlotDesc ABI drifted from the 48-byte layout"
+    );
+    descs
+        .iter()
+        .flat_map(|d| {
+            let mut row = Vec::with_capacity(VMM_PAGED_DESC_BYTES);
+            row.extend_from_slice(&d.block_table.to_ne_bytes());
+            row.extend_from_slice(&d.legacy_k_base.to_ne_bytes());
+            row.extend_from_slice(&d.legacy_v_base.to_ne_bytes());
+            row.extend_from_slice(&d.seq_len.to_ne_bytes());
+            row.extend_from_slice(&d.page_tokens.to_ne_bytes());
+            row.extend_from_slice(&d.granule_bytes.to_ne_bytes());
+            row.extend_from_slice(&d.pages_per_granule.to_ne_bytes());
+            row.extend_from_slice(&d._pad.to_ne_bytes());
+            row
+        })
+        .collect()
+}
+
+/// Pack whichever descriptor table the pool selected. Both upload paths must
+/// use this: the 32-byte arena packer written into a 48-byte staging buffer
+/// leaves the VMM granule fields stale and can hand the kernel a garbage
+/// block-table pointer for slot 1.
+fn pack_active_descs(pool: &SlotPool) -> Vec<u8> {
+    if pool.is_vmm_paged() {
+        pack_vmm_descs(pool.vmm_descriptors())
+    } else {
+        pack_descs(pool.descriptors())
+    }
 }
 
 /// The resolved KV-cache tier a slots forward runs against, plus the
@@ -265,17 +301,46 @@ pub struct SlotDescStaging {
     max_pages_per_slot: usize,
     n_slots: usize,
     max_rows: usize,
+    /// Packed descriptor width: 32 (arena/legacy) or 48 (VMM-paged).
+    desc_bytes: usize,
+    vmm_paged: bool,
 }
 
 impl SlotDescStaging {
-    /// `max_pages_per_slot` is the maximum number of pages a slot's block
-    /// table can hold. 0 = legacy mode (no block table buffers allocated).
+    /// Arena/legacy descriptor staging (32-byte `KvSlotDesc`).
     pub fn new(
         gpu: &mut Gpu,
         n_slots: usize,
         max_rows: usize,
         max_pages_per_slot: usize,
     ) -> HipResult<Self> {
+        Self::new_impl(gpu, n_slots, max_rows, max_pages_per_slot, false)
+    }
+
+    /// VMM-paged descriptor staging (48-byte `VmmPagedKvSlotDesc`).
+    pub fn new_vmm(
+        gpu: &mut Gpu,
+        n_slots: usize,
+        max_rows: usize,
+        max_pages_per_slot: usize,
+    ) -> HipResult<Self> {
+        Self::new_impl(gpu, n_slots, max_rows, max_pages_per_slot, true)
+    }
+
+    /// `max_pages_per_slot` is the maximum number of pages a slot's block
+    /// table can hold. 0 = legacy mode (no block table buffers allocated).
+    fn new_impl(
+        gpu: &mut Gpu,
+        n_slots: usize,
+        max_rows: usize,
+        max_pages_per_slot: usize,
+        vmm_paged: bool,
+    ) -> HipResult<Self> {
+        let desc_bytes = if vmm_paged {
+            VMM_PAGED_DESC_BYTES
+        } else {
+            DESC_BYTES
+        };
         // Allocate all five staging buffers, freeing whatever already
         // succeeded if a later allocation fails partway through.
         let mut allocated: Vec<GpuTensor> = Vec::new();
@@ -288,7 +353,7 @@ impl SlotDescStaging {
             // pool rounds sub-256-byte allocations up to 256 B: the
             // overflow was silently absorbed up to 8 slots and would trip
             // the memcpy_htod bound assert at 9+.
-            &[n_slots * DESC_BYTES], // descs_dev
+            &[n_slots * desc_bytes], // descs_dev
             &[max_rows * 4],         // row_slot_dev
             &[max_rows * 4],         // tile_slot_dev
             &[max_rows * 4],         // tile_row0_dev
@@ -342,6 +407,8 @@ impl SlotDescStaging {
             max_pages_per_slot,
             n_slots,
             max_rows,
+            desc_bytes,
+            vmm_paged,
         })
     }
 
@@ -372,6 +439,8 @@ pub(crate) enum LayerKvAddr<'a> {
         desc_staging: &'a SlotDescStaging,
         single_slot: Option<(u64, usize)>,
         n_tiles: Option<usize>,
+        /// True for the shared paged pool's `_vmm_paged` descriptor ABI.
+        vmm_paged: bool,
     },
     Vmm(vmm::VmmLayerKv<'a>),
 }
@@ -396,6 +465,7 @@ fn layer_kv_write_attend(
             desc_staging,
             single_slot,
             n_tiles,
+            vmm_paged,
         } => {
             // Batched KV write — slot-aware, ONE launch per arena across every
             // slot, on the engine's resolved KV tier (`kv.mode`). Both arenas
@@ -415,6 +485,7 @@ fn layer_kv_write_attend(
                 n,
                 &desc_staging.descs_dev,
                 &desc_staging.row_slot_dev,
+                *vmm_paged,
             )?;
             // Batched attend — slot-aware, one launch across every slot.
             // `positions[]` (not any `desc.seq_len`) is authoritative for the
@@ -449,6 +520,7 @@ fn layer_kv_write_attend(
                         nt,
                     )
                 }),
+                *vmm_paged,
             )
         }
         LayerKvAddr::Vmm(layer) => vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n),
@@ -932,6 +1004,503 @@ fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
     }
 }
 
+/// Decode-width MQ4V2 (1..=[`FEW_ROW_ROUTE_ROWS`]). The prefill WMMA tile is
+/// 16 rows and a PM4 recording is pinned to its base kernel, so a 1..4 row
+/// slot step was paying for an empty tile. The x-batch GEMV is the sequential
+/// accumulator with each weight row decoded once for up to four activations.
+
+fn slots_few_mq4v2(dt: DType, k: usize, n: usize) -> bool {
+    dt == DType::MQ4G256V2
+        && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&n)
+        && k.is_multiple_of(256)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slots_qkvza_few_mq4v2(
+    gpu: &mut Gpu,
+    wqkv: &GpuTensor,
+    wz: &GpuTensor,
+    w_beta: &GpuTensor,
+    w_alpha: &GpuTensor,
+    x: &GpuTensor,
+    y_qkv: &GpuTensor,
+    y_z: &GpuTensor,
+    y_beta: &GpuTensor,
+    y_alpha: &GpuTensor,
+    qkv_m: usize,
+    z_m: usize,
+    beta_m: usize,
+    alpha_m: usize,
+    k: usize,
+    n: usize,
+) -> HipResult<()> {
+    slots_mq4v2_apply(gpu, wqkv, x, y_qkv, qkv_m, k, n)?;
+    slots_mq4v2_apply(gpu, wz, x, y_z, z_m, k, n)?;
+    slots_mq4v2_apply(gpu, w_beta, x, y_beta, beta_m, k, n)?;
+    slots_mq4v2_apply(gpu, w_alpha, x, y_alpha, alpha_m, k, n)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slots_qkv_few_mq4v2(
+    gpu: &mut Gpu,
+    wq: &GpuTensor,
+    wk: &GpuTensor,
+    wv: &GpuTensor,
+    x: &GpuTensor,
+    y_q: &GpuTensor,
+    y_k: &GpuTensor,
+    y_v: &GpuTensor,
+    q_m: usize,
+    k_m: usize,
+    v_m: usize,
+    k: usize,
+    n: usize,
+) -> HipResult<()> {
+    slots_mq4v2_apply(gpu, wq, x, y_q, q_m, k, n)?;
+    slots_mq4v2_apply(gpu, wk, x, y_k, k_m, k, n)?;
+    slots_mq4v2_apply(gpu, wv, x, y_v, v_m, k, n)
+}
+
+/// One row uses the sequential GEMV. Two to eight rows use the x-batch GEMV,
+/// which decodes each weight row once and keeps that same per-row sum.
+fn slots_mq4v2_apply(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> HipResult<()> {
+    if n == 1 {
+        let x1 = x.sub_offset(0, k);
+        let y1 = y.sub_offset(0, m);
+        gpu.gemv_mq4g256v2(w, &x1, &y1, m, k)
+    } else {
+        gpu.gemv_mq4g256v2_xbatch(w, x, y, m, k, n)
+    }
+}
+
+/// One conv1d launch across every live slot. The lane kernel's ring pointers
+/// are by-value kernargs, so a retained PM4 tape records them the same way
+/// the per-slot launch did. Spec-verify steps keep the per-slot loop because
+/// they also snapshot tape rows.
+#[allow(clippy::too_many_arguments)]
+fn slots_conv1d_split<D>(
+    gpu: &mut Gpu,
+    batch: &SlotBatch,
+    dn_states: &D,
+    pbs: &PrefillBatchScratch,
+    conv_weight: &GpuTensor,
+    delta_layer_idx: usize,
+    k_dim: usize,
+    v_dim: usize,
+    qkv_dim: usize,
+    n_v_heads: usize,
+    n: usize,
+    mut spec_capture: Option<&mut SpecVerifyCapture>,
+) -> HipResult<()>
+where
+    D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+{
+    let mut live: Vec<(usize, usize, usize)> = Vec::new();
+    let mut row_off = 0usize;
+    for (slot, &m) in batch.m_per_slot.iter().enumerate() {
+        if m > 0 {
+            live.push((slot, row_off, m));
+        }
+        row_off += m;
+    }
+    debug_assert_eq!(row_off, n);
+    if spec_capture.is_none() && !live.is_empty() && live.len() <= 16 {
+        let lanes: Vec<(u64, usize, usize)> = live
+            .iter()
+            .map(|&(slot, row, m)| {
+                (
+                    dn_states[slot].conv_states[delta_layer_idx].buf.as_ptr() as u64,
+                    row,
+                    m,
+                )
+            })
+            .collect();
+        return gpu.conv1d_silu_split_f32_lanes(
+            &pbs.dn_q_raw_batch,
+            &pbs.dn_k_raw_batch,
+            &pbs.dn_v_batch,
+            &pbs.dn_qkv_batch,
+            conv_weight,
+            &lanes,
+            k_dim,
+            v_dim,
+        );
+    }
+    for (slot, row, m) in live {
+        if let Some(cap) = spec_capture.as_deref_mut() {
+            if cap.is_verify_slot(slot) {
+                spec_tape_layer_rows(
+                    gpu,
+                    cap,
+                    pbs,
+                    delta_layer_idx,
+                    row,
+                    m,
+                    slot,
+                    qkv_dim,
+                    n_v_heads,
+                )?;
+            }
+        }
+        let q_out = pbs.dn_q_raw_batch.sub_offset(row * k_dim, m * k_dim);
+        let k_out = pbs.dn_k_raw_batch.sub_offset(row * k_dim, m * k_dim);
+        let v_out = pbs.dn_v_batch.sub_offset(row * v_dim, m * v_dim);
+        let input = pbs.dn_qkv_batch.sub_offset(row * qkv_dim, m * qkv_dim);
+        gpu.conv1d_silu_split_f32_n(
+            &q_out,
+            &k_out,
+            &v_out,
+            &input,
+            conv_weight,
+            &dn_states[slot].conv_states[delta_layer_idx],
+            k_dim,
+            v_dim,
+            m,
+        )?;
+    }
+    Ok(())
+}
+
+/// GDN recurrence across live slots. Same-width groups of up to four
+/// share one launch (`gated_delta_net_q8_fast_slots`; extra-lane pointers
+/// are explicit HIP args so Resource wait sees every slot). A leftover
+/// slot or mixed widths keep `gated_delta_net_q8_batch_seq`. Q8-only.
+fn slots_gdn_q8<D>(
+    gpu: &mut Gpu,
+    batch: &SlotBatch,
+    dn_states: &D,
+    pbs: &PrefillBatchScratch,
+    delta_layer_idx: usize,
+    v_dim: usize,
+    n_v_heads: usize,
+    hd: usize,
+    n: usize,
+) -> HipResult<()>
+where
+    D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+{
+    let mut live: Vec<(usize, usize, usize)> = Vec::new();
+    let mut row_off = 0usize;
+    for (slot, &m) in batch.m_per_slot.iter().enumerate() {
+        if m > 0 {
+            live.push((slot, row_off, m));
+        }
+        row_off += m;
+    }
+    debug_assert_eq!(row_off, n);
+    let same_m = live.first().map(|&(_, _, m)| m);
+    // gfx1100 PM4 wait policy is Resource. Lane 0 is the scalar prefix
+    // pointers; lanes 1..3 are nine explicit pointer args each, so
+    // GDN→gated_norm is visible to alias analysis on every slot. Up to
+    // four same-width live slots share one launch; a leftover slot keeps
+    // `gated_delta_net_q8_batch_seq`.
+    let can_pair = live.len() >= 2 && same_m.is_some_and(|m| live.iter().all(|&(_, _, w)| w == m));
+    let mut paired = 0usize;
+    if can_pair {
+        let m = same_m.unwrap();
+        while live.len() - paired >= 2 {
+            let take = (live.len() - paired).min(4);
+            let mut lanes = Vec::with_capacity(take);
+            for &(slot, row, width) in &live[paired..paired + take] {
+                if !matches!(dn_states[slot].quant, StateQuant::Q8) {
+                    return Err(HipError::new(
+                        0,
+                        "forward_batch_slots: DeltaNetState must be StateQuant::Q8 \
+                         (the multi-slot batched path is Q8-only)",
+                    ));
+                }
+                let q = pbs.dn_q_batch.sub_offset(row * v_dim, width * v_dim);
+                let k = pbs.dn_k_batch.sub_offset(row * v_dim, width * v_dim);
+                let v = pbs.dn_v_batch.sub_offset(row * v_dim, width * v_dim);
+                let gate = pbs
+                    .dn_alpha_batch
+                    .sub_offset(row * n_v_heads, width * n_v_heads);
+                let beta = pbs
+                    .dn_beta_batch
+                    .sub_offset(row * n_v_heads, width * n_v_heads);
+                let out = pbs.dn_attn_out_batch.sub_offset(row * v_dim, width * v_dim);
+                let ef = dn_states[slot]
+                    .ef_residual(delta_layer_idx)
+                    .map(|t| t.buf.as_ptr() as u64)
+                    .unwrap_or(0);
+                lanes.push(rdna_compute::dflash_gdn_replay::GdnLayerTable {
+                    q: q.buf.as_ptr() as u64,
+                    k: k.buf.as_ptr() as u64,
+                    v: v.buf.as_ptr() as u64,
+                    gate: gate.buf.as_ptr() as u64,
+                    beta: beta.buf.as_ptr() as u64,
+                    s_q8: dn_states[slot].s_matrices[delta_layer_idx].buf.as_ptr() as u64,
+                    s_scales: dn_states[slot].s_scales[delta_layer_idx].buf.as_ptr() as u64,
+                    output: out.buf.as_ptr() as u64,
+                    ef,
+                });
+            }
+            gpu.gated_delta_net_q8_fast_slots(&lanes, m, n_v_heads, hd)?;
+            paired += take;
+        }
+        live.drain(..paired);
+    }
+
+    for (slot, row, m) in live {
+        if !matches!(dn_states[slot].quant, StateQuant::Q8) {
+            return Err(HipError::new(
+                0,
+                "forward_batch_slots: DeltaNetState must be StateQuant::Q8 \
+                 (the multi-slot batched path is Q8-only)",
+            ));
+        }
+        let q_view = pbs.dn_q_batch.sub_offset(row * v_dim, m * v_dim);
+        let k_view = pbs.dn_k_batch.sub_offset(row * v_dim, m * v_dim);
+        let v_view = pbs.dn_v_batch.sub_offset(row * v_dim, m * v_dim);
+        let gate_view = pbs
+            .dn_alpha_batch
+            .sub_offset(row * n_v_heads, m * n_v_heads);
+        let beta_view = pbs.dn_beta_batch.sub_offset(row * n_v_heads, m * n_v_heads);
+        let out_view = pbs.dn_attn_out_batch.sub_offset(row * v_dim, m * v_dim);
+        gpu.gated_delta_net_q8_batch_seq(
+            &q_view,
+            &k_view,
+            &v_view,
+            &gate_view,
+            &beta_view,
+            &dn_states[slot].s_matrices[delta_layer_idx],
+            &dn_states[slot].s_scales[delta_layer_idx],
+            &out_view,
+            m,
+            n_v_heads,
+            hd,
+            dn_states[slot].ef_residual(delta_layer_idx),
+        )?;
+    }
+    Ok(())
+}
+
+/// Ornith-shaped multi-slot MoE. The sealed single-row program is exact, and
+/// calling it once per live slot reloads every routed expert. For two to four
+/// decode rows on the gfx1100 K=2048 / intermediate-512 MQ4V2 shape, the
+/// router and shared expert stay on those same kernels (one row at a time)
+/// and the routed gate/up plus ninepath run once across the rows. A token
+/// whose experts differ reloads weights inside that launch; the FMA order
+/// for each token matches the single-row kernel.
+#[allow(clippy::too_many_arguments)]
+fn slots_moe_cohort(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+) -> HipResult<bool> {
+    let dim = config.dim;
+    let mi = config.moe_intermediate_size;
+    let smi = config.shared_expert_intermediate_size;
+    let n_exp = config.num_experts;
+    let k_top = config.num_experts_per_tok;
+    if n < 2
+        || n > 4
+        || !gpu.arch_caps.is_gfx1100()
+        || dim != 2048
+        || mi != 512
+        || smi != 512
+        || k_top != 8
+        || n_exp != 256
+        || ffn.cpu_deferred_experts
+        || ffn.expert_down_awq_ptrs.is_some()
+    {
+        return Ok(false);
+    }
+    let v2 = |w: &WeightTensor, m: usize, k: usize| {
+        w.gpu_dtype == DType::MQ4G256V2 && w.m == m && w.k == k && w.awq_scale.is_none()
+    };
+    if !v2(&ffn.router, 256, 2048)
+        || !v2(&ffn.shared_expert_gate, 1, 2048)
+        || !v2(&ffn.shared_expert.gate, 512, 2048)
+        || !v2(&ffn.shared_expert.up, 512, 2048)
+        || !v2(&ffn.shared_expert.down, 2048, 512)
+    {
+        return Ok(false);
+    }
+    let routed_v2 = match ffn.global_expert_dtypes.as_deref() {
+        Some(table) if !table.is_empty() => table
+            .iter()
+            .all(|(gate_up, down)| *gate_up == DType::MQ4G256V2 && *down == DType::MQ4G256V2),
+        _ => {
+            !ffn.experts.is_empty()
+                && ffn
+                    .experts
+                    .iter()
+                    .all(|expert| v2(&expert.gate_up, 1024, 2048) && v2(&expert.down, 2048, 512))
+        }
+    };
+    if !routed_v2 {
+        return Ok(false);
+    }
+    let Some(logits) = pbs.moe_router_logits_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(topk_i) = pbs.moe_topk_indices_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(topk_w) = pbs.moe_topk_weights_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(scalar) = pbs.moe_shared_scalar_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(shared_gate) = pbs.moe_shared_gate_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(shared_up) = pbs.moe_shared_up_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(shared_rot) = pbs.moe_shared_rot_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(gate) = pbs.moe_gate_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(up) = pbs.moe_up_batch.as_ref() else {
+        return Ok(false);
+    };
+    let Some(rot) = pbs.moe_rot_batch.as_ref() else {
+        return Ok(false);
+    };
+    let bytes_ok = |t: &GpuTensor, elems: usize| t.buf.size() / 4 >= elems;
+    if !bytes_ok(&pbs.x_batch, n * dim)
+        || !bytes_ok(&pbs.x_rot_batch, n * dim)
+        || !bytes_ok(logits, n * n_exp)
+        || !bytes_ok(topk_i, n * k_top)
+        || !bytes_ok(topk_w, n * k_top)
+        || !bytes_ok(scalar, n)
+        || !bytes_ok(shared_gate, n * smi)
+        || !bytes_ok(shared_up, n * smi)
+        || !bytes_ok(shared_rot, n * smi)
+        || !bytes_ok(gate, n * k_top * mi)
+        || !bytes_ok(up, n * k_top * mi)
+        || !bytes_ok(rot, n * k_top * mi)
+    {
+        return Ok(false);
+    }
+
+    for row in 0..n {
+        let x = pbs.x_batch.sub_offset(row * dim, dim);
+        let x_rot = pbs.x_rot_batch.sub_offset(row * dim, dim);
+        gpu.fused_rmsnorm_rotate_mq(&x, ffn_norm, &x_rot, dim, config.norm_eps)?;
+        let logits_r = logits.sub_offset(row * n_exp, n_exp);
+        let scalar_r = scalar.sub_offset(row, 1);
+        let sg = shared_gate.sub_offset(row * smi, smi);
+        let su = shared_up.sub_offset(row * smi, smi);
+        gpu.fused_qkvza_hfq4g256_mq4v2(
+            &ffn.router.buf,
+            &ffn.shared_expert_gate.buf,
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
+            &x_rot,
+            &logits_r,
+            &scalar_r,
+            &sg,
+            &su,
+            n_exp,
+            1,
+            smi,
+            smi,
+            dim,
+        )?;
+        let idx = topk_i.sub_offset(row * k_top, k_top);
+        let wts = topk_w.sub_offset(row * k_top, k_top);
+        gpu.moe_router_softmax_topk_k8_wave64_exact(
+            &logits_r,
+            &idx,
+            &wts,
+            n_exp,
+            config.norm_topk_prob,
+        )?;
+        let srot = shared_rot.sub_offset(row * smi, smi);
+        gpu.fused_silu_mul_rotate_mq(&sg, &su, &srot, smi)?;
+        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(
+            &ffn.shared_expert.down.buf,
+            &srot,
+            &x,
+            &scalar_r,
+            dim,
+            smi,
+        )?;
+    }
+    gpu.gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100(
+        &ffn.expert_gate_up_ptrs,
+        topk_i,
+        &pbs.x_rot_batch,
+        gate,
+        up,
+        mi * 2,
+        dim,
+        n,
+    )?;
+    gpu.fused_silu_mul_rotate_mq_batched(gate, up, rot, mi, n * k_top)?;
+    gpu.gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100(
+        &ffn.expert_down_ptrs,
+        topk_i,
+        topk_w,
+        rot,
+        &pbs.x_batch,
+        dim,
+        mi,
+        n,
+    )?;
+    Ok(true)
+}
+
+/// Decode-width rows each run the sealed single-row MoE. Wider prompt chunks
+/// stay on the batched prefill program.
+#[allow(clippy::too_many_arguments)]
+fn slots_moe_ffn(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    n: usize,
+    weights_moe_has_mq6: bool,
+) -> HipResult<()> {
+    // Decode-width rows (1..=8) each run the sealed single-row MoE. The
+    // batched prefill body is a different reduction: at 4 live slots, row 0
+    // and rows 1..3 diverge from a solo sealed step (and from each other)
+    // within a few dozen greedy tokens. Prompt chunks are larger than 8 and
+    // stay on that batched body.
+    if (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&n) && config.dim > 0 {
+        if slots_moe_cohort(gpu, ffn, ffn_norm, config, pbs, n)? {
+            return Ok(());
+        }
+        let dim = config.dim;
+        for row in 0..n {
+            let x = pbs.x_batch.sub_offset(row * dim, dim);
+            crate::qwen35::forward::moe_ffn_dispatch(gpu, ffn, &x, ffn_norm, config, s, false)?;
+        }
+        return Ok(());
+    }
+    let ctx = DispatchCtx::new(gpu).with_batch_size(n);
+    prefill_moe_ffn_body_batched(
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        &ctx,
+        weights_moe_has_mq6,
+        /*routed_out=*/ None,
+    )
+}
+
 /// FWHT-rotated residual projection: `y[0..n*m] += w · FWHT(x[0..n*k])` for
 /// any rotated container (`slots_weight_rotated`). The residual key MUST come
 /// from `slots_residual_gemm_key`, NOT `residual_gemm_key_for`: the dispatch
@@ -950,6 +1519,15 @@ fn mq4_residual_proj(
     n: usize,
 ) -> HipResult<()> {
     rotate_x_mq_batched_for(gpu, w, x, scratch, w.k, n)?;
+    if n == 1 && slots_few_mq4v2(w.gpu_dtype, w.k, 1) {
+        let x1 = scratch.sub_offset(0, w.k);
+        let y1 = y.sub_offset(0, w.m);
+        return gpu.gemv_hfq4g256_residual_mq4v2(&w.buf, &x1, &y1, w.m, w.k);
+    }
+    if slots_few_mq4v2(w.gpu_dtype, w.k, n) {
+        let y_n = y.sub_offset(0, n * w.m);
+        return gpu.gemv_mq4g256v2_xbatch_residual(&w.buf, scratch, &y_n, w.m, w.k, n);
+    }
     let y_n = y.sub_offset(0, n * w.m);
     let key = slots_residual_gemm_key(w.gpu_dtype).ok_or_else(|| {
         HipError::new(
@@ -1418,25 +1996,49 @@ where
             } else {
                 &pbs.x_norm_batch
             };
-            run_fused_qkvza_key(
-                gpu,
-                fused_qkvza_key_for(dt),
-                &layer.wqkv.buf,
-                &layer.wz.buf,
-                &layer.w_beta.buf,
-                &layer.w_alpha.buf,
-                x,
-                &pbs.dn_qkv_batch,
-                &pbs.dn_z_batch,
-                &pbs.dn_beta_batch,
-                &pbs.dn_alpha_batch,
-                layer.wqkv.m,
-                layer.wz.m,
-                layer.w_beta.m,
-                layer.w_alpha.m,
-                layer.wqkv.k,
-                n,
-            )?;
+            if slots_few_mq4v2(dt, layer.wqkv.k, n) {
+                // Decode-width rows: sequential GEMV, weight decoded once per
+                // four rows. The fused WMMA tile is 16 wide and recording
+                // keeps only its base kernel.
+                slots_qkvza_few_mq4v2(
+                    gpu,
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    x,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.wqkv.m,
+                    layer.wz.m,
+                    layer.w_beta.m,
+                    layer.w_alpha.m,
+                    layer.wqkv.k,
+                    n,
+                )?;
+            } else {
+                run_fused_qkvza_key(
+                    gpu,
+                    fused_qkvza_key_for(dt),
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    x,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.wqkv.m,
+                    layer.wz.m,
+                    layer.w_beta.m,
+                    layer.w_alpha.m,
+                    layer.wqkv.k,
+                    n,
+                )?;
+            }
         }
         GroupPlan::Mixed { .. } => {
             for (w, out) in [
@@ -1462,43 +2064,20 @@ where
     )?;
 
     // 4. conv1d — STATEFUL (ring buffer), looped per slot.
-    let mut row_off = 0usize;
-    for (s, &m) in batch.m_per_slot.iter().enumerate() {
-        if m > 0 {
-            if let Some(cap) = spec_capture.as_deref_mut() {
-                if cap.is_verify_slot(s) {
-                    spec_tape_layer_rows(
-                        gpu,
-                        cap,
-                        pbs,
-                        delta_layer_idx,
-                        row_off,
-                        m,
-                        s,
-                        qkv_dim,
-                        n_v_heads,
-                    )?;
-                }
-            }
-            let q_out = pbs.dn_q_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
-            let k_out = pbs.dn_k_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
-            let v_out = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let input = pbs.dn_qkv_batch.sub_offset(row_off * qkv_dim, m * qkv_dim);
-            gpu.conv1d_silu_split_f32_n(
-                &q_out,
-                &k_out,
-                &v_out,
-                &input,
-                &layer.conv_weight,
-                &dn_states[s].conv_states[delta_layer_idx],
-                k_dim,
-                v_dim,
-                m,
-            )?;
-        }
-        row_off += m;
-    }
-    debug_assert_eq!(row_off, n);
+    slots_conv1d_split(
+        gpu,
+        batch,
+        dn_states,
+        pbs,
+        &layer.conv_weight,
+        delta_layer_idx,
+        k_dim,
+        v_dim,
+        qkv_dim,
+        n_v_heads,
+        n,
+        spec_capture.as_deref_mut(),
+    )?;
 
     // 5. Q/K L2-norm(+scale, +repeat-interleave) — stateless, batched over N.
     if config.linear_num_key_heads < n_v_heads {
@@ -1529,51 +2108,19 @@ where
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
     }
 
-    // 6. Gated Delta Net recurrence — STATEFUL (S matrix), looped per slot.
-    // Existing, unmodified `gated_delta_net_q8_batch_seq`; each launch
-    // advances exactly one slot's own `DeltaNetState`. Do NOT use
-    // `gated_delta_net_q8_batch_seq_slots` — it now asserts
-    // `s_stride_elems == 0` (the stride design was found unsound; see
-    // 8fb0e38e). No stride is needed here: one launch per slot already
-    // addresses that slot's state directly.
-    let mut row_off = 0usize;
-    for (s, &m) in batch.m_per_slot.iter().enumerate() {
-        if m > 0 {
-            if !matches!(dn_states[s].quant, StateQuant::Q8) {
-                return Err(HipError::new(
-                    0,
-                    "forward_batch_slots: DeltaNetState must be StateQuant::Q8 \
-                     (the multi-slot batched path is Q8-only)",
-                ));
-            }
-            let q_view = pbs.dn_q_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let k_view = pbs.dn_k_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let v_view = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let gate_view = pbs
-                .dn_alpha_batch
-                .sub_offset(row_off * n_v_heads, m * n_v_heads);
-            let beta_view = pbs
-                .dn_beta_batch
-                .sub_offset(row_off * n_v_heads, m * n_v_heads);
-            let out_view = pbs.dn_attn_out_batch.sub_offset(row_off * v_dim, m * v_dim);
-            gpu.gated_delta_net_q8_batch_seq(
-                &q_view,
-                &k_view,
-                &v_view,
-                &gate_view,
-                &beta_view,
-                &dn_states[s].s_matrices[delta_layer_idx],
-                &dn_states[s].s_scales[delta_layer_idx],
-                &out_view,
-                m,
-                n_v_heads,
-                config.linear_value_head_dim,
-                dn_states[s].ef_residual(delta_layer_idx),
-            )?;
-        }
-        row_off += m;
-    }
-    debug_assert_eq!(row_off, n);
+    // 6. Gated Delta Net recurrence — STATEFUL (S matrix). Same-width live
+    // slots share one by-value table launch; mixed widths stay per-slot.
+    slots_gdn_q8(
+        gpu,
+        batch,
+        dn_states,
+        pbs,
+        delta_layer_idx,
+        v_dim,
+        n_v_heads,
+        config.linear_value_head_dim,
+        n,
+    )?;
 
     // 7. Batched gated output norm — stateless, batched over N.
     gpu.gated_norm_f32_batched(
@@ -1648,6 +2195,7 @@ fn run_deltanet_moe_layer_slots<D>(
     // instead of the model-wide flag would silently diverge from the
     // reference whenever the SAME model mixes an MQ6 layer elsewhere.
     weights_moe_has_mq6: bool,
+    s: &Qwen35Scratch,
 ) -> HipResult<()>
 where
     D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
@@ -1733,25 +2281,49 @@ where
             } else {
                 &pbs.x_norm_batch
             };
-            run_fused_qkvza_key(
-                gpu,
-                fused_qkvza_key_for(dt),
-                &layer.wqkv.buf,
-                &layer.wz.buf,
-                &layer.w_beta.buf,
-                &layer.w_alpha.buf,
-                x,
-                &pbs.dn_qkv_batch,
-                &pbs.dn_z_batch,
-                &pbs.dn_beta_batch,
-                &pbs.dn_alpha_batch,
-                layer.wqkv.m,
-                layer.wz.m,
-                layer.w_beta.m,
-                layer.w_alpha.m,
-                layer.wqkv.k,
-                n,
-            )?;
+            if slots_few_mq4v2(dt, layer.wqkv.k, n) {
+                // Decode-width rows: sequential GEMV, weight decoded once per
+                // four rows. The fused WMMA tile is 16 wide and recording
+                // keeps only its base kernel.
+                slots_qkvza_few_mq4v2(
+                    gpu,
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    x,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.wqkv.m,
+                    layer.wz.m,
+                    layer.w_beta.m,
+                    layer.w_alpha.m,
+                    layer.wqkv.k,
+                    n,
+                )?;
+            } else {
+                run_fused_qkvza_key(
+                    gpu,
+                    fused_qkvza_key_for(dt),
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    x,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.wqkv.m,
+                    layer.wz.m,
+                    layer.w_beta.m,
+                    layer.w_alpha.m,
+                    layer.wqkv.k,
+                    n,
+                )?;
+            }
         }
         GroupPlan::Mixed { .. } => {
             for (w, out) in [
@@ -1779,43 +2351,20 @@ where
     // 4. conv1d — STATEFUL (ring buffer), looped per slot. Byte-identical to
     // run_deltanet_layer_slots step 4 — conv_weight is a dequantized F32
     // GpuTensor regardless of the layer's projection weight dtype.
-    let mut row_off = 0usize;
-    for (s, &m) in batch.m_per_slot.iter().enumerate() {
-        if m > 0 {
-            if let Some(cap) = spec_capture.as_deref_mut() {
-                if cap.is_verify_slot(s) {
-                    spec_tape_layer_rows(
-                        gpu,
-                        cap,
-                        pbs,
-                        delta_layer_idx,
-                        row_off,
-                        m,
-                        s,
-                        qkv_dim,
-                        n_v_heads,
-                    )?;
-                }
-            }
-            let q_out = pbs.dn_q_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
-            let k_out = pbs.dn_k_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
-            let v_out = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let input = pbs.dn_qkv_batch.sub_offset(row_off * qkv_dim, m * qkv_dim);
-            gpu.conv1d_silu_split_f32_n(
-                &q_out,
-                &k_out,
-                &v_out,
-                &input,
-                &layer.conv_weight,
-                &dn_states[s].conv_states[delta_layer_idx],
-                k_dim,
-                v_dim,
-                m,
-            )?;
-        }
-        row_off += m;
-    }
-    debug_assert_eq!(row_off, n);
+    slots_conv1d_split(
+        gpu,
+        batch,
+        dn_states,
+        pbs,
+        &layer.conv_weight,
+        delta_layer_idx,
+        k_dim,
+        v_dim,
+        qkv_dim,
+        n_v_heads,
+        n,
+        spec_capture.as_deref_mut(),
+    )?;
 
     // 5. Q/K L2-norm(+scale, +repeat-interleave) — stateless, batched over N.
     if config.linear_num_key_heads < n_v_heads {
@@ -1846,48 +2395,19 @@ where
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
     }
 
-    // 6. Gated Delta Net recurrence — STATEFUL (S matrix), looped per slot.
-    // Same Q8-only per-slot dispatch as run_deltanet_layer_slots step 6 —
-    // the GDN recurrence dtype is a DeltaNetState property, independent of
-    // this layer's projection weight dtype.
-    let mut row_off = 0usize;
-    for (s, &m) in batch.m_per_slot.iter().enumerate() {
-        if m > 0 {
-            if !matches!(dn_states[s].quant, StateQuant::Q8) {
-                return Err(HipError::new(
-                    0,
-                    "forward_batch_slots: DeltaNetState must be StateQuant::Q8 \
-                     (the multi-slot batched path is Q8-only)",
-                ));
-            }
-            let q_view = pbs.dn_q_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let k_view = pbs.dn_k_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let v_view = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let gate_view = pbs
-                .dn_alpha_batch
-                .sub_offset(row_off * n_v_heads, m * n_v_heads);
-            let beta_view = pbs
-                .dn_beta_batch
-                .sub_offset(row_off * n_v_heads, m * n_v_heads);
-            let out_view = pbs.dn_attn_out_batch.sub_offset(row_off * v_dim, m * v_dim);
-            gpu.gated_delta_net_q8_batch_seq(
-                &q_view,
-                &k_view,
-                &v_view,
-                &gate_view,
-                &beta_view,
-                &dn_states[s].s_matrices[delta_layer_idx],
-                &dn_states[s].s_scales[delta_layer_idx],
-                &out_view,
-                m,
-                n_v_heads,
-                config.linear_value_head_dim,
-                dn_states[s].ef_residual(delta_layer_idx),
-            )?;
-        }
-        row_off += m;
-    }
-    debug_assert_eq!(row_off, n);
+    // 6. Gated Delta Net recurrence — STATEFUL (S matrix). Same-width live
+    // slots share one by-value table launch; mixed widths stay per-slot.
+    slots_gdn_q8(
+        gpu,
+        batch,
+        dn_states,
+        pbs,
+        delta_layer_idx,
+        v_dim,
+        n_v_heads,
+        config.linear_value_head_dim,
+        n,
+    )?;
 
     // 7. Batched gated output norm — stateless, batched over N.
     gpu.gated_norm_f32_batched(
@@ -1924,17 +2444,15 @@ where
         ),
         _ => (0, None),
     };
-    let ctx = DispatchCtx::new(gpu);
-    let moe_result = prefill_moe_ffn_body_batched(
+    let moe_result = slots_moe_ffn(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
         config,
         pbs,
+        s,
         n,
-        &ctx,
         weights_moe_has_mq6,
-        /*routed_out=*/ None,
     );
     if trace_on {
         let moe_ns = t_moe.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
@@ -2074,31 +2592,63 @@ fn kv_write_slots(
     n_rows: usize,
     descs: &GpuTensor,
     row_slot: &GpuTensor,
+    vmm_paged: bool,
 ) -> HipResult<()> {
+    if vmm_paged && !kv.is_q8() {
+        return Err(rdna_compute::HipError::new(
+            0,
+            "VMM-paged KV supports q8 only in phase 1",
+        ));
+    }
     match kv.mode {
         KvMode::Q8 => {
-            gpu.kv_cache_write_q8_0_batched_slots(
-                k_cache,
-                k_batch,
-                positions,
-                n_kv_heads,
-                head_dim,
-                n_rows,
-                Some(descs),
-                Some(row_slot),
-                /*use_v_base=*/ false,
-            )?;
-            gpu.kv_cache_write_q8_0_batched_slots(
-                v_cache,
-                v_batch,
-                positions,
-                n_kv_heads,
-                head_dim,
-                n_rows,
-                Some(descs),
-                Some(row_slot),
-                /*use_v_base=*/ false,
-            )
+            if vmm_paged {
+                gpu.kv_cache_write_q8_0_batched_slots_vmm_paged(
+                    k_cache,
+                    k_batch,
+                    positions,
+                    n_kv_heads,
+                    head_dim,
+                    n_rows,
+                    Some(descs),
+                    Some(row_slot),
+                    /*use_v_base=*/ false,
+                )?;
+                gpu.kv_cache_write_q8_0_batched_slots_vmm_paged(
+                    v_cache,
+                    v_batch,
+                    positions,
+                    n_kv_heads,
+                    head_dim,
+                    n_rows,
+                    Some(descs),
+                    Some(row_slot),
+                    /*use_v_base=*/ false,
+                )
+            } else {
+                gpu.kv_cache_write_q8_0_batched_slots(
+                    k_cache,
+                    k_batch,
+                    positions,
+                    n_kv_heads,
+                    head_dim,
+                    n_rows,
+                    Some(descs),
+                    Some(row_slot),
+                    /*use_v_base=*/ false,
+                )?;
+                gpu.kv_cache_write_q8_0_batched_slots(
+                    v_cache,
+                    v_batch,
+                    positions,
+                    n_kv_heads,
+                    head_dim,
+                    n_rows,
+                    Some(descs),
+                    Some(row_slot),
+                    /*use_v_base=*/ false,
+                )
+            }
         }
         KvMode::Asym2 => gpu.kv_cache_write_asym2_batched_slots(
             k_cache,
@@ -2307,7 +2857,14 @@ fn tier_attend_slots(
     row_slot_dev: &GpuTensor,
     single_slot: Option<(u64, usize)>,
     multi_slot_tiles: Option<(&GpuTensor, &GpuTensor, &GpuTensor, usize)>,
+    vmm_paged: bool,
 ) -> HipResult<()> {
+    if vmm_paged && !kv.is_q8() {
+        return Err(rdna_compute::HipError::new(
+            0,
+            "VMM-paged attention supports q8 only in phase 1",
+        ));
+    }
     if kv.is_q8() {
         return q8_attend_slots(
             gpu,
@@ -2327,6 +2884,7 @@ fn tier_attend_slots(
             row_slot_dev,
             single_slot,
             multi_slot_tiles,
+            vmm_paged,
         );
     }
     let d = Some(descs_dev);
@@ -2565,9 +3123,14 @@ fn q8_attend_slots(
     row_slot_dev: &GpuTensor,
     single_slot: Option<(u64, usize)>,
     multi_slot_tiles: Option<(&GpuTensor, &GpuTensor, &GpuTensor, usize)>,
+    vmm_paged: bool,
 ) -> HipResult<()> {
     if let Some((k_base, slab_bytes)) = single_slot {
-        if q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
+        // The pointer-shifted WMMA view assumes one contiguous slab. A
+        // VMM-paged slot's pages are packed into granules and may have
+        // holes, so this reduction is never valid there even if a caller
+        // forgets the `!pool.is_paged()` gate.
+        if !vmm_paged && q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
             let k_view = k_cache.sub_offset(k_base as usize, slab_bytes);
             let v_view = v_cache.sub_offset(k_base as usize, slab_bytes);
             return gpu.attention_q8_0_flash_prefill_wmma(
@@ -2597,22 +3160,41 @@ fn q8_attend_slots(
             let tile_slot_view = tile_slot_dev.sub_offset(0, n_tiles);
             let tile_row0_view = tile_row0_dev.sub_offset(0, n_tiles);
             let tile_qbase_view = tile_qbase_dev.sub_offset(0, n_tiles);
-            return gpu.attention_q8_0_flash_prefill_wmma_slots(
-                q,
-                k_cache,
-                v_cache,
-                out,
-                positions,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_ctx_len,
-                batch_size,
-                Some(descs_dev),
-                Some(&tile_slot_view),
-                Some(&tile_row0_view),
-                Some(&tile_qbase_view),
-            );
+            return if vmm_paged {
+                gpu.attention_q8_0_flash_prefill_wmma_slots_vmm_paged(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    positions,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx_len,
+                    batch_size,
+                    Some(descs_dev),
+                    Some(&tile_slot_view),
+                    Some(&tile_row0_view),
+                    Some(&tile_qbase_view),
+                )
+            } else {
+                gpu.attention_q8_0_flash_prefill_wmma_slots(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    positions,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx_len,
+                    batch_size,
+                    Some(descs_dev),
+                    Some(&tile_slot_view),
+                    Some(&tile_row0_view),
+                    Some(&tile_qbase_view),
+                )
+            };
         }
     }
     // Context length above which the flash (context-split) kernel beats the
@@ -2633,20 +3215,69 @@ fn q8_attend_slots(
     // simply on the wrong side for this path. At ~1086 tokens the two arms
     // were within run-to-run noise, hence 2048 rather than 0.
     //
-    // Left at 8192 for other non-gfx120x parts: the measurement is gfx1151's
-    // and does not transfer. gfx1200/gfx1201 keep 4096, which already puts a
-    // 4096-token context on the flash side.
+    // gfx1100 uses the same 2048. Its paged PM4 tape bakes `max_ctx_len` to
+    // the 8192-token bucket, so a crossover of 8192 keeps that whole bucket
+    // on the scalar kernel: one workgroup per head scans the live KV
+    // serially. rocprofv3 on a 1024-token Nex N2.5 mini decode records
+    // `attention_q8_0_kv_batched_vmm_paged` only at capture (20 calls, 0.2%
+    // of visible GPU time); the retained tape itself is not a HIP dispatch.
+    // Wall rate on that tape fell 215 → 113 tok/s by 1.4k tokens. 2048
+    // selects the tiled flash kernel for the bucket. Same model, one
+    // gfx1100: 198 tok/s at 512 tokens and 185 tok/s at 4096. Other
+    // non-gfx120x parts stay at 8192; that measurement does not transfer.
+    // gfx1200/gfx1201 keep 4096, which already puts a 4096-token context
+    // on the flash side.
     let crossover = gpu.slots_attn_crossover().unwrap_or({
         if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
             4096
-        } else if gpu.arch_caps.is_gfx1151() {
+        } else if gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1100() {
             2048
         } else {
             8192
         }
     });
     if max_ctx_len <= crossover {
-        gpu.attention_q8_0_kv_batched_masked_slots(
+        if vmm_paged {
+            gpu.attention_q8_0_kv_batched_masked_slots_vmm_paged(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap,
+                max_ctx_len,
+                batch_size,
+                None,
+                0,
+                0,
+                Some(descs_dev),
+                Some(row_slot_dev),
+            )
+        } else {
+            gpu.attention_q8_0_kv_batched_masked_slots(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap,
+                max_ctx_len,
+                batch_size,
+                None,
+                0,
+                0,
+                Some(descs_dev),
+                Some(row_slot_dev),
+            )
+        }
+    } else if vmm_paged {
+        gpu.attention_flash_q8_0_batched_masked_slots_vmm_paged(
             q,
             k_cache,
             v_cache,
@@ -2658,6 +3289,7 @@ fn q8_attend_slots(
             physical_cap,
             max_ctx_len,
             batch_size,
+            flash_partials,
             None,
             0,
             0,
@@ -2776,22 +3408,40 @@ fn run_fullattn_layer_slots(
             } else {
                 &pbs.x_norm_batch
             };
-            run_fused_qkv_key(
-                gpu,
-                fused_qkv_key_for(dt),
-                &layer.wq.buf,
-                &layer.wk.buf,
-                &layer.wv.buf,
-                x,
-                &pbs.fa_q_full_batch,
-                &pbs.fa_k_batch,
-                &pbs.fa_v_batch,
-                layer.wq.m,
-                layer.wk.m,
-                layer.wv.m,
-                layer.wq.k,
-                n,
-            )?;
+            if slots_few_mq4v2(dt, layer.wq.k, n) {
+                slots_qkv_few_mq4v2(
+                    gpu,
+                    &layer.wq.buf,
+                    &layer.wk.buf,
+                    &layer.wv.buf,
+                    x,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    layer.wq.m,
+                    layer.wk.m,
+                    layer.wv.m,
+                    layer.wq.k,
+                    n,
+                )?;
+            } else {
+                run_fused_qkv_key(
+                    gpu,
+                    fused_qkv_key_for(dt),
+                    &layer.wq.buf,
+                    &layer.wk.buf,
+                    &layer.wv.buf,
+                    x,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    layer.wq.m,
+                    layer.wk.m,
+                    layer.wv.m,
+                    layer.wq.k,
+                    n,
+                )?;
+            }
         }
         GroupPlan::Mixed { .. } => {
             for (w, out) in [
@@ -3019,22 +3669,40 @@ fn run_fullattn_moe_layer_slots(
             } else {
                 &pbs.x_norm_batch
             };
-            run_fused_qkv_key(
-                gpu,
-                fused_qkv_key_for(dt),
-                &layer.wq.buf,
-                &layer.wk.buf,
-                &layer.wv.buf,
-                x,
-                &pbs.fa_q_full_batch,
-                &pbs.fa_k_batch,
-                &pbs.fa_v_batch,
-                layer.wq.m,
-                layer.wk.m,
-                layer.wv.m,
-                layer.wq.k,
-                n,
-            )?;
+            if slots_few_mq4v2(dt, layer.wq.k, n) {
+                slots_qkv_few_mq4v2(
+                    gpu,
+                    &layer.wq.buf,
+                    &layer.wk.buf,
+                    &layer.wv.buf,
+                    x,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    layer.wq.m,
+                    layer.wk.m,
+                    layer.wv.m,
+                    layer.wq.k,
+                    n,
+                )?;
+            } else {
+                run_fused_qkv_key(
+                    gpu,
+                    fused_qkv_key_for(dt),
+                    &layer.wq.buf,
+                    &layer.wk.buf,
+                    &layer.wv.buf,
+                    x,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    layer.wq.m,
+                    layer.wk.m,
+                    layer.wv.m,
+                    layer.wq.k,
+                    n,
+                )?;
+            }
         }
         GroupPlan::Mixed { .. } => {
             for (w, out) in [
@@ -3157,17 +3825,15 @@ fn run_fullattn_moe_layer_slots(
         ),
         _ => (0, None),
     };
-    let ctx = DispatchCtx::new(gpu);
-    let moe_result = prefill_moe_ffn_body_batched(
+    let moe_result = slots_moe_ffn(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
         config,
         pbs,
+        s,
         n,
-        &ctx,
         weights_moe_has_mq6,
-        /*routed_out=*/ None,
     );
     if trace_on {
         let moe_ns = t_moe.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
@@ -3211,7 +3877,7 @@ fn run_fullattn_moe_layer_slots(
 /// to every slot count once the WMMA flash-prefill port (root cause #1)
 /// stopped masking the same mismatch at `n_slots >= 2` — see the loop body
 /// below for the empirical confirmation.
-fn final_logits_per_slot(
+pub(crate) fn final_logits_per_slot(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -3613,15 +4279,17 @@ fn per_slot_head(
                 continue;
             }
             let last_row = row_off + m - 1;
-            let dim_row_bytes = dim * 4;
-            gpu.memcpy_dtod_at_auto(
-                &s.x.buf,
-                0,
-                &pbs.x_batch.buf,
-                last_row * dim_row_bytes,
-                dim_row_bytes,
+            // Read the row as a view. A device copy here is a `hipMemcpyDtoD`
+            // inside the forward body, which a retained PM4 tape cannot replay
+            // (the capture's effect audit refuses it). The view is the same
+            // bytes, so the norm/GEMV below are unchanged.
+            let last_row_view = pbs.x_batch.sub_offset(last_row * dim, dim);
+            gpu.rmsnorm_f32(
+                &last_row_view,
+                &weights.output_norm,
+                &s.tmp,
+                config.norm_eps,
             )?;
-            gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
             let ctx = DispatchCtx::new(gpu);
             let wr = weights.output.dispatch_ref();
             let logits_view = logits_out.sub_offset(slot * config.vocab_size, config.vocab_size);
@@ -3709,14 +4377,17 @@ pub fn forward_batch_slots(
 ///
 /// A captured graph bakes `max_ctx_len` into kernargs, but it grows by one
 /// every decode step, so capturing per step would be pointless. Instead the
-/// bound is rounded up to a bucket and the graph is reused until the context
-/// crosses into the next one -- one capture per 256 generated tokens.
+/// bound is rounded up to a bucket that covers the LDS-backed scalar
+/// attention kernel (scores[max_ctx] lives in shared memory). The kernel
+/// still loops to positions[b]+1, so a larger bucket does not over-scan;
+/// it only sizes LDS. 8192 is also the scalar kernel's LDS ceiling (64 KB).
+/// gfx1100's crossover is 2048, so that bucket's tape runs the tiled flash
+/// kernel instead of the serial scan; the bucket still keeps one tape for
+/// the whole window instead of re-arming every 256 tokens.
 ///
-/// Over-scanning inside a bucket is correct, not merely tolerable:
-/// `positions[]` is the authoritative causal bound everywhere downstream
-/// (SP1's only Critical defect), so positions past a row's own are masked.
-/// It costs at most one bucket of extra KV scan per step.
-pub const DECODE_GRAPH_CTX_BUCKET: usize = 256;
+/// `positions[]` is the authoritative causal bound (SP1). The bucket only
+/// sizes LDS; the kernel loops to `positions[b] + 1`, not to the bucket.
+pub const DECODE_GRAPH_CTX_BUCKET: usize = 8192;
 
 /// Identity of a captured decode graph. Any change invalidates it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3789,6 +4460,11 @@ pub struct SlotDecodeGraph {
     key: Option<DecodeGraphKey>,
     captures: usize,
     replays: usize,
+    /// Prepared slots-PM4 tape. The bucket is baked `max_ctx_len`. The body
+    /// hash covers which slots are live, the lm_head skip mask, and the VL
+    /// flags: conv state and per-slot logit rows are recorded pointers, so
+    /// a different live slot is a different tape.
+    redline_tape: Option<PagedPm4TapeKey>,
 }
 
 impl SlotDecodeGraph {
@@ -3812,7 +4488,314 @@ impl SlotDecodeGraph {
             let _ = gpu.hip.graph_destroy(graph);
         }
         self.key = None;
+        self.redline_tape = None;
     }
+}
+
+/// Identity of a prepared paged-PM4 tape. Any change rearms.
+///
+/// `body` is [`decode_graph_m_hash`]: per-slot row counts, the lm_head skip
+/// mask, and the VL flags. Row count alone is not enough. The decode body
+/// records each live slot's conv-state pointer and logit row, so slot 0's
+/// width-1 tape must not replay for slot 1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PagedPm4TapeKey {
+    ctx_bucket: usize,
+    body: u64,
+}
+
+fn paged_pm4_tape_key(
+    batch: &SlotBatch,
+    lm_head_skip: &[bool],
+    physical_cap: usize,
+) -> PagedPm4TapeKey {
+    PagedPm4TapeKey {
+        ctx_bucket: decode_ctx_bucket(batch, physical_cap),
+        body: decode_graph_m_hash(
+            &batch.m_per_slot,
+            lm_head_skip,
+            !batch.pos3.is_empty(),
+            !batch.ext_emb.is_empty(),
+        ),
+    }
+}
+
+/// A prepared tape must be dropped when this step's shape is not the one it
+/// recorded.
+///
+/// `plan_ready` is the installed PM4 plan, not `should_route_pm4`.
+/// Prompt prefill calls `enter_batched_forward`, which clears forward eligibility
+/// and leaves the plan installed. The next decode is ineligible at entry, so a
+/// check gated on `should_route_pm4` would skip the rearm, mark the step
+/// eligible, and replay the previous width. A 1-slot continuation after a
+/// 3-slot batch then samples the wide tape's logits (an extra leading newline
+/// on this model) and only the following request records the right body.
+fn paged_pm4_tape_stale(
+    installed: Option<PagedPm4TapeKey>,
+    key: PagedPm4TapeKey,
+    plan_ready: bool,
+) -> bool {
+    plan_ready && installed != Some(key)
+}
+
+/// Position a paged PM4 tape may bind.
+///
+/// Every live row must be a single-token decode row. Position equality is
+/// required only when the prepared tape actually binds a position *kernarg*
+/// (`position_bound`): this body carries each row's absolute position in the
+/// uploaded `positions[]` buffer and synthesizes no position bindings, so one
+/// prepared tape serves any set of single-token rows inside its context
+/// bucket — mixed slot positions included, which is what makes retained PM4
+/// usable for independent parallel generations. A route that ever binds a
+/// position scalar keeps the lockstep rule.
+///
+/// Shape is not admission. A one-token prefill matches this predicate; the
+/// caller passes `redline_ok` only for a real continuation.
+fn paged_decode_pos(batch: &SlotBatch, position_bound: bool) -> Option<usize> {
+    if batch.is_empty() || !batch.m_per_slot.iter().all(|&m| m <= 1) {
+        return None;
+    }
+    if !batch.m_per_slot.iter().any(|&m| m == 1) {
+        return None;
+    }
+    let max_pos = *batch.positions.iter().max()? as usize;
+    if position_bound {
+        batch
+            .positions
+            .iter()
+            .all(|&p| p as usize == max_pos)
+            .then_some(max_pos)
+    } else {
+        Some(max_pos)
+    }
+}
+
+fn decode_ctx_bucket(batch: &SlotBatch, physical_cap: usize) -> usize {
+    let true_ctx = (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
+        .min(physical_cap)
+        .max(1);
+    true_ctx
+        .div_ceil(DECODE_GRAPH_CTX_BUCKET)
+        .saturating_mul(DECODE_GRAPH_CTX_BUCKET)
+        .min(physical_cap)
+        .max(1)
+}
+
+/// Why this step must not run the prepared paged tape, or `None`.
+///
+/// The tape bakes `max_ctx_len` (= `ctx_bucket`) and each live slot's state
+/// pointers, and reads tokens, positions, descriptors and block tables from
+/// device buffers uploaded outside it. Those uploads are only as good as the
+/// host state they copy, so this re-checks, before any GPU work, the facts a
+/// replay relies on and nothing re-validates on the device:
+///
+/// - every row is a single-token row of a live slot inside the pool;
+/// - every position is inside the tape's context bucket, so the baked
+///   `max_ctx_len` covers it (a row past it would attend a truncated window);
+/// - in paged mode, the row's block table covers `pos` (the KV write resolves
+///   `block_table[pos / PAGE_TOKENS]`; a short table reads stale staging) and
+///   every entry names a real page (an out-of-range entry addresses past the
+///   arena).
+///
+/// The run loop provisions the frontier before the forward, so a failure here
+/// is a host-state bug. It fails closed instead of corrupting another slot.
+fn paged_replay_input_error<'a, F>(
+    batch: &SlotBatch,
+    ctx_bucket: usize,
+    n_slots: usize,
+    n_pages: Option<usize>,
+    table: F,
+) -> Option<String>
+where
+    F: Fn(usize) -> Option<&'a [u32]>,
+{
+    let rows = batch.positions.len();
+    if batch.row_slot.len() != rows || batch.tokens.len() != rows {
+        return Some(format!(
+            "row arrays disagree: tokens={} positions={} row_slot={}",
+            batch.tokens.len(),
+            rows,
+            batch.row_slot.len()
+        ));
+    }
+    if batch.m_per_slot.len() > n_slots {
+        return Some(format!(
+            "batch names {} slots but the pool has {n_slots}",
+            batch.m_per_slot.len()
+        ));
+    }
+    let page_tokens = rdna_compute::page_pool::PAGE_TOKENS;
+    for row in 0..rows {
+        let slot = batch.row_slot[row];
+        let pos = batch.positions[row];
+        if slot < 0 || slot as usize >= batch.m_per_slot.len() {
+            return Some(format!("row {row} names slot {slot} outside the batch"));
+        }
+        let slot = slot as usize;
+        if batch.m_per_slot[slot] != 1 {
+            return Some(format!(
+                "row {row} is in slot {slot} with {} rows; a paged tape replays only \
+                 single-token rows",
+                batch.m_per_slot[slot]
+            ));
+        }
+        if pos < 0 || pos as usize >= ctx_bucket {
+            return Some(format!(
+                "row {row} (slot {slot}) position {pos} is outside the tape's ctx_bucket \
+                 {ctx_bucket}"
+            ));
+        }
+        let Some(n_pages) = n_pages else {
+            continue;
+        };
+        let Some(pages) = table(slot) else {
+            return Some(format!("slot {slot} has no block table"));
+        };
+        if pages.len() * page_tokens <= pos as usize {
+            return Some(format!(
+                "slot {slot} block table holds {} pages ({} tokens) but row {row} writes \
+                 position {pos}",
+                pages.len(),
+                pages.len() * page_tokens
+            ));
+        }
+        if let Some(bad) = pages.iter().find(|&&p| p as usize >= n_pages) {
+            return Some(format!(
+                "slot {slot} block table names page {bad} of a {n_pages}-page pool"
+            ));
+        }
+    }
+    None
+}
+
+/// Retained-PM4 body for a paged decode step.
+///
+/// Uploads (tokens, positions, descriptors, block tables) stay outside the
+/// tape, same contract as the hipGraph path, and the recorded kernels read
+/// those device buffers. That is what makes one tape serve a whole bucket of
+/// tokens and any composition of single-token rows: every row's position is
+/// in `positions[]`, not in a kernarg. A new context bucket or a new
+/// live-slot pattern rearms — `max_ctx_len` and the per-slot state pointers
+/// are baked.
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_slots_redline(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pool: &mut SlotPool,
+    dn_states: &mut [DeltaNetState],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    desc_staging: &mut SlotDescStaging,
+    kv: &SlotKvTier,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    cache: &mut SlotDecodeGraph,
+    lm_head_skip: &[bool],
+    pos: usize,
+) -> HipResult<()> {
+    let tape_key = paged_pm4_tape_key(batch, lm_head_skip, pool.cap_tokens());
+    if paged_pm4_tape_stale(
+        cache.redline_tape,
+        tape_key,
+        gpu.replay.prepared_pm4_plan_ready(),
+    ) {
+        gpu.replay.rearm_after_layout_growth();
+        cache.redline_tape = None;
+    }
+    upload_step_inputs(gpu, batch, pool, desc_staging, pbs)?;
+    let input_error = {
+        let n_pages = pool.page_pool().map(|pp| pp.n_pages());
+        paged_replay_input_error(
+            batch,
+            tape_key.ctx_bucket,
+            pool.descriptors().len(),
+            n_pages,
+            |slot| pool.block_table(SlotId(slot)).map(|bt| bt.page_indices()),
+        )
+    };
+    if let Some(reason) = input_error {
+        // Fail closed before any kernel reads the uploaded inputs: drop the
+        // tape so nothing replays it, and refuse the step.
+        gpu.replay.rearm_after_layout_growth();
+        cache.redline_tape = None;
+        return Err(HipError::new(
+            0,
+            &format!("slots paged PM4 step refused: {reason}"),
+        ));
+    }
+    gpu.replay.set_forward_eligible(true);
+    gpu.replay
+        .begin_auto_capture_if_armed()
+        .map_err(|reason| HipError::new(0, reason))?;
+    if gpu.replay.should_route_pm4() {
+        return unsafe { gpu.replay_pm4_routed(pos) }.map_err(|reason| {
+            gpu.replay
+                .poison(format!("slots paged PM4 replay failed: {reason}"));
+            HipError::new(0, &reason)
+        });
+    }
+    let result = forward_batch_slots_opts(
+        gpu,
+        weights,
+        config,
+        batch,
+        pool,
+        dn_states,
+        k_arenas,
+        v_arenas,
+        desc_staging,
+        kv,
+        pbs,
+        s,
+        logits_out,
+        None,
+        SlotStepOpts {
+            skip_uploads: true,
+            ctx_override: Some(tape_key.ctx_bucket),
+        },
+        lm_head_skip,
+        None,
+    );
+    if gpu.replay.should_auto_finalize_capture() {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| HipError::new(0, &format!("slots paged PM4 capture sync: {e}")))?;
+        gpu.replay
+            .finish_capture()
+            .map_err(|reason| HipError::new(0, reason))?;
+        if gpu.replay.uses_pm4_transport() {
+            let launches = gpu.replay.recorded_launches().len();
+            if let Err(reason) = gpu
+                .replay
+                .prepare_pm4_prefix(gpu.device_id as usize, launches)
+            {
+                gpu.replay
+                    .poison(format!("slots paged PM4 prepare failed: {reason}"));
+                cache.redline_tape = None;
+                eprintln!("[redline] slots paged falling back to HIP: {reason}");
+            } else {
+                cache.redline_tape = Some(tape_key);
+                // One receipt per prepared tape (never per token): the route
+                // proof a timed arm needs to show the PM4 body is installed.
+                eprintln!(
+                    "[redline] slots paged PM4 prepared: {} launches, ctx_bucket={}, \
+                     live_slots={}, tape_hash={:016x}",
+                    launches,
+                    tape_key.ctx_bucket,
+                    batch.m_per_slot.iter().filter(|&&m| m == 1).count(),
+                    tape_key.body
+                );
+            }
+        } else {
+            gpu.replay
+                .poison("slots VMM-paged Redline is PM4-only".to_string());
+            cache.redline_tape = None;
+        }
+    }
+    result
 }
 
 /// `forward_batch_slots` with hipGraph capture/replay for decode-shaped steps.
@@ -3855,6 +4838,7 @@ pub fn forward_batch_slots_graphed(
         /* mtp_k */ 0,
         /* lm_head_skip */ &[],
         /* spec_capture */ None,
+        /* redline_ok */ true,
     )
 }
 
@@ -3873,6 +4857,12 @@ pub fn forward_batch_slots_graphed(
 /// rows via a batched GEMM instead; the single-row GEMV would be discarded
 /// work that re-reads the whole lm_head weight). The mask is part of the
 /// graph key: a captured graph bakes which GEMVs exist.
+///
+/// `redline_ok` is the engine's decode-versus-prefill decision. Lockstep
+/// shape is not enough: a one-token prefill tail matches decode and must
+/// stay on eager HIP so it cannot record or replay the continuation tape.
+/// Callers that have no prefill mask (the plain graphed wrapper) pass
+/// `true`.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_slots_graphed_opts(
     gpu: &mut Gpu,
@@ -3892,6 +4882,7 @@ pub fn forward_batch_slots_graphed_opts(
     verify_rows: usize,
     lm_head_skip: &[bool],
     mut spec_capture: Option<&mut SpecVerifyCapture>,
+    redline_ok: bool,
 ) -> HipResult<()> {
     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
     // An MTP verify step is graphable when every slot's row count is a decode
@@ -3900,7 +4891,52 @@ pub fn forward_batch_slots_graphed_opts(
     // vary step to step and would thrash the capture cache.
     let mtp_verify_shape =
         !batch.is_empty() && spec_verify_graph_shape(&batch.m_per_slot, verify_rows);
+    if redline_ok
+        && pool.is_paged()
+        && spec_capture.is_none()
+        && gpu.replay.is_enabled()
+        && gpu.replay.uses_pm4_transport()
+    {
+        if let Some(pos) = paged_decode_pos(batch, gpu.replay.has_position_bindings()) {
+            return forward_batch_slots_redline(
+                gpu,
+                weights,
+                config,
+                batch,
+                pool,
+                dn_states,
+                k_arenas,
+                v_arenas,
+                desc_staging,
+                kv,
+                pbs,
+                s,
+                logits_out,
+                cache,
+                lm_head_skip,
+                pos,
+            );
+        }
+    }
     if !gpu.slots_decode_graph() || !(pure_decode || mtp_verify_shape) || pool.is_paged() {
+        gpu.replay.set_forward_eligible(false);
+        // A paged step runs the SAME uploads and the SAME `max_ctx_len` bound as
+        // the retained-PM4 path. Those were two implementations before — this
+        // branch let the body upload inline with `max_ctx_len = physical cap`,
+        // while `forward_batch_slots_redline` uploaded through
+        // `upload_step_inputs` with the bucketed bound — so an eager step and a
+        // replayed step of the same batch were not the same computation. One
+        // routine, one bound: eager output is then the retained tape's reference
+        // by construction, not by luck.
+        let opts = if pool.is_paged() {
+            upload_step_inputs(gpu, batch, pool, desc_staging, pbs)?;
+            SlotStepOpts {
+                skip_uploads: true,
+                ctx_override: Some(decode_ctx_bucket(batch, pool.cap_tokens())),
+            }
+        } else {
+            SlotStepOpts::default()
+        };
         return forward_batch_slots_opts(
             gpu,
             weights,
@@ -3916,7 +4952,7 @@ pub fn forward_batch_slots_graphed_opts(
             s,
             logits_out,
             None,
-            SlotStepOpts::default(),
+            opts,
             lm_head_skip,
             spec_capture,
         );
@@ -4059,7 +5095,7 @@ pub fn forward_batch_slots_graphed_opts(
 /// Undo `advance_slot_seq_lens` for this batch: restore each active slot to
 /// the length it had before the step. Used only by the graph path, which runs
 /// the same step body twice (once to warm, once to capture).
-fn rewind_slot_seq_lens(batch: &SlotBatch, pool: &mut SlotPool) -> HipResult<()> {
+pub(crate) fn rewind_slot_seq_lens(batch: &SlotBatch, pool: &mut SlotPool) -> HipResult<()> {
     for (slot_ix, &m) in batch.m_per_slot.iter().enumerate() {
         if m == 0 {
             continue;
@@ -4191,6 +5227,24 @@ pub fn upload_step_inputs(
         .collect();
     gpu.hip
         .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
+    // Per-step state trace: the one place both the eager body and the
+    // retained-PM4 path pass through, so a parity diff can compare the exact
+    // inputs (rows, positions, descriptor length) a step was given.
+    if gpu.slot_trace() {
+        let descs: Vec<(usize, Option<usize>)> = (0..batch.m_per_slot.len())
+            .map(|slot| {
+                (
+                    slot,
+                    pool.block_table(rdna_compute::slot_pool::SlotId(slot))
+                        .map(|table| table.live_tokens()),
+                )
+            })
+            .collect();
+        eprintln!(
+            "[slot-trace] step: m={:?} positions={:?} descs={:?}",
+            batch.m_per_slot, batch.positions, descs
+        );
+    }
     // Block tables BEFORE descs: activating a paged descriptor mutates the
     // descriptor table, so it must be uploaded after this. Skipping this in
     // paged mode would let `mark_uploaded` below clear the block-table dirty
@@ -4198,7 +5252,17 @@ pub fn upload_step_inputs(
     // mappings, i.e. silent cross-session corruption.
     upload_block_tables(gpu, pool, desc_staging)?;
     if pool.descriptors_dirty() {
-        let desc_bytes = pack_descs(pool.descriptors());
+        debug_assert_eq!(
+            desc_staging.vmm_paged,
+            pool.is_vmm_paged(),
+            "SlotDescStaging width must match the pool's descriptor kind"
+        );
+        let desc_bytes = pack_active_descs(pool);
+        debug_assert_eq!(
+            desc_bytes.len(),
+            pool.descriptors().len() * desc_staging.desc_bytes,
+            "descriptor packing width drifted from the staging allocation"
+        );
         gpu.hip
             .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
         pool.mark_uploaded();
@@ -4449,7 +5513,17 @@ pub fn forward_batch_slots_opts(
             .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
         upload_block_tables(gpu, pool, desc_staging)?;
         if pool.descriptors_dirty() {
-            let desc_bytes = pack_descs(pool.descriptors());
+            debug_assert_eq!(
+                desc_staging.vmm_paged,
+                pool.is_vmm_paged(),
+                "SlotDescStaging width must match the pool's descriptor kind"
+            );
+            let desc_bytes = pack_active_descs(pool);
+            debug_assert_eq!(
+                desc_bytes.len(),
+                pool.descriptors().len() * desc_staging.desc_bytes,
+                "descriptor packing width drifted from the staging allocation"
+            );
             gpu.hip
                 .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
             pool.mark_uploaded();
@@ -4525,9 +5599,19 @@ pub fn forward_batch_slots_opts(
     // are layer-invariant config, and re-uploading per layer would repeat
     // identical work), mirroring row_slot_dev's "every step, not every
     // layer" upload policy.
+    //
+    // `active_slots >= 1`, not `> 1`: a paged pool never takes the
+    // single-slot reduction above, so a step with one prefilling slot (every
+    // MoE prefill, which `split_isolated_prefill` runs alone, and every solo
+    // prompt) must still reach a WMMA prefill kernel. With `> 1` it fell to
+    // the per-row decode attend (scalar below the crossover, flash above),
+    // which costs O(rows x ctx) without WMMA: the 16-49% paged prefill
+    // regression, growing with prompt length. For a non-paged q8 pool
+    // `single_slot` is `Some` whenever one slot is active, so this changes
+    // nothing there.
     let n_tiles: Option<usize> = if kv.is_q8()
         && single_slot.is_none()
-        && active_slots > 1
+        && active_slots >= 1
         && n > active_slots
         && q8_flash_prefill_wmma_eligible(gpu, config.head_dim, n)
     {
@@ -4569,6 +5653,7 @@ pub fn forward_batch_slots_opts(
             desc_staging,
             single_slot,
             n_tiles,
+            vmm_paged: pool.is_vmm_paged(),
         },
         kv,
         pbs,
@@ -4623,7 +5708,7 @@ pub fn forward_batch_slots_opts(
 /// The per-layer body shared by the arena and VMM slots forwards. `kv_addr`
 /// yields the KV storage for FullAttention layer `kv_layer_idx`.
 #[allow(clippy::too_many_arguments)]
-fn run_layers_slots<'a, D, F>(
+pub(crate) fn run_layers_slots<'a, D, F>(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -4694,6 +5779,7 @@ where
                     delta_layer_idx,
                     spec_capture.as_deref_mut(),
                     weights.moe_has_mq6,
+                    s,
                 )?;
                 delta_layer_idx += 1;
             }
@@ -4742,6 +5828,170 @@ mod tests {
     use super::*;
     use hipfire_dispatch::types::KernelKey;
     use rdna_compute::DType;
+
+    #[test]
+    fn paged_decode_pos_allows_ragged_positions_without_a_position_binding() {
+        let mut batch = SlotBatch {
+            m_per_slot: vec![1, 0, 1],
+            tokens: vec![1, 2],
+            positions: vec![9, 9],
+            row_slot: vec![0, 2],
+            ..SlotBatch::default()
+        };
+        // No position binding: one tape serves ragged positions (the max is
+        // what the bucket and the replay observation take).
+        assert_eq!(paged_decode_pos(&batch, false), Some(9));
+        batch.positions[1] = 10;
+        assert_eq!(paged_decode_pos(&batch, false), Some(10));
+        // A tape that binds a position scalar keeps the lockstep rule.
+        assert_eq!(paged_decode_pos(&batch, true), None);
+        batch.positions[1] = 9;
+        assert_eq!(paged_decode_pos(&batch, true), Some(9));
+        // Multi-row and empty batches never route.
+        batch.m_per_slot = vec![2, 0, 0];
+        batch.tokens = vec![1, 2];
+        batch.positions = vec![9, 10];
+        batch.row_slot = vec![0, 0];
+        assert_eq!(paged_decode_pos(&batch, false), None);
+        assert_eq!(paged_decode_pos(&SlotBatch::default(), false), None);
+    }
+
+    #[test]
+    fn paged_pm4_tape_key_rearms_on_bucket_slot_and_skip() {
+        let slot0 = SlotBatch {
+            m_per_slot: vec![1, 0],
+            tokens: vec![1],
+            positions: vec![9],
+            row_slot: vec![0],
+            ..SlotBatch::default()
+        };
+        let slot1 = SlotBatch {
+            m_per_slot: vec![0, 1],
+            tokens: vec![1],
+            positions: vec![9],
+            row_slot: vec![1],
+            ..SlotBatch::default()
+        };
+        let both = SlotBatch {
+            m_per_slot: vec![1, 1],
+            tokens: vec![1, 2],
+            positions: vec![9, 9],
+            row_slot: vec![0, 1],
+            ..SlotBatch::default()
+        };
+        let skip = [false, false];
+        let key0 = paged_pm4_tape_key(&slot0, &skip, 32768);
+        assert_eq!(key0, paged_pm4_tape_key(&slot0, &skip, 32768));
+        assert_eq!(key0.ctx_bucket, 8192);
+        // Conv state and the logit row are recorded per slot index.
+        assert_ne!(key0, paged_pm4_tape_key(&slot1, &skip, 32768));
+        assert_ne!(key0, paged_pm4_tape_key(&both, &skip, 32768));
+        assert_ne!(key0, paged_pm4_tape_key(&slot0, &[true, false], 32768));
+
+        let mut crossed = slot0.clone();
+        crossed.positions = vec![8192];
+        let crossed_key = paged_pm4_tape_key(&crossed, &skip, 32768);
+        assert_eq!(crossed_key.ctx_bucket, 16384);
+        assert_ne!(key0, crossed_key);
+
+        let mut vision = slot0.clone();
+        vision.pos3 = vec![[9, 0, 0]];
+        assert_ne!(key0, paged_pm4_tape_key(&vision, &skip, 32768));
+    }
+
+    fn replay_batch(m: Vec<usize>, positions: Vec<i32>, row_slot: Vec<i32>) -> SlotBatch {
+        SlotBatch {
+            m_per_slot: m,
+            tokens: vec![1; positions.len()],
+            positions,
+            row_slot,
+            ..SlotBatch::default()
+        }
+    }
+
+    #[test]
+    fn paged_replay_inputs_accept_rows_inside_the_bucket_and_tables() {
+        let tables: Vec<Vec<u32>> = vec![vec![0, 1], vec![], vec![5]];
+        let batch = replay_batch(vec![1, 0, 1], vec![255, 127], vec![0, 2]);
+        let got = paged_replay_input_error(&batch, 256, 3, Some(8), |s| {
+            tables.get(s).map(|t| t.as_slice())
+        });
+        assert_eq!(got, None);
+        // Arena (unpaged) pools have no tables to check.
+        assert_eq!(
+            paged_replay_input_error(&batch, 256, 3, None, |_| None),
+            None
+        );
+    }
+
+    #[test]
+    fn paged_replay_inputs_refuse_a_position_outside_the_bucket() {
+        let batch = replay_batch(vec![1], vec![256], vec![0]);
+        let got = paged_replay_input_error(&batch, 256, 1, None, |_| None);
+        assert!(got.unwrap().contains("ctx_bucket"));
+        let neg = replay_batch(vec![1], vec![-1], vec![0]);
+        assert!(paged_replay_input_error(&neg, 256, 1, None, |_| None).is_some());
+    }
+
+    #[test]
+    fn paged_replay_inputs_refuse_a_table_short_of_the_write_position() {
+        // Position 128 is the first token of logical page 1; one page is short.
+        let tables: Vec<Vec<u32>> = vec![vec![3]];
+        let batch = replay_batch(vec![1], vec![128], vec![0]);
+        let got = paged_replay_input_error(&batch, 256, 1, Some(8), |s| {
+            tables.get(s).map(|t| t.as_slice())
+        });
+        assert!(got.unwrap().contains("writes position 128"));
+        // 127 is still inside page 0.
+        let ok = replay_batch(vec![1], vec![127], vec![0]);
+        assert_eq!(
+            paged_replay_input_error(&ok, 256, 1, Some(8), |s| tables
+                .get(s)
+                .map(|t| t.as_slice())),
+            None
+        );
+    }
+
+    #[test]
+    fn paged_replay_inputs_refuse_out_of_range_pages_and_bad_rows() {
+        let tables: Vec<Vec<u32>> = vec![vec![8]];
+        let batch = replay_batch(vec![1], vec![0], vec![0]);
+        let got = paged_replay_input_error(&batch, 256, 1, Some(8), |s| {
+            tables.get(s).map(|t| t.as_slice())
+        });
+        assert!(got.unwrap().contains("names page 8"));
+        // Missing table.
+        assert!(paged_replay_input_error(&batch, 256, 1, Some(8), |_| None).is_some());
+        // A multi-row slot never replays a decode tape.
+        let wide = replay_batch(vec![2], vec![0, 1], vec![0, 0]);
+        assert!(paged_replay_input_error(&wide, 256, 1, None, |_| None).is_some());
+        // Row naming a slot outside the batch.
+        let stray = replay_batch(vec![1], vec![0], vec![3]);
+        assert!(paged_replay_input_error(&stray, 256, 1, None, |_| None).is_some());
+        // Batch wider than the pool.
+        let over = replay_batch(vec![1, 1], vec![0, 0], vec![0, 1]);
+        assert!(paged_replay_input_error(&over, 256, 1, None, |_| None).is_some());
+    }
+
+    #[test]
+    fn paged_pm4_tape_stale_drops_a_prepared_plan_the_prefill_left_installed() {
+        let wide = PagedPm4TapeKey {
+            ctx_bucket: 2048,
+            body: 1,
+        };
+        let narrow = PagedPm4TapeKey {
+            ctx_bucket: 2048,
+            body: 2,
+        };
+        // Prefill cleared forward eligibility, but the wide plan is still
+        // installed. The narrow step has to drop it.
+        assert!(paged_pm4_tape_stale(Some(wide), narrow, true));
+        assert!(paged_pm4_tape_stale(None, narrow, true));
+        // Same shape replays. No plan means this step records; nothing to drop.
+        assert!(!paged_pm4_tape_stale(Some(wide), wide, true));
+        assert!(!paged_pm4_tape_stale(Some(wide), narrow, false));
+        assert!(!paged_pm4_tape_stale(None, narrow, false));
+    }
 
     #[test]
     fn v2_one_to_one_keys_no_hfq4_fallback() {

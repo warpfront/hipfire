@@ -195,6 +195,7 @@ fn main() {
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
                 min_p: 0.0,
+                logprobs_top_k: None,
                 visual_data: None,
                 json_schema: spec.json_schema.clone(),
                 started_in_think: false,
@@ -209,7 +210,7 @@ fn main() {
         while let Ok(ev) = rx.recv() {
             match ev {
                 Event::Accepted { reused: r, .. } => reused = r,
-                Event::Token { id } => tokens.push(id),
+                Event::Token { id, .. } => tokens.push(id),
                 Event::Rejected { reason, .. } => panic!("rejected: {reason}"),
                 Event::Done { .. } => break,
             }
@@ -284,6 +285,7 @@ fn main() {
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
                 min_p: 0.0,
+                logprobs_top_k: None,
                 visual_data: None,
                 json_schema: None,
                 started_in_think: false,
@@ -410,6 +412,7 @@ fn main() {
                     presence_penalty: 0.0,
                     frequency_penalty: 0.0,
                     min_p: 0.0,
+                    logprobs_top_k: None,
                     visual_data: None,
                     json_schema: None,
                     started_in_think: false,
@@ -431,7 +434,7 @@ fn main() {
                         session = s;
                         reused = r;
                     }
-                    Event::Token { id } => tokens.push(id),
+                    Event::Token { id, .. } => tokens.push(id),
                     Event::Done { .. } => break,
                     Event::Rejected { reason, .. } => panic!("a20 rejected: {reason}"),
                 }
@@ -722,6 +725,7 @@ fn main() {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             min_p: 0.0,
+            logprobs_top_k: None,
             visual_data: None,
             json_schema: None,
             started_in_think: false,
@@ -738,7 +742,7 @@ fn main() {
     while let Ok(ev) = rx_long.recv() {
         match ev {
             Event::Accepted { reused: r, .. } => reused_long = r,
-            Event::Token { id } => toks_long.push(id),
+            Event::Token { id, .. } => toks_long.push(id),
             Event::Rejected { reason, .. } => panic!("long request rejected: {reason}"),
             Event::Done { .. } => break,
         }
@@ -842,6 +846,7 @@ fn main() {
                     presence_penalty: 0.0,
                     frequency_penalty: 0.0,
                     min_p: 0.0,
+                    logprobs_top_k: None,
                     visual_data: None,
                     json_schema: None,
                     started_in_think: false,
@@ -865,7 +870,7 @@ fn main() {
                 while let Ok(ev) = rx.recv() {
                     match ev {
                         Event::Accepted { reused: r, .. } => reused = r,
-                        Event::Token { id } => tokens.push(id),
+                        Event::Token { id, .. } => tokens.push(id),
                         Event::Rejected { reason, .. } => {
                             panic!("concurrent request rejected: {reason}")
                         }

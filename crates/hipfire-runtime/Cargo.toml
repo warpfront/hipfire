@@ -697,6 +697,10 @@ name = "test_serve_concurrent"
 required-features = ["lab"]
 
 [[example]]
+name = "test_slots_vmm_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "test_serve_tool_reentry"
 required-features = ["lab"]
 
@@ -862,6 +866,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "moe_nan_guard_regress"
+required-features = ["lab"]
+
+[[example]]
+name = "vmm_paged_swap_smoke"
 required-features = ["lab"]
 
 # DFlash railgun window GPU oracle (design A); `--features lab`.

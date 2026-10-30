@@ -278,7 +278,8 @@ impl Pm4Commands {
                 }
                 .with_dispatch_initiator_policy(dispatch_initiator_policy)
                 .with_dispatch_interleave(dispatch_interleave)
-                .with_resource_limits_policy(resource_limits_policy);
+                .with_resource_limits_policy(resource_limits_policy)
+                .with_gfx11_cwsr_priv(gfx11_cwsr_priv(architecture));
                 Self::Legacy {
                     architecture,
                     commands,
@@ -724,6 +725,38 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    // Shared-pool `_vmm_paged` decode. Descriptor bytes live in `descs_dev`
+    // (kernarg holds the pointer); positions/row_slot are the same. Offsets
+    // match `attention.rs` blob builders after natural alignment + pad_to(16).
+    if kernel == "kv_cache_write_q8_0_batched_vmm_paged" {
+        return Some(vec![write(0), read(8), read(16), read(40), read(48)]);
+    }
+    if kernel == "attention_q8_0_kv_batched_vmm_paged" {
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            read(32),
+            read(40),
+            read(80),
+            read(88),
+        ]);
+    }
+    if kernel == "attention_flash_q8_0_tile_batched_vmm_paged" {
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            read(32),
+            read(40),
+            read(48),
+            read(56),
+            read(112),
+            read(120),
+        ]);
+    }
     // The repacker completely overwrites all three planes on each launch.
     // ADD is a read-modify-write of Y0, represented conservatively as Write.
     if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
@@ -901,6 +934,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             // only changes the recorded kernarg length (64 B padded).
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched"
+            | "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -915,6 +949,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_mq4g256v2_moe_ninepath_d4"
             | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
+            | "gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         // expert_ptrs, topk_indices, topk_weights, act (read); out is RMW.
@@ -1007,6 +1042,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_residual"
             | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
+            | "gemv_mq4g256v2_xbatch"
+            | "gemv_mq4g256v2_xbatch_residual"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_k2560"
             | "gemv_mq6g256v2_k2560_u2"
@@ -1085,7 +1122,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     if kernel == "moe_router_softmax_topk_k8_wave64"
         || kernel == "moe_router_softmax_topk_k8_wave64_exact"
+        || kernel == "moe_router_softmax_topk_k8_wave"
     {
+        // wave: logits read, topk idx/weights write. 3 pointers + 2 i32 = 32 B.
+        // Logits are not stored (the fused softmax stays in registers).
         return Some(vec![read(0), write(8), write(16)]);
     }
     if kernel.starts_with("gated_delta_net_q8_compact") {
@@ -1101,6 +1141,35 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]);
     }
+    if kernel == "gated_delta_net_q8_fast_slots" {
+        // Scalar prefix (same as gated_delta_net_q8_fast, lane 0) plus nine
+        // explicit pointers per extra lane at 96 / 168 / 240. Null pointers
+        // are skipped later.
+        let mut effects = vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(80),
+        ];
+        for lane in 1..4 {
+            let base = 96 + (lane - 1) * 72;
+            effects.push(read(base));
+            effects.push(read(base + 8));
+            effects.push(read(base + 16));
+            effects.push(read(base + 24));
+            effects.push(read(base + 32));
+            effects.push(write(base + 40));
+            effects.push(write(base + 48));
+            effects.push(write(base + 56));
+            effects.push(write(base + 64));
+        }
+        return Some(effects);
+    }
     if kernel == "fused_qkvza_hfq4g256_k2048_scalar_prep" {
         return Some(vec![
             read(0),
@@ -1115,6 +1184,17 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(72),
             read(80),
         ]);
+    }
+    if kernel == "conv1d_silu_split_f32_lanes" {
+        // q/k/v writes, input and weight reads, then 16 conv-ring pointers
+        // inlined at offset 40. Unused lanes are null and skipped. Without
+        // a per-lane effect the by-value table hides those rings from
+        // Resource wait and the next GDN launch races them on gfx1100.
+        let mut effects = vec![write(0), write(8), write(16), read(24), read(32)];
+        for lane in 0..16 {
+            effects.push(write(40 + lane * 8));
+        }
+        return Some(effects);
     }
     if kernel == "conv1d_silu_split_qknorm_b256_scalar_prep" {
         return Some(vec![
@@ -1416,6 +1496,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
+        | "gemv_mq4g256v2_xbatch_residual_sigmoid"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2" => {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
@@ -1535,6 +1616,24 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel == "kv_cache_write_q8_0_batched_vmm_paged" {
+        return Some(64);
+    }
+    if kernel == "attention_q8_0_kv_batched_vmm_paged" {
+        return Some(96);
+    }
+    if kernel == "attention_flash_q8_0_tile_batched_vmm_paged" {
+        return Some(128);
+    }
+    // X-batched MQ4V2 GEMV: `a, x, y` pointers then three i32 (`m`, `k`, `b`),
+    // no trailing pad, so the recorded blob is 36 bytes. Their pointer
+    // effects below are inert without this arm.
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_xbatch" | "gemv_mq4g256v2_xbatch_residual"
+    ) {
+        return Some(36);
+    }
     if kernel == "fused_rmsnorm_mq_rotate_f16" {
         return Some(48);
     }
@@ -1773,6 +1872,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
             | "gemv_mq4g256v2_moe_ninepath_d4"
             | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
+            | "gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         return Some(64);
@@ -1792,6 +1892,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         kernel,
         "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched"
+            | "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100"
             | "gemm_mq4g256v2_moe_grouped_wmma_k2"
             | "gemm_mq4g256v2_moe_grouped_wmma_gfx12"
             | "gemm_mq6g256v2_moe_grouped_wmma_k2"
@@ -1896,6 +1997,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     if kernel == "moe_router_softmax_topk_k8_wave64"
         || kernel == "moe_router_softmax_topk_k8_wave64_exact"
+        || kernel == "moe_router_softmax_topk_k8_wave"
     {
         return Some(32);
     }
@@ -1951,6 +2053,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
+        | "gemv_mq4g256v2_xbatch_residual_sigmoid"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2"
         | "hc_mix_4stream"
         | "kv_cache_write_asym_k_fwht3"
@@ -1960,6 +2063,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rope_partial_halfsplit_f32"
         | "rope_partial_halfsplit_f32_headgrid"
         | "conv1d_gated_decode_f32" => Some(48),
+        "conv1d_silu_split_f32_lanes" => Some(304),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_k6144_gfx1100"
@@ -2024,6 +2128,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_mq4g256v2"
         | "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100"
         | "gated_delta_net_q8_fast" => Some(96),
+        "gated_delta_net_q8_fast_slots" => Some(96 + 3 * 9 * 8),
         "gated_delta_net_f32" => Some(80),
         _ => None,
     }
@@ -3316,6 +3421,125 @@ fn gfx1100_experiment_alias(architecture: Pm4Architecture, device_name: &str) ->
     }
 }
 
+/// GFX11 raw-PM4 dispatches must set `COMPUTE_PGM_RSRC1.PRIV` (bit 20) for
+/// CWSR. The AQL dispatch microcode sets it implicitly; without it a queue
+/// preemption (CWSR save/restore) during a retained PM4 dispatch faulted on
+/// gfx1100 with an SQC page-0 read (see
+/// docs/investigations/2026-10-29-gfx11-pm4-cwsr-priv.md).
+///
+/// Negative control (test-only, default off):
+/// `HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV=1` leaves the bit clear on GFX11 so the
+/// fault can be reproduced against the same build.
+fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
+    if architecture != Pm4Architecture::Gfx11 {
+        return false;
+    }
+    if hipfire_config::process_value("HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV").as_deref() == Some("1") {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!("[redline] DEBUG negative control: gfx11 COMPUTE_PGM_RSRC1.PRIV not set")
+        });
+        return false;
+    }
+    true
+}
+
+/// DEBUG (test-only, default off): `HIPFIRE_DEBUG_FORCE_EVICT_MS=N` starts one
+/// background thread, on the first PM4 replay, that registers a 2 MiB
+/// anonymous host buffer with `hipHostRegister` (a KFD userptr BO) and every
+/// N ms drops and re-faults one of its pages (`madvise(MADV_DONTNEED)` plus a
+/// write). Each drop fires the userptr MMU notifier, so KFD evicts (preempts,
+/// CWSR-saves) and later restores every queue of the process. It drives the
+/// queue-preemption path without a profiler; it is a repro aid, not a
+/// production setting.
+fn debug_force_evict_start() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(ms) = hipfire_config::process_value("HIPFIRE_DEBUG_FORCE_EVICT_MS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+    else {
+        return;
+    };
+    ONCE.call_once(move || {
+        unsafe extern "C" {
+            fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+            fn dlsym(
+                h: *mut std::ffi::c_void,
+                name: *const std::ffi::c_char,
+            ) -> *mut std::ffi::c_void;
+            fn mmap(
+                addr: *mut std::ffi::c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut std::ffi::c_void;
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+        const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
+        const RTLD_LAZY_NOLOAD: i32 = 0x1 | 0x4;
+        const MADV_DONTNEED: i32 = 4;
+        let len: usize = 2 << 20;
+        let buf = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ_WRITE,
+                MAP_PRIVATE_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if buf as isize == -1 {
+            eprintln!("[force-evict] mmap failed");
+            return;
+        }
+        unsafe { std::ptr::write_bytes(buf as *mut u8, 1, len) };
+        // The HIP runtime is already loaded by the time a PM4 replay runs.
+        let handle = [c"libamdhip64.so", c"libamdhip64.so.6", c"libamdhip64.so.7"]
+            .iter()
+            .map(|name| unsafe { dlopen(name.as_ptr(), RTLD_LAZY_NOLOAD) })
+            .find(|h| !h.is_null());
+        let Some(handle) = handle else {
+            eprintln!("[force-evict] libamdhip64 not loaded");
+            return;
+        };
+        let register = unsafe { dlsym(handle, c"hipHostRegister".as_ptr()) };
+        if register.is_null() {
+            eprintln!("[force-evict] hipHostRegister missing");
+            return;
+        }
+        let register: unsafe extern "C" fn(*mut std::ffi::c_void, usize, u32) -> i32 =
+            unsafe { std::mem::transmute(register) };
+        let status = unsafe { register(buf, len, 0) };
+        eprintln!("[force-evict] hipHostRegister({len} B) status={status} period={ms} ms");
+        if status != 0 {
+            return;
+        }
+        let addr = buf as usize;
+        std::thread::Builder::new()
+            .name("force-evict".into())
+            .spawn(move || {
+                let mut drops: u64 = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    let page = addr + ((drops as usize % 512) << 12);
+                    unsafe {
+                        madvise(page as *mut std::ffi::c_void, 4096, MADV_DONTNEED);
+                        std::ptr::write_volatile(page as *mut u8, 1);
+                    }
+                    drops += 1;
+                    if drops.is_multiple_of(1000) {
+                        eprintln!("[force-evict] {drops} drops");
+                    }
+                }
+            })
+            .ok();
+    });
+}
+
 fn gfx10_dispatch_initiator_policy(
     architecture: Pm4Architecture,
     device_name: &str,
@@ -4225,7 +4449,9 @@ struct SnapshotEntry {
 }
 
 pub(crate) fn is_gdn_kernel(kernel: &str) -> bool {
-    kernel == "gated_delta_net_q8_fast" || kernel.starts_with("gated_delta_net_q8_compact")
+    kernel == "gated_delta_net_q8_fast"
+        || kernel == "gated_delta_net_q8_fast_slots"
+        || kernel.starts_with("gated_delta_net_q8_compact")
 }
 
 /// Fail-closed gate for the PM4/AQL lowering, which turns a recorded HIP
@@ -4356,6 +4582,15 @@ impl ReplayController {
     /// [`Self::retained_kernarg_bindings`]).
     pub(crate) fn synthesized_position_bindings(&self) -> &[(usize, ReplayKernargBinding)] {
         &self.synthesized_position_bindings
+    }
+
+    /// Whether this tape carries a position *kernarg* binding, i.e. a scalar
+    /// position baked into a launch. A body that keeps every row's position in
+    /// a device buffer (and so has none) replays one tape for any set of rows
+    /// inside its bucket; a body with a binding needs every live row to share
+    /// that one value.
+    pub fn has_position_bindings(&self) -> bool {
+        !self.synthesized_position_bindings.is_empty()
     }
 
     /// The complete retained binding set for the first `prefix` recorded
@@ -5168,6 +5403,7 @@ impl PreparedPm4Replay {
                 });
             }
         }
+        debug_force_evict_start();
         let patch_started = crate::gap_timing::now();
         // Patch typed kernarg bindings while queue is quiescent.
         // Single code path shared with recorded-HIP replay: both transports
@@ -6033,6 +6269,7 @@ impl ReplayController {
                 .with_dynamic_group_bytes(launch.shared_mem)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             if launch.kernel == "gated_delta_net_q8_fast"
+                || launch.kernel == "gated_delta_net_q8_fast_slots"
                 || launch.kernel.starts_with("gated_delta_net_q8_compact")
             {
                 if metadata.kernarg_segment_size < 80 {
@@ -6951,7 +7188,17 @@ impl ReplayController {
                         }
                     }
                     for commands in &mut lanes {
-                        commands.trailing_release()?;
+                        // Native semaphores publish with WRITE_DATA only when
+                        // the lane already ends in CS_PARTIAL_FLUSH. A system
+                        // acquire here hides that idle and the gfx11 native
+                        // builder refuses the tape. The next phase's entry
+                        // acquire, plus the terminal acquire on the stitched
+                        // stream, still covers GL2.
+                        if native_phase_sync {
+                            commands.wait_compute_idle()?;
+                        } else {
+                            commands.trailing_release()?;
+                        }
                         command_dwords = command_dwords
                             .checked_add(commands.len_dwords())
                             .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -7020,7 +7267,11 @@ impl ReplayController {
                         )
                         .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
                 }
-                commands.trailing_release()?;
+                if native_phase_sync {
+                    commands.wait_compute_idle()?;
+                } else {
+                    commands.trailing_release()?;
+                }
                 command_dwords = command_dwords
                     .checked_add(commands.len_dwords())
                     .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -9346,6 +9597,97 @@ mod tests {
     }
 
     #[test]
+    fn vmm_paged_slots_effect_contracts_match_launch_blobs() {
+        use std::ffi::c_void;
+
+        let null = std::ptr::null::<c_void>();
+        let mut write = hip_bridge::KernargBlob::new();
+        write.push_ptr(null);
+        write.push_ptr(null);
+        write.push_ptr(null);
+        write.push_i32(0);
+        write.push_i32(0);
+        write.push_i32(0);
+        write.push_ptr(null);
+        write.push_ptr(null);
+        write.push_i32(0);
+        write.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("kv_cache_write_q8_0_batched_vmm_paged"),
+            Some(write.len())
+        );
+        let write_fx = pointer_effects("kv_cache_write_q8_0_batched_vmm_paged")
+            .expect("vmm-paged write contract");
+        assert_eq!(
+            write_fx
+                .iter()
+                .map(|e| (e.offset, e.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, RecordedAccessMode::Write),
+                (8, RecordedAccessMode::Read),
+                (16, RecordedAccessMode::Read),
+                (40, RecordedAccessMode::Read),
+                (48, RecordedAccessMode::Read),
+            ]
+        );
+
+        let mut lds = hip_bridge::KernargBlob::new();
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_i32(0);
+        lds.push_i32(0);
+        lds.push_i32(0);
+        lds.push_i32(0);
+        lds.push_f32(0.0);
+        lds.push_i32(0);
+        lds.push_i32(0);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("attention_q8_0_kv_batched_vmm_paged"),
+            Some(lds.len())
+        );
+        assert_eq!(
+            pointer_effects("attention_q8_0_kv_batched_vmm_paged").map(|e| e.len()),
+            Some(8)
+        );
+
+        let mut tile = hip_bridge::KernargBlob::new();
+        for _ in 0..8 {
+            tile.push_ptr(null);
+        }
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_f32(0.0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_ptr(null);
+        tile.push_ptr(null);
+        tile.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("attention_flash_q8_0_tile_batched_vmm_paged"),
+            Some(tile.len())
+        );
+        assert_eq!(
+            pointer_effects("attention_flash_q8_0_tile_batched_vmm_paged").map(|e| e.len()),
+            Some(10)
+        );
+    }
+
+    #[test]
     fn deltanet_f32_retained_effect_contract_covers_recurrent_state() {
         assert_eq!(expected_kernarg_bytes("gated_delta_net_f32"), Some(80));
         let effects = pointer_effects("gated_delta_net_f32").expect("GDN FP32 contract");
@@ -10024,6 +10366,7 @@ mod tests {
             "gemv_mq4g256v2_moe_gate_up_k8_indexed",
             "gemv_mq6g256v2_moe_gate_up_k8_indexed",
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
+            "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(64));
             let got = pointer_effects(symbol).expect("mqv2 gate_up pointer contract");
@@ -10090,6 +10433,7 @@ mod tests {
         for symbol in [
             "gemv_mq4g256v2_moe_ninepath_d4",
             "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
+            "gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100",
             "gemv_mq6g256v2_moe_ninepath_d4",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(64));
@@ -10431,6 +10775,45 @@ mod tests {
         assert_ne!(symbol, "gemv_mq4g256v2_residual");
         assert!(pointer_effects("gemv_mq4g256v2_residual_sigmoid_scaled").is_none());
         assert!(expected_kernarg_bytes("gemv_mq4g256v2_residual_sigmoid_scaled").is_none());
+    }
+
+    #[test]
+    fn mq4g256v2_xbatch_residual_sigmoid_keeps_4ptr_abi() {
+        let symbol = "gemv_mq4g256v2_xbatch_residual_sigmoid";
+        let want = [read(0), read(8), write(16), read(24)];
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..4 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        blob.push_i32(0);
+        assert_eq!(blob.len(), 44, "{symbol} explicit args occupy 44 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 48, "{symbol} recorded launches pad to 16");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+        let got = pointer_effects(symbol).expect("xbatch sigmoid residual pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+    }
+
+    #[test]
+    fn gated_delta_net_q8_fast_slots_tracks_four_lanes() {
+        let symbol = "gated_delta_net_q8_fast_slots";
+        assert_eq!(expected_kernarg_bytes(symbol), Some(96 + 3 * 9 * 8));
+        let got = pointer_effects(symbol).expect("gdn slots pointer contract");
+        // Lane 0 prefix (9 effects, ef @80) plus 3 extra lanes * 9 pointers.
+        assert_eq!(got.len(), 9 + 3 * 9);
+        assert_eq!(got[8].offset, 80);
+        assert_eq!(got[9].offset, 96);
+        assert_eq!(got[17].offset, 160);
+        assert_eq!(got[18].offset, 168);
+        assert_eq!(got[26].offset, 232);
+        assert_eq!(got[27].offset, 240);
+        assert_eq!(got[35].offset, 304);
     }
 
     #[test]
@@ -12216,8 +12599,9 @@ mod tests {
         let metadata_kernarg_size = 80usize;
         assert!(metadata_kernarg_size >= 80);
         let bindings: Vec<(usize, ReplayKernargBinding)> = vec![];
-        let is_gdn =
-            kernel == "gated_delta_net_q8_fast" || kernel.starts_with("gated_delta_net_q8_compact");
+        let is_gdn = kernel == "gated_delta_net_q8_fast"
+            || kernel == "gated_delta_net_q8_fast_slots"
+            || kernel.starts_with("gated_delta_net_q8_compact");
         assert!(is_gdn);
         let has_binding = bindings.iter().any(|(_, b)| {
             matches!(

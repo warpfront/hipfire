@@ -3178,43 +3178,70 @@ pub fn mtp_batched_verify_accept_from_batch(
         &draft.sampling,
     )?;
 
-    // Greedy accept: argmax per verify row on GPU, one packed D2H, host-side
-    // prefix rule. (The slot-engine MTP path is greedy-only, matching the
-    // retired `is_external = true` behaviour.)
-    let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
-    gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
-    let mut argmax_host: Vec<i32> = vec![0; n_verify];
+    // Sampled requests use the same rejection rule the singleton MTP path
+    // (and DFlash) use: accept each draft with `u * p_draft <= p_target`,
+    // draw a residual bonus on rejection, and sample the target nucleus on a
+    // full accept. Greedy requests keep the argmax prefix rule and its A10
+    // fault seam.
+    let (mut committed, mut hit_eos, accept_count): (Vec<u32>, bool, usize) = if draft.use_sampling
     {
-        let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
-        };
-        gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
-    }
-    let argmax_per_pos: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
-    if mtp_trace_enabled() {
-        eprintln!(
-            "[mtp-trace] accept cur_pos={} n_verify={} drafts={} candidates={:?} argmax={:?}",
-            draft.cur_pos,
-            n_verify,
+        let mut committed = Vec::with_capacity(drafts_generated + 1);
+        let mut accept_count = 0;
+        let hit_eos = mtp_sampled_accept(
+            gpu,
+            state,
+            &logits_view,
+            &draft.draft_softmaxes,
+            &draft.draft_probs,
+            &draft.candidates,
             drafts_generated,
-            &draft.candidates[..drafts_generated.min(draft.candidates.len())],
-            argmax_per_pos
-        );
-    }
-    // A10 fault seam (oracle only, see `arm_mtp_full_reject`): the committed
-    // token is the trunk's own argmax, so greedy output must equal the
-    // accepting MTP / AR sequence; the cell proves rejected draft rows never
-    // become cache-visible (spec §4.6.2) and the repair path handles a
-    // zero-length accepted prefix.
-    let fault_full_reject = MTP_FULL_REJECT.load(std::sync::atomic::Ordering::Acquire);
-    let accepted = if fault_full_reject {
-        greedy_trunk_spine_accept(&[], &argmax_per_pos[..1], eos_token_id)
+            vocab,
+            false,
+            draft.sampling.temp,
+            draft.sampling.top_p,
+            draft.sampling.top_k,
+            draft.sampling.min_p,
+            eos_token_id,
+            &mut committed,
+            &mut accept_count,
+        )?;
+        (committed, hit_eos, accept_count)
     } else {
-        greedy_trunk_spine_accept(&draft.candidates, &argmax_per_pos, eos_token_id)
+        // Greedy accept: argmax per verify row on GPU, one packed D2H, host-side
+        // prefix rule.
+        let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
+        gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
+        let mut argmax_host: Vec<i32> = vec![0; n_verify];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
+            };
+            gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
+        }
+        let argmax_per_pos: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+        if mtp_trace_enabled() {
+            eprintln!(
+                "[mtp-trace] accept cur_pos={} n_verify={} drafts={} candidates={:?} argmax={:?}",
+                draft.cur_pos,
+                n_verify,
+                drafts_generated,
+                &draft.candidates[..drafts_generated.min(draft.candidates.len())],
+                argmax_per_pos
+            );
+        }
+        // A10 fault seam (oracle only, see `arm_mtp_full_reject`): the committed
+        // token is the trunk's own argmax, so greedy output must equal the
+        // accepting MTP / AR sequence; the cell proves rejected draft rows never
+        // become cache-visible (spec §4.6.2) and the repair path handles a
+        // zero-length accepted prefix.
+        let fault_full_reject = MTP_FULL_REJECT.load(std::sync::atomic::Ordering::Acquire);
+        let accepted = if fault_full_reject {
+            greedy_trunk_spine_accept(&[], &argmax_per_pos[..1], eos_token_id)
+        } else {
+            greedy_trunk_spine_accept(&draft.candidates, &argmax_per_pos, eos_token_id)
+        };
+        (accepted.committed, accepted.hit_eos, accepted.accept_count)
     };
-
-    let mut committed = accepted.committed;
-    let mut hit_eos = accepted.hit_eos;
 
     // Clamp the burst to what the engine can actually KEEP. The accept rule
     // above only early-stops on `eos_token_id`, but the commit path also
@@ -3239,7 +3266,6 @@ pub fn mtp_batched_verify_accept_from_batch(
     }
     committed.truncate(keep);
 
-    let accept_count = accepted.accept_count;
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
     if mtp_trace_enabled() {

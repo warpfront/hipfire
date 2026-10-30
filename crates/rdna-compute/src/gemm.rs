@@ -37690,8 +37690,12 @@ impl Gpu {
         // Small-N eager HIP: exact-gfx1100 RAW-slab ldsstage default-on via
         // flags.gate_up_ldsstage (HIPFIRE_GATEUP_LDSSTAGE; =0 → historical base),
         // 1<=N<=16, K%512==0. Capture/replay and other shapes keep base block32.
-        let (kname, ksrc, block_x) = if !self.replay.is_recording()
-            && !self.graphs.capture_mode
+        // `ldsstage` carries a replay.rs kernarg contract, so a retained tape
+        // records and replays it too. Excluding recording here made the tape a
+        // different computation from eager: measured on gfx1100/MoE, the first
+        // divergence after the residual tier was this gate_up GEMM (eager
+        // `..._ldsstage` block 256, recording base block 32).
+        let (kname, ksrc, block_x) = if !self.graphs.capture_mode
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && (1..=16).contains(&batch_size)
@@ -39711,15 +39715,15 @@ impl Gpu {
         // atomics), launches via launch_maybe_blob (blob ABI recorded under
         // capture), and its symbols carry the replay.rs kernarg contract, so
         // verify-graph capture bakes ks4_lds and every replayed cycle keeps
-        // the win. Only Redline tape recording keeps the base contract.
+        // the win. Redline tape recording takes `ldsstage` too (its contract
+        // is registered); only `ksplit_lds`, which has none, keeps the base.
         // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables BOTH the ksplit
         // and ldsstage kernels (flags.residual_ksplit_off) and restores the
         // base oracle. The ldsstage kernel (gfx1100 port of the gfx12
         // ldsstage design) is default-on for exact gfx1100
         // (flags.residual_ldsstage) wherever K % 512 == 0; set
         // HIPFIRE_RESIDUAL_LDSSTAGE=0 to restore the split-K table path.
-        if !self.replay.is_recording()
-            && !self.flags.residual_ksplit_off
+        if !self.flags.residual_ksplit_off
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && batch_size <= 16
@@ -39729,17 +39733,28 @@ impl Gpu {
                 self.flags.residual_ldsstage,
                 k,
             ) {
+                // `ldsstage` is deterministic, launches through
+                // `launch_maybe_blob`, and carries a replay.rs kernarg
+                // contract, so a retained tape can record and replay it. It
+                // MUST: an eager step on this shape selects it, so recording
+                // the base kernel instead made the tape a different
+                // computation from eager. Measured on gfx1100/MoE: the first
+                // decode-step residual GEMM at launch 2229 was
+                // `..._ldsstage` block 256 eagerly and base block 32 under
+                // recording, and the two greedy texts parted at a near-tie.
                 ResidualVerifyTier::LdsStage => {
                     return self.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
                         a_raw, x, y, m, k, batch_size,
                     );
                 }
-                ResidualVerifyTier::Ksplit { kw } => {
+                // `ksplit_lds` has no replay.rs kernarg contract yet, so a
+                // retained tape keeps the base kernel for that tier.
+                ResidualVerifyTier::Ksplit { kw } if !self.replay.is_recording() => {
                     return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
                         a_raw, x, y, m, k, batch_size, kw,
                     );
                 }
-                ResidualVerifyTier::Base => {}
+                ResidualVerifyTier::Ksplit { .. } | ResidualVerifyTier::Base => {}
             }
         }
         // Exact gfx1100 production multi-wave policy: MW4 for N 416..463
@@ -41690,6 +41705,8 @@ impl Gpu {
     ) -> HipResult<()> {
         if self.q8x_verify_active(k, batch_size) {
             // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
+            // Inactive under recording/capture, so the retained tape below
+            // keeps its own body.
             return self.gemm_mq4g256v2_q8x(
                 &[(a_gate, y_gate, gate_m), (a_up, y_up, up_m)],
                 x,
@@ -41697,6 +41714,28 @@ impl Gpu {
                 batch_size,
                 false,
             );
+        }
+        // Decode-width rows: the WMMA tile is 16 and `ensure_fp16_x` launches
+        // `convert_f32_to_f16`. A 4-slot retained tape was paying that convert
+        // plus an empty 12-row tile every MoE layer. The x-batch GEMV reads
+        // each weight row once for up to four activations and writes Y
+        // outright, matching the slots QKV path. gfx1100 only: the retained
+        // slots tape this route exists for is gfx1100, and the GEMV's f32-x
+        // arithmetic differs from the WMMA arms below, so gfx1151/gfx1201
+        // keep the incumbent kernels and their byte identity.
+        if self.arch_caps.is_gfx1100()
+            && (1..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&batch_size)
+            && k.is_multiple_of(256)
+        {
+            if batch_size == 1 {
+                let x1 = x.sub_offset(0, k);
+                let g1 = y_gate.sub_offset(0, gate_m);
+                let u1 = y_up.sub_offset(0, up_m);
+                self.gemv_mq4g256v2(a_gate, &x1, &g1, gate_m, k)?;
+                return self.gemv_mq4g256v2(a_up, &x1, &u1, up_m, k);
+            }
+            self.gemv_mq4g256v2_xbatch(a_gate, x, y_gate, gate_m, k, batch_size)?;
+            return self.gemv_mq4g256v2_xbatch(a_up, x, y_up, up_m, k, batch_size);
         }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
@@ -41725,7 +41764,24 @@ impl Gpu {
     ) -> HipResult<()> {
         if self.q8x_verify_active(k, batch_size) {
             // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
+            // Inactive under recording/capture, so the decode arms below keep
+            // the retained tape's body.
             return self.gemm_mq4g256v2_q8x(&[(a_raw, y, m)], x, k, batch_size, true);
+        }
+        if batch_size == 1 && k.is_multiple_of(256) {
+            // One row stays on the arch residual GEMV, including the gfx1100
+            // M=2048 K=4096 noscratch kernel. The 4-wide x-batch body keeps
+            // four accumulator sets at B=1 and misses that specialization.
+            let x1 = x.sub_offset(0, k);
+            let y1 = y.sub_offset(0, m);
+            return self.gemv_hfq4g256_residual_mq4v2(a_raw, &x1, &y1, m, k);
+        }
+        if (2..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&batch_size)
+            && k.is_multiple_of(256)
+        {
+            // Several decode rows: one weight pass per four activations.
+            // Both write Y in place, so a retained tape has no host memset.
+            return self.gemv_mq4g256v2_xbatch_residual(a_raw, x, y, m, k, batch_size);
         }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
@@ -41756,17 +41812,33 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if batch_size == 1 {
+            // One row is the AR singleton and the MQ4V2 GEMV writes Y
+            // outright, so it needs neither the residual pairing nor the Y
+            // zeroing. That zeroing is a host `hipMemset`, and host work
+            // inside a forward body is state a retained PM4 tape cannot
+            // replay (`effect-incomplete capture`) — the slots MoE body hit it
+            // three times per layer. `layer_ops::project_rotated` already
+            // keeps the GEMV for exactly this case; applying the same rule
+            // here is what makes it unbypassable for key-routed callers.
+            return self.gemv_mq4g256v2(a_raw, x, y, m, k);
+        }
+        if batch_size <= crate::prefill_invariant::FEW_ROW_ROUTE_ROWS {
+            // Few-row rows are per-row GEMV arithmetic too, and they write Y
+            // outright. Same reason as the one-row arm: the plain GEMM below
+            // zeroes Y with a host memset, which a retained tape cannot replay.
+            // gfx1100 has no rows_x4 PM image, so that helper fell through to
+            // one singleton GEMV per row (four weight passes). The x-batch
+            // GEMV is the same accumulator with each weight row decoded once
+            // for up to four activations — the slots QKV path already uses it.
+            return self.gemv_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size);
+        }
         if self.arch_caps.has_wmma() {
             // Plain GEMM semantics: Y = W·X . The V2 WMMA kernels are
             // residual (Y += W·X), so zero Y first on the active stream,
             // invalidate the fp16-X cache, then dispatch arch-aware.
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
-            match self.active_stream.as_ref() {
-                Some(stream) => self
-                    .hip
-                    .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
-                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
-            }
+            self.zero_f32_rows(y, m, batch_size)?;
             return self.gemm_hfq4g256_residual_mq4v2(a_raw, x, y, m, k, batch_size);
         }
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
@@ -42060,6 +42132,100 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
+    }
+
+    /// Residual `Y += W·X` sibling of [`Self::gemv_mq4g256v2_xbatch`].
+    /// Same per-row accumulation as the singleton GEMV, weights read once
+    /// per chunk of four rows, and Y is updated in place so a retained tape
+    /// does not need a host memset.
+    pub fn gemv_mq4g256v2_xbatch_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
+    }
+
+    /// Shared-expert down fuse: `y[b] += sigmoid(c[b]) * (W · x[b])`.
+    /// Weights are decoded once per chunk of four rows. `c` is `[batch]`
+    /// pre-sigmoid logits. A single decode row on gfx1100/gfx1201 with the
+    /// K=512 shared-down shape keeps the specialized k512 singleton.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq4g256v2_xbatch_residual_sigmoid(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        c: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        const FUNC: &str = "gemv_mq4g256v2_xbatch_residual_sigmoid";
+        const XBATCH_MAX: usize = 4;
+        if batch_size == 0 {
+            return Ok(());
+        }
+        if !k.is_multiple_of(256) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_mq4g256v2_xbatch_residual_sigmoid: requires K%256==0",
+            ));
+        }
+        if batch_size == 1
+            && m == 2_048
+            && k == 512
+            && (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201())
+        {
+            let x1 = x.sub_offset(0, k);
+            let y1 = y.sub_offset(0, m);
+            let c1 = c.sub_offset(0, 1);
+            return self.gemv_mq4g256v2_residual_sigmoid_scaled_k512(a_raw, &x1, &y1, &c1, m, k);
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMV_MQ4G256V2_XBATCH_RESIDUAL_SIGMOID_SRC,
+            FUNC,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        for start in (0..batch_size).step_by(XBATCH_MAX) {
+            let rows = XBATCH_MAX.min(batch_size - start);
+            let x_rows = x.sub_offset(start * k, rows * k);
+            let y_rows = y.sub_offset(start * m, rows * m);
+            let c_rows = c.sub_offset(start, rows);
+            let x_ptr = x_rows.buf.as_ptr();
+            let y_ptr = y_rows.buf.as_ptr();
+            let c_ptr = c_rows.buf.as_ptr();
+            let b_val = rows as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &c_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &b_val as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_ptr(c_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b
+            })?;
+        }
+        Ok(())
     }
 
     /// MQ4G256V2 without WMMA: the x-batched scalar GEMV decodes each weight
@@ -45969,6 +46135,20 @@ impl Gpu {
     }
 
     /// Zero `y` (`n` rows of `m` F32) on the active stream.
+    ///
+    /// Deliberately a `hipMemset`, not the recorded `zero_f32` kernel. A memset
+    /// inside the forward body is state a retained tape cannot replay, so
+    /// capture refuses to prepare (`effect-incomplete capture`). Issuing the
+    /// zero as `zero_f32` instead does make the tape prepare, but it changes the
+    /// body a recording runs against the body an eager step runs, and the
+    /// measured result was a near-tie divergence plus one PM4 queue stall
+    /// (`REDLINE_QUEUE_TIMEOUT last_packet_id=184`, HIP 700).
+    ///
+    /// The fix that removes the zero instead of moving it is the one-row GEMV
+    /// in [`Self::gemm_mq4g256v2`]: at `batch_size == 1` this routine is no
+    /// longer reached at all. It stays a memset for the multi-row case, where
+    /// the residual WMMA GEMM is the only V2 compute kernel. See
+    /// `docs/plans/2026-10-25-vmm-backed-shared-paged-kv.md` § Phase 6.
     fn zero_f32_rows(&mut self, y: &GpuTensor, m: usize, n: usize) -> HipResult<()> {
         match self.active_stream.as_ref() {
             Some(stream) => self.hip.memset_async(&y.buf, 0, n * m * 4, stream),

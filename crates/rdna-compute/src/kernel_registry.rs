@@ -697,6 +697,35 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ),
         ["attention_flash_q8_0_tile_batched_paged"]
     );
+    // VMM-backed shared paged route: same bodies, 48-byte header and the
+    // `_vmm_paged` symbol. The arena `_paged` modules above stay byte-identical.
+    add!(
+        "kv_cache_write_q8_0_batched_vmm_paged",
+        kernels::kv_slot_desc_vmm_paged_source(
+            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+            "kv_cache_write_q8_0_batched",
+            "kv_cache_write_q8_0_batched_vmm_paged"
+        ),
+        ["kv_cache_write_q8_0_batched_vmm_paged"]
+    );
+    add!(
+        "attention_q8_0_kv_batched_vmm_paged",
+        kernels::kv_slot_desc_vmm_paged_source(
+            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            "attention_q8_0_kv_batched",
+            "attention_q8_0_kv_batched_vmm_paged"
+        ),
+        ["attention_q8_0_kv_batched_vmm_paged"]
+    );
+    add!(
+        "attention_flash_q8_0_tile_batched_vmm_paged",
+        kernels::kv_slot_givens4_vmm_paged_source(
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+            "attention_flash_q8_0_tile_batched_vmm_paged"
+        ),
+        ["attention_flash_q8_0_tile_batched_vmm_paged"]
+    );
     add!(
         "kv_cache_write_asym_k_givens3_batched_paged",
         kernels::kv_slot_givens4_paged_source(
@@ -730,6 +759,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 )
             ),
             ["attention_q8_0_flash_prefill_wmma_paged"]
+        );
+        add!(
+            "attention_q8_0_flash_prefill_wmma_gfx11_hd256_vmm_paged",
+            format!(
+                "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM 256\n#define PREFETCH_V 1\n{}",
+                kernels::kv_slot_desc_vmm_paged_source(
+                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC,
+                    "attention_q8_0_flash_prefill_wmma",
+                    "attention_q8_0_flash_prefill_wmma_vmm_paged"
+                )
+            ),
+            ["attention_q8_0_flash_prefill_wmma_vmm_paged"]
         );
     }
     add!(
@@ -836,6 +877,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gated_delta_net_q8_fast",
                 "gated_delta_net_q8_fast_independent_masked",
             ]
+        );
+        add!(
+            "gated_delta_net_q8_fast_slots",
+            kernels::GATED_DELTA_NET_Q8_FAST_SLOTS_SRC,
+            ["gated_delta_net_q8_fast_slots"]
         );
         add!(
             "gdn_pre_batched_gfx1201",
@@ -1356,6 +1402,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gated_delta_net_q8_fast",
                 "gated_delta_net_q8_fast_independent_masked"
             ]
+        );
+        add!(
+            "gated_delta_net_q8_fast_slots",
+            kernels::GATED_DELTA_NET_Q8_FAST_SLOTS_SRC,
+            ["gated_delta_net_q8_fast_slots"]
         );
         add!(
             "gdn_chunk_prep_gfx11",
@@ -4306,6 +4357,27 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
             kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC,
             ["gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"]
+        );
+        // Multi-slot MoE decode: the same bodies with the token folded into
+        // grid.x so one launch serves up to four live lanes
+        // (gemv.rs `gemv_moe_gate_up_k8_slots`, `gemv_moe_ninepath_rpb8_slots`).
+        add!(
+            "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100",
+            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_SLOTS_GFX1100_SRC,
+            ["gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100"]
+        );
+        add!(
+            "gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100",
+            kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_SLOTS_GFX1100_SRC,
+            ["gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100"]
+        );
+        // Decode-width shared-expert down fold (`sigmoid(c) * (A . x)` added to
+        // the residual), gfx1100 only (hipfire-dispatch `qt44_qt53_prefill`
+        // and `pipeline/mod.rs`).
+        add!(
+            "gemv_mq4g256v2_xbatch_residual_sigmoid",
+            kernels::GEMV_MQ4G256V2_XBATCH_RESIDUAL_SIGMOID_SRC,
+            ["gemv_mq4g256v2_xbatch_residual_sigmoid"]
         );
         add!(
             "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch",
@@ -10716,6 +10788,27 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Multi-slot serving (gfx1201 subset): the slot-batched GDN decode
+        // module and the VMM-paged KV descriptor twins of the arena `_paged`
+        // modules (shared paged KV over hipMemCreate granules).
+        const MULTI_SLOT_ADDED_MODULES: [&str; 4] = [
+            "gated_delta_net_q8_fast_slots",
+            "kv_cache_write_q8_0_batched_vmm_paged",
+            "attention_q8_0_kv_batched_vmm_paged",
+            "attention_flash_q8_0_tile_batched_vmm_paged",
+        ];
+        for module in MULTI_SLOT_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing multi-slot module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // The gfx1201 Z/beta/alpha fold split of the non-fused IU4 verify GDN projection
         // (`gemm_zba_fold_g12_iu4_prepared`) is its own module on gfx1201 (the gfx1100/gfx1151
         // halo split of the same name is a P0 module there).
@@ -10832,6 +10925,7 @@ mod tests {
                 + FP8_SPLIT_LSE_ADDED_MODULES.len()
                 + SHARED_LAUNCHER_ADDED_MODULES.len()
                 + VMM_EXACT_MTP_SEGS_ADDED_MODULES.len()
+                + MULTI_SLOT_ADDED_MODULES.len()
                 + ZBA_FOLD_SPLIT_ADDED_MODULES.len()
                 + A3B_DN_ROWS_ADDED_MODULES.len()
                 + A3B_FA_LANES_ADDED_MODULES.len()

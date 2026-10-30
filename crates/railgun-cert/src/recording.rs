@@ -756,7 +756,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "replay-recorder-lifecycle",
         predicates: &[IsRecording, ReplayState],
-        condition: "`should_auto_finalize_capture` (replay.rs:4586-4588) in qwen35 forward_scratch (forward.rs:1831), deepseek4 decode_step_with_graph (forward.rs:3642), lfm2moe decode_step_with_retained_replay (state checks, forward.rs:106-170); gemma4 `graph_exact` keeps its AR HipGraph off while `is_recording()` (forward.rs)",
+        condition: "`should_auto_finalize_capture` (replay.rs:4586-4588) in qwen35 forward_scratch (forward.rs:1831), deepseek4 decode_step_with_graph (forward.rs:3642), lfm2moe decode_step_with_retained_replay (state checks, forward.rs:106-170), qwen35 multi-slot PM4 decode forward_batch_slots_redline (forward_slots.rs); gemma4 `graph_exact` keeps its AR HipGraph off while `is_recording()` (forward.rs)",
         effect: Lifecycle,
         switches: "finish the one-shot capture after the recorded forward",
         kernels: &[],
@@ -866,9 +866,9 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "gfx1100-mq4v2-verify-tier",
         predicates: &[IsRecording, CaptureMode],
-        condition: "exact gfx1100 N <= 16 verify tiers: gate/up LDS-stage (`!is_recording() && !capture_mode`, gemm.rs:32712-32725); its F16 twin allows capture/recording only with split_verify_capture (mq_f16_producers.rs:504-512). Residual LDS-stage/split-K uses `!is_recording()` only (gemm.rs:34592-34610)",
+        condition: "exact gfx1100 N <= 16 verify tiers: gate/up LDS-stage (`!capture_mode`, gemm_gate_up_mq4g256v2_wmma; Redline recording takes it, its kernarg contract is registered in replay.rs); its F16 twin allows capture/recording only with split_verify_capture (mq_f16_producers.rs:504-512). Residual: LDS-stage ignores both (recorded too); split-K uses `!is_recording()` only (gemm_mq4g256v2_residual_wmma, `ResidualVerifyTier::Ksplit` guard)",
         effect: KernelSelection,
-        switches: "eager: *_gfx1100_ldsstage / ksplit kernels; recorded: base `gemm_*_mq4g256v2_wmma`, except the admitted split-verifier F16 gate/up preserves LDS-stage. The residual tier ignores capture_mode, so a HipGraph keeps it while a recording does not",
+        switches: "eager and recorded: *_gfx1100_ldsstage gate/up and residual; HipGraph capture: base gate/up (F16 split-verifier excepted), LDS-stage residual. Only the residual split-K tier (HIPFIRE_RESIDUAL_LDSSTAGE=0) differs under recording: eager ksplit_lds, recorded base `gemm_mq4g256v2_residual_wmma`",
         kernels: &["gemm_*_mq4g256v2_wmma*"],
         verdict: NotEquivalent,
         evidence: "different reduction order; no byte-exact oracle. Reaches no default program (gfx1100 MQ4V2 verify = DFlash on gfx1100, not a default)",
@@ -1144,7 +1144,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "replay-enabled-process-route",
         predicates: &[ReplayEnabled],
-        condition: "process-level `replay.is_enabled()`: qwen35 AR HipGraph off (forward.rs:1712-1716), DS4 retained FFN split tape (forward.rs:4402-4417) and eligibility (3487-3500), lfm2moe eligibility (forward.rs:57)",
+        condition: "process-level `replay.is_enabled()`: qwen35 AR HipGraph off (forward.rs:1712-1716), DS4 retained FFN split tape (forward.rs:4402-4417) and eligibility (3487-3500), lfm2moe eligibility (forward.rs:57), qwen35 multi-slot paged decode routes to the retained PM4 body (forward_slots.rs forward_batch_slots_graphed_opts: `is_enabled() && uses_pm4_transport()`)",
         effect: ProcessRoute,
         switches: "Redline process: split-FFN tape body, no AR HipGraph; HIP process: ffn_stub + routed FFN, AR HipGraph",
         kernels: &[],
@@ -2060,6 +2060,18 @@ pub const SITES: &[Site] = &[
         function: "build",
         occurrences: 1,
         decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/forward_slots.rs",
+        function: "forward_batch_slots_graphed_opts",
+        occurrences: 1,
+        decisions: &["replay-enabled-process-route"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/forward_slots.rs",
+        function: "forward_batch_slots_redline",
+        occurrences: 1,
+        decisions: &["replay-recorder-lifecycle"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/speculative.rs",
@@ -3002,7 +3014,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/gemm.rs",
         function: "gemm_gate_up_mq4g256v2_wmma",
-        occurrences: 6,
+        occurrences: 5,
         decisions: &[
             "gfx11-mqv2-prefill-projection-routes",
             "gfx1100-mq4v2-verify-tier",

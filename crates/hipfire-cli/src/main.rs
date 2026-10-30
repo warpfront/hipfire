@@ -975,6 +975,14 @@ pub(crate) struct ServeArgs {
     /// KV storage backend for models loaded by this service (`legacy` or `vmm`).
     #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
     kv_backend: Option<String>,
+    /// Multi-slot KV: use one shared paged pool (128-token pages, block tables,
+    /// refcounted prefix sharing and COW) instead of fixed per-slot slabs.
+    #[arg(long)]
+    multi_slot_paged: bool,
+    /// Physical pages in the shared multi-slot paged pool; 0 = auto-size from
+    /// free VRAM. Implies --multi-slot-paged when > 0.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(0..=1048576))]
+    multi_slot_paged_pages: Option<u64>,
     /// Vision-tower sidecar wired into every model load (`params["vision"]`);
     /// overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`;
     /// skipped while `vision_mode=off`.
@@ -3925,6 +3933,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             kv_k: None,
             kv_v: None,
             kv_backend: None,
+            multi_slot_paged: false,
+            multi_slot_paged_pages: None,
             vision: None,
             idle_timeout: None,
             tp: None,
@@ -16873,6 +16883,9 @@ effort = "high"
                     1024,
                     false,
                     0,
+                    "arena",
+                    false,
+                    0,
                     false,
                     4096,
                     1,
@@ -16911,6 +16924,9 @@ effort = "high"
                     multi_slot_slots: 4,
                     multi_slot_ctx: 8192,
                     multi_slot_prefill_chunk: 1024,
+                    multi_slot_paged: false,
+                    multi_slot_paged_pages: 0,
+                    multi_slot_paged_backend: "arena".into(),
                     spawner: crate::serve::EngineSpawner {
                         daemon: daemon.clone(),
                         process_config: process_config.clone(),

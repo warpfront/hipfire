@@ -130,6 +130,7 @@ pub mod slab_moe;
 pub mod spec_sampling_cpu_ar;
 pub mod tape_copy;
 pub mod verify_twins;
+pub mod vmm_page_pool;
 pub use gemm::F2GdnTargets;
 pub use gemm_fp8_verify::{
     fp8_verify_symbol, fp8_verify_tile, Fp8VerifyOp, Fp8VerifyReceipt, Fp8VerifyTarget,
