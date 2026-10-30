@@ -192,15 +192,11 @@ impl Qwen4Bundle {
         // between the previous decision stands. An AR window is a one-token
         // window the root plans as `ArSynced` (the head stays aligned), so a
         // lane crossing back loses no state.
-        let max_active = hipfire_config::developer_var("HIPFIRE_EP_MTP_LANE_MAX_ACTIVE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4);
-        if requests.len() <= max_active {
-            self.mesh_native_on = true;
-        } else if requests.len() >= max_active + 2 {
-            self.mesh_native_on = false;
-        }
+        self.mesh_native_on = crate::lane_switch::native_mode(
+            requests.len(),
+            self.mesh_native_on,
+            crate::lane_switch::max_active(),
+        );
         let switched: Vec<MeshDecodeRequest>;
         let requests = if self.mesh_native_on {
             requests
