@@ -1326,6 +1326,11 @@ fn commit_with_proto(
                     .as_ref()
                     .and_then(|p| p.lanes.iter().find(|o| o.key.request_epoch == r.epoch))
                     .ok_or_else(|| format!("commit_step: {:?} has no published window", r.epoch))?;
+                // The window ends with its step (its tickets were consumed at
+                // the publish).
+                if let Some(spec) = lane.spec.as_mut() {
+                    spec.window = None;
+                }
                 // The host table mirrors the root's published state.
                 lane.host.generated.extend_from_slice(&out.emitted);
                 lane.host.pending_seed = Some(out.next_seed);
@@ -1891,5 +1896,32 @@ mod tests {
             &host(1, 0, LaneStatus::Decoding, 10, 10),
             &plan.requests[0]
         ));
+    }
+}
+
+#[cfg(test)]
+mod commit_window_tests {
+    /// A lane's pending window ends with its committed step: the next
+    /// `draft_step` refuses a lane that still holds one. (Host-only pin: the
+    /// commit needs a device.)
+    #[test]
+    fn commit_clears_every_decode_lane_window() {
+        let src = include_str!("lane_exec.rs");
+        let start = src
+            .find("fn commit_with_proto(")
+            .expect("commit_with_proto");
+        let body = &src[start..];
+        let ar = body
+            .find("RequestStepKind::Ar | RequestStepKind::Verify { .. } =>")
+            .expect("decode arm");
+        let arm = &body[ar..];
+        let clear = arm.find("spec.window = None;").expect("window cleared");
+        let mirror = arm
+            .find("lane.host.pending_seed = Some(out.next_seed)")
+            .expect("mirror");
+        assert!(
+            clear < mirror,
+            "the window is cleared with the published mirror"
+        );
     }
 }
