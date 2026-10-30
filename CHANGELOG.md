@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: `hipfire-quantize --format hfq6` / `hfq2g128` (and the HFQ3-G128 / HFQ2-G128 fallbacks of the MQ3 / MQ2 formats) no longer write `[rows, K]` matrices with `K % group != 0` packed across rows, which loaded without error and decoded as garbage; the loaders now refuse such files.** HFQ6-G256, HFQ4-G256, HFQ2-G128, HFQ3-G128 and Q4F16-G64 kernels read `K / group` groups per row. The quantizer now re-encodes a ragged-K matrix of these formats per row: HFQ6-G256 and embeddings as Q8_F16, the rest as row-padded HFQ4-G128 (one `K=… % … != 0, X -> Y` line per tensor). `validate_payload_extent` (manifest load and every `decode_raw_codec` caller) requires `K % group == 0` and the exact per-row extent for these formats on `[rows, K]` matrices; conv1d and other higher ranks stay flat. SmolLM2-360M (hidden 960): `--format hfq6` previously emitted `emetery` and stopped, and now answers "The capital of France is Paris. ..." (gfx1151); the old flat files are refused with `HFQ6G256 payload requires K%256==0, got K=960`. Requantize affected files (HIPF-209).
+
 ## v0.4.5 — 2026-11-11 (re-cut)
 
 The v0.4.5 tag first pointed at `b30b46c1e2` (2026-10-30); that GitHub release was never published. v0.4.5 was re-cut at `7f7cf7f50f` and now includes everything below. If you fetched the October tag, run `git fetch --tags --force`.
