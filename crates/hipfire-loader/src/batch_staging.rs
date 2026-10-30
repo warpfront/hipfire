@@ -755,25 +755,26 @@ fn stage_qwen4_lanes(
         bundle.pp_stage_lanes(gpus, requested, row_budget, spec)
     } else {
         match m.qwen4_mut() {
-            Some(bundle) => match bundle.stage_lanes_with_copy(gpu, requested, row_budget, spec, copy)
-            {
-                // A native-MTP EP store that does not fit (or is refused) is
-                // labeled and replaced by the AR store, never silently
-                // narrowed (no lower K, no copy dropped, no smaller context).
-                Err(e) if topology == "ep" && spec.is_some() => {
-                    let reason = format!(
-                        "EP native-MTP lanes (k={} copy={}) refused: {e}",
-                        spec.map_or(0, |s| s.k),
-                        if copy.is_some() { "on" } else { "off" }
-                    );
-                    eprintln!("[daemon] qwen4 fn-lanes: {reason}; staging AR lanes");
-                    spec = None;
-                    copy = None;
-                    spec_fallback = Some(reason);
-                    bundle.stage_lanes_with_copy(gpu, requested, row_budget, None, None)
+            Some(bundle) => {
+                match bundle.stage_lanes_with_copy(gpu, requested, row_budget, spec, copy) {
+                    // A native-MTP EP store that does not fit (or is refused) is
+                    // labeled and replaced by the AR store, never silently
+                    // narrowed (no lower K, no copy dropped, no smaller context).
+                    Err(e) if topology == "ep" && spec.is_some() => {
+                        let reason = format!(
+                            "EP native-MTP lanes (k={} copy={}) refused: {e}",
+                            spec.map_or(0, |s| s.k),
+                            if copy.is_some() { "on" } else { "off" }
+                        );
+                        eprintln!("[daemon] qwen4 fn-lanes: {reason}; staging AR lanes");
+                        spec = None;
+                        copy = None;
+                        spec_fallback = Some(reason);
+                        bundle.stage_lanes_with_copy(gpu, requested, row_budget, None, None)
+                    }
+                    other => other,
                 }
-                other => other,
-            },
+            }
             None => return refuse("model state not Qwen4"),
         }
     };
@@ -807,7 +808,10 @@ fn stage_qwen4_lanes(
         (Some(k), _) => format!(
             "mtp K={k}{}",
             if topology == "ep" {
-                format!(" executor=ep-mesh copy={}", if copy.is_some() { "on" } else { "off" })
+                format!(
+                    " executor=ep-mesh copy={}",
+                    if copy.is_some() { "on" } else { "off" }
+                )
             } else {
                 String::new()
             }
@@ -1101,7 +1105,9 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
 
 #[cfg(test)]
 mod tests {
-    use super::{ep_spec_lane_reservation, ep_spec_off_reason, stochastic_q8_state_without_ef, StateQuant};
+    use super::{
+        ep_spec_lane_reservation, ep_spec_off_reason, stochastic_q8_state_without_ef, StateQuant,
+    };
     use hipfire_runtime::loader_api::SpecLoadCfg;
 
     #[test]
@@ -1113,7 +1119,10 @@ mod tests {
         );
         // The kill switch is reported first; sampled lanes stay AR with the
         // oracle gate named.
-        assert_eq!(ep_spec_off_reason(false, true), Some("HIPFIRE_EP_MTP_LANES=0"));
+        assert_eq!(
+            ep_spec_off_reason(false, true),
+            Some("HIPFIRE_EP_MTP_LANES=0")
+        );
         let sampled = ep_spec_off_reason(true, true).expect("sampled EP lanes stay AR");
         assert!(sampled.contains("serve.batch_sampled") && sampled.contains("2000"));
     }
@@ -1133,14 +1142,23 @@ mod tests {
             ..on
         };
         let (k, _) = ep_spec_lane_reservation(true, false, wide, "gfx1201");
-        assert_eq!(k, Some(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1));
+        assert_eq!(
+            k,
+            Some(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1)
+        );
         // `serve.batch_spec` off, MTP not explicit, sampled lanes: AR store.
-        assert_eq!(ep_spec_lane_reservation(false, false, on, "gfx1201"), (None, false));
+        assert_eq!(
+            ep_spec_lane_reservation(false, false, on, "gfx1201"),
+            (None, false)
+        );
         assert_eq!(
             ep_spec_lane_reservation(true, false, SpecLoadCfg::default(), "gfx1201"),
             (None, false)
         );
-        assert_eq!(ep_spec_lane_reservation(true, true, on, "gfx1201"), (None, false));
+        assert_eq!(
+            ep_spec_lane_reservation(true, true, on, "gfx1201"),
+            (None, false)
+        );
     }
 
     #[test]

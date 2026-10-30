@@ -4572,9 +4572,8 @@ impl Qwen4Bundle {
             let chunk = self.spec_chunk_rows().unwrap_or(1).max(1);
             self.ensure_spec_hidden(gpu, (spec.k + 1).max(chunk))?;
         }
-        let store =
-            crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget, spec, copy)
-                .map_err(BundleError::Forward)?;
+        let store = crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget, spec, copy)
+            .map_err(BundleError::Forward)?;
         self.lanes = Some(store);
         Ok(())
     }

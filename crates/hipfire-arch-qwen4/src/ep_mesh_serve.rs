@@ -92,8 +92,11 @@ impl Qwen4Bundle {
         if store.spec().is_none() {
             return Err("EP mesh lanes need native-MTP lanes".to_string());
         }
-        let mut mesh =
-            EpMeshLanes::new(self, topology_generation, crate::mtp_lanes::floor_env_enabled())?;
+        let mut mesh = EpMeshLanes::new(
+            self,
+            topology_generation,
+            crate::mtp_lanes::floor_env_enabled(),
+        )?;
         mesh.set_driver_terminates(true);
         self.mesh_lanes = Some(Box::new(mesh));
         Ok(())
@@ -256,10 +259,9 @@ impl Qwen4Bundle {
                         request.epoch
                     ));
                 }
-                let seed = lane
-                    .host
-                    .pending_seed
-                    .ok_or_else(|| format!("mesh step: lane {:?} has no pending seed", request.epoch))?;
+                let seed = lane.host.pending_seed.ok_or_else(|| {
+                    format!("mesh step: lane {:?} has no pending seed", request.epoch)
+                })?;
                 (!mesh.has_lane(request.epoch)).then(|| MeshLaneAdmission {
                     epoch: request.epoch,
                     position: lane.state.position,
@@ -307,7 +309,9 @@ impl Qwen4Bundle {
             .step(self, gpu, &lane_requests, &budgets, &mut GreedyRule)
             .map_err(|error| match error {
                 MeshStepError::Aborted(record) => {
-                    format!("EP mesh lane step aborted (mesh quarantined, reload to recover): {record}")
+                    format!(
+                        "EP mesh lane step aborted (mesh quarantined, reload to recover): {record}"
+                    )
                 }
                 other => format!("EP mesh lane step: {other}"),
             })?;

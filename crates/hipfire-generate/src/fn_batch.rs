@@ -964,11 +964,7 @@ fn finish_lane(
         .and_then(|b| b.lane_spec_stats_for(&ctl.epoch))
     {
         done["mtp"] = serde_json::json!(true);
-        if stats.windows != 0
-            || stats.ar_windows != 0
-            || stats.copy_windows != 0
-            || stats.retired
-        {
+        if stats.windows != 0 || stats.ar_windows != 0 || stats.copy_windows != 0 || stats.retired {
             done["mtp_windows"] = serde_json::json!(stats.windows);
             done["ar_windows"] = serde_json::json!(stats.ar_windows);
             done["mtp_retired"] = serde_json::json!(stats.retired);
@@ -1525,11 +1521,7 @@ pub fn drive_qwen4_lane_batch(
                 let skip_seed = controls[idx]
                     .as_mut()
                     .is_some_and(|c| std::mem::take(&mut c.skip_first_forward));
-                let forwarded = forwarded_tokens(
-                    plan_seed,
-                    &advance.committed_ids,
-                    skip_seed,
-                );
+                let forwarded = forwarded_tokens(plan_seed, &advance.committed_ids, skip_seed);
                 let length_finish = advance.finish.as_deref() == Some("length");
                 let _scope = match &sched.lanes[idx] {
                     BatchLane::Running(lane) => BatchAttemptScope::enter_for_generation(
@@ -1766,7 +1758,13 @@ mod tests {
         assert_eq!(mix.steps[&8], 1);
         let two = mix.by_lanes[&2];
         assert_eq!(
-            (two.native_windows, two.copy_windows, two.ar_windows, two.offered, two.accepted),
+            (
+                two.native_windows,
+                two.copy_windows,
+                two.ar_windows,
+                two.offered,
+                two.accepted
+            ),
             (3, 1, 0, 9, 3)
         );
     }
@@ -1780,10 +1778,17 @@ mod tests {
         let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
         let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
         let body = &prod[drive..];
-        let exec = body.find("executor.commit_step(&plan, out)").expect("executor half");
+        let exec = body
+            .find("executor.commit_step(&plan, out)")
+            .expect("executor half");
         let mesh = body.find("ep_mesh_decode_step").expect("mesh half");
-        let emit = body.find("for (advance, decode_seed) in ticks").expect("emission");
-        assert!(exec < mesh && mesh < emit, "executor half, mesh half, then one emission loop");
+        let emit = body
+            .find("for (advance, decode_seed) in ticks")
+            .expect("emission");
+        assert!(
+            exec < mesh && mesh < emit,
+            "executor half, mesh half, then one emission loop"
+        );
         let between = &body[exec..emit];
         assert!(
             !between.contains("continue;"),

@@ -2902,7 +2902,7 @@ pub fn qwen4_ep_vram_layers(
     // Lab measurement knob: cap the resident MoE layers (every rank) to hold a
     // placement fixed across arms with different lane reservations. Never
     // raises the plan; unset in production.
-    if let Some(cap) = std::env::var("HIPFIRE_EP_LAB_RESIDENT_LAYERS")
+    if let Some(cap) = hipfire_config::developer_var("HIPFIRE_EP_LAB_RESIDENT_LAYERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {

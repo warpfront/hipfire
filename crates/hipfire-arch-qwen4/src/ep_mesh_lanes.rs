@@ -58,22 +58,23 @@ use crate::gpu_forward_lanes::{
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
 use crate::lane_exec::pick_at;
 use crate::mesh_lane_protocol::{
-    LaneWindowKey,
     AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DraftProposal, DraftRound,
-    EvidenceError, HeadState, LaneAdmission, LaneAdmit, LaneKind, LaneMeshExecutor,
-    LanePlan, LaneRequest, MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts,
-    OpLedger, PhaseTiming, PreparedReceipt, ProposalSource, ProtocolError, RankCostEvidence,
-    RankDraftResult, RankError, RankOwnership, RankReady, RankSession, RankVerifyResult,
-    ReadyStatus, RootConfig, SamplerOutput, StagePolicy, StepOutput, StepPhase, TimedPhase,
-    VerifyPlan, WindowBudgets, WindowStart,
+    EvidenceError, HeadState, LaneAdmission, LaneAdmit, LaneKind, LaneMeshExecutor, LanePlan,
+    LaneRequest, LaneWindowKey, MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts, OpLedger,
+    PhaseTiming, PreparedReceipt, ProposalSource, ProtocolError, RankCostEvidence, RankDraftResult,
+    RankError, RankOwnership, RankReady, RankSession, RankVerifyResult, ReadyStatus, RootConfig,
+    SamplerOutput, StagePolicy, StepOutput, StepPhase, TimedPhase, VerifyPlan, WindowBudgets,
+    WindowStart,
 };
-use crate::mtp_lanes::lane_call;
 use crate::mesh_rank_copy::{
     arm_lane_verify, begin_lane_window, catch_up_lane, head_ticket_point, is_probe_op,
     native_keep_cap, prepare_rank_lane, probe_outcome, publish_rank_lane, save_probe_state,
     settle_probe, take_head_ticket, HeadTicketPoint, RankPrepare,
 };
-use crate::mtp_spec::{draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH};
+use crate::mtp_lanes::lane_call;
+use crate::mtp_spec::{
+    draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH,
+};
 use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::{Gpu, GpuTensor};
 use std::collections::HashSet;
@@ -418,8 +419,11 @@ impl RankLane<'_> {
             // Round 0: owed-row catch-ups, then the head tickets that follow one.
             let mut catch_rows = 0usize;
             if !round.catch_up.is_empty() {
-                let epochs: Vec<RequestEpoch> =
-                    round.catch_up.iter().map(|(k, _)| k.request_epoch).collect();
+                let epochs: Vec<RequestEpoch> = round
+                    .catch_up
+                    .iter()
+                    .map(|(k, _)| k.request_epoch)
+                    .collect();
                 let (mut lanes, _) = store.draft_parts(&epochs)?;
                 for ((key, catch_up), lane) in round.catch_up.iter().zip(lanes.iter_mut()) {
                     catch_rows += catch_up_lane(bundle, gpu, &mut **lane, catch_up)?;
@@ -431,11 +435,10 @@ impl RankLane<'_> {
             if round.ops.is_empty() {
                 return Ok((catch_rows, Vec::new()));
             }
-            let epochs: Vec<RequestEpoch> =
-                round.ops.iter().map(|o| o.key.request_epoch).collect();
+            let epochs: Vec<RequestEpoch> = round.ops.iter().map(|o| o.key.request_epoch).collect();
             let (mut lanes, spec_store) = store.draft_parts(&epochs)?;
-            let spec_store = spec_store
-                .ok_or_else(|| "head draft in a store without MTP lanes".to_string())?;
+            let spec_store =
+                spec_store.ok_or_else(|| "head draft in a store without MTP lanes".to_string())?;
             let slot_bytes = Gpu::TOPK8_OUT_BYTES;
             let bytes = round.ops.len() * slot_bytes;
             if bytes > spec_store.draft_top1_host.len() {
@@ -466,7 +469,9 @@ impl RankLane<'_> {
                     .as_ref()
                     .ok_or_else(|| "draft op without a pending window".to_string())?
                     .position;
-                let top1 = spec_store.draft_top1.sub_offset(slot * slot_bytes, slot_bytes);
+                let top1 = spec_store
+                    .draft_top1
+                    .sub_offset(slot * slot_bytes, slot_bytes);
                 let j = op.position - window_position;
                 let hidden = (j == 0).then_some(&*pending_hidden);
                 lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
@@ -595,7 +600,10 @@ impl RankLane<'_> {
             }
             forwarded?;
             gpu.hip
-                .memcpy_dtoh(&mut top1_host[..n_dec * std::mem::size_of::<i32>()], &top1.buf)
+                .memcpy_dtoh(
+                    &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
+                    &top1.buf,
+                )
                 .map_err(|e| e.to_string())?;
             gpu.take_device_wait_error().map_err(|e| e.to_string())?;
             let mut picks = Vec::with_capacity(plan.lanes.len());
@@ -643,8 +651,8 @@ impl RankLane<'_> {
                     continue;
                 }
                 let win = &step.lanes[i];
-                let config =
-                    spec_config.ok_or_else(|| "MTP lane in a store without MTP lanes".to_string())?;
+                let config = spec_config
+                    .ok_or_else(|| "MTP lane in a store without MTP lanes".to_string())?;
                 let hidden =
                     hidden.ok_or_else(|| "MTP lane without a hidden capture".to_string())?;
                 let prepared = prepare_rank_lane(
@@ -687,7 +695,6 @@ fn rank_counts(step: &ExecStep, rank_head: bool) -> OpCounts {
         consumed_rows: totals.2,
     }
 }
-
 
 impl LaneMeshExecutor for RankLane<'_> {
     fn ownership(&self) -> RankOwnership {
@@ -1074,7 +1081,6 @@ impl LaneMeshExecutor for RankLane<'_> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Concurrent step driver
 // ---------------------------------------------------------------------------
@@ -1237,7 +1243,10 @@ pub(crate) fn drive_step<F: MeshFanout>(
     if !fatal.is_empty() {
         // The step is already published at the root (no step is in flight):
         // quarantine the mesh with no step key and make every rank follow.
-        let reason = format!("publish failed after all ranks prepared: {}", fatal.join("; "));
+        let reason = format!(
+            "publish failed after all ranks prepared: {}",
+            fatal.join("; ")
+        );
         let phase = root.phase();
         let record = match root.abort_step(None, phase, &reason) {
             Ok(record) => record,
@@ -1332,19 +1341,21 @@ impl EpFanout<'_> {
         f: &(dyn Fn(&mut RankLane<'_>) -> Result<T, RankError> + Sync),
     ) -> Result<Vec<T>, RankError> {
         let named = |e: RankError| format!("rank {}: {}", e.rank, e.reason);
-        self.fan(|lane| f(lane).map_err(named), &|lane| f(lane).map_err(named))
-            .map_err(|reason| {
-                let rank = reason
-                    .strip_prefix("rank ")
-                    .and_then(|r| r.split(':').next())
-                    .and_then(|r| r.parse().ok())
-                    .unwrap_or(0);
-                let text = reason
-                    .split_once(": ")
-                    .filter(|_| reason.starts_with("rank "))
-                    .map_or(reason.clone(), |(_, rest)| rest.to_string());
-                rank_err(rank, text)
-            })
+        self.fan(|lane| f(lane).map_err(named), &|lane| {
+            f(lane).map_err(named)
+        })
+        .map_err(|reason| {
+            let rank = reason
+                .strip_prefix("rank ")
+                .and_then(|r| r.split(':').next())
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(0);
+            let text = reason
+                .split_once(": ")
+                .filter(|_| reason.starts_with("rank "))
+                .map_or(reason.clone(), |(_, rest)| rest.to_string());
+            rank_err(rank, text)
+        })
     }
 }
 
@@ -1588,7 +1599,11 @@ impl EpMeshLanes {
     /// The window budgets of the staged store (verify rows per lane, copy take
     /// cap and head-lag rows from the store's own copy budget) with route
     /// policy `lab`.
-    pub fn window_budgets(&self, bundle: &Qwen4Bundle, lab: LabRoutes) -> Result<WindowBudgets, String> {
+    pub fn window_budgets(
+        &self,
+        bundle: &Qwen4Bundle,
+        lab: LabRoutes,
+    ) -> Result<WindowBudgets, String> {
         let store = bundle
             .lanes()
             .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
@@ -1623,7 +1638,11 @@ impl EpMeshLanes {
         self.prefill_ran = true;
     }
 
-    fn fan<'a>(&'a mut self, bundle: &'a mut Qwen4Bundle, gpu: &'a mut Gpu) -> (EpFanout<'a>, &'a mut MeshRoot) {
+    fn fan<'a>(
+        &'a mut self,
+        bundle: &'a mut Qwen4Bundle,
+        gpu: &'a mut Gpu,
+    ) -> (EpFanout<'a>, &'a mut MeshRoot) {
         (
             EpFanout {
                 bundle,
@@ -1733,8 +1752,7 @@ impl EpMeshLanes {
         gpu: &mut Gpu,
     ) -> Result<Vec<RankLaneStats>, String> {
         let (mut fan, _) = self.fan(bundle, gpu);
-        fan.soft(&|lane| lane.exec.stats())
-            .map_err(|e| e.reason)
+        fan.soft(&|lane| lane.exec.stats()).map_err(|e| e.reason)
     }
 
     /// Serve-driver addition (EpServe): the root's request-termination rule
@@ -1753,7 +1771,9 @@ impl EpMeshLanes {
     /// close tokens). The ranks' lane tables take the same token through
     /// `Qwen4Bundle::force_lane_seed`; the rank preflight checks the two agree.
     pub fn force_seed(&mut self, epoch: RequestEpoch, token: u32) -> Result<(), String> {
-        self.root.force_seed(epoch, token).map_err(|e| e.to_string())
+        self.root
+            .force_seed(epoch, token)
+            .map_err(|e| e.to_string())
     }
 
     /// [`Self::release_lane`] without a device handle: the release is host

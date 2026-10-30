@@ -276,7 +276,6 @@ fn note_gather(head: bool, bytes: u64) {
     });
 }
 
-
 /// The row-gather hook one rank installs into its forward
 /// (`Qwen4GpuForward::attach_ep`).
 pub(crate) struct Qwen4EpRowGatherHook {
@@ -2209,7 +2208,11 @@ impl Qwen4Bundle {
         // after the head gathers: a route/depth disagreement changes the number
         // of gathers. EP native-MTP lanes plan on rank 0 alone and replay on the
         // others ([`crate::ep_mesh_lanes`]).
-        if self.lanes.as_ref().is_some_and(|store| store.spec().is_some()) {
+        if self
+            .lanes
+            .as_ref()
+            .is_some_and(|store| store.spec().is_some())
+        {
             return Err(
                 "qwen4 EP: native-MTP lanes decode through the mesh lane protocol (EpMeshLanes), \
                  not the per-rank draft_step"

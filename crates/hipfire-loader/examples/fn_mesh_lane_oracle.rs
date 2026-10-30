@@ -95,7 +95,9 @@ use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::ep_mesh_lanes::{EpMeshLanes, MeshLaneAdmission, MeshStepError};
 use hipfire_arch_qwen4::gpu_forward_lanes::{LaneStagePolicy, StageName};
 use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
-use hipfire_arch_qwen4::mesh_lane_protocol::{GreedyRule, LaneRequest, SamplingMode, WindowBudgets};
+use hipfire_arch_qwen4::mesh_lane_protocol::{
+    GreedyRule, LaneRequest, SamplingMode, WindowBudgets,
+};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch,
@@ -864,11 +866,19 @@ struct LocalLanes<'a> {
 impl LaneBackend for LocalLanes<'_> {
     fn stage(&mut self, max_lanes: usize, row_budget: usize) -> R<()> {
         self.gpu.bind_thread().map_err(e)?;
-        let before = self.gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
+        let before = self
+            .gpu
+            .device_mem_info()
+            .map(|(free, _)| free)
+            .unwrap_or(0);
         self.bundle
             .stage_lanes(self.gpu, max_lanes, row_budget, None)
             .map_err(e)?;
-        let after = self.gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
+        let after = self
+            .gpu
+            .device_mem_info()
+            .map(|(free, _)| free)
+            .unwrap_or(0);
         eprintln!(
             "[{TOOL}] lane stage (AR) consumed {} MiB on rank 0 ({} MiB free after)",
             before.saturating_sub(after) >> 20,
@@ -1822,7 +1832,17 @@ fn drive_mtp_k(
     let mut lanes: Vec<MtpLane> = Vec::with_capacity(k);
     let mut windows = Vec::new();
     let result = drive_mtp_inner(
-        bundle, gpu, mesh, cfg, max_seq, depth, routes, k, next_tag, vocab, &mut lanes,
+        bundle,
+        gpu,
+        mesh,
+        cfg,
+        max_seq,
+        depth,
+        routes,
+        k,
+        next_tag,
+        vocab,
+        &mut lanes,
         &mut windows,
     );
     let mut release_error = None;
@@ -1915,8 +1935,14 @@ fn drive_mtp_inner(
     let budgets: WindowBudgets = mesh.window_budgets(bundle, lab_routes(routes))?;
     let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
     let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
-    let (mut ev_wall, mut ev_crit, mut ev_ex, mut ev_head, mut ev_bytes, mut ev_priced) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::<bool>::new());
+    let (mut ev_wall, mut ev_crit, mut ev_ex, mut ev_head, mut ev_bytes, mut ev_priced) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::<bool>::new(),
+    );
     let (mut total_windows, mut total_offered, mut total_accepted, mut total_emitted) =
         (0u64, 0u64, 0u64, 0u64);
     loop {
@@ -2126,7 +2152,10 @@ fn drive_mtp_inner(
             decode_tokens,
             steps_wall,
             decode_wall,
-            lane_decode_rows: lanes.iter().map(|l| l.committed.len().saturating_sub(1)).collect(),
+            lane_decode_rows: lanes
+                .iter()
+                .map(|l| l.committed.len().saturating_sub(1))
+                .collect(),
         },
         summary,
     ))
@@ -2155,7 +2184,9 @@ fn drive_mtp_ep(
         if args.copy { ",copy" } else { "" }
     );
     if args.logits {
-        return Err("--logits is not available with --spec mtp (verify rows are not AR rows)".into());
+        return Err(
+            "--logits is not available with --spec mtp (verify rows are not AR rows)".into(),
+        );
     }
     gpu.bind_thread().map_err(e)?;
     let copy_cfg = if args.copy {
@@ -2202,9 +2233,21 @@ fn drive_mtp_ep(
     let mut failures = Vec::new();
     let mut status = PolicyStatus::Pass;
     for &k in &args.ks {
-        eprintln!("[{TOOL}] {label}: K={k}: {k} concurrent MTP lanes ({} tokens)", args.tokens);
+        eprintln!(
+            "[{TOOL}] {label}: K={k}: {k} concurrent MTP lanes ({} tokens)",
+            args.tokens
+        );
         let out = match drive_mtp_k(
-            bundle, gpu, &mut mesh, &cfg, args.max_seq, depth, routes, k, &mut next_tag, vocab,
+            bundle,
+            gpu,
+            &mut mesh,
+            &cfg,
+            args.max_seq,
+            depth,
+            routes,
+            k,
+            &mut next_tag,
+            vocab,
         ) {
             Ok(out) => out,
             Err(x) => {
@@ -2218,11 +2261,7 @@ fn drive_mtp_ep(
             ids_lines.push(json!({
                 "kind": "lane", "policy": label, "k": k, "prompt": index, "ids": run.ids[index],
             }));
-            let comparison = compare(
-                &references[index].ids[..args.tokens],
-                &run.ids[index],
-                None,
-            );
+            let comparison = compare(&references[index].ids[..args.tokens], &run.ids[index], None);
             if !comparison.equal {
                 if status == PolicyStatus::Pass {
                     status = PolicyStatus::Fail;

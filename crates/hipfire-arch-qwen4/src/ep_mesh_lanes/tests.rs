@@ -11,9 +11,7 @@
 use super::*;
 use crate::lane::LabRoutes;
 use crate::mesh_lane_protocol::scripted::{Call, FailAt, Script, ScriptedExecutor, WindowScript};
-use crate::mesh_lane_protocol::{
-    run_mesh_step, GreedyRule, LaneAdmission, MeshKind, SamplingMode,
-};
+use crate::mesh_lane_protocol::{run_mesh_step, GreedyRule, LaneAdmission, MeshKind, SamplingMode};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -393,12 +391,7 @@ impl MeshFanout for ThreadedFanout {
     }
 }
 
-fn script(
-    tag: u64,
-    seq: u64,
-    drafts: &[u32],
-    picks: &[u32],
-) -> ((u64, u64), WindowScript) {
+fn script(tag: u64, seq: u64, drafts: &[u32], picks: &[u32]) -> ((u64, u64), WindowScript) {
     (
         (tag, seq),
         WindowScript {
@@ -526,7 +519,10 @@ fn mesh_lane_ep_serial_dispatch_of_a_collective_phase_cannot_rendezvous() {
     // because of exactly this.
     let rv = Rendezvous::new(2, Duration::from_millis(200));
     let script_rc = Rc::new(RefCell::new(Script::default()));
-    script_rc.borrow_mut().windows.extend([script(1, 0, &[10], &[10, 4])]);
+    script_rc
+        .borrow_mut()
+        .windows
+        .extend([script(1, 0, &[10], &[10, 4])]);
     let mut ranks: Vec<GatherSim> = (0..2)
         .map(|r| GatherSim {
             inner: ScriptedExecutor::new(RankOwnership::ep(r), script_rc.clone()),
@@ -609,11 +605,14 @@ fn mesh_lane_ep_a_rank_rejection_rejects_the_whole_step_before_any_collective() 
 #[test]
 fn mesh_lane_ep_a_verify_failure_on_one_rank_aborts_every_rank_and_wakes_the_gather() {
     let mut root = root(false);
-    let mut fan = fanout_with(vec![script(1, 0, &[10, 11], &[10, 11, 4])], |rank, setup| {
-        if rank == 1 {
-            setup.fail_at = Some(FailAt::Verify);
-        }
-    });
+    let mut fan = fanout_with(
+        vec![script(1, 0, &[10, 11], &[10, 11, 4])],
+        |rank, setup| {
+            if rank == 1 {
+                setup.fail_at = Some(FailAt::Verify);
+            }
+        },
+    );
     admit(&mut root, &mut fan, 1, 10, 9, None, Some(2));
     let started = std::time::Instant::now();
     let error = drive_step(
@@ -689,7 +688,10 @@ fn mesh_lane_ep_a_repair_failure_after_verify_aborts_before_any_publication() {
     .expect_err("a prepare failure poisons the step");
     assert!(matches!(error, ProtocolError::Aborted(_)), "{error}");
     assert_eq!(root.counters().steps_published, 0);
-    assert!(root.generated(epoch(1)).unwrap().is_empty(), "no IDs leaked");
+    assert!(
+        root.generated(epoch(1)).unwrap().is_empty(),
+        "no IDs leaked"
+    );
     let sims = fan.finish();
     assert!(sims.iter().all(|s| s.published.is_empty()));
 }
