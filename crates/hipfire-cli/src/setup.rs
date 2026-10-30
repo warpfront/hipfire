@@ -116,6 +116,27 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     let commit = crate::git_output(&source, &["rev-parse", "HEAD"])
         .context("failed to resolve full git HEAD for source checkout")?;
 
+    // A requested tag must match what the source tree is actually on. A
+    // bootstrap whose acquisition step failed or was skipped would otherwise
+    // rebuild the previous checkout and stamp it as the requested release;
+    // observed once on a managed install where `--tag <nonexistent>` built
+    // and installed the previously checked-out version with the new tag
+    // recorded in install.json.
+    if let Some(tag) = args.tag.as_deref() {
+        if let Err(reason) = verify_source_tag(&source, tag) {
+            bail!("--tag {tag} requested but the source tree does not match: {reason}");
+        }
+    }
+
+    // An explicit --gpu-arch naming no supported architecture is almost
+    // always a typo; the previous behaviour installed a JIT-only setup that
+    // only failed later at model load.
+    if let Some(arch) = args.gpu_arch.as_deref() {
+        if let Err(reason) = validate_explicit_gpu_arch(arch) {
+            bail!("{reason}");
+        }
+    }
+
     // Honour explicit --hipcc and --strict-rocm for this run without mutating
     // process-global env in tests — the pure helpers below take them as params.
     // For the live installer we also export them so child cargo/hipcc processes
@@ -850,6 +871,41 @@ fn kernel_pack_tag(args: &crate::SetupArgs) -> Option<&str> {
     args.tag.as_deref().or(args.reference.as_deref())
 }
 
+/// `Err(reason)` when `--tag` names a release the source tree is not on.
+///
+/// Verified only when the tree can be described as an exact tag; a tree that
+/// cannot (no git, detached non-tag commit) passes, so unusual dev flows are
+/// never blocked - the dangerous case is a *verified* mismatch, which means
+/// acquisition failed and the previous checkout is about to be rebuilt and
+/// stamped as the requested release.
+fn verify_source_tag(source: &Path, tag: &str) -> Result<(), String> {
+    let Ok(actual) = crate::git_output(source, &["describe", "--tags", "--exact-match", "HEAD"])
+    else {
+        return Ok(());
+    };
+    if actual == tag {
+        return Ok(());
+    }
+    Err(format!(
+        "HEAD is at tag {actual}, not {tag}; the tag was not acquired (failed fetch or skipped checkout)"
+    ))
+}
+
+/// An explicit `--gpu-arch` must name a supported architecture. Detected
+/// arches elsewhere take the softer "no indexed kernel registry" JIT path;
+/// this gate is for the flag only, where an unknown value is a typo that
+/// previously produced a JIT-only install failing only at model load.
+fn validate_explicit_gpu_arch(arch: &str) -> Result<(), String> {
+    let normalized = arch.to_ascii_lowercase();
+    if rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(&normalized.as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "--gpu-arch {arch} is not a supported architecture ({}); refusing rather than installing a setup whose kernels can only JIT",
+        rdna_compute::kernel_registry::SUPPORTED_ARCHES.join(", ")
+    ))
+}
+
 /// A ROCm root with the HIP runtime but no device compiler, enough to run a
 /// prebuilt kernel pack. An explicit root is taken as given; otherwise the
 /// candidates must share one runtime library.
@@ -1337,7 +1393,8 @@ mod tests {
         ensure_rocm_complete, install_binary_with_backup, metadata_ref_from_parts,
         parse_gpu_arches, pin_cargo_to_source_target, prompt_line_from_read, restore_config_toml,
         rollback_replacements, root_supports_compiler, selection_from_prompt_read,
-        snapshot_config_toml, usable_rocm_roots, BinaryReplacement, ContinueDecision, PromptRead,
+        snapshot_config_toml, usable_rocm_roots, validate_explicit_gpu_arch, verify_source_tag,
+        BinaryReplacement, ContinueDecision, PromptRead,
     };
     use std::{
         env, fs,
@@ -1552,6 +1609,62 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An explicit --gpu-arch naming nothing supported is a typo and must
+    /// refuse instead of installing a JIT-only setup (the footgun from the
+    /// review of #1002); a supported value in any case passes.
+    #[test]
+    fn explicit_gpu_arch_gate_accepts_supported_and_refuses_typos() {
+        assert!(validate_explicit_gpu_arch("gfx1151").is_ok());
+        assert!(validate_explicit_gpu_arch("GFX1100").is_ok());
+        let err = validate_explicit_gpu_arch("gfx9999").unwrap_err();
+        assert!(err.contains("gfx9999"), "{err}");
+        assert!(err.contains("refusing"), "{err}");
+        assert!(err.contains("gfx1151"), "{err}");
+    }
+
+    /// `--tag` must match the source tree's actual tag: a bootstrap whose
+    /// acquisition failed or was skipped would otherwise rebuild the previous
+    /// checkout and stamp it as the requested release.
+    #[test]
+    fn requested_tag_must_match_the_source_tree() {
+        fn git(dir: &Path, args: &[&str]) {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {:?} in {:?}", args, dir);
+        }
+        let repo = test_base("tag-verify");
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join("f"), b"").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "one"]);
+        git(&repo, &["tag", "v9.9.9"]);
+        assert!(verify_source_tag(&repo, "v9.9.9").is_ok());
+        // HEAD at a different exact tag: a verified mismatch must refuse.
+        fs::write(repo.join("f"), b"x").unwrap();
+        git(&repo, &["commit", "-q", "-am", "two"]);
+        git(&repo, &["tag", "v8.8.8"]);
+        let err = verify_source_tag(&repo, "v9.9.9").unwrap_err();
+        assert!(err.contains("v9.9.9"), "{err}");
+        assert!(err.contains("not acquired"), "{err}");
+        // HEAD at a commit no tag names cannot be verified and passes (the
+        // dangerous case is a verified mismatch, not an undescribable tree).
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        assert!(verify_source_tag(&repo, "v9.9.9").is_ok());
+        // A tree without git passes for the same reason.
+        let bare = test_base("tag-verify-bare");
+        assert!(verify_source_tag(&bare, "v9.9.9").is_ok());
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&bare);
     }
 
     #[test]
