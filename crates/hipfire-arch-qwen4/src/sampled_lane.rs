@@ -229,6 +229,7 @@ pub fn draft_dist_from_row(
 impl DraftRead {
     /// Build `q` for this read. `host` is a reused buffer (only a
     /// [`Self::FullRow`] read uses it).
+    #[allow(clippy::too_many_arguments)]
     pub fn build_dist(
         &self,
         vocab: u32,
@@ -1660,6 +1661,10 @@ mod tests {
 
     impl Mesh {
         fn new(kind: MeshKind, tags: &[u64]) -> Self {
+            Self::with_floor(kind, tags, false)
+        }
+
+        fn with_floor(kind: MeshKind, tags: &[u64], floor: bool) -> Self {
             let world = match kind {
                 MeshKind::Ep => vec![RankOwnership::ep(0), RankOwnership::ep(1)],
                 MeshKind::Pp => vec![RankOwnership::pp(0, false), RankOwnership::pp(1, true)],
@@ -1675,7 +1680,7 @@ mod tests {
                         moe_once: true,
                         stream_bf16: false,
                     },
-                    floor_enabled: false,
+                    floor_enabled: floor,
                 },
             )
             .unwrap();
@@ -1779,7 +1784,7 @@ mod tests {
     }
 
     fn run_arm(kind: MeshKind, arm: &Arm, tags: &[u64], steps: usize, order: &[u64]) -> ArmRun {
-        let mut m = Mesh::new(kind, tags);
+        let mut m = Mesh::with_floor(kind, tags, arm.lab == LabRoutes::Floor);
         for &t in tags {
             m.admit(
                 t,
@@ -1840,6 +1845,16 @@ mod tests {
                 // that take the root's copy candidates (point-mass q).
                 name: "lane_copy",
                 lab: LabRoutes::Cycle,
+                spec_k: Some(3),
+                sampling: SamplingMode::Leviathan,
+                copy: vec![0, 1, 2],
+            },
+            Arm {
+                // The root with the floor enabled but no priced evidence
+                // supplied (merge_evidence/pricing is the protocol owner's;
+                // the policy then drafts its budget): the law is route-blind.
+                name: "lane_adaptive",
+                lab: LabRoutes::Floor,
                 spec_k: Some(3),
                 sampling: SamplingMode::Leviathan,
                 copy: vec![0, 1, 2],
