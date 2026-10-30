@@ -1222,8 +1222,21 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
-                // qt=52: gfx11 → MMQ-LUT residual; gfx12 keeps FP8-LUT; else
+                // qt=52: small-N gfx1100 → F16-BT-LUT (native masking);
+                // N>=128 or other gfx11 → MMQ-LUT; gfx12 keeps FP8-LUT; else
                 // fail-closed inside the FP8 launcher (never uniform).
+                if lloyd_f16_bt_route(gpu, n) {
+                    let lut = lloyd_f16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                    return gpu.gemm_mq4g256v2_residual_wmma_gfx11_lloyd(
+                        &w.buf,
+                        input,
+                        &pbs.x_batch,
+                        m,
+                        k,
+                        n,
+                        lut,
+                    );
+                }
                 if lloyd_mmq_lut_route(gpu) {
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                     return gpu.gemm_hfq4g256_residual_mmq_lloyd(
@@ -1341,9 +1354,16 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
-                // qt=52 Partial: zero then residual (== plain GEMM). gfx11 →
+                // qt=52 Partial: zero then residual (== plain GEMM).
+                // Small-N gfx1100 → F16-BT-LUT; N>=128 or other gfx11 →
                 // MMQ-LUT ADD into zeroed Y; gfx12 keeps FP8-LUT.
                 zero_partial_for_residual(gpu, out, n, m)?;
+                if lloyd_f16_bt_route(gpu, n) {
+                    let lut = lloyd_f16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                    return gpu.gemm_mq4g256v2_residual_wmma_gfx11_lloyd(
+                        &w.buf, input, &out_n, m, k, n, lut,
+                    );
+                }
                 if lloyd_mmq_lut_route(gpu) {
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                     return gpu
@@ -1601,6 +1621,44 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
             .ok()
             .as_deref()
             != Some("1")
+}
+
+/// qt=52 (MQ4G256V2Lloyd) prefill: extract the per-tensor centered f16
+/// codebook LUT or fail closed naming the prefill family. Sibling of
+/// [`lloyd_e4m3_or_fail`]; consumed by the gfx1100 F16-BT-LUT launchers.
+#[inline]
+pub(crate) fn lloyd_f16_or_fail(w: &WeightRef<'_>, family: &'static str) -> HipResult<[u32; 8]> {
+    w.lloyd_lut_f16.ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{family}: MQ4G256V2Lloyd weight (m={} k={}) reached prefill with lloyd_lut_f16=None — \
+                 re-quantize with a build that emits lloyd_levels (F32[16]); refusing uniform decode",
+                w.m, w.k
+            ),
+        )
+    })
+}
+
+/// Small-batch F16-BT-LUT route for qt=52 on exact gfx1100: the BT twins
+/// natively mask any N (no padding), beating per-row GEMV below 64 and
+/// pad-to-128 waste up to 127. N>=128 stays on the MMQ-LUT route; other
+/// arches keep their existing behavior. Kill switch
+/// `HIPFIRE_LLOYD_F16_GFX11=0` restores the MMQ/GEMV path.
+#[inline]
+/// Small-N F16-BT-LUT route for qt=52 on exact gfx1100: BT-tiled WMMA with
+/// per-tensor centered codebooks, valid at any N via masking. Covers N<64,
+/// where the MMQ path falls back to per-row GEMV; N>=64 stays on the
+/// (possibly padded) MMQ-LUT route. Kill switch `HIPFIRE_LLOYD_F16_GFX11=0`
+/// restores the MMQ/GEMV path (default is on).
+#[inline]
+pub(crate) fn lloyd_f16_bt_route(gpu: &Gpu, n: usize) -> bool {
+    gpu.arch.as_str() == "gfx1100"
+        && n < 64
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_F16_GFX11")
+            .ok()
+            .as_deref()
+            != Some("0")
 }
 
 /// True when all listed projection dtypes are the Lloyd-V2 dtype.
@@ -2253,8 +2311,23 @@ fn swiglu_ffn_gate_up_batched(
             n,
         )?;
     } else if ffn_is_mq4v2_lloyd {
-        // qt=52: gate+up both Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
-        if lloyd_mmq_lut_route(gpu) {
+        // qt=52: gate+up both Lloyd. Small-N gfx1100 → F16-BT-LUT;
+        // N>=128 or other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_f16_bt_route(gpu, n) {
+            gpu.gemm_gate_up_mq4g256v2_wmma_gfx11_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                lloyd_f16_or_fail(&layer.w_gate, "swiglu_ffn_gate_up_batched")?,
+                lloyd_f16_or_fail(&layer.w_up, "swiglu_ffn_gate_up_batched")?,
+            )?;
+        } else if lloyd_mmq_lut_route(gpu) {
             gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(
                 &layer.w_gate.buf,
                 &layer.w_up.buf,

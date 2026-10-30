@@ -913,8 +913,33 @@ pub fn batch_chunk_delta_net_input_projection(
             n,
         )?;
     } else if is_mq4v2_lloyd {
-        // qt=52: all four projections Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
-        if lloyd_mmq_lut_route(gpu) {
+        // qt=52: all four projections Lloyd. Small-N gfx1100 → F16-BT-LUT;
+        // N>=128 or other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_f16_bt_route(gpu, n) {
+            gpu.gemm_qkvza_mq4g256v2_wmma_gfx11_lloyd(
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                &pbs.x_rot_batch,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+                [
+                    lloyd_f16_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_f16_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_f16_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
+                    lloyd_f16_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+                ],
+            )?;
+        } else if lloyd_mmq_lut_route(gpu) {
             gpu.gemm_qkvza_mq4g256v2_mmq_lloyd(
                 &layer.wqkv.buf,
                 &layer.wz.buf,

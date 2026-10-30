@@ -805,8 +805,29 @@ pub fn batch_chunk_full_attn_input_projection(
             n,
         )?;
     } else if qkv_is_mq4v2_lloyd {
-        // qt=52: q/k/v all Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
-        if lloyd_mmq_lut_route(gpu) {
+        // qt=52: q/k/v all Lloyd. Small-N gfx1100 → F16-BT-LUT; N>=128 or
+        // other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_f16_bt_route(gpu, n) {
+            gpu.gemm_qkv_mq4g256v2_wmma_gfx11_lloyd(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+                [
+                    lloyd_f16_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
+                    lloyd_f16_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
+                    lloyd_f16_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+                ],
+            )?;
+        } else if lloyd_mmq_lut_route(gpu) {
             gpu.gemm_qkv_mq4g256v2_mmq_lloyd(
                 &layer.wq.buf,
                 &layer.wk.buf,
@@ -2983,14 +3004,18 @@ pub fn batched_gemm_single_weight(
         }
         DType::MQ4G256V2Lloyd => {
             // qt=52 mixed-format twin of the V2 arm: zero Y then residual
-            // (== plain GEMM). gfx11 → MMQ-LUT ADD; gfx12 keeps FP8-LUT.
+            // (== plain GEMM). Small-N gfx1100 → F16-BT-LUT; N>=128 or other
+            // gfx11 → MMQ-LUT ADD; gfx12 keeps FP8-LUT.
             let bytes = w.m * n * 4;
             if let Some(stream) = gpu.active_stream.as_ref() {
                 gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
             } else {
                 gpu.hip.memset(&y.buf, 0, bytes)?;
             }
-            if lloyd_mmq_lut_route(gpu) {
+            if lloyd_f16_bt_route(gpu, n) {
+                let lut = lloyd_f16_or_fail(w, "batched_gemm_single_weight")?;
+                gpu.gemm_mq4g256v2_residual_wmma_gfx11_lloyd(&w.buf, x, y, w.m, w.k, n, lut)
+            } else if lloyd_mmq_lut_route(gpu) {
                 let c16 = lloyd_c16_or_fail(w, "batched_gemm_single_weight")?;
                 gpu.gemm_hfq4g256_residual_mmq_lloyd(&w.buf, x, y, w.m, w.k, n, c16)
             } else {
