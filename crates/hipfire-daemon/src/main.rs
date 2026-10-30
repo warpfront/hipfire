@@ -2384,16 +2384,15 @@ fn main() {
                 // store. Only the exact VMM route stages Qwen4 lanes;
                 // `vmm_batch` is false for the non-exact route and without
                 // `serve_vmm_batch`.
-                let (ep_spec_k, ep_spec_copy) = if load_tp > 1 {
+                // Only Qwen4 expert-parallel loads read it (the topology comes
+                // from `topology.ep`, not the `tp` param).
+                let (ep_spec_k, ep_spec_copy) =
                     hipfire_loader::batch_staging::ep_spec_lane_reservation(
                         parsed_vmm_batch.is_some_and(|params| params.spec),
                         parsed_vmm_batch.is_some_and(|params| params.sampled),
                         spec_cfg,
                         gpu.arch.as_str(),
-                    )
-                } else {
-                    (None, false)
-                };
+                    );
                 admission.batch_request = hipfire_loader::admission::BatchLoadRequest {
                     vmm_batch: parsed_vmm_batch.is_some_and(|params| !params.nonexact),
                     continuous_batch_size: parsed_continuous_batch_size,
