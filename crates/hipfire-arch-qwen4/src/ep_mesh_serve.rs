@@ -42,10 +42,12 @@ pub const MESH_PRICE_GAP: Duration = Duration::from_millis(100);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshDecodeRequest {
     pub epoch: RequestEpoch,
-    /// The driver's draft allowance: at most `budget` drafts this window
-    /// (tokens left and context already folded in); `budget + 1` tokens and
-    /// positions remain at least. `0` is an AR window.
-    pub budget: usize,
+    /// Tokens the request may still emit, the pending seed included (`>= 1`;
+    /// `1` while emitter-forced tokens are queued: an AR window). The root
+    /// alone derives the window's depth from it: native drafts up to the
+    /// store's `k` and copy candidates up to the copy take cap, both below
+    /// `tokens_left` and the lane's context.
+    pub tokens_left: usize,
 }
 
 /// One lane's published window, ready for the driver's emission loop.
@@ -285,10 +287,10 @@ impl Qwen4Bundle {
                 .and_then(|store| store.lane(&request.epoch))
                 .map(|lane| lane.state.position)
                 .ok_or_else(|| format!("mesh step: lane {:?} vanished", request.epoch))?;
-            // `budget` has tokens left and context folded in: `budget + 1`
-            // tokens and positions remain.
-            let left = (request.budget + 1).min(max_seq.saturating_sub(position));
-            if left == 0 {
+            // The root bounds the window's drafts by the tokens the request
+            // may still emit and by the positions the context has left.
+            let context_left = max_seq.saturating_sub(position);
+            if context_left == 0 {
                 return Err(format!(
                     "mesh step: lane {:?} has no context left",
                     request.epoch
@@ -298,8 +300,8 @@ impl Qwen4Bundle {
             retired_before.push(mesh.root().lane_retired(request.epoch).unwrap_or(false));
             lane_requests.push(LaneRequest {
                 epoch: request.epoch,
-                remaining: left,
-                context_left: left,
+                remaining: request.tokens_left.max(1),
+                context_left,
                 forced: None,
                 sampling: SamplingMode::Greedy,
             });

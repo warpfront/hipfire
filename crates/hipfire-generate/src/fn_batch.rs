@@ -729,9 +729,22 @@ fn plan_step(
             requests.push((c.epoch, budget));
         }
         if mesh_mode {
-            mesh_requests = requests
+            // The root derives depth itself (native up to `k`, copy up to the
+            // copy take cap): it gets the tokens left, not the native budget.
+            mesh_requests = controls
                 .iter()
-                .map(|&(epoch, budget)| MeshDecodeRequest { epoch, budget })
+                .enumerate()
+                .filter_map(|(idx, c)| {
+                    let c = c.as_ref().filter(|c| chosen.contains(&c.slot))?;
+                    Some(MeshDecodeRequest {
+                        epoch: c.epoch,
+                        tokens_left: if c.forced.is_empty() {
+                            c.max_tokens.saturating_sub(streamed[idx]).max(1)
+                        } else {
+                            1
+                        },
+                    })
+                })
                 .collect();
         } else if !requests.is_empty() {
             let mut executor = owner.executor()?;
