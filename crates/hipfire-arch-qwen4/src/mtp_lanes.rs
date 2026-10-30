@@ -38,10 +38,11 @@ use crate::lane::{
 use crate::lane_exec::{LaneDraft, LaneRoute};
 use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
-    accept_native_greedy, draft_accept_estimate, finish_native_window, floor_with_call_log,
-    mtp_prefill_chunk, mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
-    mtp_skip_intermediate_pick_enabled, HeadTicket, NativeFinish, Qwen4Floor, Qwen4Ops,
-    TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH, MTP_WINDOW_COST,
+    accept_native_greedy, draft_accept_estimate, floor_with_call_log, mtp_prefill_chunk,
+    mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
+    mtp_skip_intermediate_pick_enabled, prepare_native_window, publish_native_window, HeadTicket,
+    NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket, DRAFT_ACCEPT_MAX,
+    MTP_ROW_WORTH, MTP_WINDOW_COST,
 };
 
 use hipfire_runtime::slot_batch::RequestEpoch;
@@ -603,13 +604,23 @@ pub(crate) fn draft_lanes(
     Ok(out)
 }
 
-/// Finish a Verify lane after the trunk forward: greedy accept over the
-/// lane's picks, then the singleton's window tail on the lane's own states.
-/// `hidden` is the store's wide-hidden capture, the lane's rows starting at
-/// `row_begin`; `picks` are the lane's `1 + d` greedy picks. Returns the
-/// window (the lane's `window.outcome` is the caller's to set).
+/// A lane window whose every fallible operation succeeded and whose tickets
+/// validated but are still live; [`publish_lane_window`] consumes them.
+pub(crate) struct PreparedLaneWindow {
+    /// The window outcome (the lane's `window.outcome` is the caller's to set).
+    pub result: MtpWindow,
+    /// The native prepared handle (live tickets, committed position).
+    pub native: PreparedNativeWindow,
+}
+
+/// Prepare a Verify lane after the trunk forward: greedy accept over the
+/// lane's picks, then every fallible operation of the singleton's window tail
+/// on the lane's own states, ending in a non-consuming ticket validation.
+/// On `Err` no ticket was consumed. `hidden` is the store's wide-hidden
+/// capture, the lane's rows starting at `row_begin`; `picks` are the lane's
+/// `1 + d` greedy picks.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn finish_lane_window(
+pub(crate) fn prepare_lane_window(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
     lane: &mut Qwen4LaneState,
@@ -618,7 +629,7 @@ pub(crate) fn finish_lane_window(
     row_begin: usize,
     picks: &[u32],
     skip_rollback: bool,
-) -> Result<MtpWindow, String> {
+) -> Result<PreparedLaneWindow, String> {
     let wide = bundle
         .config
         .hc_count
@@ -715,8 +726,8 @@ pub(crate) fn finish_lane_window(
     } else {
         acceptance
     };
-    lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-        finish_native_window(
+    let native = lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+        prepare_native_window(
             b,
             &mut Qwen4Ops::Single(&mut *gpu),
             NativeFinish {
@@ -735,7 +746,55 @@ pub(crate) fn finish_lane_window(
         .map_err(BundleError::Forward)
     }))
     .map_err(|e| format!("finish_lane_window: {e}"))?;
+    Ok(PreparedLaneWindow { result, native })
+}
+
+/// Consume the tickets of a prepared lane window ([`publish_native_window`]
+/// on the lane's own states). No GPU operation runs; the lane's tickets were
+/// validated by [`prepare_lane_window`]. Returns the window.
+pub(crate) fn publish_lane_window(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    lane: &mut Qwen4LaneState,
+    prepared: PreparedLaneWindow,
+) -> Result<MtpWindow, String> {
+    let Qwen4LaneState { state, spec, .. } = lane;
+    let spec = spec
+        .as_mut()
+        .ok_or_else(|| "publish_lane_window: lane has no MTP state".to_string())?;
+    let LaneSpec { head, draft, .. } = spec;
+    let PreparedLaneWindow { result, native } = prepared;
+    lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+        publish_native_window(b, &mut Qwen4Ops::Single(&mut *gpu), native)
+            .map_err(BundleError::Forward)
+    }))
+    .map_err(|e| format!("finish_lane_window: {e}"))?;
     Ok(result)
+}
+
+/// [`prepare_lane_window`] then [`publish_lane_window`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_lane_window(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    lane: &mut Qwen4LaneState,
+    config: LaneSpecConfig,
+    hidden: &GpuTensor,
+    row_begin: usize,
+    picks: &[u32],
+    skip_rollback: bool,
+) -> Result<MtpWindow, String> {
+    let prepared = prepare_lane_window(
+        bundle,
+        gpu,
+        lane,
+        config,
+        hidden,
+        row_begin,
+        picks,
+        skip_rollback,
+    )?;
+    publish_lane_window(bundle, gpu, lane, prepared)
 }
 
 /// The head work of an `ArSynced` lane after its AR row: append the seed
@@ -881,6 +940,109 @@ pub(crate) fn prefill_tile(
 
 #[cfg(test)]
 mod tests {
+    // The finish split's ordering guarantee. `Qwen4Bundle`/`Gpu` cannot be built
+    // host-only, so the real functions cannot run on a fake; these pin the
+    // contract structurally on the source and the signatures.
+    const SPEC_SRC: &str = include_str!("mtp_spec.rs");
+    const LANES_SRC: &str = include_str!("mtp_lanes.rs");
+
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let head = format!("pub(crate) fn {name}(");
+        let start = src.find(&head).unwrap_or_else(|| panic!("{name} missing"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("fn end");
+        &rest[..end]
+    }
+
+    #[test]
+    fn finish_split_prepare_validates_and_never_consumes() {
+        let body = fn_body(SPEC_SRC, "prepare_native_window");
+        assert!(body.contains("ops_window_valid("), "prepare validates");
+        for consume in [
+            "ops_finish_window(",
+            "commit_validated(",
+            "retain_window(",
+            "pp_window_finalize(",
+            "ops_release_window(",
+        ] {
+            assert!(!body.contains(consume), "prepare must not call {consume}");
+        }
+        // Validation is the last fallible op: nothing fallible after it but
+        // the Ok(..) construction.
+        let valid = body.find("ops_window_valid(").unwrap();
+        let tail = &body[valid..];
+        assert!(!tail.contains("ops.gpu()") && !tail.contains("copy_hidden_row"));
+        // Every fallible GPU op precedes the validation.
+        for gpu_op in [
+            "mtp_append_token(",
+            "copy_hidden_row(",
+            "ops_rollback_rows(",
+        ] {
+            assert!(
+                body.rfind(gpu_op).unwrap() < valid,
+                "{gpu_op} after validation"
+            );
+        }
+    }
+
+    #[test]
+    fn finish_split_publish_is_consume_only() {
+        let body = fn_body(SPEC_SRC, "publish_native_window");
+        assert!(body.contains("ops_finish_window("));
+        for gpu_op in [
+            "ops.gpu()",
+            "copy_hidden_row(",
+            "mtp_append_token(",
+            "restore",
+        ] {
+            assert!(!body.contains(gpu_op), "publish must not run {gpu_op}");
+        }
+        let body = fn_body(LANES_SRC, "publish_lane_window");
+        assert!(body.contains("publish_native_window("));
+        assert!(!body.contains("prepare_native_window("));
+    }
+
+    #[test]
+    fn finish_split_wrappers_are_prepare_then_publish() {
+        let native = fn_body(SPEC_SRC, "finish_native_window");
+        let (p, q) = (
+            native.find("prepare_native_window(").expect("prepare"),
+            native.find("publish_native_window(").expect("publish"),
+        );
+        assert!(p < q, "prepare before publish");
+        assert!(native.contains("prepare_native_window(picks, ops, f, timers)?"));
+        let lane = fn_body(LANES_SRC, "finish_lane_window");
+        let (p, q) = (
+            lane.find("prepare_lane_window(").expect("prepare"),
+            lane.find("publish_lane_window(").expect("publish"),
+        );
+        assert!(p < q, "prepare before publish");
+        let prepare = fn_body(LANES_SRC, "prepare_lane_window");
+        assert!(prepare.contains("prepare_native_window("));
+        assert!(!prepare.contains("publish_native_window("));
+    }
+
+    #[test]
+    fn finish_split_signatures() {
+        let _: fn(
+            &mut Qwen4Bundle,
+            &mut Qwen4Ops<'_>,
+            NativeFinish<'_>,
+            Option<&mut crate::mtp_spec::MtpPhaseTimers>,
+        ) -> Result<PreparedNativeWindow, String> = prepare_native_window;
+        let _: fn(
+            &mut Qwen4Bundle,
+            &mut Qwen4Ops<'_>,
+            PreparedNativeWindow,
+        ) -> Result<MtpWindow, String> = publish_native_window;
+        let _: fn(
+            &mut Qwen4Bundle,
+            &mut Gpu,
+            &mut Qwen4LaneState,
+            PreparedLaneWindow,
+        ) -> Result<MtpWindow, String> = publish_lane_window;
+    }
+
     use super::*;
     use hipfire_runtime::spec_economics::batched_depth;
 
