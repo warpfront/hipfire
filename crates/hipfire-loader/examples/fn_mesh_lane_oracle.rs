@@ -2640,7 +2640,12 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     eprintln!("[{TOOL}] loading {}", args.model);
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
-    let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
+    // `--spec mtp` arms the native MTP head on every EP rank (under EP the
+    // loader attaches it only on an explicit request); the AR oracle loads as before.
+    let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
+        mtp: (args.spec == SpecMode::Mtp).then_some(true),
+        ..Default::default()
+    };
     let mut model = match args.reserve_lanes {
         None => hipfire_loader::load_model(
             &args.model,
