@@ -773,9 +773,18 @@ pub(crate) fn decode_raw_codec(
             ),
         ));
     }
-    if codec.dtype == DType::HFQ4G128 {
-        // Same per-row extent the weight_store manifest paths enforce: a
-        // pre-`b4846285e` file packs groups across rows and decodes to NaN.
+    if matches!(
+        codec.dtype,
+        DType::HFQ4G128
+            | DType::HFQ6G256
+            | DType::HFQ4G256
+            | DType::HFQ2G128
+            | DType::HFQ3G128
+            | DType::Q4F16G64
+    ) {
+        // Same per-row extent the weight_store manifest paths enforce: older
+        // quantizers packed ragged-K matrices across rows, which the per-row
+        // kernels decode to garbage or NaN.
         crate::weight_store::validate_payload_extent(&[m, k], codec.dtype, data.len()).map_err(
             |reason| hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}")),
         )?;
