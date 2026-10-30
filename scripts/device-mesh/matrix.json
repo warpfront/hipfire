@@ -1779,7 +1779,7 @@
      "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu dense_reset_phase_error_visible_and_unattested -- --ignored --exact --test-threads=1 # unattested reset-phase counterpart (rolled_back=false, still exactly one terminal)"
     ],
     "positive": [
-     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu -- --ignored --test-threads=1"
+     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu dense_llama_fault_rolls_back_and_retry_matches_fresh dense_lfm_fault_rolls_back_and_retry_matches_fresh dense_reset_phase_error_visible_and_unattested -- --ignored --test-threads=1 --nocapture"
     ]
    },
    "env": {
@@ -1800,6 +1800,10 @@
     "min_passed": 1
    },
    "predicate": {
+    "forbid": [
+     "skip: dense fixture",
+     "skip: no GPU"
+    ],
     "kind": "cargo",
     "min_passed": 3
    },
