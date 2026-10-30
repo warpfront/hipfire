@@ -1736,6 +1736,65 @@ impl EpMeshLanes {
         fan.soft(&|lane| lane.exec.stats())
             .map_err(|e| e.reason)
     }
+
+    /// Serve-driver addition (EpServe): the root's request-termination rule
+    /// ([`MeshRoot::set_driver_terminates`]): the driver closes lanes on
+    /// EOS/stop/length, the root never does and drafts through an EOS draft.
+    pub fn set_driver_terminates(&mut self, on: bool) {
+        self.root.set_driver_terminates(on);
+    }
+
+    /// Whether the root holds `epoch`'s lane.
+    pub fn has_lane(&self, epoch: RequestEpoch) -> bool {
+        self.root.has_lane(epoch)
+    }
+
+    /// Replace a live lane's pending seed at the root (the emitter's forced
+    /// close tokens). The ranks' lane tables take the same token through
+    /// `Qwen4Bundle::force_lane_seed`; the rank preflight checks the two agree.
+    pub fn force_seed(&mut self, epoch: RequestEpoch, token: u32) -> Result<(), String> {
+        self.root.force_seed(epoch, token).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::release_lane`] without a device handle: the release is host
+    /// bookkeeping on the root and on every rank's [`RankSession`]. Runs on a
+    /// quarantined mesh too (a failed step's lanes must still leave): once the
+    /// root is quarantined a refusal is not an error of the release itself.
+    pub fn release_lane_host(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        epoch: RequestEpoch,
+    ) -> Result<(), String> {
+        let root = self.root.release_lane(epoch).map_err(|e| e.to_string());
+        let Some(mesh) = bundle.ep.take() else {
+            return Err("qwen4 EP mesh is not attached".to_string());
+        };
+        let rank0 = &mut self.rank0;
+        let ranks = mesh.run_forced(
+            || {
+                rank0
+                    .session
+                    .release(&epoch)
+                    .map_err(|e| format!("rank {}: {}", e.rank, e.reason))
+            },
+            &|peer_bundle, _, mirrors| {
+                let rank = peer_rank(peer_bundle);
+                let exec = mirrors
+                    .mesh_lanes
+                    .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)));
+                exec.session
+                    .release(&epoch)
+                    .map_err(|e| format!("rank {}: {}", e.rank, e.reason))
+            },
+        );
+        bundle.ep = Some(mesh);
+        let quarantined = self.root.quarantined().is_some();
+        if quarantined {
+            return Ok(());
+        }
+        root?;
+        ranks.map(|_| ())
+    }
 }
 
 #[cfg(test)]

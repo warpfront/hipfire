@@ -1172,7 +1172,7 @@ fn qwen4_auto_mtp_k(gpu_arch: &str, cpu_window_rows: Option<usize>) -> usize {
 /// pipeline-parallel load; the Single load re-resolves an `auto` cap after
 /// placement (`qwen4_auto_mtp_k`) and narrows a CPU-placed load to the CPU
 /// window.
-fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
+pub(crate) fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
     qwen4_explicit_mtp_k(spec)
         .map(|k| k.clamp(1, hipfire_runtime::spec_economics::DERIVED_MAX_DRAFTS))
         .unwrap_or_else(|| qwen4_auto_mtp_k(gpu_arch, None))
@@ -2871,17 +2871,11 @@ pub fn qwen4_ep_vram_layers(
     // The lane store the stage after this load commits on every rank, from
     // the same bytes helper `stage_rank_lanes` uses (same context commit:
     // backend, `max_seq`, requested chunk and VMM granularity).
-    let copy = (batch.spec_k.is_some() && batch.spec_copy)
-        .then(|| {
-            hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
-                hipfire_config::ngram_mod_copy_triple(),
-            )
-            .ok()
-            .map(|ngram| hipfire_arch_qwen4::lane::LaneCopyConfig {
-                ngram,
-                head_lag_rows: 8,
-            })
-        })
+    // Spec lanes are reserved only when the load attaches the MTP head (EP:
+    // an explicit `--spec mtp`), else the stage after this load is AR lanes.
+    let spec_k = batch.spec_k.filter(|_| shared.native_mtp);
+    let copy = (spec_k.is_some() && batch.spec_copy)
+        .then(|| hipfire_arch_qwen4::ep::ep_default_copy_config(gpu.arch.as_str()))
         .flatten();
     let lane = qwen4_ep_lane_request(batch, shared.backend, |lanes, row_budget| {
         hipfire_arch_qwen4::ep::ep_lane_store_device_bytes(
@@ -2893,7 +2887,7 @@ pub fn qwen4_ep_vram_layers(
             shared.vmm_granularity,
             lanes,
             row_budget,
-            batch.spec_k,
+            spec_k,
             copy.as_ref(),
         )
     });

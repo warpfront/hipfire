@@ -216,6 +216,11 @@ pub struct Qwen4Bundle {
     /// Exact AR lane store of the Flash-Next batch route (`stage_lanes`);
     /// `None` = not staged. Lane steps never touch `state` or `mtp`.
     pub(crate) lanes: Option<crate::lane::Qwen4LaneStore>,
+    /// The EP native-MTP lane transaction owner ([`crate::ep_mesh_serve`]):
+    /// `Some` once the serve driver armed it on a staged EP spec store, so
+    /// decode runs through the mesh protocol instead of the per-rank
+    /// executor. Always `None` outside EP and for AR lane stores.
+    pub(crate) mesh_lanes: Option<Box<crate::ep_mesh_lanes::EpMeshLanes>>,
     /// Expert-parallel mesh (`attach_ep_mesh`): this bundle is rank 0 and every
     /// daemon-facing call is replicated on the peer ranks. `None` = single
     /// device (the default; no behaviour change).
@@ -912,6 +917,7 @@ impl Qwen4Bundle {
             turn_end_token: None,
             state_format,
             lanes: None,
+            mesh_lanes: None,
             ep: None,
             pp: None,
             pp_band: None,
@@ -4622,7 +4628,14 @@ impl Qwen4Bundle {
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
     ) -> Result<(), BundleError> {
         if self.ep.is_some() {
-            return self.ep_release_lane(epoch);
+            // The mesh lane owner (when armed) forgets the lane first: its
+            // sessions are host bookkeeping and must leave with the store's.
+            let mesh = self.ep_mesh_release(epoch);
+            let store = self.ep_release_lane(epoch);
+            return match (mesh, store) {
+                (Err(error), Ok(())) => Err(BundleError::Forward(error)),
+                (_, store) => store,
+            };
         }
         self.with_lanes(|store, _| store.release(epoch))
     }
@@ -4646,7 +4659,11 @@ impl Qwen4Bundle {
         token: u32,
     ) -> Result<(), BundleError> {
         if self.ep.is_some() {
-            return self.ep_force_lane_seed(epoch, token);
+            self.ep_force_lane_seed(epoch, token)?;
+            // The root's pending seed must equal the ranks' tables'.
+            return self
+                .ep_mesh_force_seed(epoch, token)
+                .map_err(BundleError::Forward);
         }
         self.with_lanes(|store, _| store.force_seed(epoch, token))
     }

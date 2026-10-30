@@ -535,6 +535,57 @@ fn leave_planned_route(gpu: &mut Gpu, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Why an EP load that carries the MTP head still stages AR lanes: the
+/// `HIPFIRE_EP_MTP_LANES=0` kill switch (EP lanes are AR lanes, as before the
+/// mesh lane protocol), or `serve.batch_sampled` (the EP rank executor has no
+/// sampler-owner hooks, so sampled lanes stay AR until the lane sampled
+/// oracle `HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes`, topology ep2, passes >= 2000
+/// trials and the mesh sampled route is turned on). `None` = stage MTP lanes.
+pub fn ep_spec_off_reason(kill_switch_on: bool, sampled: bool) -> Option<&'static str> {
+    if !kill_switch_on {
+        return Some("HIPFIRE_EP_MTP_LANES=0");
+    }
+    if sampled {
+        return Some(
+            "serve.batch_sampled: sampled EP lanes stay AR lanes until the lane sampled oracle \
+             (HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes, topology ep2, >= 2000 trials) passes",
+        );
+    }
+    None
+}
+
+/// What an EP load reserves for the lane store its batch staging will make:
+/// `(spec_k, copy)` for [`BatchLoadRequest`](crate::admission::BatchLoadRequest)
+/// (`(None, false)` = AR lanes). The same predicate and K the staging applies
+/// (`stage_qwen4_lanes`), so the resident-expert split reserves the bytes the
+/// spec store will commit: `serve.batch_spec` on, native MTP explicitly on
+/// (EP attaches heads only then), the kill switch and sampled lanes both off,
+/// K = the load's resolved draft depth clamped to the lane ring.
+pub fn ep_spec_lane_reservation(
+    batch_spec: bool,
+    batch_sampled: bool,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
+    gpu_arch: &str,
+) -> (Option<usize>, bool) {
+    let admitted = batch_spec
+        && spec.mtp == Some(true)
+        && ep_spec_off_reason(
+            hipfire_config::developer_bool("HIPFIRE_EP_MTP_LANES", true),
+            batch_sampled,
+        )
+        .is_none();
+    if !admitted {
+        return (None, false);
+    }
+    let k = crate::carriers::qwen4_native_mtp_k(spec, gpu_arch)
+        .min(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1)
+        .max(1);
+    (
+        Some(k),
+        hipfire_arch_qwen4::ep::ep_default_copy_config(gpu_arch).is_some(),
+    )
+}
+
 /// Stage the exact Flash-Next (qwen4) lane store beside the resident
 /// bundle: native MTP lanes when `req.spec` (`serve.batch_spec`) is on and
 /// the loaded model carries the MTP head, AR lanes otherwise. Qwen4 has only
@@ -545,11 +596,19 @@ fn leave_planned_route(gpu: &mut Gpu, label: &str) -> Result<(), String> {
 ///
 /// Topology (`Qwen4Bundle::lane_topology`):
 /// - `single`: one-device budget check here, then `stage_lanes`.
-/// - `ep`: replicated rank stores through `stage_lanes` (the arch fans it
-///   out and budgets every rank against its own free memory). Native MTP is
-///   unsupported: AR lanes. Route-kernel ownership: only the load's `gpu`
-///   (rank 0) ever runs `begin_route_kernels`; peer rank devices are never
-///   planned and stay lazy, so resetting rank 0 is sufficient.
+/// - `ep`: replicated rank stores (the arch fans staging out and budgets
+///   every rank against its own free memory). With `serve.batch_spec`, the MTP
+///   head loaded and neither kill switch (`HIPFIRE_EP_MTP_LANES=0`) nor
+///   `serve.batch_sampled` set, native-MTP lanes are staged with the default
+///   copy lane ([`hipfire_arch_qwen4::ep::ep_default_copy_config`]) and the
+///   mesh lane transaction is armed
+///   ([`hipfire_arch_qwen4::bundle::Qwen4Bundle::ep_mesh_lanes_arm`]): decode
+///   runs as root-planned windows replayed on every rank. A spec store that
+///   does not fit is a labeled refusal (per-rank byte message in the log):
+///   AR lanes are staged instead and reported as `spec=off`, never as MTP.
+///   Route-kernel ownership: only the load's `gpu` (rank 0) ever runs
+///   `begin_route_kernels`; peer rank devices are never planned and stay
+///   lazy, so resetting rank 0 is sufficient.
 /// - `pp`: band-scoped stores through `pp_stage_lanes` (the arch budgets
 ///   every band on its own device and resets each band device's finished
 ///   route). Native MTP is unsupported: AR lanes. The daemon `gpu` is a
@@ -605,14 +664,25 @@ fn stage_qwen4_lanes(
         ),
         other => other.to_string(),
     };
-    // EP and PP stage AR lanes only: a spec config is never forwarded there.
+    // PP stages AR lanes only: a spec config is never forwarded there. EP
+    // stages native-MTP lanes unless the kill switch or sampled lanes say no.
     let spec_off_reason: Option<String> = match (natural_spec_off, topology) {
-        (None, "pp" | "ep") => {
+        (None, "pp") => {
             eprintln!(
-                "[daemon] qwen4 fn-lanes: native-MTP lanes are not supported under topology.ep/pp yet; staging AR lanes"
+                "[daemon] qwen4 fn-lanes: native-MTP lanes are not supported under topology.pp yet; staging AR lanes"
             );
-            Some(format!("native-MTP unsupported under topology.{topology}"))
+            Some("native-MTP unsupported under topology.pp".to_string())
         }
+        (None, "ep") => ep_spec_off_reason(
+            hipfire_config::developer_bool("HIPFIRE_EP_MTP_LANES", true),
+            req.sampled,
+        )
+        .map(|reason| {
+            eprintln!(
+                "[daemon] qwen4 fn-lanes: EP native-MTP lanes off ({reason}); staging AR lanes"
+            );
+            reason.to_string()
+        }),
         (reason, _) => reason.map(str::to_string),
     };
     let spec = spec_off_reason
@@ -666,6 +736,13 @@ fn stage_qwen4_lanes(
     if let Err(e) = leave_planned_route(gpu, "daemon device") {
         return refuse(&e);
     }
+    // The default copy lane of EP native-MTP lanes (the singleton's own
+    // policy, `speculation.mtp_ngram_copy`); single-card lanes stay copy-off.
+    let mut copy = (topology == "ep" && spec.is_some())
+        .then(|| hipfire_arch_qwen4::ep::ep_default_copy_config(gpu.arch.as_str()))
+        .flatten();
+    let mut spec = spec;
+    let mut spec_fallback: Option<String> = None;
     let staged = if topology == "pp" {
         let Some((bundle, gpus)) = m.qwen4_mesh_mut() else {
             return refuse("topology.pp bundle has no caller-owned mesh devices");
@@ -678,12 +755,43 @@ fn stage_qwen4_lanes(
         bundle.pp_stage_lanes(gpus, requested, row_budget, spec)
     } else {
         match m.qwen4_mut() {
-            Some(bundle) => bundle.stage_lanes(gpu, requested, row_budget, spec),
+            Some(bundle) => match bundle.stage_lanes_with_copy(gpu, requested, row_budget, spec, copy)
+            {
+                // A native-MTP EP store that does not fit (or is refused) is
+                // labeled and replaced by the AR store, never silently
+                // narrowed (no lower K, no copy dropped, no smaller context).
+                Err(e) if topology == "ep" && spec.is_some() => {
+                    let reason = format!(
+                        "EP native-MTP lanes (k={} copy={}) refused: {e}",
+                        spec.map_or(0, |s| s.k),
+                        if copy.is_some() { "on" } else { "off" }
+                    );
+                    eprintln!("[daemon] qwen4 fn-lanes: {reason}; staging AR lanes");
+                    spec = None;
+                    copy = None;
+                    spec_fallback = Some(reason);
+                    bundle.stage_lanes_with_copy(gpu, requested, row_budget, None, None)
+                }
+                other => other,
+            },
             None => return refuse("model state not Qwen4"),
         }
     };
     if let Err(e) = staged {
         return refuse(&format!("{topology} staging failed: {e}"));
+    }
+    let spec_on_k = spec.as_ref().map(|s| s.k);
+    let spec_off_reason = spec_off_reason.or(spec_fallback);
+    // EP native-MTP lanes decode through the mesh lane transaction.
+    if topology == "ep" && spec_on_k.is_some() {
+        match m.qwen4_mut() {
+            Some(bundle) => {
+                if let Err(e) = bundle.ep_mesh_lanes_arm(1) {
+                    return refuse(&format!("ep mesh lanes: {e}"));
+                }
+            }
+            None => return refuse("model state not Qwen4"),
+        }
     }
     // serve.batch_sampled: the lane stores take sampled requests (per-lane
     // host draws); recorded on every store of the topology (every EP rank,
@@ -696,7 +804,14 @@ fn stage_qwen4_lanes(
         return refuse("lane store missing after staging");
     };
     let spec_log = match (spec_on_k, spec_off_reason) {
-        (Some(k), _) => format!("mtp K={k}"),
+        (Some(k), _) => format!(
+            "mtp K={k}{}",
+            if topology == "ep" {
+                format!(" executor=ep-mesh copy={}", if copy.is_some() { "on" } else { "off" })
+            } else {
+                String::new()
+            }
+        ),
         (None, Some(reason)) => format!("off ({reason})"),
         (None, None) => "off".to_string(),
     };
@@ -986,7 +1101,47 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
 
 #[cfg(test)]
 mod tests {
-    use super::{stochastic_q8_state_without_ef, StateQuant};
+    use super::{ep_spec_lane_reservation, ep_spec_off_reason, stochastic_q8_state_without_ef, StateQuant};
+    use hipfire_runtime::loader_api::SpecLoadCfg;
+
+    #[test]
+    fn ep_native_mtp_lanes_stage_unless_killed_or_sampled() {
+        assert_eq!(ep_spec_off_reason(true, false), None);
+        assert_eq!(
+            ep_spec_off_reason(false, false),
+            Some("HIPFIRE_EP_MTP_LANES=0")
+        );
+        // The kill switch is reported first; sampled lanes stay AR with the
+        // oracle gate named.
+        assert_eq!(ep_spec_off_reason(false, true), Some("HIPFIRE_EP_MTP_LANES=0"));
+        let sampled = ep_spec_off_reason(true, true).expect("sampled EP lanes stay AR");
+        assert!(sampled.contains("serve.batch_sampled") && sampled.contains("2000"));
+    }
+
+    #[test]
+    fn ep_spec_reservation_follows_the_staging_predicate() {
+        let on = SpecLoadCfg {
+            mtp: Some(true),
+            mtp_k: Some(3),
+            ..SpecLoadCfg::default()
+        };
+        let (k, _) = ep_spec_lane_reservation(true, false, on, "gfx1201");
+        assert_eq!(k, Some(3));
+        // K is clamped to the lane ring (`LANE_MAX_ROWS - 1` drafts).
+        let wide = SpecLoadCfg {
+            mtp_k: Some(63),
+            ..on
+        };
+        let (k, _) = ep_spec_lane_reservation(true, false, wide, "gfx1201");
+        assert_eq!(k, Some(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1));
+        // `serve.batch_spec` off, MTP not explicit, sampled lanes: AR store.
+        assert_eq!(ep_spec_lane_reservation(false, false, on, "gfx1201"), (None, false));
+        assert_eq!(
+            ep_spec_lane_reservation(true, false, SpecLoadCfg::default(), "gfx1201"),
+            (None, false)
+        );
+        assert_eq!(ep_spec_lane_reservation(true, true, on, "gfx1201"), (None, false));
+    }
 
     #[test]
     fn exact_ef_guard_only_rejects_live_stochastic_q8_state() {

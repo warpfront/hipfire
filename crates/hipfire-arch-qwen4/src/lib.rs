@@ -35,6 +35,7 @@ pub mod decode_share_shadows;
 pub(crate) mod dflash_target;
 pub mod ep;
 pub mod ep_mesh_lanes;
+pub mod ep_mesh_serve;
 pub mod ep_seal;
 pub mod ep_trunk_split;
 pub mod expert_keep;

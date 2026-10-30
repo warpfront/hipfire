@@ -1511,6 +1511,7 @@ impl Qwen4Bundle {
 
     /// Stop and free the mesh (before the bundle itself is freed).
     pub(crate) fn ep_close(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        self.mesh_lanes = None;
         match self.ep.take() {
             Some(mesh) => mesh.close(gpu).map_err(ep_err),
             None => Ok(()),
@@ -1743,6 +1744,25 @@ pub fn ep_lane_fit(rank: usize, need: u64, free: u64, reserve: u64) -> Result<()
 /// load-time reservation and the batch staging share.
 pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
     requested_row_budget.max(lanes)
+}
+
+/// The copy lane EP native-MTP lanes stage under the default policy: armed
+/// exactly where the singleton's native Qwen4 n-gram copy lane is
+/// (`speculation.mtp_ngram_copy`, `auto` on gfx1151/gfx1201, `off` is the kill
+/// switch), with the production copy triple and 8 owed head rows per lane.
+/// `None` = copy off (or its config refused). The one helper the load-time
+/// reservation, the daemon's request and the batch staging share, so the
+/// reserved and the staged store cannot differ.
+pub fn ep_default_copy_config(gpu_arch: &str) -> Option<crate::lane::LaneCopyConfig> {
+    if !hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, gpu_arch) {
+        return None;
+    }
+    let ngram =
+        crate::mtp_spec::qwen4_ngram_mod_config(hipfire_config::ngram_mod_copy_triple()).ok()?;
+    Some(crate::lane::LaneCopyConfig {
+        ngram,
+        head_lag_rows: 8,
+    })
 }
 
 /// Device bytes one rank's lane store commits, for `lanes` lanes at
@@ -2252,6 +2272,15 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         plan: &BatchStepPlan,
     ) -> Result<StepOutput, String> {
+        // A prefill tile in the interval makes the next mesh step's wall an
+        // unusable decode price.
+        if plan
+            .requests
+            .iter()
+            .any(|r| r.kind == hipfire_runtime::slot_batch::RequestStepKind::Prefill)
+        {
+            self.ep_mesh_note_prefill();
+        }
         self.ep_lane_strict(
             "lane forward_step",
             |bundle| run_lane_exec(bundle, |exec| exec.forward_step(gpu, plan)),

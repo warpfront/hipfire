@@ -45,7 +45,7 @@
 //! install a `LaneSampling` right after admission: the lane draws on the host
 //! with the AR singleton's sampler and the request seed, and MTP lanes verify
 //! sampled windows naively. Promoted lanes are greedy-only.
-//! Single and expert-parallel stores run every decode lane through the mesh
+//! Single stores run every decode lane through the mesh
 //! lane protocol's one-rank reducer (`hipfire_arch_qwen4::lane_rank`): the
 //! driver's four entries are the protocol's phases (`draft_step`: plan, begin,
 //! draft rounds, seal; `forward_step`: verify, decide, prepare; `commit_step`:
@@ -54,6 +54,17 @@
 //! plans rows from it and emits `forwarded_tokens` from the advance the
 //! root's output produced). The driver keeps request termination (EOS, stop,
 //! length, think budget, cancel): the root never closes a lane.
+//! An expert-parallel store staged with native-MTP lanes
+//! (`Qwen4Bundle::ep_mesh_lanes_armed`) splits each tick: the executor plan
+//! carries prefill tiles only, and every chosen decoding lane runs as one
+//! root-planned mesh window (`ep_mesh_decode_step`: rank 0 routes, drafts and
+//! decides, every rank replays the ordered messages) whose advance feeds the
+//! same emission path (`forwarded_tokens` from the window's seed). The two
+//! halves fail independently: an error in one errors only its own lanes and
+//! the other half's committed tokens are still emitted. Route mix by step
+//! concurrency is logged once per drive (`[fn-lane-mesh-mix]`). An AR EP store
+//! (kill switch `HIPFIRE_EP_MTP_LANES=0`, sampled lanes) keeps the executor
+//! path unchanged.
 
 use crate::ar::*;
 use crate::batch::{
@@ -62,6 +73,7 @@ use crate::batch::{
 };
 use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
+use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
 use hipfire_arch_qwen4::lane::{LaneSampling, LaneStatus};
 use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute, Qwen4LaneExecutor};
 use hipfire_engine::emit::*;
@@ -510,6 +522,14 @@ struct DraftFailure {
     epochs: Vec<RequestEpoch>,
 }
 
+/// One scheduler tick's work: the lane executor's plan (everything but the
+/// mesh lanes' decode) and, on an armed EP mesh store, the decoding lanes the
+/// root plans and the ranks replay as one mesh step ([`MeshDecodeRequest`]).
+struct PlannedStep {
+    plan: BatchStepPlan,
+    mesh: Vec<MeshDecodeRequest>,
+}
+
 /// `HIPFIRE_CB_PHASES=1` (developer diagnostic): one `[fn-lane-step]` stderr
 /// line per lane step. `host` is the wall time from the previous step's end
 /// to this plan (terminal decisions, inbox, admission); `plan` holds the
@@ -539,6 +559,7 @@ impl StepTrace {
         &mut self,
         marks: [Instant; 4],
         plan: &BatchStepPlan,
+        mesh: &MeshStepFacts,
         tokens: usize,
         accepted: usize,
         active: usize,
@@ -562,11 +583,56 @@ impl StepTrace {
             }
         }
         eprintln!("[fn-lane-step] n={} t={:.1} host={:.2} plan={:.2} fwd={:.2} commit={:.2} emit={:.2} active={active} queued={queued} \
-            pf={pf} pf_rows={pf_rows} ar={ar} ver={ver} ver_rows={ver_rows} tokens={tokens} accepted={accepted}",
+            pf={pf} pf_rows={pf_rows} ar={ar} ver={ver} ver_rows={ver_rows} mesh_lanes={} mesh_native={} mesh_copy={} mesh_ar={} tokens={tokens} accepted={accepted}",
             self.step, ms(self.origin, marks[0]), ms(self.last, marks[0]), ms(marks[0], marks[1]), ms(marks[1], marks[2]),
-            ms(marks[2], marks[3]), ms(marks[3], now));
+            ms(marks[2], marks[3]), ms(marks[3], now), mesh.lanes, mesh.native_windows, mesh.copy_windows, mesh.ar_windows);
         self.step += 1;
         self.last = now;
+    }
+}
+
+/// Route mix of one drive's EP mesh decode steps, keyed by the lanes a step
+/// carried (the step's concurrency): windows by final source (native drafts,
+/// copy candidates, AR rows), drafts offered/accepted and tokens emitted.
+/// Logged once when the drive ends (`[fn-lane-mesh-mix]`), so a receipt needs
+/// no per-step diagnostic flag.
+#[derive(Default)]
+struct MeshMix {
+    by_lanes: std::collections::BTreeMap<usize, MeshStepFacts>,
+    steps: std::collections::BTreeMap<usize, usize>,
+}
+
+impl MeshMix {
+    fn note(&mut self, facts: &MeshStepFacts) {
+        if facts.lanes == 0 {
+            return;
+        }
+        let sum = self.by_lanes.entry(facts.lanes).or_default();
+        sum.lanes += facts.lanes;
+        sum.native_windows += facts.native_windows;
+        sum.copy_windows += facts.copy_windows;
+        sum.ar_windows += facts.ar_windows;
+        sum.offered += facts.offered;
+        sum.accepted += facts.accepted;
+        sum.emitted += facts.emitted;
+        *self.steps.entry(facts.lanes).or_default() += 1;
+    }
+
+    fn report(&self) {
+        for (lanes, sum) in &self.by_lanes {
+            eprintln!(
+                "[fn-lane-mesh-mix] lanes={lanes} steps={} windows={} native={} copy={} ar={} \
+                 offered={} accepted={} emitted={}",
+                self.steps.get(lanes).copied().unwrap_or(0),
+                sum.native_windows + sum.copy_windows + sum.ar_windows,
+                sum.native_windows,
+                sum.copy_windows,
+                sum.ar_windows,
+                sum.offered,
+                sum.accepted,
+                sum.emitted
+            );
+        }
     }
 }
 
@@ -584,7 +650,7 @@ fn plan_step(
     row_budget: usize,
     cursor: &mut usize,
     max_lanes: usize,
-) -> Result<Result<BatchStepPlan, DraftFailure>, String> {
+) -> Result<Result<PlannedStep, DraftFailure>, String> {
     let max_seq = model.max_seq;
     let mut owner = Owner::of(model, gpu)?;
     let mut order: Vec<_> = controls
@@ -596,6 +662,9 @@ fn plan_step(
     order.sort_by_key(|&(slot, _)| slot);
     let store = owner.bundle.lanes().ok_or("qwen4 lanes not staged")?;
     let spec_k = store.spec().map(|s| s.k);
+    // Armed EP native-MTP lanes: decode runs through the mesh lane protocol
+    // (root plans, every rank replays); the executor plans prefill only.
+    let mesh_mode = owner.bundle.ep_mesh_lanes_armed();
     let decoding: Vec<_> = order
         .iter()
         .filter_map(|&(slot, epoch)| {
@@ -638,6 +707,7 @@ fn plan_step(
         }
     }
     let mut drafts: Vec<LaneDraft> = Vec::new();
+    let mut mesh_requests: Vec<MeshDecodeRequest> = Vec::new();
     if let Some(k) = spec_k {
         let mut requests = Vec::new();
         for (idx, c) in controls.iter().enumerate() {
@@ -658,7 +728,12 @@ fn plan_step(
             };
             requests.push((c.epoch, budget));
         }
-        if !requests.is_empty() {
+        if mesh_mode {
+            mesh_requests = requests
+                .iter()
+                .map(|&(epoch, budget)| MeshDecodeRequest { epoch, budget })
+                .collect();
+        } else if !requests.is_empty() {
             let mut executor = owner.executor()?;
             match executor.draft_step(&requests) {
                 Ok(d) => drafts = d,
@@ -686,6 +761,7 @@ fn plan_step(
                 0,
                 Vec::new(),
             )),
+            LaneStatus::Decoding if mesh_mode && chosen.contains(&slot) => {}
             LaneStatus::Decoding if chosen.contains(&slot) => {
                 let position = lane.state.position;
                 match drafts.iter().find(|d| d.epoch == epoch) {
@@ -781,7 +857,10 @@ fn plan_step(
             plan.decode_rows += len;
         }
     }
-    Ok(Ok(plan))
+    Ok(Ok(PlannedStep {
+        plan,
+        mesh: mesh_requests,
+    }))
 }
 
 fn emit_forwarded(
@@ -882,16 +961,24 @@ fn finish_lane(
     // singleton's done keys; `mtp_drafts`/`mtp_accepted` are lane-only.
     if let Some(stats) = model
         .qwen4()
-        .and_then(|b| b.lanes())
-        .and_then(|s| s.lane_spec_stats(&ctl.epoch))
+        .and_then(|b| b.lane_spec_stats_for(&ctl.epoch))
     {
         done["mtp"] = serde_json::json!(true);
-        if stats.windows != 0 || stats.ar_windows != 0 || stats.retired {
+        if stats.windows != 0
+            || stats.ar_windows != 0
+            || stats.copy_windows != 0
+            || stats.retired
+        {
             done["mtp_windows"] = serde_json::json!(stats.windows);
             done["ar_windows"] = serde_json::json!(stats.ar_windows);
             done["mtp_retired"] = serde_json::json!(stats.retired);
             done["mtp_drafts"] = serde_json::json!(stats.drafts);
             done["mtp_accepted"] = serde_json::json!(stats.accepted);
+            if stats.copy_windows != 0 {
+                done["mtp_copy_windows"] = serde_json::json!(stats.copy_windows);
+                done["mtp_copy_drafts"] = serde_json::json!(stats.copy_drafts);
+                done["mtp_copy_accepted"] = serde_json::json!(stats.copy_accepted);
+            }
         }
     }
     let action = qwen_ar_cache_action(&finish, &visible);
@@ -973,6 +1060,7 @@ pub fn drive_qwen4_lane_batch(
     let mut controls: Vec<Option<LaneCtl>> = (0..sched.max_batch).map(|_| None).collect();
     let mut cursor = 0;
     let mut trace = StepTrace::new();
+    let mut mix = MeshMix::default();
     let batch_size = sched.max_batch;
     // Requests already queued at entry; the promoted lane never passes the
     // inbox, so it is never handed back to the singleton.
@@ -1249,7 +1337,10 @@ pub fn drive_qwen4_lane_batch(
                 })
                 .collect();
             let t_plan = Instant::now();
-            let plan = match plan_step(
+            let PlannedStep {
+                plan,
+                mesh: mesh_requests,
+            } = match plan_step(
                 m,
                 gpu,
                 &mut controls,
@@ -1258,7 +1349,7 @@ pub fn drive_qwen4_lane_batch(
                 &mut cursor,
                 max_lanes,
             )? {
-                Ok(plan) => plan,
+                Ok(planned) => planned,
                 Err(failure) => {
                     for epoch in &failure.epochs {
                         if let Some(idx) = controls
@@ -1279,73 +1370,118 @@ pub fn drive_qwen4_lane_batch(
                     continue;
                 }
             };
-            if plan.requests.is_empty() {
+            if plan.requests.is_empty() && mesh_requests.is_empty() {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
             let t_fwd = Instant::now();
             let mut t_commit = t_fwd;
-            let stepped = {
-                let mut owner = Owner::of(m, gpu)?;
-                let mut executor = owner.executor()?;
-                let result = executor
-                    .provision_step(&plan)
-                    .and_then(|()| executor.forward_step(&plan))
-                    .and_then(|out| {
-                        t_commit = Instant::now();
-                        executor.commit_step(&plan, out)
-                    });
-                if result.is_err() {
-                    executor.abort_step(&plan);
-                }
-                result
-            };
-            let t_done = Instant::now();
-            let advances = match stepped {
-                Ok(a) => a,
-                Err(error) => {
-                    for request in &plan.requests {
-                        if let Some(idx) = controls
-                            .iter()
-                            .position(|c| c.as_ref().is_some_and(|c| c.epoch == request.epoch))
-                        {
-                            lane_error(
-                                sched,
-                                m,
-                                &mut controls,
-                                idx,
-                                stdout,
-                                &format!("qwen4 lane step failed: {error}"),
-                                "gpu",
-                            )?;
+            // The executor's plan first (prefill tiles; every row of a store
+            // without the mesh lane owner), then the mesh lanes' decode step.
+            // A failure errors only its own lanes: what the other half
+            // already committed must still be emitted below.
+            let mut ticks: Vec<(RequestAdvance, Option<u32>)> = Vec::new();
+            if !plan.requests.is_empty() {
+                let stepped = {
+                    let mut owner = Owner::of(m, gpu)?;
+                    let mut executor = owner.executor()?;
+                    let result = executor
+                        .provision_step(&plan)
+                        .and_then(|()| executor.forward_step(&plan))
+                        .and_then(|out| {
+                            t_commit = Instant::now();
+                            executor.commit_step(&plan, out)
+                        });
+                    if result.is_err() {
+                        executor.abort_step(&plan);
+                    }
+                    result
+                };
+                match stepped {
+                    Ok(advances) => ticks.extend(advances.into_iter().map(|a| (a, None))),
+                    Err(error) => {
+                        for request in &plan.requests {
+                            if let Some(idx) = controls
+                                .iter()
+                                .position(|c| c.as_ref().is_some_and(|c| c.epoch == request.epoch))
+                            {
+                                lane_error(
+                                    sched,
+                                    m,
+                                    &mut controls,
+                                    idx,
+                                    stdout,
+                                    &format!("qwen4 lane step failed: {error}"),
+                                    "gpu",
+                                )?;
+                            }
                         }
                     }
-                    continue;
                 }
-            };
+            }
+            let mut mesh_facts = MeshStepFacts::default();
+            if !mesh_requests.is_empty() {
+                let stepped = {
+                    let mut owner = Owner::of(m, gpu)?;
+                    owner
+                        .bundle
+                        .ep_mesh_decode_step(&mut *owner.gpu, &mesh_requests)
+                };
+                match stepped {
+                    Ok((decoded, facts)) => {
+                        mesh_facts = facts;
+                        mix.note(&mesh_facts);
+                        ticks.extend(decoded.into_iter().map(|d| (d.advance, Some(d.seed))));
+                    }
+                    Err(error) => {
+                        for request in &mesh_requests {
+                            if let Some(idx) = controls
+                                .iter()
+                                .position(|c| c.as_ref().is_some_and(|c| c.epoch == request.epoch))
+                            {
+                                lane_error(
+                                    sched,
+                                    m,
+                                    &mut controls,
+                                    idx,
+                                    stdout,
+                                    &format!("qwen4 lane step failed: {error}"),
+                                    "gpu",
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+            let t_done = Instant::now();
             let decoded = trace.is_some().then(|| {
-                advances
+                ticks
                     .iter()
-                    .filter(|a| {
-                        plan.requests
-                            .iter()
-                            .any(|r| r.epoch == a.epoch && r.kind != RequestStepKind::Prefill)
+                    .filter(|(a, seed)| {
+                        seed.is_some()
+                            || plan
+                                .requests
+                                .iter()
+                                .any(|r| r.epoch == a.epoch && r.kind != RequestStepKind::Prefill)
                     })
-                    .fold((0, 0), |(t, c), a| {
+                    .fold((0, 0), |(t, c), (a, _)| {
                         (t + a.committed_ids.len(), c + a.accepted_drafts)
                     })
             });
-            for advance in advances {
+            for (advance, decode_seed) in ticks {
                 let idx = controls
                     .iter()
                     .position(|c| c.as_ref().is_some_and(|c| c.epoch == advance.epoch))
                     .ok_or("qwen4 advance has no request owner")?;
-                let request = plan
-                    .requests
-                    .iter()
-                    .find(|r| r.epoch == advance.epoch)
-                    .ok_or("qwen4 advance not in plan")?;
-                if request.kind == RequestStepKind::Prefill {
+                let request = plan.requests.iter().find(|r| r.epoch == advance.epoch);
+                let is_prefill = decode_seed.is_none()
+                    && request.is_some_and(|r| r.kind == RequestStepKind::Prefill);
+                let plan_seed = match (decode_seed, request) {
+                    (Some(seed), _) => seed,
+                    (None, Some(r)) => plan.batch.tokens[r.rows.begin],
+                    (None, None) => return Err("qwen4 advance not in plan".into()),
+                };
+                if is_prefill {
                     // `prefill_progress` for the lane's prompt chunk (the
                     // last chunk is silent: `done < total` only).
                     if let BatchLane::Running(lane) | BatchLane::Seeding(lane) = &sched.lanes[idx] {
@@ -1390,7 +1526,7 @@ pub fn drive_qwen4_lane_batch(
                     .as_mut()
                     .is_some_and(|c| std::mem::take(&mut c.skip_first_forward));
                 let forwarded = forwarded_tokens(
-                    plan.batch.tokens[request.rows.begin],
+                    plan_seed,
                     &advance.committed_ids,
                     skip_seed,
                 );
@@ -1458,6 +1594,7 @@ pub fn drive_qwen4_lane_batch(
                 trace.line(
                     [t_plan, t_fwd, t_commit, t_done],
                     &plan,
+                    &mesh_facts,
                     tokens,
                     accepted,
                     active,
@@ -1466,6 +1603,7 @@ pub fn drive_qwen4_lane_batch(
             }
         }
     })();
+    mix.report();
     if let Err(error) = result {
         let mut cleanup_error = None;
         for idx in 0..sched.max_batch {
@@ -1603,5 +1741,53 @@ mod tests {
         assert_eq!(forwarded_tokens(7, &[8, 9, 10], true), vec![8, 9]);
         assert!(forwarded_tokens(7, &[8], true).is_empty());
         assert!(forwarded_tokens(7, &[], true).is_empty());
+    }
+
+    #[test]
+    fn mesh_mix_sums_windows_by_the_lanes_a_step_carried() {
+        use super::{MeshMix, MeshStepFacts};
+        let mut mix = MeshMix::default();
+        let facts = |lanes, native, copy, ar| MeshStepFacts {
+            lanes,
+            native_windows: native,
+            copy_windows: copy,
+            ar_windows: ar,
+            offered: native * 3,
+            accepted: native,
+            emitted: native * 2 + copy + ar,
+        };
+        mix.note(&facts(2, 2, 0, 0));
+        mix.note(&facts(2, 1, 1, 0));
+        mix.note(&facts(8, 3, 2, 3));
+        // A step with no lane (never produced) is not a bucket.
+        mix.note(&MeshStepFacts::default());
+        assert_eq!(mix.by_lanes.len(), 2);
+        assert_eq!(mix.steps[&2], 2);
+        assert_eq!(mix.steps[&8], 1);
+        let two = mix.by_lanes[&2];
+        assert_eq!(
+            (two.native_windows, two.copy_windows, two.ar_windows, two.offered, two.accepted),
+            (3, 1, 0, 9, 3)
+        );
+    }
+
+    /// The mesh half of a tick must never swallow the executor half's
+    /// committed tokens (and vice versa): both halves' failures error only
+    /// their own lanes and the advances of the other still flow to emission.
+    #[test]
+    fn a_tick_emits_both_halves_even_when_one_errors() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let body = &prod[drive..];
+        let exec = body.find("executor.commit_step(&plan, out)").expect("executor half");
+        let mesh = body.find("ep_mesh_decode_step").expect("mesh half");
+        let emit = body.find("for (advance, decode_seed) in ticks").expect("emission");
+        assert!(exec < mesh && mesh < emit, "executor half, mesh half, then one emission loop");
+        let between = &body[exec..emit];
+        assert!(
+            !between.contains("continue;"),
+            "a failed half must not skip the other half's emission"
+        );
     }
 }

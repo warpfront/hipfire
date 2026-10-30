@@ -2376,18 +2376,30 @@ fn main() {
                     0,
                 );
                 // The continuous-batch request staged after this load, so a
-                // Qwen4 expert-parallel load reserves the AR lane store's
-                // bytes before it splits the experts. Only the exact VMM
-                // route stages Qwen4 lanes; `vmm_batch` is false for the
-                // non-exact route and without `serve_vmm_batch`.
+                // Qwen4 expert-parallel load reserves the lane store's bytes
+                // before it splits the experts: the native-MTP lane store
+                // (default copy lane included) when the staging will stage it
+                // (`serve.batch_spec`, explicit `--spec mtp`, no
+                // `HIPFIRE_EP_MTP_LANES=0`, no sampled lanes), else the AR
+                // store. Only the exact VMM route stages Qwen4 lanes;
+                // `vmm_batch` is false for the non-exact route and without
+                // `serve_vmm_batch`.
+                let (ep_spec_k, ep_spec_copy) = if load_tp > 1 {
+                    hipfire_loader::batch_staging::ep_spec_lane_reservation(
+                        parsed_vmm_batch.is_some_and(|params| params.spec),
+                        parsed_vmm_batch.is_some_and(|params| params.sampled),
+                        spec_cfg,
+                        gpu.arch.as_str(),
+                    )
+                } else {
+                    (None, false)
+                };
                 admission.batch_request = hipfire_loader::admission::BatchLoadRequest {
                     vmm_batch: parsed_vmm_batch.is_some_and(|params| !params.nonexact),
                     continuous_batch_size: parsed_continuous_batch_size,
                     row_budget: parsed_vmm_batch.map_or(0, |params| params.max_batch_tokens),
-                    // EP stages AR lanes under serve (the topology override);
-                    // mesh spec lanes are staged by the oracle/driver.
-                    spec_k: None,
-                    spec_copy: false,
+                    spec_k: ep_spec_k,
+                    spec_copy: ep_spec_copy,
                 };
                 // Only tp>1 EP loads defer prior retirement. Every single-device
                 // or pp load (Qwen4/Flash-Next included) is unload-first: after
