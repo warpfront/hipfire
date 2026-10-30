@@ -92,7 +92,10 @@
 //! `devices`) is recorded in `report.json`.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_arch_qwen4::ep_mesh_lanes::{EpMeshLanes, MeshLaneAdmission, MeshStepError};
 use hipfire_arch_qwen4::gpu_forward_lanes::{LaneStagePolicy, StageName};
+use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
+use hipfire_arch_qwen4::mesh_lane_protocol::{GreedyRule, LaneRequest, SamplingMode, WindowBudgets};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch,
@@ -1715,6 +1718,508 @@ fn sweep_verdict(outcomes: &[PolicyOutcome]) -> Verdict {
     }
 }
 
+// ------------------------------------------------------------ MTP EP arm
+
+/// One lane of the native-MTP EP run: prefill through the ordinary lane
+/// executor (identical on every rank), decode through the mesh lane protocol.
+struct MtpLane {
+    epoch: RequestEpoch,
+    slot: usize,
+    progress: Progress,
+    /// The prompt-completing pick, then every emitted token.
+    committed: Vec<u32>,
+    admitted: bool,
+    in_mesh: bool,
+    windows: u64,
+    offered: u64,
+    accepted: u64,
+}
+
+fn lab_routes(routes: RoutesArg) -> LabRoutes {
+    match routes {
+        RoutesArg::Floor => LabRoutes::Floor,
+        RoutesArg::Cycle => LabRoutes::Cycle,
+        RoutesArg::Batched => LabRoutes::Batched,
+    }
+}
+
+fn mesh_step_error(error: MeshStepError) -> String {
+    match error {
+        MeshStepError::Preflight(v) => format!("mesh preflight rejected: {v:?}"),
+        MeshStepError::Aborted(record) => format!("mesh step aborted: {record}"),
+        MeshStepError::Protocol(p) => format!("mesh protocol: {p}"),
+    }
+}
+
+fn merged_json(m: &hipfire_arch_qwen4::mesh_lane_protocol::MergedCostEvidence) -> Value {
+    json!({
+        "step_seq": m.key.step_seq,
+        "ranks": m.ranks,
+        "target_exchanges": m.counts.target_exchanges,
+        "gather_bytes": m.counts.gather_bytes,
+        "head_draft_calls": m.counts.head_draft_calls,
+        "head_append_rows": m.counts.head_append_rows,
+        "row_groups": m.counts.row_groups,
+        "drafts_generated": m.counts.drafts_generated,
+        "accepted": m.counts.accepted,
+        "consumed_rows": m.counts.consumed_rows,
+        "wall_us": m.wall_us,
+        "critical_path_us": m.critical_path_us,
+        "synchronized": m.synchronized,
+        "priced": m.priced,
+        "unpriced_reason": m.unpriced_reason,
+    })
+}
+
+struct MtpKRun {
+    run: KRun,
+    windows: Vec<Value>,
+    rank_stats: Vec<Value>,
+    summary: Value,
+}
+
+/// Run prompts `0..k` as `k` concurrent native-MTP lanes on the EP mesh until
+/// each has `cfg.tokens` committed ids; every lane is released (also on
+/// error).
+#[allow(clippy::too_many_arguments)]
+fn drive_mtp_k(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    mesh: &mut EpMeshLanes,
+    cfg: &DriveCfg<'_>,
+    max_seq: usize,
+    depth: usize,
+    routes: RoutesArg,
+    k: usize,
+    next_tag: &mut u64,
+    vocab: usize,
+) -> R<MtpKRun> {
+    let mut lanes: Vec<MtpLane> = Vec::with_capacity(k);
+    let mut windows = Vec::new();
+    let result = drive_mtp_inner(
+        bundle, gpu, mesh, cfg, max_seq, depth, routes, k, next_tag, vocab, &mut lanes,
+        &mut windows,
+    );
+    let mut release_error = None;
+    for lane in lanes.iter_mut() {
+        if lane.in_mesh {
+            lane.in_mesh = false;
+            if let Err(x) = mesh.release_lane(bundle, gpu, lane.epoch) {
+                release_error.get_or_insert(format!("mesh release {:?}: {x}", lane.epoch));
+            }
+        }
+        if lane.admitted {
+            lane.admitted = false;
+            if let Err(x) = bundle.release_lane(&lane.epoch) {
+                release_error.get_or_insert(format!("release {:?}: {x}", lane.epoch));
+            }
+        }
+    }
+    let rank_stats = mesh
+        .rank_stats(bundle, gpu)
+        .map(|all| {
+            all.into_iter()
+                .map(|s| {
+                    json!({
+                        "rank": s.rank, "steps": s.steps,
+                        "native_windows": s.native_windows,
+                        "draft_mismatches": s.draft_mismatches,
+                        "pick_mismatches": s.pick_mismatches,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    match (result, release_error) {
+        (Err(x), _) => Err(x),
+        (Ok(_), Some(x)) => Err(x),
+        (Ok((run, summary)), None) => Ok(MtpKRun {
+            run,
+            windows,
+            rank_stats,
+            summary,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_mtp_inner(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    mesh: &mut EpMeshLanes,
+    cfg: &DriveCfg<'_>,
+    max_seq: usize,
+    depth: usize,
+    routes: RoutesArg,
+    k: usize,
+    next_tag: &mut u64,
+    vocab: usize,
+    lanes: &mut Vec<MtpLane>,
+    windows: &mut Vec<Value>,
+) -> R<(KRun, Value)> {
+    if k > cfg.max_lanes || k > cfg.prompts.len() {
+        return Err(format!(
+            "K={k} exceeds the staged lanes ({}) or the prompts ({})",
+            cfg.max_lanes,
+            cfg.prompts.len()
+        ));
+    }
+    for prompt in &cfg.prompts[..k] {
+        *next_tag += 1;
+        let epoch = RequestEpoch {
+            request_tag: *next_tag,
+            owner_generation: 1,
+        };
+        let slot = bundle.admit_lane(gpu, epoch, prompt.to_vec()).map_err(e)?;
+        lanes.push(MtpLane {
+            epoch,
+            slot,
+            progress: Progress {
+                prompt_len: prompt.len(),
+                prefilled: 0,
+                ar_steps: 0,
+            },
+            committed: Vec::new(),
+            admitted: true,
+            in_mesh: false,
+            windows: 0,
+            offered: 0,
+            accepted: 0,
+        });
+    }
+    let budgets = WindowBudgets {
+        max_lanes: cfg.max_lanes,
+        verify_rows_per_lane: depth + 1,
+        max_rows: cfg.max_lanes * (depth + 1),
+        copy_take_cap: 0,
+        lab: lab_routes(routes),
+        pp_microbatch_lanes: None,
+    };
+    let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
+    let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
+    let (mut total_windows, mut total_offered, mut total_accepted, mut total_emitted) =
+        (0u64, 0u64, 0u64, 0u64);
+    loop {
+        // Prefill: one tile per Prefilling lane through the lane executor.
+        let prefill: Vec<usize> = (0..lanes.len())
+            .filter(|&i| lanes[i].progress.prefilled < lanes[i].progress.prompt_len)
+            .collect();
+        let mut prefill_ran = false;
+        if !prefill.is_empty() {
+            let mut specs = Vec::with_capacity(prefill.len());
+            for &i in &prefill {
+                let lane = &lanes[i];
+                let len = bundle
+                    .lane_executor()
+                    .map_err(e)?
+                    .exact_prefill_chunk_len(&lane.epoch)?;
+                let p = lane.progress;
+                if len == 0 || p.prefilled + len > p.prompt_len {
+                    return Err(format!(
+                        "lane {i}: prefill tile of {len} rows at {}/{}",
+                        p.prefilled, p.prompt_len
+                    ));
+                }
+                specs.push(RowSpec {
+                    slot: lane.slot,
+                    epoch: lane.epoch,
+                    tokens: cfg.prompts[i][p.prefilled..p.prefilled + len].to_vec(),
+                    start: p.prefilled,
+                    kind: RequestStepKind::Prefill,
+                });
+            }
+            let plan = build_plan(cfg.max_lanes, specs);
+            let started = Instant::now();
+            let result = LocalLanes {
+                bundle: &mut *bundle,
+                gpu: &mut *gpu,
+                vocab,
+            }
+            .step(&plan, false)?;
+            steps += 1;
+            steps_wall += started.elapsed().as_secs_f64();
+            prefill_ran = true;
+            mesh.note_prefill();
+            for (request, advance) in plan.requests.iter().zip(&result.advances) {
+                let idx = lanes
+                    .iter()
+                    .position(|lane| lane.epoch == request.epoch)
+                    .ok_or("plan epoch is not one of this run's lanes")?;
+                lanes[idx].progress.prefilled += request.rows.len;
+                if lanes[idx].progress.prefilled < lanes[idx].progress.prompt_len {
+                    continue;
+                }
+                let [id] = advance.committed_ids.as_slice() else {
+                    return Err(format!(
+                        "lane {idx}: prompt-completing tile committed {:?}",
+                        advance.committed_ids
+                    ));
+                };
+                lanes[idx].committed.push(*id);
+                // No EOS handling: the AR reference loop ignores EOS, and the
+                // oracle compares exact id streams.
+                mesh.admit_lane(
+                    bundle,
+                    gpu,
+                    MeshLaneAdmission {
+                        epoch: lanes[idx].epoch,
+                        position: lanes[idx].progress.prompt_len,
+                        seed: *id,
+                        eos: None,
+                        rng_seed: lanes[idx].epoch.request_tag,
+                        prompt: cfg.prompts[idx].to_vec(),
+                        spec_k: Some(depth),
+                    },
+                )?;
+                lanes[idx].in_mesh = true;
+            }
+        }
+
+        // Lanes with everything they need leave the mesh.
+        for lane in lanes.iter_mut() {
+            if lane.in_mesh && lane.committed.len() >= cfg.tokens {
+                lane.in_mesh = false;
+                mesh.release_lane(bundle, gpu, lane.epoch)?;
+                lane.admitted = false;
+                bundle.release_lane(&lane.epoch).map_err(e)?;
+            }
+        }
+
+        // Decode: one mesh step over every lane that still needs tokens.
+        let active: Vec<usize> = (0..lanes.len())
+            .filter(|&i| lanes[i].in_mesh && lanes[i].committed.len() < cfg.tokens)
+            .collect();
+        if active.is_empty() {
+            if prefill.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let mut requests = Vec::with_capacity(active.len());
+        for &i in &active {
+            let lane = &lanes[i];
+            let (position, _) = mesh
+                .root()
+                .lane_position(lane.epoch)
+                .ok_or_else(|| format!("lane {i}: the root lost its position"))?;
+            requests.push(LaneRequest {
+                epoch: lane.epoch,
+                remaining: cfg.tokens - lane.committed.len(),
+                context_left: max_seq.saturating_sub(position),
+                copy_candidates: Vec::new(),
+                forced: None,
+                sampling: SamplingMode::Greedy,
+            });
+        }
+        let started = Instant::now();
+        let report = mesh
+            .step(bundle, gpu, &requests, &budgets, &mut GreedyRule)
+            .map_err(mesh_step_error)?;
+        let wall = started.elapsed().as_secs_f64();
+        steps += 1;
+        steps_wall += wall;
+        let mut emitted_step = 0usize;
+        for out in &report.output.lanes {
+            let idx = lanes
+                .iter()
+                .position(|lane| lane.epoch == out.key.request_epoch)
+                .ok_or("mesh output epoch is not one of this run's lanes")?;
+            let lane = &mut lanes[idx];
+            lane.committed.extend_from_slice(&out.emitted);
+            lane.windows += 1;
+            lane.offered += out.source.offered as u64;
+            lane.accepted += out.source.accepted as u64;
+            emitted_step += out.emitted.len();
+            total_windows += 1;
+            total_offered += out.source.offered as u64;
+            total_accepted += out.source.accepted as u64;
+            total_emitted += out.emitted.len() as u64;
+            windows.push(json!({
+                "k": k, "step": report.key.step_seq, "lane": idx,
+                "window_seq": out.key.window_seq,
+                "source": format!("{:?}", out.source.source),
+                "offered": out.source.offered,
+                "accepted": out.source.accepted,
+                "consumed_rows": out.consumed_rows,
+                "emitted": out.emitted,
+                "terminal": out.terminal,
+            }));
+        }
+        if let Some(prior) = mesh.last_evidence() {
+            windows.push(json!({
+                "k": k, "kind": "evidence-of-previous-step",
+                "prior_priced": report.prior_priced,
+                "evidence": merged_json(prior),
+            }));
+        }
+        if !prefill_ran {
+            decode_steps += 1;
+            decode_wall += wall;
+            decode_tokens += emitted_step;
+        }
+    }
+    for (i, lane) in lanes.iter().enumerate() {
+        if lane.committed.len() < cfg.tokens {
+            return Err(format!(
+                "lane {i} ended with {}/{} committed ids",
+                lane.committed.len(),
+                cfg.tokens
+            ));
+        }
+    }
+    let ids: Vec<Vec<u32>> = lanes
+        .iter()
+        .map(|lane| lane.committed[..cfg.tokens].to_vec())
+        .collect();
+    let summary = json!({
+        "windows": total_windows,
+        "drafts_offered": total_offered,
+        "drafts_accepted": total_accepted,
+        "tokens_emitted": total_emitted,
+        // Accepted drafts per window (the wire `tau`) and emitted per window.
+        "tau": if total_windows > 0 { total_accepted as f64 / total_windows as f64 } else { 0.0 },
+        "yield": if total_windows > 0 { total_emitted as f64 / total_windows as f64 } else { 0.0 },
+        "per_lane": lanes.iter().map(|l| json!({
+            "windows": l.windows, "offered": l.offered, "accepted": l.accepted,
+        })).collect::<Vec<_>>(),
+    });
+    Ok((
+        KRun {
+            k,
+            ids,
+            logits_sha: vec![Vec::new(); k],
+            steps,
+            decode_steps,
+            decode_tokens,
+            steps_wall,
+            decode_wall,
+            lane_decode_rows: lanes.iter().map(|l| l.committed.len().saturating_sub(1)).collect(),
+        },
+        summary,
+    ))
+}
+
+/// The native-MTP EP arm: stage MTP lanes, then every K of `args.ks` as
+/// concurrent lanes, ids compared with the serialized singleton AR reference.
+/// One outcome (policy label `mtp:k=..,routes=..`).
+#[allow(clippy::too_many_arguments)]
+fn drive_mtp_ep(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    args: &Args,
+    prompts: &[&[u32]],
+    references: &[Reference],
+    max_lanes: usize,
+    row_budget: usize,
+    vocab: usize,
+    ids_lines: &mut Vec<Value>,
+) -> R<Vec<PolicyOutcome>> {
+    let depth = args.k.unwrap_or(DEFAULT_K);
+    let routes = args.routes.unwrap_or(RoutesArg::Cycle);
+    let label = format!("mtp:k={depth},routes={}", routes.name());
+    if args.logits {
+        return Err("--logits is not available with --spec mtp (verify rows are not AR rows)".into());
+    }
+    gpu.bind_thread().map_err(e)?;
+    bundle
+        .stage_lanes(
+            gpu,
+            max_lanes,
+            row_budget,
+            Some(LaneSpecConfig {
+                k: depth,
+                end_of_turn: None,
+            }),
+        )
+        .map_err(e)?;
+    let mut mesh = EpMeshLanes::new(bundle, 1, routes == RoutesArg::Floor)?;
+    let cfg = DriveCfg {
+        prompts,
+        tokens: args.tokens,
+        max_lanes,
+        row_budget,
+        want_logits: false,
+    };
+    let mut next_tag = 0u64;
+    let mut runs = Vec::new();
+    let mut per_k = Vec::new();
+    let mut failures = Vec::new();
+    let mut status = PolicyStatus::Pass;
+    for &k in &args.ks {
+        eprintln!("[{TOOL}] {label}: K={k}: {k} concurrent MTP lanes ({} tokens)", args.tokens);
+        let out = match drive_mtp_k(
+            bundle, gpu, &mut mesh, &cfg, args.max_seq, depth, routes, k, &mut next_tag, vocab,
+        ) {
+            Ok(out) => out,
+            Err(x) => {
+                status = PolicyStatus::Error(format!("K={k}: {x}"));
+                break;
+            }
+        };
+        let run = &out.run;
+        let mut compared = Vec::with_capacity(k);
+        for index in 0..k {
+            ids_lines.push(json!({
+                "kind": "lane", "policy": label, "k": k, "prompt": index, "ids": run.ids[index],
+            }));
+            let comparison = compare(
+                &references[index].ids[..args.tokens],
+                &run.ids[index],
+                None,
+            );
+            if !comparison.equal {
+                if status == PolicyStatus::Pass {
+                    status = PolicyStatus::Fail;
+                }
+                failures.push(format!("K={k} prompt {index}"));
+            }
+            compared.push(comparison_json(index, &comparison));
+        }
+        for w in &out.windows {
+            ids_lines.push(json!({"kind": "window", "policy": label, "window": w}));
+        }
+        let equal = compared.iter().all(|c| c["equal"] == json!(true));
+        per_k.push(json!({
+            "k": run.k, "equal": equal,
+            "decode_wall_s": run.decode_wall,
+            "aggregate_tok_s": run.aggregate_tok_s(),
+        }));
+        runs.push(json!({
+            "k": run.k,
+            "equal": equal,
+            "prompts": compared,
+            "steps": run.steps,
+            "decode_steps": run.decode_steps,
+            "decode_tokens": run.decode_tokens,
+            "decode_wall_s": run.decode_wall,
+            "steps_wall_s": run.steps_wall,
+            "aggregate_tok_s": run.aggregate_tok_s(),
+            "mtp": out.summary,
+            "rank_stats": out.rank_stats,
+            "timing_includes_logits_read": false,
+        }));
+    }
+    let mut record = json!({
+        "spec": label,
+        "describe": format!("native-MTP EP lanes depth {depth} routes {}", routes.name()),
+        "tokens": args.tokens,
+        "status": status.label(),
+        "all_equal": status == PolicyStatus::Pass,
+        "failures": failures,
+        "per_k": per_k,
+        "runs": runs,
+    });
+    if let PolicyStatus::Error(message) = &status {
+        record["error"] = json!(message);
+    }
+    Ok(vec![PolicyOutcome {
+        spec: label,
+        status,
+        record,
+        failures,
+    }])
+}
+
 // ------------------------------------------------------------------- main
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1968,9 +2473,15 @@ fn ensure_spec_supported(args: &Args) -> R<()> {
             if let Some(point) = args.fault_point {
                 shape.push_str(&format!(" fault-point={}", point.name()));
             }
-            Err(format!(
-                "{TOOL}: --spec mtp ({shape}) is not yet implemented by S3/S5: the EP/PP speculative lane protocol this arm drives has not landed. This refusal is the interface boundary, not a pass; the invocation was validated and recorded in manifest.json"
-            ))
+            // The EP lane protocol (S3) runs the plain greedy matrix; the PP arm
+            // (S5), the soak and the fault points are other owners' boundaries.
+            if args.pp > 1 || args.soak_seconds.is_some() || args.fault_point.is_some() {
+                return Err(format!(
+                    "{TOOL}: --spec mtp ({shape} pp={}) is not yet implemented by S3/S5: only the EP2 greedy matrix (--pp 1, no --soak-seconds/--fault-point) executes. This refusal is the interface boundary, not a pass; the invocation was validated and recorded in manifest.json",
+                    args.pp
+                ));
+            }
+            Ok(())
         }
     }
 }
@@ -2312,6 +2823,28 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     // Lanes: staged once, then every policy's whole K matrix.
     let prompt_ids: Vec<&[u32]> = prompts.iter().map(|prompt| prompt.ids.as_slice()).collect();
     let outcomes = match pp_gpus.as_deref_mut() {
+        Some(_) if args.spec == SpecMode::Mtp => {
+            return Err("--spec mtp under --pp is the PP arm, not implemented here".into());
+        }
+        None if args.spec == SpecMode::Mtp => {
+            if !ep {
+                return Err(
+                    "--spec mtp runs the EP2 mesh lane protocol: load with topology.ep (the single-card MTP lane oracle is fn_lane_oracle)"
+                        .into(),
+                );
+            }
+            drive_mtp_ep(
+                bundle,
+                &mut gpu,
+                args,
+                &prompt_ids,
+                &references,
+                max_lanes_requested,
+                row_budget,
+                vocab,
+                ids_lines,
+            )
+        }
         Some(gpus) => drive_all(
             &mut PpLanes {
                 bundle,
@@ -3609,8 +4142,11 @@ mod spec_schema_tests {
     fn mtp_execution_is_an_explicit_boundary_and_ar_is_not() {
         let ar = parse("", 1).unwrap();
         ensure_spec_supported(&ar).unwrap();
+        // The EP greedy matrix executes; soak, fault points and PP refuse.
+        ensure_spec_supported(&parse(" --spec mtp", 1).unwrap()).unwrap();
+        ensure_spec_supported(&parse(" --spec mtp --k 7 --routes batched", 1).unwrap()).unwrap();
         for extra in [
-            " --spec mtp",
+            " --spec mtp --pp 2",
             " --spec mtp --k 7 --routes cycle --soak-seconds 1800",
             " --spec mtp --fault-point target-edge",
         ] {
