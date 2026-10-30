@@ -7871,18 +7871,74 @@ pub(crate) struct NativeFinish<'a> {
     pub retain: bool,
 }
 
+/// A native window whose every fallible target/head operation succeeded and
+/// whose tickets validated, but whose tickets are still live (nothing is
+/// consumed). [`publish_native_window`] consumes them; a caller whose
+/// cross-owner agreement fails drops this and aborts, leaving the tickets
+/// for the outer rollback.
+pub(crate) struct PreparedNativeWindow {
+    /// The window's outcome, returned by publish.
+    pub window: MtpWindow,
+    /// The still-live pre-window target ticket.
+    pub target_snapshot: TargetTicket,
+    /// The still-live pre-window head ticket.
+    pub mtp_ticket: HeadTicket,
+    /// Retain (keep rollback-able) instead of consuming at publish.
+    pub retain: bool,
+    /// The position both target and head hold after the window.
+    pub committed_end: usize,
+}
+
 /// A batched window's tail, from the target's accepted length through the
 /// ticket commit: ring rollback (or the replay when the ring does not cover
 /// the verify), head commit (truncate to the seed's row, then the kept drafts' rows rebuilt teacher-forced), the
 /// position checks, the pending hidden copy and the commit of both tickets.
 /// `mtp_step` and the lane executor both end their windows here; the caller
 /// clears its own scratch ticket and head ticket after `Ok`.
+/// Composition of [`prepare_native_window`] and [`publish_native_window`].
 pub(crate) fn finish_native_window(
     picks: &mut Qwen4Bundle,
     ops: &mut Qwen4Ops<'_>,
     f: NativeFinish<'_>,
-    mut timers: Option<&mut MtpPhaseTimers>,
+    timers: Option<&mut MtpPhaseTimers>,
 ) -> Result<MtpWindow, String> {
+    let prepared = prepare_native_window(picks, ops, f, timers)?;
+    publish_native_window(picks, ops, prepared)
+}
+
+/// Consume (or retain) the tickets of a [`PreparedNativeWindow`]. Infallible
+/// for a Local target (the tickets were validated by prepare and no GPU
+/// operation runs here). The Mesh variant (`pp_window_finalize`) can fail,
+/// hence the `Result`; the PP policy for that failure belongs to the PP path.
+pub(crate) fn publish_native_window(
+    picks: &mut Qwen4Bundle,
+    ops: &mut Qwen4Ops<'_>,
+    prepared: PreparedNativeWindow,
+) -> Result<MtpWindow, String> {
+    let PreparedNativeWindow {
+        window,
+        target_snapshot,
+        mtp_ticket,
+        retain,
+        committed_end,
+    } = prepared;
+    debug_assert_eq!(
+        picks.state.position, committed_end,
+        "publish_native_window: the target moved after prepare"
+    );
+    picks.ops_finish_window(ops, target_snapshot, mtp_ticket, retain)?;
+    Ok(window)
+}
+
+/// Every fallible operation of a window's tail (target rollback/replay, head
+/// restore and teacher-forced rebuild, position checks, pending hidden copy)
+/// plus a non-consuming ticket validation. On `Err` no ticket was consumed.
+pub(crate) fn prepare_native_window(
+    picks: &mut Qwen4Bundle,
+    ops: &mut Qwen4Ops<'_>,
+    f: NativeFinish<'_>,
+    mut timers: Option<&mut MtpPhaseTimers>,
+) -> Result<PreparedNativeWindow, String> {
     let NativeFinish {
         position,
         block,
@@ -7992,12 +8048,18 @@ pub(crate) fn finish_native_window(
         drafts_generated: drafts.len(),
     };
     // All fallible GPU operations are complete. Validate every owner's
-    // ticket (every band and the head, under a mesh) before invalidating
-    // any, then perform the no-copy commit boundary; a retaining window keeps
-    // the arena entries instead, so a terminal stop inside it can still roll
-    // every owner back.
-    picks.ops_finish_window(ops, target_snapshot, mtp_ticket, retain)?;
-    Ok(window)
+    // ticket (every band and the head, under a mesh) without consuming any;
+    // `publish_native_window` performs the no-copy commit boundary (a
+    // retaining window keeps the arena entries instead, so a terminal stop
+    // inside it can still roll every owner back).
+    picks.ops_window_valid(target_snapshot, mtp_ticket)?;
+    Ok(PreparedNativeWindow {
+        window,
+        target_snapshot,
+        mtp_ticket,
+        retain,
+        committed_end,
+    })
 }
 
 /// How a batched window's head reaches the committed position. Every route
