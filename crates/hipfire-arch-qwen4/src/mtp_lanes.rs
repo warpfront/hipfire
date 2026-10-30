@@ -820,6 +820,7 @@ pub(crate) fn prepare_lane_window(
                 verify_hidden: &verify_hidden,
                 ple_normed: Some(&ple_normed),
                 retain: false,
+                head_at_start: false,
             },
             None,
         )

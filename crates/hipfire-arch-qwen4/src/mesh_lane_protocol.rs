@@ -49,10 +49,10 @@ use crate::mesh_lane_copy::{
 };
 use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy};
 use crate::mtp_spec::{target_commit_accept_len, HeadLag, NGRAM_DEPTHS};
+use crate::sampled_lane::{DraftRead, LaneRng, RowHandle};
 use hipfire_runtime::ngram_mod::NgramModConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::{accept_greedy_prefix, GreedyAccept, MtpWindow};
-use hipfire_runtime::spec_sampling::SpecRng;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -684,11 +684,14 @@ pub struct DraftRound {
     pub catch_up: Vec<(LaneWindowKey, CatchUp)>,
 }
 
-/// What the sampler owner read for one op. The head's q/candidate
-/// distribution handle (S4) extends this struct.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the sampler owner read for one op: the head's argmax and keep-going
+/// hint, and (Leviathan lanes) the exact candidate logits `q` is built from.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftProposal {
     pub key: LaneWindowKey,
+    /// The head's argmax token. Greedy/naive lanes propose exactly this; a
+    /// Leviathan lane's token is drawn by the root from `read`
+    /// ([`AcceptRule::draft_token`]) and this value is only a hint.
     pub token: u32,
     /// The head's own hint that deeper drafting is worthwhile; the root
     /// combines it with depth/EOS and may still stop.
@@ -698,11 +701,12 @@ pub struct DraftProposal {
     /// the ledger) but is NOT kept; drafting ends. Never set on the first
     /// draft of a lane.
     pub drop_last: bool,
-    /// The head's row-0 argmax before any sampled draw, when it differs from
-    /// `token` (a sampled lane). The first-candidate confirmation of a copy
-    /// window compares it (`None`: `token` is the argmax). Read only for a
-    /// lane's confirmation op.
-    pub argmax: Option<u32>,
+    /// The head's exact rescored candidate logits (or the full draft row),
+    /// copied out before another lane's Draft overwrites the shared draft
+    /// buffers. `Some` only for a Leviathan lane (S4); the root builds `q`
+    /// from it under the lane's sampler. A dropped proposal still draws
+    /// (the singleton draws before it prunes).
+    pub read: Option<DraftRead>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -800,9 +804,18 @@ pub fn pack_row_groups(rows: &[usize], max_rows: usize) -> Vec<RowGroup> {
 /// The sampler owner's target output for the sealed rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SamplerOutput {
-    /// Per lane (plan order): the target's pick at every row. S4 extends
-    /// this with per-row distribution handles for sampled routes.
+    /// Per lane (plan order): the target's pick at every row.
     pub picks: Vec<(LaneWindowKey, Vec<u32>)>,
+    /// Lazy access to the sampler owner's resident verify logits, for the
+    /// root's sampled acceptance (S4). `None` on greedy-only steps.
+    pub rows: Option<RowHandle>,
+}
+
+impl SamplerOutput {
+    /// Greedy picks only (no distribution rows).
+    pub fn picks_only(picks: Vec<(LaneWindowKey, Vec<u32>)>) -> Self {
+        Self { picks, rows: None }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -900,13 +913,36 @@ pub trait AcceptRule {
     /// `drafts` are the verified proposals; `picks` the target's pick per
     /// verify row (`drafts.len() + 1` long). Returns the committed tail:
     /// accepted drafts then the bonus, unless an accepted draft was EOS.
+    /// `Err` (a row could not be read, a distribution is missing) aborts the
+    /// step; the staged RNG is then discarded.
     fn accept(
         &mut self,
         lane: &LanePlan,
         drafts: &[u32],
         picks: &[u32],
-        rng: &mut SpecRng,
-    ) -> GreedyAccept;
+        rng: &mut LaneRng,
+    ) -> Result<GreedyAccept, String>;
+
+    /// The token of native proposal `index` of `lane` (`prior_drafts` are
+    /// the `index` tokens already kept). Called by the root for every head
+    /// proposal with the lane's staged RNG. The default keeps the head's
+    /// argmax; a Leviathan rule draws from `q` here.
+    fn draft_token(
+        &mut self,
+        _lane: &LanePlan,
+        _index: usize,
+        _prior_drafts: &[u32],
+        proposal: &DraftProposal,
+        _rng: &mut LaneRng,
+    ) -> Result<u32, String> {
+        Ok(proposal.token)
+    }
+
+    /// The sampler owner's verify output, before any `accept` of the step.
+    fn observe_verify(&mut self, _out: &SamplerOutput) {}
+
+    /// The step published: fold its emitted tokens into rule-side history.
+    fn on_publish(&mut self, _out: &StepOutput) {}
 }
 
 /// The shared greedy accept-prefix rule; never draws.
@@ -918,9 +954,9 @@ impl AcceptRule for GreedyRule {
         lane: &LanePlan,
         drafts: &[u32],
         picks: &[u32],
-        _rng: &mut SpecRng,
-    ) -> GreedyAccept {
-        accept_greedy_prefix(drafts, picks, lane.eos)
+        _rng: &mut LaneRng,
+    ) -> Result<GreedyAccept, String> {
+        Ok(accept_greedy_prefix(drafts, picks, lane.eos))
     }
 }
 
@@ -1297,7 +1333,7 @@ struct RootLane {
     position: usize,
     seed: u32,
     eos: Option<u32>,
-    rng: SpecRng,
+    rng: LaneRng,
     policy: Option<LaneSpecPolicy>,
     generated: Vec<u32>,
     /// The request's copy lane (`None`: copy not armed on this lane).
@@ -1334,7 +1370,7 @@ struct PendingObservation {
 #[derive(Clone)]
 struct StagedLane {
     epoch: RequestEpoch,
-    rng: SpecRng,
+    rng: LaneRng,
     policy: Option<LaneSpecPolicy>,
     window: Option<WindowUpdate>,
     /// The copy lane's mutable state, staged (`None`: copy not armed).
@@ -1674,7 +1710,7 @@ impl MeshRoot {
                 position: a.position,
                 seed: a.seed,
                 eos: a.eos,
-                rng: SpecRng::new(a.rng_seed),
+                rng: LaneRng::new(a.rng_seed),
                 policy,
                 generated: Vec::new(),
                 copy,
@@ -1755,6 +1791,12 @@ impl MeshRoot {
             let mut r = l.rng;
             r.next_u64()
         })
+    }
+
+    /// Both of the request's RNG streams as `(next Leviathan draw, naive
+    /// xorshift32 state)`, without advancing them (diagnostic).
+    pub fn rng_fingerprint(&self, epoch: RequestEpoch) -> Option<(u64, u32)> {
+        self.lanes.get(&epoch).map(|l| l.rng.fingerprint())
     }
 
     pub fn generated(&self, epoch: RequestEpoch) -> Option<&[u32]> {
@@ -2274,6 +2316,20 @@ impl MeshRoot {
         round: &DraftRound,
         results: &[RankDraftResult],
     ) -> Result<(), ProtocolError> {
+        self.collect_draft_with(round, results, &mut GreedyRule)
+    }
+
+    /// [`Self::collect_draft`] with the acceptance rule that draws sampled
+    /// proposals: for every proposal the root asks `rule.draft_token` with the
+    /// lane's *staged* RNG (a Leviathan lane's token is drawn from its `q`
+    /// here; nothing else draws). A rule error aborts the step and the staged
+    /// RNG is discarded with it.
+    pub fn collect_draft_with(
+        &mut self,
+        round: &DraftRound,
+        results: &[RankDraftResult],
+        rule: &mut dyn AcceptRule,
+    ) -> Result<(), ProtocolError> {
         self.check_phase("collect_draft", StepPhase::Armed)?;
         {
             let s = self.step_ref();
@@ -2369,45 +2425,82 @@ impl MeshRoot {
             ));
         }
         let n_ops = round.ops.len();
-        let s = self.step_mut();
-        for p in &proposals {
-            let i = s
-                .start
-                .lanes
-                .iter()
-                .position(|l| l.key == p.key)
-                .expect("keys checked against the round");
-            let l = &s.start.lanes[i];
-            let (source, copy_confirm, native_depth, max_depth, eos) =
-                (l.source, l.copy_confirm, l.native_depth, l.max_depth, l.eos);
-            let first_candidate = l.copy_drafts.first().copied();
-            let d = &mut s.draft[i];
-            if source == ProposalSource::Copy && copy_confirm && d.confirm.is_none() {
-                // The first-candidate confirmation: the head's own row-0
-                // argmax. A hit abandons the head's draft (the window is a
-                // copy window); a miss falls back to the native route.
-                let hit = first_candidate == Some(p.argmax.unwrap_or(p.token));
-                d.confirm = Some(hit);
-                if hit || native_depth == 0 {
+        let mut failure: Option<String> = None;
+        {
+            let s = self.step_mut();
+            for p in &proposals {
+                let i = s
+                    .start
+                    .lanes
+                    .iter()
+                    .position(|l| l.key == p.key)
+                    .expect("keys checked against the round");
+                let l = &s.start.lanes[i];
+                let (source, copy_confirm, native_depth, max_depth, eos) =
+                    (l.source, l.copy_confirm, l.native_depth, l.max_depth, l.eos);
+                let first_candidate = l.copy_drafts.first().copied();
+                if source == ProposalSource::Copy && copy_confirm && s.draft[i].confirm.is_none()
+                {
+                    // The first-candidate confirmation: the head's own row-0
+                    // argmax (`p.token`, before any sampled draw: nothing is
+                    // drawn for an abandoned draft). A hit abandons the
+                    // head's draft (the window is a copy window); a miss
+                    // falls back to the native route and draws as it would.
+                    let hit = first_candidate == Some(p.token);
+                    let d = &mut s.draft[i];
+                    d.confirm = Some(hit);
+                    if hit || native_depth == 0 {
+                        d.active = false;
+                        continue;
+                    }
+                }
+                let index = s.draft[i].drafts.len();
+                // After a missed confirmation the drafts are the native
+                // route's: the rule sees the lane as a native window.
+                let native_view;
+                let lane_view: &LanePlan = if source == ProposalSource::Copy {
+                    let mut v = s.start.lanes[i].clone();
+                    v.source = ProposalSource::Native;
+                    native_view = v;
+                    &native_view
+                } else {
+                    &s.start.lanes[i]
+                };
+                let token = match rule.draft_token(
+                    lane_view,
+                    index,
+                    &s.draft[i].drafts,
+                    p,
+                    &mut s.staged[i].rng,
+                ) {
+                    Ok(token) => token,
+                    Err(e) => {
+                        failure = Some(format!("proposal {index} of lane {i}: {e}"));
+                        break;
+                    }
+                };
+                let cap = if source == ProposalSource::Copy {
+                    native_depth
+                } else {
+                    max_depth
+                };
+                let d = &mut s.draft[i];
+                if p.drop_last {
+                    // A dropped token never enters the window.
                     d.active = false;
-                    continue;
+                } else {
+                    d.drafts.push(token);
+                    d.active = p.keep_going && d.drafts.len() < cap && eos != Some(token);
                 }
             }
-            let cap = if source == ProposalSource::Copy {
-                native_depth
-            } else {
-                max_depth
-            };
-            if p.drop_last {
-                // A dropped token never enters the window.
-                d.active = false;
-            } else {
-                d.drafts.push(p.token);
-                d.active = p.keep_going && d.drafts.len() < cap && eos != Some(p.token);
+            if failure.is_none() {
+                s.round += 1;
+                s.head_calls += n_ops;
             }
         }
-        s.round += 1;
-        s.head_calls += n_ops;
+        if let Some(reason) = failure {
+            return Err(self.fail(None, reason));
+        }
         Ok(())
     }
 
@@ -2610,9 +2703,10 @@ impl MeshRoot {
                 s.picks.clone().expect("verified phase holds picks"),
             )
         };
+        rule.observe_verify(&picks);
         let mut decisions = Vec::with_capacity(start.lanes.len());
         let mut updates: Vec<(usize, WindowUpdate, Option<MtpWindow>)> = Vec::new();
-        let mut rng_out: Vec<SpecRng> = Vec::new();
+        let mut rng_out: Vec<LaneRng> = Vec::new();
         let mut shadows: Vec<Option<CopyShadow>> = Vec::new();
         let mut final_sources: Vec<ProposalSource> = Vec::new();
         for (i, l) in start.lanes.iter().enumerate() {
@@ -2635,7 +2729,14 @@ impl MeshRoot {
                     // only for a window that stayed a copy window).
                     let mut eff = l.clone();
                     eff.source = fsrc;
-                    let acc = rule.accept(&eff, drafts, lane_picks, &mut rng);
+                    let acc = match rule.accept(&eff, drafts, lane_picks, &mut rng) {
+                        Ok(acc) => acc,
+                        Err(e) => {
+                            return Err(
+                                self.fail(None, format!("acceptance of lane {i} failed: {e}"))
+                            )
+                        }
+                    };
                     let accepted_eos = acc.hit_eos && acc.committed.len() == acc.accepted;
                     let shape_ok = acc.accepted <= drafts.len()
                         && !acc.committed.is_empty()
@@ -3604,7 +3705,7 @@ pub fn run_mesh_step(
                 }
             }
         }
-        if let Err(e) = root.collect_draft(&round, &results) {
+        if let Err(e) = root.collect_draft_with(&round, &results, rule) {
             return Err(abort_all_after(root, ranks, e));
         }
     }
@@ -3649,6 +3750,7 @@ pub fn run_mesh_step(
         return Err(abort_all_after(root, ranks, e));
     }
     let out = root.publish_commit()?;
+    rule.on_publish(&out);
     for r in ranks.iter_mut() {
         r.publish_commit(&decision);
     }
@@ -3696,9 +3798,6 @@ pub(crate) mod scripted {
         /// Head step `j` drafted a token that the singleton rule drops
         /// (default `false`).
         pub drop_last: Vec<bool>,
-        /// The head's row-0 argmax when it differs from the drafted token
-        /// (a sampled lane); read by a copy window's confirmation.
-        pub argmax: Option<u32>,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -3848,7 +3947,7 @@ pub(crate) mod scripted {
                         token,
                         keep_going: w.keep_going.get(j).copied().unwrap_or(true),
                         drop_last: w.drop_last.get(j).copied().unwrap_or(false),
-                        argmax: if j == 0 { w.argmax } else { None },
+                        read: None,
                     });
                 }
                 res.proposals = Some(props);
@@ -3883,7 +3982,7 @@ pub(crate) mod scripted {
                     }
                     picks.push((l.key, w.picks[..l.rows.len()].to_vec()));
                 }
-                res.sampler = Some(SamplerOutput { picks });
+                res.sampler = Some(SamplerOutput::picks_only(picks));
             }
             let c = self.counts.entry(plan.key.clone()).or_default();
             c.row_groups = plan.ledger.row_groups;
@@ -3964,6 +4063,7 @@ mod tests {
     use super::scripted::*;
     use super::*;
     use crate::gpu_forward_lanes::row_group_count;
+    use hipfire_runtime::spec_sampling::SpecRng;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -4127,7 +4227,6 @@ mod tests {
                     picks: picks.to_vec(),
                     keep_going: Vec::new(),
                     drop_last: Vec::new(),
-                    argmax: None,
                 },
             );
         }
@@ -4284,8 +4383,8 @@ mod tests {
             _lane: &LanePlan,
             drafts: &[u32],
             picks: &[u32],
-            rng: &mut SpecRng,
-        ) -> GreedyAccept {
+            rng: &mut LaneRng,
+        ) -> Result<GreedyAccept, String> {
             let mut committed = Vec::new();
             let mut accepted = 0;
             for &d in drafts {
@@ -4297,11 +4396,11 @@ mod tests {
             }
             let _ = rng.next_u64();
             committed.push(picks[accepted]);
-            GreedyAccept {
+            Ok(GreedyAccept {
                 committed,
                 accepted,
                 hit_eos: false,
-            }
+            })
         }
     }
 
@@ -5878,14 +5977,14 @@ mod tests {
                 _l: &LanePlan,
                 d: &[u32],
                 _p: &[u32],
-                _r: &mut SpecRng,
-            ) -> GreedyAccept {
+                _r: &mut LaneRng,
+            ) -> Result<GreedyAccept, String> {
                 // Claims an accepted prefix that is not the drafts.
-                GreedyAccept {
+                Ok(GreedyAccept {
                     committed: vec![d[0] + 1, 5],
                     accepted: 1,
                     hit_eos: false,
-                }
+                })
             }
         }
         let mut m = Mesh::new(MeshKind::Ep, false);

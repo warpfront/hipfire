@@ -30,9 +30,7 @@ use crate::weights::{
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 use hipfire_runtime::ple_hot_store::HotRowStore;
-use hipfire_runtime::sampler::{
-    apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, PenaltyTable, SamplerConfig,
-};
+use hipfire_runtime::sampler::{apply_logit_policy_cpu, PenaltyTable, SamplerConfig};
 use hipfire_runtime::session_cache::{
     stride_boundaries, SessionCache, SessionDriver, SessionPieceKey, SessionRoute, SessionState,
     SnapshotParts, StateLayout,
@@ -3236,7 +3234,10 @@ impl Qwen4Bundle {
     /// re-scored candidates' exact logits, or the whole draft logit row when
     /// the draft head does not re-score. `policy` is applied over `history`
     /// (the AR history of the row being drafted) to those exact logits, by
-    /// token id, before truncation.
+    /// token id, before truncation. The statistics are
+    /// [`crate::sampled_lane::draft_dist_from_candidates`] /
+    /// [`crate::sampled_lane::draft_dist_from_row`], shared with the mesh
+    /// lanes' root-side `q` ([`Self::mtp_draft_read`] is their device read).
     pub(crate) fn mtp_draft_dist(
         &self,
         gpu: &Gpu,
@@ -3256,37 +3257,43 @@ impl Qwen4Bundle {
             .draft;
         let vocab = self.config.vocab_size as u32;
         match draft.rescored_candidates() {
-            Some(candidates) => {
-                scratch.clear();
-                scratch.extend(
-                    candidates
-                        .iter()
-                        .copied()
-                        .filter(|&(token, _)| token < vocab),
-                );
-                // `rescored_candidates` is a fixed `[_; 8]`, so the filtered
-                // count is at most 8.
-                let mut ids = [0u32; 8];
-                let mut values = [0f32; 8];
-                let n = scratch.len();
-                for (slot, &(token, logit)) in scratch.iter().enumerate() {
-                    ids[slot] = token;
-                    values[slot] = logit;
-                }
-                apply_logit_policy_candidates_cpu(&ids[..n], &mut values[..n], history, policy);
-                for (entry, &logit) in scratch.iter_mut().zip(&values[..n]) {
-                    entry.1 = logit;
-                }
-                out.build_from_candidates(scratch, spec)
-            }
+            Some(candidates) => crate::sampled_lane::draft_dist_from_candidates(
+                candidates, vocab, spec, history, policy, scratch, out,
+            ),
             None => {
                 gpu.download_f32_into(draft.logits(), host)
                     .map_err(BundleError::Hip)?;
-                apply_logit_policy_cpu(host, history, policy);
-                out.build_from_logits(host, spec, scratch)
+                crate::sampled_lane::draft_dist_from_row(host, spec, history, policy, scratch, out)
             }
         }
         .map_err(BundleError::Forward)
+    }
+
+    /// The last MTP prediction's raw draft material, copied out of the head's
+    /// shared buffers: the 8 re-scored candidates' exact logits (host-resident,
+    /// no device traffic), or the whole draft logit row when the head does not
+    /// re-score. A mesh lane's sampler owner calls this right after each Draft
+    /// op, before another lane's Draft overwrites the buffers, and hands the
+    /// copy to the root ([`crate::mesh_lane_protocol::DraftProposal::read`]).
+    pub fn mtp_draft_read(&self, gpu: &Gpu) -> Result<crate::sampled_lane::DraftRead, BundleError> {
+        let draft = &self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .draft;
+        match draft.rescored_candidates() {
+            Some(candidates) => Ok(crate::sampled_lane::DraftRead::Candidates(
+                candidates.to_vec(),
+            )),
+            None => {
+                let mut row = Vec::new();
+                gpu.download_f32_into(draft.logits(), &mut row)
+                    .map_err(BundleError::Hip)?;
+                Ok(crate::sampled_lane::DraftRead::FullRow(row))
+            }
+        }
     }
 
     /// The last MTP step of a chain: append only its K/V and index-key cache
