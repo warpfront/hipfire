@@ -63,6 +63,30 @@
 //!     [--pp 1] [--row-budget R] [--skip-model-hash] [--logits]
 //!     [--policies 'g0' | 'per-lane;per-lane:moe=once;production'] [--tokens-sweep N]
 //! ```
+//!
+//! Speculative-lane schema (CLI contract; execution is an explicit boundary):
+//! ```text
+//!     [--spec ar|mtp] [--k K] [--routes floor|cycle|batched]
+//!     [--soak-seconds S [--soak-seed N]] [--fault-point POINT]
+//! ```
+//! `--spec ar` (default) is the oracle above, unchanged. `--spec mtp` selects
+//! the native-MTP lane arm: `--k` is the draft depth (1..=7, default 3) and
+//! `--routes` the window route policy (`floor` = production floor, `batched` =
+//! forced batched windows, `cycle` = deterministic native/copy/AR mix, default
+//! `cycle`), as in `fn_lane_oracle`. `--soak-seconds S` runs the bounded
+//! mixed-lifecycle soak (lanes 1..=max(ks), cycling native/copy/AR, late
+//! arrivals, cancellations and slot reuse from the recorded `--soak-seed`);
+//! `--fault-point` injects one all-owner abort at `before-draft`,
+//! `head-round`, `target-edge`, `repair` or `before-publish` and expects the
+//! bounded join and quarantine. `--k`, `--routes`, `--soak-seconds` and
+//! `--fault-point` need `--spec mtp`; soak and a fault point are exclusive.
+//! Every `--spec mtp` invocation is parsed, validated and recorded in
+//! `manifest.json`, then fails with "not yet implemented by S3/S5" until the
+//! EP/PP speculative lane protocol lands: that refusal is the interface
+//! boundary, never a pass. `DIR/manifest.json` (all specs) holds the expanded
+//! command, the SHA-256 of every prompt fixture and of this binary, the
+//! model hash (once computed) and the recorded environment.
+//!
 //! `--pp N>1` loads the model on a PP mesh (the `pp` argument of `load_model`,
 //! as `fn_ep_oracle`); the topology (`pp`, `band_counts`, `output_owner`,
 //! `devices`) is recorded in `report.json`.
@@ -175,7 +199,7 @@ fn ids_md5(ids: &[u32]) -> String {
 
 // ------------------------------------------------------------------- args
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Args {
     model: String,
     prompt_files: Vec<String>,
@@ -197,6 +221,18 @@ struct Args {
     /// Loader-planned AR lane capacity (`--reserve-lanes N`): the admitted
     /// route's per-load VMM batch request. `None` = plain `load_model`.
     reserve_lanes: Option<usize>,
+    /// `--spec`; the AR oracle unless `mtp`.
+    spec: SpecMode,
+    /// Draft depth; `Some` exactly under `--spec mtp` (default [`DEFAULT_K`]).
+    k: Option<usize>,
+    /// Route policy; `Some` exactly under `--spec mtp` (default cycle).
+    routes: Option<RoutesArg>,
+    /// Bounded mixed-lifecycle soak, seconds (`--spec mtp` only).
+    soak_seconds: Option<u64>,
+    /// Lifecycle seed of the soak; `Some` exactly when `soak_seconds` is.
+    soak_seed: Option<u64>,
+    /// Injected abort point (`--spec mtp` only, exclusive with the soak).
+    fault_point: Option<FaultPoint>,
 }
 
 fn parse_ks(value: &str) -> R<Vec<usize>> {
@@ -273,6 +309,111 @@ fn parse_policies(value: &str) -> R<Vec<PolicyEntry>> {
     Ok(entries)
 }
 
+// ------------------------------------------------------------- spec schema
+
+/// `--spec`: the AR oracle (default) or the native-MTP lane arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecMode {
+    Ar,
+    Mtp,
+}
+
+impl SpecMode {
+    fn parse(value: &str) -> R<Self> {
+        match value {
+            "ar" => Ok(Self::Ar),
+            "mtp" => Ok(Self::Mtp),
+            other => Err(format!("--spec must be ar|mtp, got {other:?}")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ar => "ar",
+            Self::Mtp => "mtp",
+        }
+    }
+}
+
+/// `--routes`: the window route policy of an MTP run (`fn_lane_oracle`'s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutesArg {
+    Floor,
+    Cycle,
+    Batched,
+}
+
+impl RoutesArg {
+    fn parse(value: &str) -> R<Self> {
+        match value {
+            "floor" => Ok(Self::Floor),
+            "cycle" => Ok(Self::Cycle),
+            "batched" => Ok(Self::Batched),
+            other => Err(format!(
+                "--routes must be floor|cycle|batched, got {other:?}"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Floor => "floor",
+            Self::Cycle => "cycle",
+            Self::Batched => "batched",
+        }
+    }
+}
+
+/// `--fault-point`: where an injected failure must abort every owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultPoint {
+    BeforeDraft,
+    HeadRound,
+    TargetEdge,
+    Repair,
+    BeforePublish,
+}
+
+impl FaultPoint {
+    const ALL: [FaultPoint; 5] = [
+        Self::BeforeDraft,
+        Self::HeadRound,
+        Self::TargetEdge,
+        Self::Repair,
+        Self::BeforePublish,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::BeforeDraft => "before-draft",
+            Self::HeadRound => "head-round",
+            Self::TargetEdge => "target-edge",
+            Self::Repair => "repair",
+            Self::BeforePublish => "before-publish",
+        }
+    }
+
+    fn parse(value: &str) -> R<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|point| point.name() == value)
+            .ok_or_else(|| {
+                let names: Vec<_> = Self::ALL.iter().map(|point| point.name()).collect();
+                format!(
+                    "--fault-point must be one of {}, got {value:?}",
+                    names.join("|")
+                )
+            })
+    }
+}
+
+/// Default draft depth of `--spec mtp` (`fn_lane_oracle`'s).
+const DEFAULT_K: usize = 3;
+/// Deepest native draft.
+const MAX_K: usize = 7;
+/// Soak lifecycle seed when `--soak-seconds` is given without `--soak-seed`.
+const DEFAULT_SOAK_SEED: u64 = 0x50A4_5EED;
+
 fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut model = None;
     let mut prompt_files = Vec::new();
@@ -287,6 +428,12 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut policies = None;
     let mut tokens_sweep = None;
     let mut reserve_lanes = None;
+    let mut spec = SpecMode::Ar;
+    let mut k = None;
+    let mut routes = None;
+    let mut soak_seconds = None;
+    let mut soak_seed = None;
+    let mut fault_point = None;
     while let Some(flag) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match flag.as_str() {
@@ -309,6 +456,14 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             "--reserve-lanes" => {
                 reserve_lanes = Some(value("--reserve-lanes")?.parse::<usize>().map_err(e)?)
             }
+            "--spec" => spec = SpecMode::parse(&value("--spec")?)?,
+            "--k" => k = Some(value("--k")?.parse::<usize>().map_err(e)?),
+            "--routes" => routes = Some(RoutesArg::parse(&value("--routes")?)?),
+            "--soak-seconds" => {
+                soak_seconds = Some(value("--soak-seconds")?.parse::<u64>().map_err(e)?)
+            }
+            "--soak-seed" => soak_seed = Some(value("--soak-seed")?.parse::<u64>().map_err(e)?),
+            "--fault-point" => fault_point = Some(FaultPoint::parse(&value("--fault-point")?)?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -340,6 +495,40 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     if reserve_lanes == Some(0) {
         return Err("--reserve-lanes must be at least 1".into());
     }
+    if spec == SpecMode::Ar {
+        for (given, flag) in [
+            (k.is_some(), "--k"),
+            (routes.is_some(), "--routes"),
+            (soak_seconds.is_some(), "--soak-seconds"),
+            (soak_seed.is_some(), "--soak-seed"),
+            (fault_point.is_some(), "--fault-point"),
+        ] {
+            if given {
+                return Err(format!("{flag} needs --spec mtp"));
+            }
+        }
+    } else {
+        let depth = *k.get_or_insert(DEFAULT_K);
+        if depth == 0 || depth > MAX_K {
+            return Err(format!("--k must be in 1..={MAX_K}, got {depth}"));
+        }
+        routes.get_or_insert(RoutesArg::Cycle);
+    }
+    if soak_seconds == Some(0) {
+        return Err("--soak-seconds must be at least 1".into());
+    }
+    if soak_seed.is_some() && soak_seconds.is_none() {
+        return Err("--soak-seed needs --soak-seconds".into());
+    }
+    if soak_seconds.is_some() && fault_point.is_some() {
+        return Err(
+            "--soak-seconds and --fault-point are exclusive: run injected failures separately from the uninterrupted soak"
+                .into(),
+        );
+    }
+    if soak_seconds.is_some() {
+        soak_seed.get_or_insert(DEFAULT_SOAK_SEED);
+    }
     Ok(Args {
         model: model.ok_or("--model is required")?,
         prompt_files,
@@ -359,19 +548,31 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         }),
         tokens_sweep,
         reserve_lanes,
+        spec,
+        k,
+        routes,
+        soak_seconds,
+        soak_seed,
+        fault_point,
     })
 }
 
 const HELP: &str = "fn_mesh_lane_oracle --model M.mq4 --prompt-file P [--prompt-file P ...] \
 --max-seq N --tokens T --ks 1,2,4,8 --out DIR [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] \
-[--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N]\n\
+[--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N] \
+[--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--soak-seconds S [--soak-seed N]] \
+[--fault-point before-draft|head-round|target-edge|repair|before-publish]\n\
 EP comes from topology.ep / the S1 env var as in fn_ep_oracle; --pp N>1 runs the PP lanes arm. \
 --policies sweeps lane stage share policies (production | per-lane | per-lane:<stage>=once,... | g0) \
 over one reference; --tokens-sweep N sets tokens per lane for every policy after the first. \
 --reserve-lanes N loads through the admitted route with the daemon's VMM-batch request (serve.vmm_batch, \
 continuous_batch_size N) so a qwen4 EP load reserves N AR lanes before the expert split (planner capacity \
 only; default off = plain load_model, N=1 is the same plan). \
+--spec mtp (--k 1..=7, default 3; --routes default cycle) selects the native-MTP lane arm; --soak-seconds and \
+--fault-point need it and are exclusive. Its execution is not yet implemented by S3/S5: the invocation is \
+validated and recorded in DIR/manifest.json (expanded command, prompt fixture hashes, binary sha), then refused. \
 Needs at least max(ks) prompt files. \
+DIR/manifest.json is written for every run. \
 Exit 0 all equal, 1 mismatch, 2 refusal/error. DIR must not exist.";
 
 // ---------------------------------------------------------------- prompts
@@ -1556,8 +1757,264 @@ fn write_ids(path: &Path, lines: &[Value]) -> R<()> {
     std::fs::write(path, text).map_err(|x| format!("write {}: {x}", path.display()))
 }
 
+// ----------------------------------------------------------------- manifest
+
+const MANIFEST_SCHEMA: u64 = 1;
+
+/// The environment a run records (report and manifest): `HIPFIRE_*` plus the
+/// device selectors and `HOME`.
+fn recorded_env() -> serde_json::Map<String, Value> {
+    std::env::vars()
+        .filter(|(key, _)| {
+            key.starts_with("HIPFIRE_")
+                || matches!(
+                    key.as_str(),
+                    "ROCR_VISIBLE_DEVICES" | "HIP_VISIBLE_DEVICES" | "FABRIC_CARDS" | "HOME"
+                )
+        })
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect()
+}
+
+/// One shell word: bare when it is made only of safe characters, otherwise
+/// single-quoted.
+fn shell_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,+@%".contains(&b));
+    if safe {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+fn absolute_path(path: &str, cwd: &Path) -> String {
+    cwd.join(path).display().to_string()
+}
+
+/// The invocation with every option spelled out (paths made absolute against
+/// `cwd`, defaults filled in). Parsing it yields the same [`Args`] as the
+/// original invocation, so the manifest command reproduces the run.
+fn expanded_argv(args: &Args, cwd: &Path) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut push = |flag: &str, value: String| {
+        argv.push(flag.to_string());
+        argv.push(value);
+    };
+    push("--model", absolute_path(&args.model, cwd));
+    for path in &args.prompt_files {
+        push("--prompt-file", absolute_path(path, cwd));
+    }
+    push("--max-seq", args.max_seq.to_string());
+    push("--tokens", args.tokens.to_string());
+    push(
+        "--ks",
+        args.ks
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    push("--out", absolute_path(&args.out.display().to_string(), cwd));
+    push("--pp", args.pp.to_string());
+    if let Some(budget) = args.row_budget {
+        push("--row-budget", budget.to_string());
+    }
+    let default_policy = args.policies.len() == 1 && args.policies[0].policy.is_none();
+    if !default_policy {
+        push(
+            "--policies",
+            args.policies
+                .iter()
+                .map(|entry| entry.spec.as_str())
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+    }
+    if let Some(sweep) = args.tokens_sweep {
+        push("--tokens-sweep", sweep.to_string());
+    }
+    if let Some(lanes) = args.reserve_lanes {
+        push("--reserve-lanes", lanes.to_string());
+    }
+    push("--spec", args.spec.name().to_string());
+    if let Some(k) = args.k {
+        push("--k", k.to_string());
+    }
+    if let Some(routes) = args.routes {
+        push("--routes", routes.name().to_string());
+    }
+    if let Some(seconds) = args.soak_seconds {
+        push("--soak-seconds", seconds.to_string());
+    }
+    if let Some(seed) = args.soak_seed {
+        push("--soak-seed", seed.to_string());
+    }
+    if let Some(point) = args.fault_point {
+        push("--fault-point", point.name().to_string());
+    }
+    if args.skip_model_hash {
+        argv.push("--skip-model-hash".to_string());
+    }
+    if args.logits {
+        argv.push("--logits".to_string());
+    }
+    argv
+}
+
+/// `exe` and `argv` as one copy-pasteable shell command.
+fn expanded_command(exe: &str, argv: &[String]) -> String {
+    std::iter::once(exe)
+        .chain(argv.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Size and SHA-256 of every `--prompt-file`, in lane order.
+fn fixture_records(args: &Args, cwd: &Path) -> R<Vec<Value>> {
+    args.prompt_files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let absolute = absolute_path(path, cwd);
+            let bytes = std::fs::metadata(&absolute)
+                .map_err(|x| format!("prompt fixture {path}: {x}"))?
+                .len();
+            Ok(json!({
+                "index": index,
+                "path": path,
+                "absolute_path": absolute,
+                "bytes": bytes,
+                "sha256": file_sha256(Path::new(&absolute))?,
+            }))
+        })
+        .collect()
+}
+
+/// The speculative-lane selection as recorded in the report and manifest.
+fn spec_json(args: &Args) -> Value {
+    json!({
+        "spec": args.spec.name(),
+        "k": args.k,
+        "routes": args.routes.map(RoutesArg::name),
+        "soak_seconds": args.soak_seconds,
+        "soak_seed": args.soak_seed,
+        "fault_point": args.fault_point.map(FaultPoint::name),
+    })
+}
+
+/// `manifest.json` before the model hash is known (`"pending"` until the run
+/// computes it; `null` under `--skip-model-hash`).
+fn build_manifest(
+    args: &Args,
+    invoked_argv: &[String],
+    exe: &str,
+    binary_sha256: &str,
+    cwd: &Path,
+    fixtures: Vec<Value>,
+    env: serde_json::Map<String, Value>,
+) -> Value {
+    let argv = expanded_argv(args, cwd);
+    let distinct: BTreeSet<&str> = fixtures
+        .iter()
+        .filter_map(|fixture| fixture["sha256"].as_str())
+        .collect();
+    json!({
+        "tool": TOOL,
+        "schema": MANIFEST_SCHEMA,
+        "command": expanded_command(exe, &argv),
+        "expanded_argv": argv,
+        "invoked_argv": invoked_argv,
+        "cwd": cwd.display().to_string(),
+        "binary": {
+            "path": exe,
+            "sha256": binary_sha256,
+            "package_version": env!("CARGO_PKG_VERSION"),
+        },
+        "model": {
+            "path": absolute_path(&args.model, cwd),
+            "sha256": if args.skip_model_hash { Value::Null } else { json!("pending") },
+        },
+        "prompts": fixtures,
+        "distinct_prompts": distinct.len(),
+        "ks": args.ks,
+        "pp": args.pp,
+        "max_seq": args.max_seq,
+        "tokens": args.tokens,
+        "spec": spec_json(args),
+        "env": env,
+        "completed": false,
+    })
+}
+
+/// The interface boundary of `--spec mtp`: the EP/PP speculative lane protocol
+/// it would drive (S3/S5) has not landed, so the invocation is refused with an
+/// explicit error. Never a pass: no lane window is run and no verdict exists.
+fn ensure_spec_supported(args: &Args) -> R<()> {
+    match args.spec {
+        SpecMode::Ar => Ok(()),
+        SpecMode::Mtp => {
+            let mut shape = format!(
+                "k={} routes={}",
+                args.k.unwrap_or(DEFAULT_K),
+                args.routes.map_or("cycle", RoutesArg::name)
+            );
+            if let Some(seconds) = args.soak_seconds {
+                shape.push_str(&format!(" soak={seconds}s"));
+            }
+            if let Some(point) = args.fault_point {
+                shape.push_str(&format!(" fault-point={}", point.name()));
+            }
+            Err(format!(
+                "{TOOL}: --spec mtp ({shape}) is not yet implemented by S3/S5: the EP/PP speculative lane protocol this arm drives has not landed. This refusal is the interface boundary, not a pass; the invocation was validated and recorded in manifest.json"
+            ))
+        }
+    }
+}
+
+/// Writes `manifest.json`, records the speculative selection in `report`, then
+/// checks the spec is executable. A fixture that cannot be read fails here.
+fn prepare_run(args: &Args, report: &mut Value, manifest: &mut Value) -> R<()> {
+    let cwd = std::env::current_dir().map_err(e)?;
+    let exe = std::fs::read_link("/proc/self/exe")
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let binary_sha256 = file_sha256(Path::new("/proc/self/exe"))?;
+    let invoked: Vec<String> = std::env::args().skip(1).collect();
+    *manifest = build_manifest(
+        args,
+        &invoked,
+        &exe,
+        &binary_sha256,
+        &cwd,
+        fixture_records(args, &cwd)?,
+        recorded_env(),
+    );
+    write_json(&args.out.join("manifest.json"), manifest)?;
+    report["manifest"] = json!("manifest.json");
+    report["spec"] = spec_json(args);
+    ensure_spec_supported(args)
+}
+
+/// Completes the manifest with the run's outcome (model hash, completion,
+/// verdict, error). A manifest that was never built stays absent.
+fn finalize_manifest(manifest: &mut Value, report: &Value) {
+    if manifest.is_null() {
+        return;
+    }
+    if !report["model_sha256"].is_null() {
+        manifest["model"]["sha256"] = report["model_sha256"].clone();
+    }
+    manifest["completed"] = report["completed"].clone();
+    manifest["verdict"] = report["verdict"].clone();
+    manifest["error"] = report["error"].clone();
+}
+
 /// Refuse an existing DIR, create it, run, and always leave `report.json`
-/// (with `error` on a refusal/error) and `ids.jsonl` behind.
+/// (with `error` on a refusal/error), `ids.jsonl` and `manifest.json` behind.
 fn run(args: Args) -> R<Verdict> {
     if args.out.exists() {
         return Err(format!(
@@ -1568,13 +2025,19 @@ fn run(args: Args) -> R<Verdict> {
     std::fs::create_dir_all(&args.out)
         .map_err(|x| format!("create {}: {x}", args.out.display()))?;
     let mut report = json!({"tool": TOOL, "completed": false});
+    let mut manifest = Value::Null;
     let mut ids_lines = Vec::new();
-    let result = run_inner(&args, &mut report, &mut ids_lines);
+    let result = prepare_run(&args, &mut report, &mut manifest)
+        .and_then(|()| run_inner(&args, &mut report, &mut ids_lines));
     if let Err(error) = &result {
         report["error"] = json!(error);
     }
+    finalize_manifest(&mut manifest, &report);
     write_ids(&args.out.join("ids.jsonl"), &ids_lines)?;
     write_json(&args.out.join("report.json"), &report)?;
+    if !manifest.is_null() {
+        write_json(&args.out.join("manifest.json"), &manifest)?;
+    }
     result
 }
 
@@ -1763,16 +2226,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
         Value::String(file_sha256(Path::new(&args.model))?)
     };
     let exe = std::fs::read("/proc/self/exe").map_err(e)?;
-    let env: serde_json::Map<String, Value> = std::env::vars()
-        .filter(|(key, _)| {
-            key.starts_with("HIPFIRE_")
-                || matches!(
-                    key.as_str(),
-                    "ROCR_VISIBLE_DEVICES" | "HIP_VISIBLE_DEVICES" | "FABRIC_CARDS" | "HOME"
-                )
-        })
-        .map(|(key, value)| (key, Value::String(value)))
-        .collect();
+    let env = recorded_env();
     let max_lanes_requested = *args.ks.last().expect("ks is non-empty");
     let row_budget = args.row_budget.unwrap_or(max_lanes_requested);
     report["binary"] = json!(std::fs::read_link("/proc/self/exe")
@@ -2849,5 +3303,431 @@ mod tests {
             .contains("unusable"));
         assert_eq!(sweep_verdict(&outcomes), Verdict::Fail);
         assert!(sweep_summary(&outcomes).contains("[3] production=SKIPPED"));
+    }
+}
+
+// ----------------------------------------------------- spec schema / manifest
+
+#[cfg(test)]
+mod spec_schema_tests {
+    use super::*;
+
+    fn argv(line: &str) -> impl Iterator<Item = String> + '_ {
+        line.split_whitespace().map(str::to_owned)
+    }
+
+    const BASE: &str = "--model /m/m.mq4 --max-seq 4096 --tokens 8 --out /o/x";
+
+    fn files(n: usize) -> String {
+        (0..n)
+            .map(|i| format!(" --prompt-file /p/p{i}.txt"))
+            .collect()
+    }
+
+    fn parse(extra: &str, n_files: usize) -> R<Args> {
+        parse_args_from(argv(&format!(
+            "{BASE} --ks 1{extra}{}",
+            files(n_files.max(1))
+        )))
+    }
+
+    #[test]
+    fn ar_is_the_default_and_carries_no_spec_state() {
+        let args = parse("", 1).unwrap();
+        assert_eq!(args.spec, SpecMode::Ar);
+        assert_eq!(
+            (args.k, args.routes, args.soak_seconds, args.soak_seed),
+            (None, None, None, None)
+        );
+        assert_eq!(args.fault_point, None);
+        assert_eq!(parse(" --spec ar", 1).unwrap(), args);
+        // Every pre-existing flag still parses exactly as before.
+        let full = parse(
+            " --pp 2 --row-budget 3 --skip-model-hash --logits --policies g0 --tokens-sweep 4 --reserve-lanes 8",
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            (full.pp, full.row_budget, full.reserve_lanes),
+            (2, Some(3), Some(8))
+        );
+        assert_eq!(full.spec, SpecMode::Ar);
+    }
+
+    #[test]
+    fn mtp_defaults_and_ranges() {
+        let args = parse(" --spec mtp", 1).unwrap();
+        assert_eq!(args.spec, SpecMode::Mtp);
+        assert_eq!((args.k, args.routes), (Some(3), Some(RoutesArg::Cycle)));
+        assert_eq!(
+            (args.soak_seconds, args.soak_seed, args.fault_point),
+            (None, None, None)
+        );
+        for k in [1usize, 3, 7] {
+            assert_eq!(
+                parse(&format!(" --spec mtp --k {k}"), 1).unwrap().k,
+                Some(k)
+            );
+        }
+        for bad in ["0", "8", "-1", "x", "3.5"] {
+            assert!(
+                parse(&format!(" --spec mtp --k {bad}"), 1).is_err(),
+                "k {bad}"
+            );
+        }
+        for (text, routes) in [
+            ("floor", RoutesArg::Floor),
+            ("cycle", RoutesArg::Cycle),
+            ("batched", RoutesArg::Batched),
+        ] {
+            let args = parse(&format!(" --spec mtp --routes {text}"), 1).unwrap();
+            assert_eq!(args.routes, Some(routes));
+            assert_eq!(routes.name(), text);
+        }
+        assert!(parse(" --spec mtp --routes interleaved", 1).is_err());
+        assert!(parse(" --spec bogus", 1).is_err());
+        assert!(parse(" --spec", 1).is_err());
+    }
+
+    #[test]
+    fn mtp_only_flags_need_spec_mtp() {
+        for flag in [
+            "--k 3",
+            "--routes cycle",
+            "--soak-seconds 60",
+            "--soak-seed 7",
+            "--fault-point repair",
+        ] {
+            let name = flag.split(' ').next().unwrap();
+            let error = parse(&format!(" {flag}"), 1).unwrap_err();
+            assert_eq!(error, format!("{name} needs --spec mtp"), "{flag}");
+            let error = parse(&format!(" --spec ar {flag}"), 1).unwrap_err();
+            assert_eq!(error, format!("{name} needs --spec mtp"), "{flag}");
+        }
+    }
+
+    #[test]
+    fn fault_points_and_soak() {
+        let names = [
+            ("before-draft", FaultPoint::BeforeDraft),
+            ("head-round", FaultPoint::HeadRound),
+            ("target-edge", FaultPoint::TargetEdge),
+            ("repair", FaultPoint::Repair),
+            ("before-publish", FaultPoint::BeforePublish),
+        ];
+        assert_eq!(names.len(), FaultPoint::ALL.len());
+        for (text, point) in names {
+            let args = parse(&format!(" --spec mtp --fault-point {text}"), 1).unwrap();
+            assert_eq!(args.fault_point, Some(point));
+            assert_eq!(point.name(), text);
+        }
+        for bad in ["before_draft", "publish", "BEFORE-DRAFT", ""] {
+            assert!(
+                parse_args_from(
+                    argv(&format!("{BASE} --ks 1 --spec mtp --fault-point"))
+                        .chain([bad.to_string()])
+                        .chain(argv(&files(1)))
+                )
+                .is_err(),
+                "accepted fault point {bad:?}"
+            );
+        }
+        let soak = parse(" --spec mtp --k 7 --routes cycle --soak-seconds 1800", 1).unwrap();
+        assert_eq!(
+            (soak.soak_seconds, soak.soak_seed),
+            (Some(1800), Some(DEFAULT_SOAK_SEED))
+        );
+        let seeded = parse(" --spec mtp --soak-seconds 60 --soak-seed 99", 1).unwrap();
+        assert_eq!(seeded.soak_seed, Some(99));
+        assert!(parse(" --spec mtp --soak-seconds 0", 1).is_err());
+        assert!(parse(" --spec mtp --soak-seed 5", 1)
+            .unwrap_err()
+            .contains("--soak-seconds"));
+        let both = parse(" --spec mtp --soak-seconds 60 --fault-point repair", 1).unwrap_err();
+        assert!(both.contains("exclusive"), "{both}");
+    }
+
+    #[test]
+    fn multiple_prompt_files_are_preserved_in_order() {
+        let args = parse_args_from(argv(&format!(
+            "{BASE} --ks 1,8 --pp 2 --spec mtp --k 3 --routes cycle{}",
+            files(8)
+        )))
+        .unwrap();
+        assert_eq!(args.ks, vec![1, 8]);
+        assert_eq!(args.prompt_files.len(), 8);
+        assert_eq!(args.prompt_files[0], "/p/p0.txt");
+        assert_eq!(args.prompt_files[7], "/p/p7.txt");
+        let few = parse_args_from(argv(&format!("{BASE} --ks 1,8 --spec mtp{}", files(4))));
+        assert!(few.unwrap_err().contains("at least 8 --prompt-file"));
+    }
+
+    #[test]
+    fn expanded_argv_round_trips_to_the_same_args() {
+        let cwd = Path::new("/work");
+        for extra in [
+            "",
+            " --pp 2 --row-budget 5 --logits --skip-model-hash --tokens-sweep 3 --reserve-lanes 8",
+            " --policies g0",
+            " --policies per-lane;per-lane:moe=once;production",
+            " --spec mtp",
+            " --spec mtp --k 7 --routes batched",
+            " --spec mtp --k 7 --routes cycle --soak-seconds 1800 --soak-seed 42",
+            " --spec mtp --k 1 --routes floor --fault-point head-round",
+        ] {
+            let args = parse_args_from(
+                argv(&format!("{BASE} --ks 1,2{}", files(2))).chain(
+                    extra
+                        .split(' ')
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_owned),
+                ),
+            )
+            .unwrap();
+            let expanded = expanded_argv(&args, cwd);
+            let reparsed = parse_args_from(expanded.iter().cloned()).unwrap();
+            assert_eq!(reparsed, args, "{extra}");
+        }
+    }
+
+    #[test]
+    fn expanded_argv_makes_paths_absolute_and_fills_defaults() {
+        let args = parse_args_from(argv(
+            "--model rel/m.mq4 --max-seq 4096 --tokens 8 --out rel/out --ks 1 --prompt-file rel/a.txt",
+        ))
+        .unwrap();
+        let line = expanded_command("/bin/oracle", &expanded_argv(&args, Path::new("/work")));
+        assert!(
+            line.starts_with("/bin/oracle --model /work/rel/m.mq4 "),
+            "{line}"
+        );
+        for want in [
+            "--prompt-file /work/rel/a.txt",
+            "--out /work/rel/out",
+            "--pp 1",
+            "--spec ar",
+            "--ks 1",
+        ] {
+            assert!(line.contains(want), "{want} not in {line}");
+        }
+        assert!(
+            !line.contains("--policies"),
+            "default policy is not spelled out"
+        );
+    }
+
+    #[test]
+    fn shell_words_are_quoted_only_when_needed() {
+        assert_eq!(shell_quote("--model"), "--model");
+        assert_eq!(shell_quote("/a/b-c_d.e,f=g:h"), "/a/b-c_d.e,f=g:h");
+        assert_eq!(shell_quote("per-lane;production"), "'per-lane;production'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    fn fixture(index: usize, sha: &str) -> Value {
+        json!({"index": index, "sha256": sha})
+    }
+
+    #[test]
+    fn manifest_records_command_fixtures_binary_and_spec() {
+        let args = parse_args_from(argv(&format!(
+            "{BASE} --ks 1,2 --spec mtp --k 7 --routes cycle --soak-seconds 90{}",
+            files(2)
+        )))
+        .unwrap();
+        let env = serde_json::Map::from_iter([("HIPFIRE_TOPOLOGY_EP".to_string(), json!("2"))]);
+        let manifest = build_manifest(
+            &args,
+            &["--model".to_string()],
+            "/bin/oracle",
+            "deadbeef",
+            Path::new("/work"),
+            vec![fixture(0, "aa"), fixture(1, "bb")],
+            env,
+        );
+        assert_eq!(manifest["tool"], json!(TOOL));
+        assert_eq!(manifest["binary"]["sha256"], json!("deadbeef"));
+        assert_eq!(manifest["binary"]["path"], json!("/bin/oracle"));
+        assert_eq!(manifest["model"]["sha256"], json!("pending"));
+        assert_eq!(manifest["prompts"].as_array().unwrap().len(), 2);
+        assert_eq!(manifest["distinct_prompts"], json!(2));
+        assert_eq!(manifest["spec"]["spec"], json!("mtp"));
+        assert_eq!(manifest["spec"]["k"], json!(7));
+        assert_eq!(manifest["spec"]["routes"], json!("cycle"));
+        assert_eq!(manifest["spec"]["soak_seconds"], json!(90));
+        assert_eq!(manifest["spec"]["soak_seed"], json!(DEFAULT_SOAK_SEED));
+        assert_eq!(manifest["env"]["HIPFIRE_TOPOLOGY_EP"], json!("2"));
+        assert_eq!(manifest["completed"], json!(false));
+        let command = manifest["command"].as_str().unwrap();
+        for want in ["--spec mtp", "--k 7", "--routes cycle", "--soak-seconds 90"] {
+            assert!(command.contains(want), "{want} not in {command}");
+        }
+        // Skipping the hash records null, never "pending".
+        let skipped = parse_args_from(argv(&format!(
+            "{BASE} --ks 1 --skip-model-hash{}",
+            files(1)
+        )))
+        .unwrap();
+        let manifest = build_manifest(
+            &skipped,
+            &[],
+            "/bin/oracle",
+            "x",
+            Path::new("/work"),
+            vec![fixture(0, "aa")],
+            serde_json::Map::new(),
+        );
+        assert_eq!(manifest["model"]["sha256"], Value::Null);
+        assert_eq!(manifest["distinct_prompts"], json!(1));
+    }
+
+    #[test]
+    fn manifest_finalization_takes_the_runs_outcome() {
+        let mut manifest = json!({"model": {"sha256": "pending"}, "completed": false});
+        let report = json!({
+            "model_sha256": "abc123",
+            "completed": true,
+            "verdict": "PASS",
+        });
+        finalize_manifest(&mut manifest, &report);
+        assert_eq!(manifest["model"]["sha256"], json!("abc123"));
+        assert_eq!(manifest["completed"], json!(true));
+        assert_eq!(manifest["verdict"], json!("PASS"));
+        // An error run without a model hash keeps the pending marker.
+        let mut manifest = json!({"model": {"sha256": "pending"}, "completed": false});
+        finalize_manifest(&mut manifest, &json!({"completed": false, "error": "boom"}));
+        assert_eq!(manifest["model"]["sha256"], json!("pending"));
+        assert_eq!(manifest["error"], json!("boom"));
+        let mut absent = Value::Null;
+        finalize_manifest(&mut absent, &report);
+        assert!(absent.is_null());
+    }
+
+    #[test]
+    fn mtp_execution_is_an_explicit_boundary_and_ar_is_not() {
+        let ar = parse("", 1).unwrap();
+        ensure_spec_supported(&ar).unwrap();
+        for extra in [
+            " --spec mtp",
+            " --spec mtp --k 7 --routes cycle --soak-seconds 1800",
+            " --spec mtp --fault-point target-edge",
+        ] {
+            let error = ensure_spec_supported(&parse(extra, 1).unwrap()).unwrap_err();
+            assert!(error.contains("not yet implemented by S3/S5"), "{error}");
+            assert!(error.contains("not a pass"), "{error}");
+            assert!(error.starts_with(TOOL), "{error}");
+        }
+        let soak = ensure_spec_supported(&parse(" --spec mtp --soak-seconds 5", 1).unwrap());
+        assert!(soak.unwrap_err().contains("soak=5s"));
+        let fault = ensure_spec_supported(&parse(" --spec mtp --fault-point repair", 1).unwrap());
+        assert!(fault.unwrap_err().contains("fault-point=repair"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{TOOL}-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn fixture_records_hash_each_prompt_file() {
+        let dir = scratch("fixtures");
+        std::fs::write(dir.join("a.txt"), b"abc").unwrap();
+        std::fs::write(dir.join("b.txt"), b"").unwrap();
+        let line = format!(
+            "{BASE} --ks 2 --prompt-file {} --prompt-file {}",
+            dir.join("a.txt").display(),
+            dir.join("b.txt").display()
+        );
+        let args = parse_args_from(argv(&line)).unwrap();
+        let records = fixture_records(&args, Path::new("/")).unwrap();
+        assert_eq!(records[0]["bytes"], json!(3));
+        assert_eq!(
+            records[0]["sha256"],
+            json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            records[1]["sha256"],
+            json!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        let missing = parse_args_from(argv(&format!(
+            "{BASE} --ks 1 --prompt-file {}",
+            dir.join("nope.txt").display()
+        )))
+        .unwrap();
+        assert!(fixture_records(&missing, Path::new("/"))
+            .unwrap_err()
+            .contains("nope.txt"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--spec mtp` through the real `run`: no model is loaded, the refusal is
+    /// recorded in report.json, and manifest.json carries the expanded command,
+    /// fixture hashes and binary sha.
+    #[test]
+    fn mtp_run_refuses_without_loading_and_leaves_receipts() {
+        let dir = scratch("run");
+        std::fs::write(dir.join("p0.txt"), b"abc").unwrap();
+        std::fs::write(dir.join("p1.txt"), b"abd").unwrap();
+        let out = dir.join("out");
+        let line = format!(
+            "--model {m} --max-seq 4096 --tokens 8 --ks 2 --pp 2 --spec mtp --k 3 --routes cycle --out {o} --prompt-file {a} --prompt-file {b}",
+            m = dir.join("m.mq4").display(),
+            o = out.display(),
+            a = dir.join("p0.txt").display(),
+            b = dir.join("p1.txt").display(),
+        );
+        let args = parse_args_from(argv(&line)).unwrap();
+        let error = match run(args) {
+            Err(error) => error,
+            Ok(_) => panic!("--spec mtp must not produce a verdict"),
+        };
+        assert!(error.contains("not yet implemented by S3/S5"), "{error}");
+        let read = |name: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(out.join(name)).unwrap()).unwrap()
+        };
+        let report = read("report.json");
+        assert_eq!(report["completed"], json!(false));
+        assert!(report["error"].as_str().unwrap().contains("S3/S5"));
+        assert_eq!(report["manifest"], json!("manifest.json"));
+        assert_eq!(report["spec"]["spec"], json!("mtp"));
+        assert!(report.get("verdict").is_none(), "a refusal has no verdict");
+        assert!(out.join("ids.jsonl").exists());
+        let manifest = read("manifest.json");
+        let prompts = manifest["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(
+            prompts[0]["sha256"],
+            json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_ne!(prompts[0]["sha256"], prompts[1]["sha256"]);
+        assert_eq!(manifest["distinct_prompts"], json!(2));
+        assert_eq!(manifest["binary"]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(manifest["completed"], json!(false));
+        assert!(manifest["error"].as_str().unwrap().contains("S3/S5"));
+        let command = manifest["command"].as_str().unwrap();
+        assert!(
+            command.contains("--spec mtp --k 3 --routes cycle"),
+            "{command}"
+        );
+        // The recorded command re-parses to the invocation it records.
+        let expanded: Vec<String> = manifest["expanded_argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word.as_str().unwrap().to_string())
+            .collect();
+        let reparsed = parse_args_from(expanded.into_iter()).unwrap();
+        assert_eq!(
+            (reparsed.spec, reparsed.k, reparsed.pp),
+            (SpecMode::Mtp, Some(3), 2)
+        );
+        // A second run into the same DIR is refused, as before.
+        let again = parse_args_from(argv(&line)).unwrap();
+        assert!(run(again).unwrap_err().contains("already exists"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
