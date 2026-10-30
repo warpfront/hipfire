@@ -798,6 +798,7 @@ Highlights (details in the entries below):
   - `HIPFIRE_QWEN4_MOE_EP_A8_NT` (EP A8 chain tile-run width override), `HIPFIRE_LAB_MTP_EXPERT_TRACE`, `HIPFIRE_LAB_MTP_STALE_FILL`, `HIPFIRE_QWEN4_HC_UP_TWIN_LAB` and `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` (default off with the sampled wide verify): lab-only measurement and oracle switches, no product behaviour change.
   - `HIPFIRE_EP_SHARE_HOST` (default on, `0` pins one copy per rank): the ranks of one Flash-Next EP process share ONE pinned host copy of the host-mapped token embedding (0.63 GiB) instead of one per rank.
   - Test-only harness switches (no product effect): `HIPFIRE_SAMPLED_MTP_LANES`, `HIPFIRE_SAMPLED_MTP_EXECUTOR`, `HIPFIRE_SAMPLED_MTP_LANE_K` (sampled-distribution oracle) and `HIPFIRE_VERIFY_GRAPH`.
+- **Fixed: on gfx11 A8 prefill, `HIPFIRE_A8_FUSED_PROD=0` now runs the standalone A8 quantizer instead of handing the projections to IU4 (W4A4).** `Gpu::iu4_producer_sidecar_active` and `iu4_gfx11_producer_quant_fused_active` decline a shape A8 owns when the fused producers are off; with them on (the default) nothing changes. Qwen3.8-27B mq4-xts code24 on gfx1151 (`HIPFIRE_GFX11_A8_PREFILL=1`): the opt-out went from KLD 0.048487 (IU4 level) to 0.027297, and its `.kldseq` (`aec8f346`) is now bit-identical to the fused default, so the fused and unfused A8 producers agree.
 
 ### Entries of the original 2026-10-30 cut
 
