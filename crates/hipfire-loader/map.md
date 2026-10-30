@@ -9,6 +9,8 @@ Single `load_model` dispatch for the daemon. Owns `LoadedModel` / `ModelState` c
 
 ## Gotchas
 
+- Flash-Next exact-cache native MTP uses the existing resolved proposal bound, including its internal copy lane, for the 1–8-row route allocation and placement charge. Unsupported independent drafters refuse before fulfillment. Auto keeps the existing host-spill policy; a later auto decline retains its already-admitted conservative allocation. Placement summaries inspect settled expert owners.
+
 - `load_model` requires exactly one matching carrier (0 → error; 2 → ambiguous) — add a carrier only after reserving its `arch_id` in `docs/architecture-ids.md`.
 - Per-arch load bodies now live in the arch crates as `load_<arch>_bundle(src, ctx)`; `carriers.rs` is the thin registry that calls them — do not pull weight/config parsing back into the loader.
 - `LoadedModel.ep` holds expert-parallel rank state separately from `state`; EP staging reclaims completed ranks on failure but a mid-constructor failure can leak that rank's partial allocs.

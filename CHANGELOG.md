@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Flash-Next native MTP over the exact expert LRU:** opt-in single-gfx1201 QT44/QT53 loads can run bounded greedy native MTP verify batches while retaining the mutable cache. One stable expert-table reader covers every verify row; paired fills are planned once after retirement, and logical rollback preserves monotonic cache generations. The original batched verify and row-ring repair remain in use. The existing MTP auto/host-spill policy is retained; unsupported drafters and windows above 8 rows refuse before fulfillment.
+
+- **Opt-in Flash-Next exact expert cache on gfx1201:** `HIPFIRE_QWEN4_EXPERT_CACHE=1` keeps a fixed VRAM core and reuses an evictable donor tail with asynchronous, bounded LRU fills. Routing and quantized bytes stay unchanged; misses read immutable mapped host backing until both projections finish copying. Mutable sealed bindings retain fixed table/pool owners across replay. Short prefill uses independent immutable core/host tables; staged-width prefill restores canonical donor bytes. Requires single-GPU AR or bounded native MTP, ranked MQ4 expert placement, PCIe execution and decode-share off; incompatible routes fail admission. Disabled by default.
+
+- **Lab-only gfx1201 expert-table indirection oracle:** checks fixed-table VRAM/host relocation with full-output and guard comparisons, wrong-expert controls, recorded HIP and one retained PM4 tape (optional hipGraph). Adds a CPU trace replay for fixed-core/LRU capacity planning. The lab tools enable no serving route and make no speed claim.
+
 - **Perf: the gfx1201 27B prefill gate/up GEMM (`gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`) ships a re-paired f32 K128 fold. Output is bit-identical; 27B pp8192 prefill is about 1% faster.** The fold's math is unchanged per element (`float(C) - magic`, `RN(sc*d)`, fused `fma`, ascending K128 order). Only the VOPD packet partners, the register rotation and the issue priority change:
   - **Change** (`iu4_gemm::Tune` chain fold, selected only for this export by `shipped_gate_up_slab`):
     - Each fmac pairs with the next accumulator's stage-1 `subrev`, so stage 1 leads by one accumulator.

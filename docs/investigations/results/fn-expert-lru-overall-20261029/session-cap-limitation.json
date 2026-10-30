@@ -1,0 +1,8 @@
+{
+  "case": "serve-A1",
+  "status": "FAIL",
+  "phase": "optional session",
+  "reason": "canonical expected-substring gate failed: chunk absent in turn8, finish=length gen=512; visible text ends at Error Handling",
+  "disposition": "Preserve failure. Do not tune cap, do not claim session quality pass. Continue battery/chain and fixed long workload scope; original A1 process already cleaned up so A1extra reload is used only for long workloads, not timing battery.",
+  "product_changed": false
+}

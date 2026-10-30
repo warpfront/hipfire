@@ -40,6 +40,8 @@ pub mod expert_keep;
 pub use expert_keep::{ExpertKeep, EXPERT_KEEP_METADATA_KEY, EXPERT_KEEP_SCHEMA};
 /// Per-layer contiguous expert slab arenas (K4 loader plan + fulfillment payload).
 pub mod expert_arena;
+pub(crate) mod expert_cache;
+pub mod expert_cache_config;
 /// Lever1 expert hotset sidecar parser and `HIPFIRE_QWEN4_EXPERT_HOTSET` policy.
 pub mod expert_hotset;
 pub mod expert_residency;

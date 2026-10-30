@@ -1222,3 +1222,9 @@ required-features = ["lab"]
 [[example]]
 name = "tp_peer_pushn_probe"
 required-features = ["lab"]
+
+# Model-free expert-table relocation mechanism probe; no serving admission.
+[[example]]
+name = "fn_expert_table_indirection"
+
+required-features = ["lab"]

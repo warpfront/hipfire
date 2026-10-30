@@ -1,0 +1,114 @@
+{
+  "created_utc": "2026-10-29T14:56:06.598602+00:00",
+  "scope": "old exact LRU versus mapped-short-prefill exact LRU; both cache enabled, not cache-off versus cache-on",
+  "status": "PASS_WITH_ABSOLUTE_LIMITATIONS",
+  "a_b_equivalence_pass": true,
+  "absolute_completeness_pass": false,
+  "canonical_harness_pass": false,
+  "matrix_complete": true,
+  "longbench": {
+    "selected_subset": "LongBench-v2 fixed hard30; not the full benchmark",
+    "questions_per_arm": 30,
+    "byte_equal_pairs": 30,
+    "old_correct": 11,
+    "new_correct": 11,
+    "scoring": "official gold letters; conservative formatted-final extraction, not upstream official evaluator",
+    "denominator": 30,
+    "cap_tokens": 512,
+    "truncated_ordinals_zero_based": [
+      5,
+      7,
+      13,
+      15,
+      16,
+      17,
+      19,
+      20,
+      22,
+      23,
+      24,
+      25,
+      26
+    ],
+    "raw_attractor_ordinals_zero_based": [
+      23,
+      24,
+      26
+    ],
+    "raw_attractor_note": "Numeric utility arrays/enumeration; original flags and canonical FAIL remain unchanged; no kernel/transport failure inferred."
+  },
+  "longdecode": {
+    "questions_per_arm": 5,
+    "byte_equal_pairs": 5,
+    "no_gold_accuracy_claim": true,
+    "all_natural_stop": true,
+    "cap_tokens": 16384,
+    "total_generated_tokens_per_arm": 35952,
+    "tasks": [
+      {
+        "task": "code-snake",
+        "old_gen": 12888,
+        "new_gen": 12888,
+        "finish": "stop"
+      },
+      {
+        "task": "code-tetris",
+        "old_gen": 13438,
+        "new_gen": 13438,
+        "finish": "stop"
+      },
+      {
+        "task": "story",
+        "old_gen": 2585,
+        "new_gen": 2585,
+        "finish": "stop"
+      },
+      {
+        "task": "kv-cache",
+        "old_gen": 3603,
+        "new_gen": 3603,
+        "finish": "stop"
+      },
+      {
+        "task": "radix-attention",
+        "old_gen": 3438,
+        "new_gen": 3438,
+        "finish": "stop"
+      }
+    ]
+  },
+  "settings": {
+    "sampling": "greedy",
+    "temperature": 0.0,
+    "seed": 123,
+    "thinking": "off",
+    "speculation": "off",
+    "normalization": "off",
+    "max_seq": 65536,
+    "longbench_max_tokens": 512,
+    "longdecode_max_tokens": 16384,
+    "resident_budget_mib": 18000
+  },
+  "semantic_review": {
+    "source_applicability": "All five original UTF-8 outputs match across arms; one unchanged source review applies to both.",
+    "snake": "15 core offline browser checks PASS; no uncaught JS error.",
+    "tetris": "One baseline boot defect: drawMini uses clearRect on HTMLCanvasElement. Same defect in new output. Two failure observations, nine downstream checks BLOCKED; no output patched.",
+    "story": "1903 whitespace words (1904 word-pattern count); scenes/dialogue/ending requirement review passes. No literary gold score.",
+    "kv_tutorial": "Baseline worked-example arithmetic and attention/pseudocode issues retained; example1 should be1GiB, not512MiB.",
+    "radix_tutorial": "Baseline block-count, reference-count, split/pseudocode issues retained. No formal pseudocode certification."
+  },
+  "operational_scope": {
+    "actual_model_loads": 4,
+    "suite_separated_processes": true,
+    "same_fiction16_warmup_per_suite_arm": true,
+    "reason": "Original baseline completed LB30 then canonical late attractor gate closed its process; baseline LB30 was not rerun. Remaining suite-separated processes preserve matched histories.",
+    "no_silent_cap_escalation_or_question_retry": true,
+    "performance_claim": false
+  },
+  "publication_policy": "Includes generated answers and hashed settings; excludes model/executable bytes, full LongBench contexts, prompts files, actual HTTP request bodies and HOME configs. Those original inputs remain in private QC for complete wire re-audit.",
+  "static_precommit": {
+    "command": "scripts/pre-commit-ci.sh origin/beta",
+    "pass": true,
+    "runtime_source_unchanged": true
+  }
+}

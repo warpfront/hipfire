@@ -36,6 +36,13 @@
 //! [`MoeRouteCapability::Fp8B128Grouped`]; the generic prefill Path 0/1/2 and
 //! decode gpu-top-k/CPU fallback therefore can never carry qt=55 bytes.
 
+#[path = "moe_residency.rs"]
+mod mutable_residency;
+pub use mutable_residency::{
+    MutableExpertResidency, MutableExpertResidencySpec, ResidencyLocation, ResidencyPublication,
+    ResidencySlot, ResidencySlotTicket, ResidencySnapshot, ResidencySpan, ResidencyTokenGuard,
+};
+
 use rdna_compute::DType;
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -1405,6 +1412,21 @@ pub trait RoutedExpertWeights {
     /// captured from such a set then re-checks the id per call instead of
     /// every expert.  `None` (the default) keeps the per-expert check.
     fn immutable_identity(&self) -> Option<u64> {
+        None
+    }
+
+    /// Explicit mutable-placement authority. Canonical get()/immutable_identity
+    /// remain unchanged; this capability alone authorizes fixed slot-backed
+    /// alternatives through controlled publication and GPU-retired token guards.
+    /// None preserves the original frozen pointer-table contract.
+    fn mutable_residency(&self) -> Option<&MutableExpertResidency> {
+        None
+    }
+
+    /// Architecture-maintained mirrors of the actual published device tables.
+    /// Bounded mutable verify validates these independently of the authority's
+    /// own snapshot. Frozen callers keep the original default contract.
+    fn mutable_pointer_entries(&self) -> Option<MoePointerEntries<'_>> {
         None
     }
 

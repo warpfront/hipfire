@@ -1,0 +1,57 @@
+{
+  "source_head": "7cd1213a6cc856cc39cbe61c70982d98a93827b7",
+  "gpu": "gfx1201",
+  "schema": "fn-mtp-lru-hardware-controls-v1",
+  "binary_sha256": {
+    "oracle": "f7d6eb365ccc9569021d725d3f0a98ed3049b1cb5da4f15db52b2e98e38ea96a",
+    "publication": "9e1fc183766c02a0e8ffc3a00ffc6d20ea5a35460a9a42d049b165d40fcc7fef"
+  },
+  "controls": {
+    "cpu": {
+      "status": "PASS",
+      "report_sha256": "0502a2e1be20c4233a8f2f3d2858a0657aae828b6acedb2336349718f1db1c01",
+      "stdout_sha256": "d7c96bdc20a81d71427009771193a6291cf3936dfec4ffd9418d35629b0c0b1b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "collector": {
+      "status": "PASS",
+      "report_sha256": "11e7ddc0d9a0432e372535cad6ebb736fc6e2877f851dd6b57b8af1f75c34943",
+      "stdout_sha256": "7b23e64dd4ac1fcf31d518e70ff8aa095357af329186f81a1109d657e07c14e1",
+      "stderr_sha256": "4b4c5886f716d576c18e8fa13265892c4523aa47dea561be4ba3877566bd1547",
+      "rows": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    },
+    "publication": {
+      "status": "PASS",
+      "report_sha256": "9d48684b46d768d99d5db6eddcc680e33a75afdce84ce6561d4d657920472367",
+      "stdout_sha256": "d60f0fcfaeb105bc4543588ba377dadc3a6fb69f8ce5aa4e75b0c6477c33ca1b",
+      "stderr_sha256": "0b37ee97eff685bbb8438e8e47beec606595927c4eaacc32e19c378dbea3fa9a",
+      "cases": 15
+    }
+  },
+  "model_attempt_01": {
+    "status": "FAILED_ADMISSION",
+    "cache_off_only": true,
+    "error": "qwen4: HIPFIRE_QWEN4_EXPERT_HOT_BUDGET_MIB could not be applied: HIPFIRE_QWEN4_EXPERT_HOT_BUDGET_MIB requests 20971520000 bytes (20000 MiB), but only 20089497604 bytes (19158 MiB) are available for hot experts after reserves; refusing to shrink the fixed budget",
+    "native_model_execution": false,
+    "failed_evidence_retained": true
+  },
+  "model_qualified": false,
+  "performance_claim": false,
+  "next_model_plan": {
+    "hot_budget_mib": 18000,
+    "head_reserve_k": 7,
+    "forced_native_k": 3,
+    "max_seq": 16384,
+    "reason": "identical budget in both fresh arms; prior admission cap19158MiB after reserves",
+    "status": "waiting_for_gpu_and_reviewed_terminal_oracle_fix"
+  }
+}

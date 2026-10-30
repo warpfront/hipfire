@@ -176,6 +176,8 @@ pub struct Qwen4Bundle {
     /// the published bundle so unload owns the scratch, expert pointer tables,
     /// and all per-layer dispatch state exactly once.
     pub(crate) execution: Option<Qwen4GpuForward>,
+    /// Admitted decode-cache policy. The forward owns mutable residency and DMA.
+    pub(crate) expert_cache: Option<crate::expert_cache_config::ExpertCacheLoad>,
     /// Reusable native MTP execution resources, attached only when the
     /// admitted artifact carries the validated one-layer MTP head.
     pub(crate) mtp: Option<Qwen4MtpGpu>,
@@ -468,6 +470,8 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         position: usize,
     ) -> Result<SnapshotParts<'_>, String> {
+        self.check_expert_cache_readers_idle()
+            .map_err(|e| e.to_string())?;
         if self.pp.is_some() {
             return Err("session snapshots are not supported under qwen4 topology.pp yet".into());
         }
@@ -522,6 +526,8 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<StateLayout<'_>, String> {
+        self.check_expert_cache_idle(gpu)
+            .map_err(|e| e.to_string())?;
         if self.pp.is_some() {
             return Err("session restore is not supported under qwen4 topology.pp yet".into());
         }
@@ -578,6 +584,8 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<(), String> {
+        self.check_expert_cache_idle(gpu)
+            .map_err(|e| e.to_string())?;
         if self.pp.is_some() {
             return Err("session restore is not supported under qwen4 topology.pp yet".into());
         }
@@ -622,6 +630,8 @@ impl SessionState for Qwen4Bundle {
     }
 
     fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.check_expert_cache_idle(gpu)
+            .map_err(|e| e.to_string())?;
         self.begin_npu_trunk_request(gpu)
             .map_err(|e| e.to_string())?;
         if let Some(stage) = &mut self.pair_session_stage {
@@ -889,6 +899,7 @@ impl Qwen4Bundle {
             ple,
             weight_store: AttachedWeightStore::new(transaction),
             execution: None,
+            expert_cache: None,
             mtp: None,
             spec_logits: None,
             spec_top1: None,
@@ -922,6 +933,50 @@ impl Qwen4Bundle {
             npu_model_index: None,
             cpu_d1_storage_rows: 0,
         })
+    }
+
+    /// Bind the loader's cache placement before the forward can capture it.
+    pub fn set_expert_cache(
+        &mut self,
+        config: crate::expert_cache_config::ExpertCacheConfig,
+        warm_rank: Vec<u32>,
+    ) -> Result<(), BundleError> {
+        if self.execution.is_some() || self.expert_cache.is_some() || self.mtp.is_some() {
+            return Err(BundleError::Forward(
+                "exact expert cache must be bound once before forward or native MTP attachment"
+                    .into(),
+            ));
+        }
+        if !self.config.profile.is_flash_next()
+            || !self
+                .weights
+                .expert_tiers()
+                .is_some_and(|lease| lease.expert_cache_ranges().is_some())
+        {
+            return Err(BundleError::Forward(
+                "exact expert cache needs a materialized Flash-Next cache tail".into(),
+            ));
+        }
+        let total = self
+            .config
+            .num_hidden_layers
+            .checked_mul(self.config.num_experts)
+            .ok_or_else(|| BundleError::Forward("expert-cache rank geometry overflows".into()))?;
+        let mut seen = vec![false; total];
+        if warm_rank.len() != total
+            || warm_rank.iter().any(|&id| {
+                let Some(seen) = seen.get_mut(id as usize) else {
+                    return true;
+                };
+                std::mem::replace(seen, true)
+            })
+        {
+            return Err(BundleError::Forward(
+                "exact expert cache needs a complete unique global expert rank".into(),
+            ));
+        }
+        self.expert_cache = Some(crate::expert_cache_config::ExpertCacheLoad { config, warm_rank });
+        Ok(())
     }
 
     pub fn manifest(&self) -> &Qwen4Manifest {
@@ -1611,6 +1666,19 @@ impl Qwen4Bundle {
             }
             Err(error) => return Err(BundleError::Forward(error.to_string())),
         };
+        if let Some(cache) = &self.expert_cache {
+            if let Err(error) = forward.enable_expert_cache(
+                gpu,
+                &self.weights,
+                &self.config,
+                cache.config,
+                &cache.warm_rank,
+            ) {
+                let detail = error.to_string();
+                let _ = forward.free_gpu(gpu);
+                return Err(BundleError::Forward(detail));
+            }
+        }
         if let Some(profile) = self.slowlink.profile {
             forward.set_slowlink_profile(profile);
         }
@@ -1670,6 +1738,23 @@ impl Qwen4Bundle {
     }
     /// Attach the reusable native MTP head and its bounded GPU state.
     pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
+        if let Some(cache) = &self.expert_cache {
+            let rows = cache.config.verify_rows;
+            if !(2..=hipfire_dispatch::families::moe::MutableExpertResidency::MAX_VERIFY_ROWS)
+                .contains(&rows)
+                || self
+                    .execution
+                    .as_ref()
+                    .and_then(Qwen4GpuForward::expert_cache_verify_rows)
+                    != Some(rows)
+            {
+                return Err(BundleError::Forward(
+                    "exact expert cache native MTP requires its resolved bounded verify owner"
+                        .into(),
+                ));
+            }
+            self.check_expert_cache_idle(gpu)?;
+        }
         self.ep_refuse("native MTP")?;
         Self::require_mtp_head(self.config.profile.id(), self.weights.mtp.is_some())?;
         if self.mtp.is_some() {
@@ -1737,6 +1822,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         max_k: usize,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         let Some((_, rows)) =
             crate::mtp_spec::native_mtp_capture(gpu, &self.config, self.state_format.gdn, max_k)
         else {
@@ -1765,6 +1851,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         rows: usize,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         // The root-only spec hidden allocation is the output band's under PP
         // (the caller passes the output device); only EP has no such owner.
         if self.ep.is_some() {
@@ -2293,8 +2380,27 @@ impl Qwen4Bundle {
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, prefill);
         forward.layer_capture = layer_capture;
-        let result = forward
-            .forward_chunk(
+        let result = if !prefill
+            && self.expert_cache.is_some()
+            && self.mtp.is_some()
+            && self.dflash.is_none()
+        {
+            match hidden.as_ref() {
+                Some(hidden) => forward.forward_native_mtp_verify(
+                    self,
+                    gpu,
+                    tokens,
+                    &logits,
+                    Some(&top1),
+                    hidden,
+                    output_rows,
+                ),
+                None => Err(crate::gpu_forward::Qwen4GpuForwardError::Invalid(
+                    "native MTP cache verify requires its wide hidden capture".into(),
+                )),
+            }
+        } else {
+            forward.forward_chunk(
                 self,
                 gpu,
                 tokens,
@@ -2303,7 +2409,8 @@ impl Qwen4Bundle {
                 hidden.as_ref(),
                 output_rows,
             )
-            .map_err(|error| BundleError::Forward(error.to_string()));
+        }
+        .map_err(|error| BundleError::Forward(error.to_string()));
         forward.layer_capture = None;
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
@@ -2766,6 +2873,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         ple_normed: &GpuTensor,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         self.ep_refuse("speculative decoding (verify rollback)")?;
         self.state
             .rollback_rows_retain(
@@ -2951,6 +3059,7 @@ impl Qwen4Bundle {
         position: usize,
         fresh_qsa_selection: bool,
     ) -> Result<u32, BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         let mtp = mapped_mtp(self.mtp.as_mut(), gpu, position)?;
         mtp.forward_token(
             gpu,
@@ -2983,6 +3092,7 @@ impl Qwen4Bundle {
         fresh_qsa_selection: bool,
         top1_out: &GpuTensor,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         mapped_mtp(self.mtp.as_mut(), gpu, position)?
             .forward_token_deferred(
                 gpu,
@@ -3299,6 +3409,7 @@ impl Qwen4Bundle {
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         mapped_mtp(self.mtp.as_mut(), gpu, position)?
             .forward_token(
                 gpu,
@@ -3332,6 +3443,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         last_position: usize,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         mapped_mtp(self.mtp.as_mut(), gpu, last_position).map(|_| ())
     }
 
@@ -3401,6 +3513,7 @@ impl Qwen4Bundle {
         prompt_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         let width = self
             .config
             .hc_count
@@ -3455,6 +3568,7 @@ impl Qwen4Bundle {
         prompt_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         if tokens.is_empty() {
             return Err(BundleError::Forward(
                 "Qwen4 MTP batched append has no rows".to_string(),
@@ -3496,6 +3610,7 @@ impl Qwen4Bundle {
         fresh_qsa_selection: bool,
         logits: &GpuTensor,
     ) -> Result<u32, BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         let mtp = mapped_mtp(self.mtp.as_mut(), gpu, position)?;
         mtp.forward_token_with_logits(
             gpu,
@@ -3516,6 +3631,7 @@ impl Qwen4Bundle {
         &mut self,
         gpu: &mut Gpu,
     ) -> Result<MtpGpuStateSnapshot, BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         self.mtp
             .as_mut()
             .ok_or_else(|| {
@@ -3530,6 +3646,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: MtpGpuStateSnapshot,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         self.mtp
             .as_mut()
             .ok_or_else(|| {
@@ -3543,6 +3660,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: MtpGpuStateSnapshot,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         self.mtp
             .as_mut()
             .ok_or_else(|| {
@@ -3557,6 +3675,7 @@ impl Qwen4Bundle {
         snapshot: MtpGpuStateSnapshot,
         keep: usize,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_readers_idle()?;
         let compress = self.config.indexer_compress_ratio;
         self.mtp
             .as_mut()
@@ -3571,6 +3690,7 @@ impl Qwen4Bundle {
         &self,
         snapshot: MtpGpuStateSnapshot,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_readers_idle()?;
         self.mtp
             .as_ref()
             .ok_or_else(|| {
@@ -3814,6 +3934,7 @@ impl Qwen4Bundle {
 
     /// Reset every owner for a cold prefill.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         if self.pp.is_some() {
             return Err(pp_owner_required());
         }
@@ -4476,6 +4597,11 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
+        if self.expert_cache.is_some() {
+            return Err(BundleError::Forward(
+                "exact expert cache does not support continuous-batch lanes".into(),
+            ));
+        }
         self.pp_refuse("continuous-batch lanes")?;
         if self.ep.is_some() {
             return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec);
@@ -5078,7 +5204,45 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
+    /// Pending fills touch only donor payloads. State reads/writes are allowed
+    /// while they run, but never after an unretired or unknown cache reader.
+    pub(crate) fn check_expert_cache_idle(&self, gpu: &Gpu) -> Result<(), BundleError> {
+        match self.execution.as_ref() {
+            Some(forward) => forward
+                .check_expert_cache_idle(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None if self.expert_cache.is_some() => Err(BundleError::Forward(
+                "exact expert cache state operation requires its attached forward owner".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn check_expert_cache_readers_idle(&self) -> Result<(), BundleError> {
+        match self.execution.as_ref() {
+            Some(forward) => forward
+                .check_expert_cache_readers_idle()
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None if self.expert_cache.is_some() => Err(BundleError::Forward(
+                "exact expert cache state operation requires its attached forward owner".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "lab")]
+    pub fn dev_expert_cache_snapshot(&self) -> Result<serde_json::Value, BundleError> {
+        self.execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("exact expert cache forward is not attached".into())
+            })?
+            .expert_cache_snapshot()
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         self.ep_refuse("state snapshots")?;
         self.quiesce_ple()?;
         self.state.snapshot(gpu).map_err(BundleError::State)
@@ -5089,6 +5253,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         self.ep_refuse("state restore")?;
         self.invalidate_ple_epoch()?;
         self.state
@@ -5100,6 +5265,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         self.ep_refuse("state restore")?;
         self.quiesce_ple()?;
         self.state
@@ -5108,6 +5274,7 @@ impl Qwen4Bundle {
     }
 
     pub(crate) fn validate_commit(&self, snapshot: Qwen4StateSnapshot) -> Result<(), BundleError> {
+        self.check_expert_cache_readers_idle()?;
         self.state
             .validate_commit(snapshot)
             .map_err(BundleError::State)
@@ -5167,6 +5334,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
         self.ep_refuse("state commit")?;
         self.quiesce_ple()?;
         self.state.commit(snapshot, gpu).map_err(BundleError::State)
@@ -5179,6 +5347,18 @@ impl Qwen4Bundle {
         if self.pp.is_some() {
             std::mem::forget(self);
             return Err(pp_owner_required());
+        }
+        // A cache token can outlive an unsuccessful independent PM4 submit.
+        // Prove retirement before releasing any state, output, non-expert
+        // weight or transaction owner; retaining only the expert lease would
+        // leave the rest of that token's recorded pointers dangling.
+        if let Some(Err(error)) = self
+            .execution
+            .as_mut()
+            .map(|forward| forward.preflight_free_gpu(gpu))
+        {
+            std::mem::forget(self);
+            return Err(BundleError::Hip(error));
         }
         // Peers drain and free first: their gather events and P2P reads end
         // before rank 0's buffers go.

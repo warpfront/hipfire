@@ -981,11 +981,10 @@ impl Qwen4Bundle {
         let storage = self.cpu_storage_capacity_rows();
         let cpu = self.has_cpu_deferred_experts() || storage > 0;
         let default = spec_verify_rows_cap(cpu);
-        if cpu {
-            storage.max(default)
-        } else {
-            default
-        }
+        let cap = if cpu { storage.max(default) } else { default };
+        self.expert_cache
+            .as_ref()
+            .map_or(cap, |cache| cap.min(cache.config.verify_rows))
     }
 
     /// Refuse a `rows`-row speculative verify or replay on an armed CPU
@@ -5339,6 +5338,16 @@ impl Qwen4MtpDrafter {
         }
     }
 
+    /// Refuse only a request that actually reaches sampled native MTP with
+    /// mutable expert residency. Ordinary AR sampling never enters this gate.
+    fn require_supported_cache_request(&self, cache_enabled: bool) -> Result<(), String> {
+        if cache_enabled && self.sampled.is_some() {
+            Err("exact expert cache supports greedy native MTP only; sampled native MTP is not qualified".into())
+        } else {
+            self.require_supported_request()
+        }
+    }
+
     fn bundle<'a>(target: &'a mut dyn SpecTarget) -> Result<&'a mut Qwen4Bundle, String> {
         target
             .as_any_mut()
@@ -6669,7 +6678,7 @@ impl Qwen4MtpDrafter {
         probe: Option<TakeoverProbe>,
     ) -> Result<MtpWindow, String> {
         let eos = self.end_of_turn.unwrap_or(eos);
-        self.require_supported_request()?;
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache.is_some())?;
         // The window's penalty history restarts from `emitted` (idempotent
         // after `mtp_step`'s own `begin_window`).
         if let Some(s) = self.sampled.as_mut() {
@@ -8418,6 +8427,7 @@ impl Qwen4MtpDrafter {
         eos: u32,
         plan: &WindowPlan,
     ) -> Result<MtpWindow, String> {
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache.is_some())?;
         #[cfg(feature = "lab")]
         let observed = self.lab_window_begin(target, position, seed, plan);
         let prior_ngram = self.stats.ngram_mod_windows;
@@ -9019,6 +9029,7 @@ impl Qwen4MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache.is_some())?;
         // The whole prompt is one decode-share prompt: the donor tail is
         // restored once, after its last tile (`share_finish_prompt`). A mesh
         // never takes decode-share.
@@ -9772,7 +9783,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
-        self.require_supported_request()?;
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache.is_some())?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         // Expert parallelism: rank 0 and every peer's replica run the whole
         // prefill in one fan-out. A request this drafter cannot serve under EP
@@ -9872,6 +9883,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         eos: u32,
         _grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String> {
+        self.require_supported_cache_request(Self::bundle(target)?.expert_cache.is_some())?;
         let ep = Self::bundle(target)?.ep_mesh().is_some();
         if ep {
             self.refuse_naive_under_ep()?;
@@ -10565,7 +10577,7 @@ pub fn native_mtp_device_bytes(
 /// row plus `max_k` clamped to the widest verify forward
 /// (`QWEN4_SPEC_VERIFY_ROWS - 1` drafts). The verify hidden rows and the GDN
 /// row capture of every band are sized by it.
-pub(crate) fn native_mtp_window_rows(max_k: usize) -> usize {
+pub fn native_mtp_window_rows(max_k: usize) -> usize {
     max_k.clamp(1, QWEN4_SPEC_VERIFY_ROWS - 1) + 1
 }
 
@@ -11849,6 +11861,35 @@ mod tests {
         assert!(replica.pending_replay().is_empty());
         replica.mirror_ngram_active(true);
         assert!(replica.ngram_active());
+    }
+
+    #[test]
+    fn exact_cache_refuses_sampled_native_without_changing_uncached_policy() {
+        for mode in [SampledMode::Leviathan, SampledMode::Naive] {
+            let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+            drafter.sampled_enabled = true;
+            drafter.sampled_mode = Ok(mode);
+            drafter.configure_request(SpecRequestConfig {
+                temp: 0.8,
+                rng_seed: 123,
+                ..Default::default()
+            });
+            assert!(drafter.sampled.is_some());
+            assert!(drafter.require_supported_request().is_ok());
+            let error = drafter.require_supported_cache_request(true).unwrap_err();
+            assert!(error.contains("greedy native MTP only"));
+            assert!(drafter.require_supported_cache_request(false).is_ok());
+            assert!(
+                drafter.sampled.is_some(),
+                "refusal must not silently switch to AR"
+            );
+            assert_eq!(drafter.request.temp, 0.8);
+            assert_eq!(drafter.request.rng_seed, 123);
+
+            drafter.configure_request(SpecRequestConfig::default());
+            assert!(drafter.sampled.is_none());
+            assert!(drafter.require_supported_cache_request(true).is_ok());
+        }
     }
 
     #[test]

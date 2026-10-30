@@ -1,0 +1,249 @@
+{
+  "schema": "hipfire.prefill-comparison.receipts/v1",
+  "status": "PARTIAL",
+  "all_pass": false,
+  "partial_requested": true,
+  "matrix_evidence_complete": false,
+  "mandatory_checks_pass": false,
+  "no_model_load_gpu_retry_or_parameter_changes_by_this_verifier": true,
+  "arm_identity": {
+    "A": "old LRU, cache=1",
+    "B": "mapped-short-prefill LRU, cache=1"
+  },
+  "manifests": {
+    "old": {
+      "commit": "b0fda0da1ee62fdbf59d2448866330c53893bded",
+      "base": "6c99bef7f8fcb966c4104aab2583e894f20c9d10",
+      "source_clean": true,
+      "build": "cargo build --release --locked -p hipfire-cli -p hipfire-daemon",
+      "binaries": {
+        "hipfire": {
+          "size": 102843808,
+          "sha256": "377ddf62ef484920c6a6c215132a8aa1193c29f56257f9ee62022b253c7716b6",
+          "md5": "ddcef7e8217165846105377eb0c2b333"
+        },
+        "daemon_lru_old": {
+          "size": 112706560,
+          "sha256": "bca19fd88689c87b314f031cdd3d247129f23063668a327ad380f5dc7fdb93e5",
+          "md5": "3aab6b1082c06798c6c1dd3dc386353d"
+        }
+      },
+      "created_at": "2026-10-29T11:57:34.531888+00:00",
+      "lab_build_note": "Lab executable built from same frozen source contents before final two commits; git version label may precede commit metadata.",
+      "model": {
+        "path": "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+        "size": 125288544792,
+        "mtime_ns": 1792424439201838153,
+        "sha256_from_verified_bound_hotset": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+        "full_file_rehashed": false
+      },
+      "hotset_sha256": "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086",
+      "variant": "old LRU bulk-prefill restoration",
+      "daemon_basename": "daemon_lru_old",
+      "binary_contents_unchanged": true
+    },
+    "new": {
+      "base_pr_head": "db5abf9b5b619f1858cab66851503e6725b12ced",
+      "base_beta": "6c99bef7f8fcb966c4104aab2583e894f20c9d10",
+      "candidate_branch": "feat/flash-next-lru-prefill-20261029",
+      "source_patch_sha256": "d200892c813bc08a8dd78b80e67d4bce06b05514244b54ca72f15f9d5f4c7ce8",
+      "source_patch_bytes": 36894,
+      "created_utc": "2026-10-29T12:53:40.408100+00:00",
+      "scope": "existing immutable core/host short-prefill tables; long-stage restore retained; host metadata reserve128MiB; cache route unchanged",
+      "model_parameters_unchanged": true,
+      "source_clean": false,
+      "build": "cargo build --release --locked -p hipfire-cli -p hipfire-daemon",
+      "binaries": {
+        "hipfire": {
+          "size": 102852208,
+          "sha256": "88838a950a2beff25149082a531505e1dfeee6e273441957467057dbb70b6b3e",
+          "md5": "512e5d26868971cf0600e6e1c619115f"
+        },
+        "daemon_lru_new": {
+          "size": 112715288,
+          "sha256": "7560b2b9a7881c05309efaa48db774ed7122e2d0a6fcad928495639cc36dbf3c",
+          "md5": "de80c4158d49647faf7e471dc1c10f10"
+        }
+      },
+      "model": {
+        "path": "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+        "size": 125288544792,
+        "mtime_ns": 1792424439201838153,
+        "sha256_from_verified_bound_hotset": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+        "full_file_rehashed": false
+      }
+    }
+  },
+  "baseline_receipt": {
+    "draft_pr": "https://github.com/warpfront/hipfire/pull/1022",
+    "tested_head": "db5abf9b5b619f1858cab66851503e6725b12ced",
+    "worktree": "/home/husrcf/Code/hipfire-fn-lru-prefill-20261029",
+    "focus": "prefill donor restoration cost only",
+    "old_binaries": "../update-f85ea28/beta-6c99/runtime",
+    "measured_restore_bytes_per_request": 10486579200,
+    "measured_restore_wall_seconds_approx": 0.372
+  },
+  "failures": [],
+  "pending_evidence": [
+    {
+      "where": "A1",
+      "reason": "unavailable/unsettled JSON: [Errno 2] No such file or directory: '/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-A1/run.json'"
+    },
+    {
+      "where": "B1",
+      "reason": "unavailable/unsettled JSON: [Errno 2] No such file or directory: '/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B1/run.json'"
+    },
+    {
+      "where": "B2",
+      "reason": "unavailable/unsettled JSON: [Errno 2] No such file or directory: '/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B2/run.json'"
+    },
+    {
+      "where": "A2",
+      "reason": "unavailable/unsettled JSON: [Errno 2] No such file or directory: '/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-A2/run.json'"
+    },
+    {
+      "where": "A3",
+      "reason": "unavailable/unsettled JSON: [Errno 2] No such file or directory: '/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-A3/run.json'"
+    },
+    {
+      "where": "B3",
+      "reason": "unavailable/unsettled JSON: [Errno 2] No such file or directory: '/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B3/run.json'"
+    },
+    {
+      "where": "driver matrix",
+      "reason": "unavailable/unsettled JSON: [Errno 2] No such file or directory: '/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/overall-matrix.json'"
+    },
+    {
+      "where": "A1/warmup",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "A1/battery",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "A1/chain",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "A1/staged",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "A1/longdecode",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B1/warmup",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B1/battery",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B1/chain",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B1/staged",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B1/longdecode",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B2/warmup",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B2/battery",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "A2/warmup",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "A2/battery",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "A3/warmup",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "A3/battery",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B3/warmup",
+      "reason": "required phase not confirmed"
+    },
+    {
+      "where": "B3/battery",
+      "reason": "required phase not confirmed"
+    }
+  ],
+  "coverage_limitations": [],
+  "notes": [
+    "No optional session required or merged from other processes.",
+    "Matrix cache=0/1 values are worker variant selectors; effective feature flag is checked from each run.env.",
+    "Report preserves raw FP8/VMM/Q8 startup proof separately from unobserved harness backend fields.",
+    "runaway length-cap flags are preserved; valid length stops are not silently classified as attractors.",
+    "CPU/negative lifecycle tests and Redline state parity are separate evidence, not established by text comparison here."
+  ],
+  "cases": {},
+  "transcript_comparisons": {},
+  "lifecycle": {},
+  "battery_timing": {
+    "scope": "five-prompt 512-cap battery after same-process warm16; both arms exact cache enabled",
+    "precision_note": "decode rates rounded to 0.1 tok/s and wall to 0.001s by harness; derived decode time is not raw GPU timing",
+    "formulas": {
+      "decode_tok_s": "sum(gen)/sum(gen/reported_decode_tok_s)",
+      "prefill_tok_s": "sum(ctx-cached)/sum(prefill_ms/1000)",
+      "wall_tok_s": "sum(gen)/sum(wall_s)"
+    },
+    "cases": {},
+    "arms": {
+      "A": {
+        "variant": "old LRU",
+        "n_fresh_processes": 0,
+        "cells": [],
+        "derived_decode_tok_s": null,
+        "prefill_tok_s": null,
+        "sum_prefill_ms": null,
+        "sum_request_wall_s": null,
+        "wall_tok_s": null
+      },
+      "B": {
+        "variant": "mapped-short-prefill LRU",
+        "n_fresh_processes": 0,
+        "cells": [],
+        "derived_decode_tok_s": null,
+        "prefill_tok_s": null,
+        "sum_prefill_ms": null,
+        "sum_request_wall_s": null,
+        "wall_tok_s": null
+      }
+    },
+    "three_process_median_changes": {}
+  },
+  "first_pair_sanity": null,
+  "driver_matrix_raw": null,
+  "input_receipts": {
+    "BASELINE.json": {
+      "bytes": 404,
+      "sha256": "cca308675e23f99b0754850bb90e204ef662707611a09af5891e1ebe24325f8b"
+    },
+    "runtime-old/MANIFEST.json": {
+      "bytes": 1311,
+      "sha256": "321a52e8e52004fd9ec5937ab5bef3b4766999c8605cc459eeb1f28f22b04185"
+    },
+    "runtime-new/MANIFEST.json": {
+      "bytes": 1331,
+      "sha256": "99b62f7325fae7f43670f62fe1863fc9eb530828ae9cd17d5669f5b57058fc8a"
+    }
+  }
+}

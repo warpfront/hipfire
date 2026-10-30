@@ -1,0 +1,612 @@
+{
+  "schema": "hipfire.fn_expert_cache.cpu_validation_summary.v1",
+  "created_at": "2026-10-29T11:59:52.940514+00:00",
+  "base": "6c99bef7f8fcb966c4104aab2583e894f20c9d10",
+  "branch": "pr/flash-next-exact-lru-20261029",
+  "head": "b0fda0da1ee62fdbf59d2448866330c53893bded",
+  "freeze_patch_sha256": "e24c318babc4082cc40df13ef0d7d4f3e9ca5e71a3204c2cb134b38142a3f287",
+  "scope": "Read-only audit of frozen beta-6c99 CPU/static/build logs. No GPU invocation, product edit, tuning or upstream fetch.",
+  "check_runner": {
+    "recorded_checks": 14,
+    "all_recorded_exit_codes_zero": true,
+    "cpu_filter_runs": 9
+  },
+  "cpu_tests": {
+    "successful_executions": 184,
+    "unique_crate_qualified_tests": 182,
+    "failed": 0,
+    "ignored": 0,
+    "repeated_tests": [
+      {
+        "crate": "hipfire-arch-qwen4",
+        "name": "expert_tier_owners::decode_share_tests::expert_cache_canonical_view_has_complete_fallback_without_scratch_share",
+        "logs": [
+          "cache-cpu.log",
+          "decode-share-cpu.log"
+        ]
+      },
+      {
+        "crate": "hipfire-arch-qwen4",
+        "name": "expert_tier_owners::decode_share_tests::expert_cache_slot_ranges_are_disjoint_and_restore_exact_donor_bytes",
+        "logs": [
+          "cache-cpu.log",
+          "decode-share-cpu.log"
+        ]
+      }
+    ],
+    "runs": [
+      {
+        "name": "cache-cpu",
+        "crate": "hipfire-arch-qwen4",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "hipfire-arch-qwen4",
+          "--lib",
+          "expert_cache_",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "cache-cpu.log",
+        "exit_code": 0,
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 1485,
+        "test_names": [
+          "expert_cache::tests::expert_cache_accounting_uses_token_start_mapping",
+          "expert_cache::tests::expert_cache_bounded_queue_serves_every_layer_before_second_fills",
+          "expert_cache::tests::expert_cache_cpu_alias_translation_checks_both_ends",
+          "expert_cache::tests::expert_cache_fair_fill_order_skips_empty_layers",
+          "expert_cache::tests::expert_cache_seed_reset_keeps_ticket_generation_monotonic",
+          "expert_cache::tests::expert_cache_token_drop_does_not_claim_unknown_gpu_retirement",
+          "expert_cache::tests::expert_cache_warm_order_requires_complete_permutation",
+          "expert_cache_config::tests::expert_cache_admission_refuses_each_unqualified_route",
+          "expert_cache_config::tests::expert_cache_config_is_strict_and_defaults_off",
+          "expert_cache_config::tests::expert_cache_railgun_check_compatibility_truth_table",
+          "expert_tier_owners::decode_share_tests::expert_cache_canonical_view_has_complete_fallback_without_scratch_share",
+          "expert_tier_owners::decode_share_tests::expert_cache_slot_ranges_are_disjoint_and_restore_exact_donor_bytes",
+          "expert_tier_plan::tests::expert_cache_tail_keeps_core_device_only_and_charges_only_mirror",
+          "expert_tier_plan::tests::expert_cache_zero_is_identity_and_whole_device_layers_never_donate"
+        ]
+      },
+      {
+        "name": "decode-share-cpu",
+        "crate": "hipfire-arch-qwen4",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "hipfire-arch-qwen4",
+          "--lib",
+          "decode_share_",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "decode-share-cpu.log",
+        "exit_code": 0,
+        "passed": 79,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 1420,
+        "test_names": [
+          "decode_share::tests::decode_share_admission_accepts_the_product_load",
+          "decode_share::tests::decode_share_admission_names_each_refusal",
+          "decode_share::tests::decode_share_continuous_batching_is_refused",
+          "decode_share::tests::decode_share_mode_parser_defaults_to_the_product_default",
+          "decode_share::tests::decode_share_pinned_budget_turns_on_off_but_not_the_controls",
+          "decode_share_loan::tests::a_failed_shadow_rebuild_recovers_the_tail",
+          "decode_share_loan::tests::a_failed_tile_after_a_shadow_rebuild_with_a_failed_recovery_poisons",
+          "decode_share_loan::tests::a_shadow_oracle_mismatch_poisons",
+          "decode_share_loan::tests::a_span_that_is_only_the_shadow_region_zeroes_nothing",
+          "decode_share_loan::tests::acquire_from_resident_enters_dirty_before_the_first_write_and_zeroes_the_span",
+          "decode_share_loan::tests::acquire_from_restoring_waits_first_and_starts_a_new_epoch",
+          "decode_share_loan::tests::an_abandoned_prompt_recovers_instead_of_enqueuing",
+          "decode_share_loan::tests::back_to_back_prompts_share_one_epoch_and_never_enqueue",
+          "decode_share_loan::tests::capture_refuses_a_borrowed_tile_before_any_write",
+          "decode_share_loan::tests::capture_with_a_dirty_tail_poisons_instead_of_restoring",
+          "decode_share_loan::tests::class_growth_in_the_second_prompt_zeroes_only_the_delta",
+          "decode_share_loan::tests::class_growth_zeroes_only_the_delta_and_a_smaller_class_nothing",
+          "decode_share_loan::tests::enqueue_failure_recovers_and_keeps_the_original_error",
+          "decode_share_loan::tests::epoch_numbers_and_counters_accumulate_across_epochs",
+          "decode_share_loan::tests::failed_recovery_poisons_and_everything_then_refuses",
+          "decode_share_loan::tests::finish_prompt_leaves_the_tail_dirty_until_the_next_resident_call",
+          "decode_share_loan::tests::finish_prompt_under_capture_with_a_dirty_tail_poisons",
+          "decode_share_loan::tests::no_shadow_bytes_means_no_rebuild",
+          "decode_share_loan::tests::recovery_under_a_capture_poisons",
+          "decode_share_loan::tests::require_resident_from_each_state",
+          "decode_share_loan::tests::shadows_rebuild_once_per_epoch_after_the_scratch_zero_fill",
+          "decode_share_loan::tests::sync_knob_waits_right_after_the_enqueue",
+          "decode_share_loan::tests::teardown_restores_before_release_and_reports_failure",
+          "decode_share_loan::tests::the_borrow_view_class_follows_the_epoch_and_restarts_after_a_restore",
+          "decode_share_loan::tests::the_epoch_log_reads_the_rebuild_time_after_the_restore",
+          "decode_share_loan::tests::tile_error_recovers_with_a_blocking_copy_and_returns_resident",
+          "decode_share_loan::tests::verify_failure_after_a_restore_poisons",
+          "decode_share_loan::tests::wait_failure_recovers_the_restoring_extent",
+          "decode_share_loan::tests::zero_fill_failure_recovers_the_extent_it_may_have_dirtied",
+          "decode_share_shadows::tests::region_follows_the_flags",
+          "decode_share_shadows::tests::region_is_aligned_disjoint_and_ends_at_the_total",
+          "decode_share_shadows::tests::region_members_are_exactly_the_census_owners",
+          "decode_share_shadows::tests::region_of_a_manifest_without_owners_is_empty",
+          "decode_share_shadows::tests::shadow_flags_follow_the_census_predicates",
+          "expert_residency::decode_share_stage_tests::decode_share_stage_bytes_borrow_view_counts_donors_as_host_experts",
+          "expert_residency::decode_share_stage_tests::decode_share_stage_bytes_resident_view_is_unchanged_for_non_sharing_plans",
+          "expert_residency::tests::decode_share_dedicated_forward_lowers_both_reserves_by_exactly_the_delta",
+          "expert_residency::tests::decode_share_forward_override_replaces_exactly_the_forward_term",
+          "expert_residency::tests::decode_share_r9700_class_donor_table",
+          "expert_residency::tests::decode_share_r9700_receipt_fixture",
+          "expert_residency::tests::decode_share_shadows_borrowed_in_the_donor_tail",
+          "expert_tier_owners::decode_share_tests::decode_share_borrow_digest_differs_from_resident_and_is_stable",
+          "expert_tier_owners::decode_share_tests::decode_share_borrow_tables_map_donors_to_the_mirror_and_nothing_else",
+          "expert_tier_owners::decode_share_tests::decode_share_borrow_view_is_none_on_a_non_sharing_binding",
+          "expert_tier_owners::decode_share_tests::decode_share_build_requires_bases_and_rejects_short_entry_lists",
+          "expert_tier_owners::decode_share_tests::decode_share_claim_is_exclusive_and_released",
+          "expert_tier_owners::decode_share_tests::decode_share_class_donor_counts_are_nested_and_count_a_partial_overlap",
+          "expert_tier_owners::decode_share_tests::decode_share_class_views_differ_from_resident_exactly_at_their_donors",
+          "expert_tier_owners::decode_share_tests::decode_share_layer_views_select_their_own_tables",
+          "expert_tier_owners::decode_share_tests::decode_share_non_sharing_plan_has_no_borrow_view",
+          "expert_tier_owners::decode_share_tests::decode_share_verify_tail_bytes_compares_hashes_and_names_the_first_difference",
+          "expert_tier_owners::decode_share_tests::expert_cache_canonical_view_has_complete_fallback_without_scratch_share",
+          "expert_tier_owners::decode_share_tests::expert_cache_slot_ranges_are_disjoint_and_restore_exact_donor_bytes",
+          "expert_tier_plan::tests::decode_share_digest_changes_only_with_sharing",
+          "expert_tier_plan::tests::decode_share_exact_layout_and_size",
+          "expert_tier_plan::tests::decode_share_insufficient_budget",
+          "expert_tier_plan::tests::decode_share_invariants_over_mixed_ranks",
+          "expert_tier_plan::tests::decode_share_keeps_existing_host_windows_and_rejects_duplicate_ranks",
+          "expert_tier_plan::tests::decode_share_layout_with_odd_lengths_and_several_layers",
+          "expert_tier_plan::tests::decode_share_need_zero_is_identity",
+          "expert_tier_plan::tests::decode_share_one_expert_and_exact_fit_boundary",
+          "expert_tier_plan::tests::decode_share_skips_experts_of_all_device_layers",
+          "gpu_forward::tests::decode_share_bank_swaps_track_capacity_and_dirty_prefix",
+          "gpu_forward::tests::decode_share_borrow_view_class_is_the_epochs_dirty_class",
+          "gpu_forward::tests::decode_share_borrowed_backing_holds_every_root_and_view",
+          "gpu_forward::tests::decode_share_borrowed_bank_matches_the_allocated_census",
+          "gpu_forward::tests::decode_share_capacity_classes",
+          "gpu_forward::tests::decode_share_class_selection_table",
+          "gpu_forward::tests::decode_share_dedicated_bytes_undercut_the_full_forward",
+          "gpu_forward::tests::decode_share_dirty_borrow_continues_only_inside_the_entry_that_borrowed",
+          "gpu_forward::tests::decode_share_free_lists_free_each_owner_once",
+          "gpu_forward::tests::decode_share_prefill_tile_predicate_table",
+          "gpu_forward::tests::decode_share_refusal_names_each_excluded_route",
+          "gpu_forward::tests::decode_share_tile_moe_selects_the_borrow_twins_only_while_active"
+        ]
+      },
+      {
+        "name": "gtt-cpu",
+        "crate": "hipfire-arch-qwen4",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "hipfire-arch-qwen4",
+          "--lib",
+          "expert_residency::tests::gtt_",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "gtt-cpu.log",
+        "exit_code": 0,
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 1492,
+        "test_names": [
+          "expert_residency::tests::gtt_cap_counts_what_devices_already_hold",
+          "expert_residency::tests::gtt_cap_diagnostic_does_not_claim_a_specific_provider_path",
+          "expert_residency::tests::gtt_device_totals_use_primary_nodes_and_checked_sums",
+          "expert_residency::tests::gtt_limit_ambiguous_providers_keep_the_smaller_cap",
+          "expert_residency::tests::gtt_limit_dkms_ignores_only_the_inactive_provider",
+          "expert_residency::tests::gtt_limit_missing_invalid_and_overflow_never_become_unlimited",
+          "expert_residency::tests::gtt_limit_vanilla_keeps_active_zero_and_device_bound"
+        ]
+      },
+      {
+        "name": "mutable-cpu",
+        "crate": "hipfire-dispatch",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "hipfire-dispatch",
+          "--lib",
+          "families::moe::mutable_residency::tests::",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "mutable-cpu.log",
+        "exit_code": 0,
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 623,
+        "test_names": [
+          "families::moe::mutable_residency::tests::active_token_rejects_publication_before_upload_callback",
+          "families::moe::mutable_residency::tests::changed_table_owner_generation_and_overlapping_slots_refuse",
+          "families::moe::mutable_residency::tests::idle_binding_checks_do_not_authorize_a_launch",
+          "families::moe::mutable_residency::tests::publication_preserves_binding_and_retired_token_allows_next_epoch",
+          "families::moe::mutable_residency::tests::retained_capability_keeps_payload_and_table_owners_alive",
+          "families::moe::mutable_residency::tests::uncompleted_wrong_expert_and_stale_generations_refuse",
+          "families::moe::mutable_residency::tests::unretired_guard_and_partial_upload_poison",
+          "families::moe::mutable_residency::tests::upload_panic_cannot_reopen_the_old_table_epoch"
+        ]
+      },
+      {
+        "name": "placement-cpu",
+        "crate": "hipfire-loader",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "hipfire-loader",
+          "--lib",
+          "expert_cache_placement_keeps_the_pin_and_charges_its_mirror_and_queues",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "placement-cpu.log",
+        "exit_code": 0,
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 228,
+        "test_names": [
+          "carriers::qwen4_admission_tests::expert_cache_placement_keeps_the_pin_and_charges_its_mirror_and_queues"
+        ]
+      },
+      {
+        "name": "quiescence-cpu",
+        "crate": "rdna-compute",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "rdna-compute",
+          "--lib",
+          "quiescence",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "quiescence-cpu.log",
+        "exit_code": 0,
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 1247,
+        "test_names": [
+          "replay::tests::replay_quiescence_mapping",
+          "replay::tests::unknown_quiescence_requires_quiesce_before_reuse_and_shutdown_retains"
+        ]
+      },
+      {
+        "name": "sealed-cpu",
+        "crate": "hipfire-dispatch",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "hipfire-dispatch",
+          "--lib",
+          "pipeline::sealed_moe::tests::",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "sealed-cpu.log",
+        "exit_code": 0,
+        "passed": 62,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 569,
+        "test_names": [
+          "pipeline::sealed_moe::tests::aliases_are_range_checked_and_combine_policy_is_explicit",
+          "pipeline::sealed_moe::tests::base_prefill_params_carry_no_expert_iu4",
+          "pipeline::sealed_moe::tests::binding_identity_rejects_invalid_rank_and_device_before_launch",
+          "pipeline::sealed_moe::tests::bound_construction_rejects_a_swapped_same_capacity_table_generation",
+          "pipeline::sealed_moe::tests::bound_construction_rejects_an_unbound_cache",
+          "pipeline::sealed_moe::tests::compact_bind_rank0_and_rank1_succeed_with_slot_ordered_lists",
+          "pipeline::sealed_moe::tests::compact_bind_rejects_misordered_local_experts",
+          "pipeline::sealed_moe::tests::compact_bind_rejects_missing_local_expert",
+          "pipeline::sealed_moe::tests::compact_bind_rejects_non_owned_non_dummy_pointer",
+          "pipeline::sealed_moe::tests::compact_bind_rejects_owned_pointer_mismatch",
+          "pipeline::sealed_moe::tests::compact_bind_rejects_wrong_device_and_stale_table",
+          "pipeline::sealed_moe::tests::compact_bind_rejects_wrong_dummy_layout",
+          "pipeline::sealed_moe::tests::compact_bind_same_mapping_retains_same_fingerprint",
+          "pipeline::sealed_moe::tests::cpu_deferred_splice_replaces_the_routed_tail_in_recipe_order",
+          "pipeline::sealed_moe::tests::cpwait_split_queues_the_combine_before_the_join_in_both_protocols",
+          "pipeline::sealed_moe::tests::decode_grammar_matrix_single_and_root_routed",
+          "pipeline::sealed_moe::tests::decode_lowering_emits_owner_assign_exactly_when_the_gather_asks",
+          "pipeline::sealed_moe::tests::decode_lowering_emits_row_gather_exactly_when_installed",
+          "pipeline::sealed_moe::tests::decode_lowering_refuses_a_gather_off_the_grouped_route",
+          "pipeline::sealed_moe::tests::decode_shared_policy_is_explicit_and_launch_free",
+          "pipeline::sealed_moe::tests::execution_contract_fingerprint_and_root_routed_predicate",
+          "pipeline::sealed_moe::tests::fp8_decode_and_prefill_lower_the_same_grouped_stages_without_path2",
+          "pipeline::sealed_moe::tests::grouped_prefill_capacity_accepts_just_fit_and_rejects_one_row_small",
+          "pipeline::sealed_moe::tests::live_validation_accepts_the_bound_table_and_rejects_a_third_table",
+          "pipeline::sealed_moe::tests::live_validation_allows_reuse_of_the_exact_bound_resources",
+          "pipeline::sealed_moe::tests::live_validation_rejects_swapped_same_capacity_expert_buffer",
+          "pipeline::sealed_moe::tests::live_validation_rejects_swapped_same_capacity_pointer_table",
+          "pipeline::sealed_moe::tests::local_expert_ids_follow_local_slot_order_not_global_order",
+          "pipeline::sealed_moe::tests::mixed_dtypes_allow_an_independent_down_basis_but_gate_up_basis_must_match",
+          "pipeline::sealed_moe::tests::mixed_layout_validation_checks_every_record_not_only_each_layouts_first",
+          "pipeline::sealed_moe::tests::mutable_decode_refuses_unqualified_arch_cpu_and_ep_before_sealing",
+          "pipeline::sealed_moe::tests::mutable_live_mapping_is_guarded_and_retained_identity_excludes_epoch",
+          "pipeline::sealed_moe::tests::owner_gather_off_the_grouped_route_still_refuses",
+          "pipeline::sealed_moe::tests::paro_prefill_lowers_the_routed_input_basis_after_the_shared_stages",
+          "pipeline::sealed_moe::tests::paro_separate_gate_up_uses_each_half_of_fused_rows",
+          "pipeline::sealed_moe::tests::prefill_adopt_binds_nonroot_receipt_with_provenance",
+          "pipeline::sealed_moe::tests::prefill_ep_seal_admits_compact_partial_only",
+          "pipeline::sealed_moe::tests::prefill_lowering_emits_owner_assign_exactly_when_the_gather_asks",
+          "pipeline::sealed_moe::tests::prefill_lowering_emits_row_gather_exactly_when_installed",
+          "pipeline::sealed_moe::tests::prefill_lowering_emits_tile_stages_exactly_when_installed_on_the_f16_wmma_route",
+          "pipeline::sealed_moe::tests::prefill_lowering_emits_tile_stages_exactly_when_installed_on_the_symmetric_route",
+          "pipeline::sealed_moe::tests::prefill_lowering_refuses_a_gather_off_the_grouped_route_or_into_a_partial",
+          "pipeline::sealed_moe::tests::prefill_lowering_refuses_a_tile_exchange_off_the_grouped_qt44_qt53_route",
+          "pipeline::sealed_moe::tests::public_decode_rejects_precomputed_routed_contrib_bypass",
+          "pipeline::sealed_moe::tests::qt53_resource_header_requires_exact_stride_extent_and_mixed_tag_capacity",
+          "pipeline::sealed_moe::tests::route_producer_proof_rejects_non_root_calls",
+          "pipeline::sealed_moe::tests::route_receipt_binds_grammar_dimensions_and_buffers_without_gpu_work",
+          "pipeline::sealed_moe::tests::route_receipt_rejects_another_invocation_and_buffer_pair",
+          "pipeline::sealed_moe::tests::routed_contrib_rejects_role_layer_contract_and_shape_mismatch",
+          "pipeline::sealed_moe::tests::routed_contrib_seal_binds_proof_to_nonroot_call",
+          "pipeline::sealed_moe::tests::shape_and_capacity_checks_are_checked_without_gpu_work",
+          "pipeline::sealed_moe::tests::sigmoid_decode_refuses_before_publication_without_deltanet",
+          "pipeline::sealed_moe::tests::slab_mixed_tag_allocation_carries_the_i32_owner_table_behind_the_u8_table",
+          "pipeline::sealed_moe::tests::split_cap_matches_the_narrow_verify_window_and_wide_prefill_is_ordinary",
+          "pipeline::sealed_moe::tests::split_mode_adds_only_the_two_split_stages_to_the_ordinary_program",
+          "pipeline::sealed_moe::tests::split_mode_brackets_the_routed_gpu_tail_in_both_protocols",
+          "pipeline::sealed_moe::tests::split_mode_is_distinct_from_cpu_deferred_experts",
+          "pipeline::sealed_moe::tests::split_mode_refuses_every_lowering_it_does_not_bracket",
+          "pipeline::sealed_moe::tests::split_run_gate_refuses_capture_retained_shadow_and_pm4",
+          "pipeline::sealed_moe::tests::split_transaction_phases_are_ordered_and_the_reference_keeps_the_original_route",
+          "pipeline::sealed_moe::tests::tier_bind_refuses_wrong_codec_and_pointer_entries_off_the_live_tensors",
+          "pipeline::sealed_moe::tests::tier_binding_validates_generation_content_and_keeps_owners_alive"
+        ]
+      },
+      {
+        "name": "slot-cpu",
+        "crate": "hipfire-runtime",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "hipfire-runtime",
+          "--lib",
+          "weight_pager::tests::slot_cache_",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "slot-cpu.log",
+        "exit_code": 0,
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 1885,
+        "test_names": [
+          "weight_pager::tests::slot_cache_all_pending_refusal_preserves_access_order",
+          "weight_pager::tests::slot_cache_clear_restores_slot_order_without_reusing_ticket_identity",
+          "weight_pager::tests::slot_cache_generation_exhaustion_fails_without_eviction",
+          "weight_pager::tests::slot_cache_generation_rejects_aba_commit_and_rollback",
+          "weight_pager::tests::slot_cache_partial_rollback_reuses_hole_without_evicting_or_resurrecting",
+          "weight_pager::tests::slot_cache_pending_duplicate_touches_without_claiming_fill",
+          "weight_pager::tests::slot_cache_reverse_completion_preserves_logical_lru",
+          "weight_pager::tests::slot_cache_victim_identity_and_pools_are_independent"
+        ]
+      },
+      {
+        "name": "state-failure-cpu",
+        "crate": "hipfire-generate",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "hipfire-generate",
+          "--lib",
+          "redline_snapshot_tests::qwen4_",
+          "--",
+          "--test-threads=1"
+        ],
+        "log": "state-failure-cpu.log",
+        "exit_code": 0,
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 140,
+        "test_names": [
+          "redline::redline_snapshot_tests::qwen4_ef_only_byte_divergence_fails_state_and_gdn_parity",
+          "redline::redline_snapshot_tests::qwen4_failure_probe_keeps_the_induced_error_when_recovery_fails",
+          "redline::redline_snapshot_tests::qwen4_snapshot_reads_the_live_optional_ef_owner"
+        ]
+      }
+    ]
+  },
+  "precommits": [
+    {
+      "name": "precommit-product",
+      "log": "precommit-product.log",
+      "exit_code_recorded": 0,
+      "success_marker": true,
+      "head_label": "6c99bef7f",
+      "commands": [
+        "bash scripts/leanup-ratchets.sh",
+        "python3 scripts/check-crate-maps.py --check",
+        "python3 scripts/check-scratch-growth.py",
+        "python3 scripts/check-changelog.py",
+        "python3 scripts/check-conflict-markers.py",
+        "bash scripts/ratchet-diff.sh origin/beta",
+        "cargo deny check bans licenses sources",
+        "cargo-fmt --all -- --check",
+        "bash scripts/ci-rustfmt-changed.sh",
+        "cargo clippy --workspace --all-targets --locked",
+        "python3 scripts/check-env-docs.py",
+        "python3 scripts/check-lifecycle.py"
+      ],
+      "scope_note": "Workspace all-targets clippy, formatting and static/supply-chain gates; this script explicitly skips tests and release workspace build."
+    },
+    {
+      "name": "precommit-validation",
+      "log": "precommit-validation.log",
+      "exit_code_recorded": null,
+      "success_marker": true,
+      "head_label": "2e1dc0542",
+      "commands": [
+        "bash scripts/leanup-ratchets.sh",
+        "python3 scripts/check-crate-maps.py --check",
+        "python3 scripts/check-scratch-growth.py",
+        "python3 scripts/check-changelog.py",
+        "python3 scripts/check-conflict-markers.py",
+        "bash scripts/ratchet-diff.sh origin/beta",
+        "cargo deny check bans licenses sources",
+        "cargo-fmt --all -- --check",
+        "bash scripts/ci-rustfmt-changed.sh",
+        "cargo clippy --workspace --all-targets --locked",
+        "python3 scripts/check-env-docs.py",
+        "python3 scripts/check-lifecycle.py"
+      ],
+      "scope_note": "Workspace all-targets clippy, formatting and static/supply-chain gates; this script explicitly skips tests and release workspace build."
+    }
+  ],
+  "release_build": {
+    "command": "cargo build --release --locked -p hipfire-cli -p hipfire-daemon",
+    "source_commit": "b0fda0da1ee62fdbf59d2448866330c53893bded",
+    "log": "build-product-frozen.log",
+    "success_marker": true,
+    "scope": "hipfire-cli and hipfire-daemon plus their dependency graph; not cargo build --release for every workspace member",
+    "warnings_present": true,
+    "warning_provenance": "Logs contain warnings. This audit did not compare every diagnostic with upstream, so it makes no zero-warning or all-warnings-preexisting claim."
+  },
+  "lab_builds": [
+    {
+      "name": "publication-build",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "-p",
+        "hipfire-arch-qwen4",
+        "--features",
+        "lab",
+        "--example",
+        "fn_expert_cache_publication"
+      ],
+      "exit_code": 0,
+      "log": "publication-build.log",
+      "source_note": "Lab executable built from same frozen source contents before final two commits; git version label may precede commit metadata."
+    },
+    {
+      "name": "s0-build",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "-p",
+        "rdna-compute",
+        "--features",
+        "lab",
+        "--example",
+        "fn_expert_table_indirection"
+      ],
+      "exit_code": 0,
+      "log": "s0-build.log",
+      "source_note": "Lab executable built from same frozen source contents before final two commits; git version label may precede commit metadata."
+    }
+  ],
+  "static_checks": [
+    {
+      "name": "maps",
+      "command": [
+        "python3",
+        "scripts/check-crate-maps.py",
+        "hipfire-arch-qwen4",
+        "hipfire-dispatch",
+        "hipfire-runtime",
+        "hipfire-loader",
+        "hipfire-config",
+        "rdna-compute",
+        "hipfire-generate"
+      ],
+      "exit_code": 0,
+      "log": "maps.log"
+    },
+    {
+      "name": "lifecycle",
+      "command": [
+        "python3",
+        "scripts/check-lifecycle.py",
+        "--write"
+      ],
+      "exit_code": 0,
+      "log": "lifecycle.log"
+    }
+  ],
+  "template": {
+    "source": ".github/PULL_REQUEST_TEMPLATE.md at frozen branch",
+    "surfaces": {
+      "kernel": true,
+      "load": true,
+      "serve": true,
+      "arch_crates": [
+        "hipfire-arch-qwen4"
+      ],
+      "quant_formats": false,
+      "control_plane": false,
+      "docs_ci_scripts_only": false,
+      "policy_files": false
+    },
+    "test_plan": [
+      {
+        "item": "./scripts/no-gpu-ci.sh passes, or CI jobs green",
+        "check": false,
+        "reason": "No final full no-gpu-ci or CI-green evidence in these logs. pre-commit-ci is a narrower static gate."
+      },
+      {
+        "item": "cargo build --release clean",
+        "check": false,
+        "reason": "Scoped release CLI+daemon build passed with warnings. Root virtual workspace has no default-members, so scoped build is not the full workspace command."
+      },
+      {
+        "item": "cargo test --lib --workspace passes",
+        "check": false,
+        "reason": "Only nine focused filters ran: 184 successful executions / 182 unique tests; no full workspace suite."
+      },
+      {
+        "item": "serve_harness battery on flagship",
+        "check": null,
+        "reason": "Parent is performing frozen-source GPU/model validation; use its actual battery JSON, not CPU logs or a run transcript."
+      },
+      {
+        "item": "KV backend fields inspected",
+        "check": null,
+        "reason": "Mark only after reviewing actual loaded/harness kv_backend, kv_backend_legacy and kv_backend_reason fields; disclose any legacy use."
+      },
+      {
+        "item": "speed-gate within +/-2% locked baselines",
+        "check": false,
+        "reason": "No speed-gate execution in these CPU/static logs. Keep literal item unchecked; describe any separate matched model timing evidence precisely."
+      },
+      {
+        "item": "RATCHET-RAISE label/message requirement",
+        "check": false,
+        "not_applicable": true,
+        "reason": "scripts/leanup-thresholds.txt unchanged; precommit-validation ratchet-diff passed against 6c99."
+      }
+    ],
+    "architecture_trait_note": "crates/hipfire-runtime/src/arch.rs Architecture trait is unchanged. Dispatch RoutedExpertWeights gains the opt-in mutable residency capability; describe separately."
+  },
+  "limitations": [
+    "No GPU/model qualification is inferred from CPU/build/static passes.",
+    "No full workspace lib tests, full root release build, full no-gpu-ci or final CI jobs are claimed.",
+    "Earlier f85/S0 evidence must retain its original source/binary labels; it is not included in this beta-6c99 CPU count.",
+    "Changed Python harness tests are not represented by these nine Rust filter logs; if needed, attach their separately pinned validation results."
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "frozen_utc": "2026-10-29T11:41:44.366838+00:00",
+  "base": "6c99bef7f8fcb966c4104aab2583e894f20c9d10",
+  "branch": "pr/flash-next-exact-lru-20261029",
+  "patch_sha256": "e24c318babc4082cc40df13ef0d7d4f3e9ca5e71a3204c2cb134b38142a3f287",
+  "policy": "User requested implementation freeze; only overall validation, evidence/PR preparation, and fixes required to unblock validation. No optimization search or further beta tracking.",
+  "fixed_model_settings": {
+    "expert_budget_mib": 20000,
+    "tail_percent": 50,
+    "max_inflight": 64,
+    "prefill_chunk_rows": 4096,
+    "max_seq": 16384,
+    "ple": "q4 explicit override",
+    "speculation": "off",
+    "decode_share": "off",
+    "expert_execution": "pcie",
+    "kv": "native fp8 / VMM",
+    "gdn": "Q8 EF default on"
+  }
+}

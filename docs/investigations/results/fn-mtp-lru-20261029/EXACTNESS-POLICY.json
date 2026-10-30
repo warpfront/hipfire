@@ -1,0 +1,83 @@
+{
+  "scope": "Q8 greedy native MTP plus exact-LRU oracle; model qualification pending",
+  "required_env": {
+    "HIPFIRE_MTP_MODE": "on",
+    "HIPFIRE_OFFLOAD_EXEC": "pcie",
+    "HIPFIRE_QWEN4_D2_DEFAULT": "0",
+    "HIPFIRE_QWEN4_DECODE_SHARE": "off",
+    "HIPFIRE_STATE_QUANT": "q8",
+    "HIPFIRE_MTP_NGRAM_COPY": "0",
+    "HIPFIRE_REPLAY_BACKEND": "hip",
+    "HIPFIRE_MTP_TRACE": "1 (functional evidence only)",
+    "HIPFIRE_MTP_INCREMENTAL": "0 for initial batched-native qualification; incremental is separate"
+  },
+  "matched_env": [
+    "HIPFIRE_KV_MODE (retain prior QSA policy; record actual format)",
+    "HIPFIRE_PLE_FORMAT",
+    "HIPFIRE_QWEN4_EXPERT_HOT_BUDGET_MIB",
+    "HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT",
+    "HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT",
+    "kernel cache and all unrelated overrides"
+  ],
+  "model_reserve": {
+    "head_reserve_k": 7,
+    "forced_native_k_default": 3,
+    "target_rows": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "both_arms_identical_head_reserve": true
+  },
+  "hard_exactness": [
+    {
+      "domain": "AR vs qualified target verify/commit/abandon/continuation",
+      "comparison": "zero-mask full vocabulary bits and SHA256 SessionState::snapshot_parts metadata + every fixed part + valid row bytes",
+      "basis": [
+        "wide_verify_oracle::dev_state_digest delegates to cache_quality::cq_state_families",
+        "cache_quality.rs cq_state_families hashes meta unmodified as part.0, then fixed offsets/bytes and rows*row_bytes",
+        "qwen4_wide_verify strict route requires bitwise logits/state for all explicitly requested qualified rows",
+        "state.rs session_parts_at serializes semantic state tag/position/PLE/QSA marks; no process IDs or device pointers"
+      ]
+    },
+    {
+      "domain": "cache-on vs cache-off same native schedule",
+      "comparison": "exact emitted IDs, full target hashes, native MTP head/policy state and pending hidden hashes, and repaired terminal head/target state hashes under identical replayed native windows",
+      "condition": "actual source/route/K/accepted/committed/position and committed token sequences must first match; identical model/format/head reserve/environment required"
+    },
+    {
+      "domain": "cold vs restored MTP prefix",
+      "comparison": "all MTP snapshot parts and seed exact",
+      "basis": "session_cache_hw::restored_prefill_matches_cold_on_flash_next asserts these same-schedule cold/hit states"
+    },
+    {
+      "domain": "native terminal repair",
+      "comparison": "replay the original native-window source/width/acceptance/token schedule; repair one actually consumed output; compare target logical state with sequential AR from the original prompt consuming the same history. Live session planning must preserve repaired head/target state in place, and subsequent prefill must advance to its expected positions.",
+      "basis": "Cold-prefilling generated history is a different GDN/head arithmetic schedule and cannot reconstruct the native window used as the terminal reference. Cross-schedule next-seed equality is not claimed."
+    }
+  ],
+  "diagnostic_only": [
+    {
+      "domain": "native head generation vs teacher-forced append",
+      "reason": "different arithmetic/append schedules and MTP metadata full_steps/margin may differ; neither is a new LRU defect by itself",
+      "basis": [
+        "mtp_gpu.rs::session_parts appends draft.request_state full_steps and margin bits",
+        "mtp_takeover_fill_hw explicitly reports cross4-row/1-row forced family/pending byte equality without gating it",
+        "session_cache_hw terminal test prints cross-schedule part differences; only live seed mismatch is fatal"
+      ]
+    }
+  ],
+  "not_qualified": [
+    "native PM4 replay",
+    "live Q8Ef",
+    "sampled MTP",
+    "ngram-copy",
+    "generic commit no-row-capture fallback",
+    "SSE terminal wire",
+    "actual bundle state-entry operations under intentionally busy manager guard (capability busy checks alone are not that proof)",
+    "uninstrumented performance",
+    "next-turn seed equality across different head/prefill schedules"
+  ],
+  "s0_checkpoint": "Developer-owned host bytes captured once via SessionState::snapshot_parts and restored through restore_parts/finish_restore; shape/extent checks plus S0 rehash each time. No nested model rollback ticket and no repeat model load."
+}

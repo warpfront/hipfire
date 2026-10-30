@@ -24,6 +24,62 @@ somewhere in this file).
 
 ---
 
+## Experimental Flash-Next exact expert cache
+
+`HIPFIRE_QWEN4_EXPERT_CACHE=1` (typed boolean; default off) enables the
+exact expert LRU described in [CONFIG.md](CONFIG.md). It requires one gfx1201
+GPU, uniform QT44/QT53 Flash-Next weights and an applicable ranked hotset.
+Use plain AR or greedy native MTP under the existing MTP off/auto/on policy; enabling
+the cache does not enable MTP. Native MTP requires an admitted head and a
+resolved verify window of at most 8 rows, including the seed row. The same
+proposal bound used for the GDN row ring sizes the cache routes and readback;
+native MTP's internal n-gram takeover counts toward that bound. A wider
+proposal fails the load by name, without clamping it to 8. Each native window
+reads the mutable LRU tables under one set of 48 layer guards; routes are
+observed and bounded paired fills scheduled after the whole window retires.
+Sampled native MTP requests are refused before prompt/state mutation; ordinary
+AR sampling and uncached native MTP keep their existing policy. DFlash, DSpark
+and the independent n-gram drafter remain unsupported.
+Set `HIPFIRE_QWEN4_DECODE_SHARE=off` and `HIPFIRE_OFFLOAD_EXEC=pcie`.
+CPU/D2, EP/PP/TP, continuous batching, NPU, S1, expert-keep and whole-first
+placement are refused. The MTP head follows the trunk's actual D2 verdict;
+unset head-D2 policy with no armed trunk split stays on the GPU/PCIe route.
+Routing is unchanged; a miss runs from canonical mapped host bytes and
+schedules a bounded paired fill for later windows/tokens. Dirty prefill tiles
+below the effective expert-staging threshold (2048 rows by default on gfx1201)
+use independent immutable tables: core experts stay in VRAM; donors and cold experts read their immutable host
+backing. This route preserves pending fills and decode LRU without draining
+copies or restoring donor bytes. It uses independent immutable tables and
+never stages experts. Other prefill tiles retain the frozen resident view and restore donor bytes when required, including long staged prefill and its
+subsequent clean short tail.
+
+`HIPFIRE_RAILGUN_CHECK=always` is refused before weight fulfillment when
+this cache is enabled. Its fixed physical `Weights` digest baseline conflicts
+with legal donor-slot overwrites. The resolved process configuration is
+checked, including TOML `developer.railgun_check`; disabling the cache preserves
+ordinary railgun checking. `sample(N)` has no such weight-digest conflict,
+which is not a claim that the combination has been qualified.
+
+`HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT` defaults to `50` and accepts
+`1..=100`; it requests the evictable fraction of the resident expert owner,
+rounded to whole experts from mixed-residency layers. Only that tail needs an
+extra immutable host mirror. `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` defaults to
+`64` and accepts `1..=4096` paired fills. Table/route owners and a conservative
+32 MiB device queue margin plus 128 MiB host metadata margin join admission.
+Device route storage is charged for the admitted window capacity, shared by
+preload planning and runtime allocation. A load resolved as AR at admission
+uses 1 row; native MTP reserves 2..=8 rows. If the existing host-spill policy
+later declines auto MTP to AR, that load keeps its conservative admitted
+capacity and placement budget; it does not resize the route buffers. An
+explicit native MTP request on a cache load fails instead of silently
+falling back to AR. The host margin covers both additional expert runtimes
+(decode and immutable short prefill), binding identities, LRU state and bounded
+upload/readback storage. The short prefill route borrows existing canonical
+tables and payloads and adds no expert payload or GPU table allocation.
+These margins are reserves, not measured peak-memory receipts. Invalid
+explicit values fail the load, including when the cache is disabled. This
+opt-in path carries no default-on or performance claim.
+
 ## Manual — precedence
 
 1. **Built-in typed defaults** in `hipfire-config` / `RuntimeConfig`.
@@ -648,7 +704,7 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_RAILGUN_INVENTORY` | `railgun-cert recording-inventory json` output; the matched route's recording-dependent decisions go into the shadow report. |
 | `HIPFIRE_RAILGUN_CACHE_TABLE` | railgun M2: a G4 probe `cache-table.<arch>.json` (`cargo run -p railgun --features g4-probe --example g4_probe`). Attaches silicon receipts to the cache-table rows whose tier-D rung the probe ran clean for ≥2²⁰ trials; a row whose own rung the probe saw stale fails the prepare. |
 | `HIPFIRE_RAILGUN_BACKEND` | railgun M2, developer-only: `railgun` makes the gfx12 single-IB prepared tape execute railgun's lowering (needs `HIPFIRE_RAILGUN_SHADOW`); any refusal fails the prepare closed to HIP, never to the Redline planner. |
-| `HIPFIRE_RAILGUN_CHECK` | railgun M2 check mode, developer-only: `off` (default) / `sample(N)` / `always`. Runs the prepared Qwen3.5 or Qwen4 PM4 lowering and its HIP twin on the same state and byte-compares every surface: `always` = every live `State` allocation of the `hip_bridge::registry` allocator registry (the immutable `Weights`, which both loaders register under that role, digested before and after the first checked step of each prepared program), `sample(N)` = one step in N, the program's written allocations only. A difference poisons the route; the twin's result stands. The registry records allocations only while this (or `HIPFIRE_RAILGUN_DIGEST=1`) is set. |
+| `HIPFIRE_RAILGUN_CHECK` | railgun M2 check mode, developer-only: `off` (default) / `sample(N)` / `always`. Runs the prepared Qwen3.5 or Qwen4 PM4 lowering and its HIP twin on the same state and byte-compares every surface: `always` = every live `State` allocation of the `hip_bridge::registry` allocator registry (the immutable `Weights`, which both loaders register under that role, digested before and after the first checked step of each prepared program), `sample(N)` = one step in N, the program's written allocations only. A difference poisons the route; the twin's result stands. The registry records allocations only while this (or `HIPFIRE_RAILGUN_DIGEST=1`) is set. Experimental Flash-Next exact expert cache refuses `always` before weight fulfillment because its physical donor slots are mutable; cache-off behavior is unchanged. |
 | `HIPFIRE_RAILGUN_CHECK_OUT` | railgun M2: file receiving one JSON line per replayed step (check result, phase timings, digests). |
 | `HIPFIRE_RAILGUN_NEGATIVE_CONTROL` | railgun M2 check-mode negative controls, developer-only: `flip_byte` XORs one byte of one surface into the PM4 arm's result at every checked step, which must come back unequal on exactly that byte (`negative_control.caught` in `HIPFIRE_RAILGUN_CHECK_OUT`); `drop_boundaries` executes railgun's lowering without any mid-segment wait/acquire (with `HIPFIRE_RAILGUN_BACKEND=railgun`), so `HIPFIRE_RAILGUN_CHECK` must report a difference. Never for serving. |
 | `HIPFIRE_RAILGUN_DIGEST` | railgun M2: `1` = after every replayed step, digest every live `State` allocation (paired by allocation order) into `HIPFIRE_RAILGUN_CHECK_OUT`; the G2 third arm compares these between a railgun and a pre-railgun process. |
@@ -924,7 +980,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1822
+**Count:** 1825
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2252,6 +2308,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_DIRECT_LOAD` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_QWEN4_EP` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_QWEN4_EP_TRANSPORT` | crates/hipfire-runtime/examples/ep_transport_oracle.rs | harness |
+| `HIPFIRE_QWEN4_EXPERT_CACHE` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs, docs/investigations/results/fn-expert-lru-overall-20261029/run-overall-frozen.py | developer |
+| `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs, docs/investigations/results/fn-expert-lru-overall-20261029/run-overall-frozen.py | developer |
+| `HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs, docs/investigations/results/fn-expert-lru-overall-20261029/run-overall-frozen.py | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/src/expert_hotset.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY` | crates/hipfire-arch-qwen4/src/expert_hotset.rs, crates/hipfire-arch-qwen4/src/expert_residency.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOT_BUDGET_MIB` | crates/hipfire-arch-qwen4/src/decode_share.rs, crates/hipfire-arch-qwen4/src/expert_hotset.rs | developer |
@@ -2462,7 +2521,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_REPLAY_PM4_STATEFUL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | experimental |
 | `HIPFIRE_REPLAY_PM4_STREAM_ACCOUNTING` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_REPLAY_PM4_WAIT_POLICY` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | experimental |
-| `HIPFIRE_REPLAY_ROUTE_PROOF` | crates/rdna-compute/src/replay.rs, scripts/redline-greedy-parity.py | developer |
+| `HIPFIRE_REPLAY_ROUTE_PROOF` | crates/rdna-compute/src/replay.rs, docs/investigations/results/fn-expert-lru-overall-20261029/verify-overall-receipts.py | developer |
 | `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | experimental |
 | `HIPFIRE_REPLAY_TRANSPORT` | crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs, crates/hipfire-arch-qwen4/examples/qwen4_g2_replay_gate.rs | experimental |
 | `HIPFIRE_REPO` | scripts/quantize-dspark.sh | harness |

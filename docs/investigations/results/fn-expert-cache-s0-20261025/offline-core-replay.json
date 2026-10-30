@@ -1,0 +1,975 @@
+{
+  "scope": "offline_capacity_and_traffic_estimate_only",
+  "base": "9f71309bfc7542a78e748e478bc751d4111c2845",
+  "inputs": {
+    "routes": {
+      "path": "/home/husrcf/wk/psr_data/trace1.ids",
+      "bytes": 19280076,
+      "sha256": "c8c1342a70c84015bde6ce86835031422ba2a90a7b29bc722fcf3774fbaf69c9"
+    },
+    "generations": {
+      "path": "/home/husrcf/wk/psr_data/trace1.gen.jsonl",
+      "bytes": 50306,
+      "sha256": "607ae8058365c11954e6cf1cf51fd7a8f054b458fc9b127be0c56395073237e7"
+    },
+    "hotset": {
+      "path": "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts.expert-hotset",
+      "bytes": 217676,
+      "sha256": "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086"
+    }
+  },
+  "tokens": 10609,
+  "requests": 24,
+  "model_sha256_from_hotset": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+  "payload_bytes_per_expert_assumption": 2611200,
+  "limitations": [
+    "No inference, DMA latency, asynchronous completion, or speed measurement.",
+    "Hits use the start-of-token table; fills become available before the next token.",
+    "Each request resets to its configured empty or static-hotset warm start.",
+    "Host/device bytes exclude alignment, padding, tables, runtime, prefill staging and other weights.",
+    "Static hotset keeps canonical VRAM entries without host copies; its host estimate is core-only.",
+    "The raw trace is used directly, without recomputing or changing routing."
+  ],
+  "policies": [
+    {
+      "name": "static_hotset",
+      "core_experts": 8737,
+      "device_slots": 0,
+      "slots_per_layer": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "resident_expert_capacity": 8737,
+      "hits": 2403124,
+      "misses": 2689196,
+      "hit_rate": 0.47191142740440506,
+      "misses_per_token": 253.48251484588556,
+      "idealized_fills_per_token": 0.0,
+      "evictions": 0,
+      "host_payload_bytes_estimate": 41358796800,
+      "device_expert_payload_bytes_estimate": 22814054400,
+      "zero_copy_miss_MiB_per_token_estimate": 631.230871930672,
+      "fill_MiB_per_token_estimate": 0.0,
+      "requests": [
+        {
+          "hits": 86917,
+          "misses": 158843,
+          "fills": 0
+        },
+        {
+          "hits": 123418,
+          "misses": 122342,
+          "fills": 0
+        },
+        {
+          "hits": 117232,
+          "misses": 128528,
+          "fills": 0
+        },
+        {
+          "hits": 88835,
+          "misses": 131965,
+          "fills": 0
+        },
+        {
+          "hits": 105253,
+          "misses": 140507,
+          "fills": 0
+        },
+        {
+          "hits": 117112,
+          "misses": 128648,
+          "fills": 0
+        },
+        {
+          "hits": 137256,
+          "misses": 108504,
+          "fills": 0
+        },
+        {
+          "hits": 59835,
+          "misses": 51045,
+          "fills": 0
+        },
+        {
+          "hits": 109959,
+          "misses": 135801,
+          "fills": 0
+        },
+        {
+          "hits": 100103,
+          "misses": 145657,
+          "fills": 0
+        },
+        {
+          "hits": 144554,
+          "misses": 101206,
+          "fills": 0
+        },
+        {
+          "hits": 98835,
+          "misses": 146925,
+          "fills": 0
+        },
+        {
+          "hits": 39359,
+          "misses": 46081,
+          "fills": 0
+        },
+        {
+          "hits": 103843,
+          "misses": 141917,
+          "fills": 0
+        },
+        {
+          "hits": 128331,
+          "misses": 117429,
+          "fills": 0
+        },
+        {
+          "hits": 69036,
+          "misses": 51444,
+          "fills": 0
+        },
+        {
+          "hits": 101833,
+          "misses": 143927,
+          "fills": 0
+        },
+        {
+          "hits": 99287,
+          "misses": 146473,
+          "fills": 0
+        },
+        {
+          "hits": 140456,
+          "misses": 105304,
+          "fills": 0
+        },
+        {
+          "hits": 101939,
+          "misses": 143821,
+          "fills": 0
+        },
+        {
+          "hits": 138680,
+          "misses": 107080,
+          "fills": 0
+        },
+        {
+          "hits": 81301,
+          "misses": 90539,
+          "fills": 0
+        },
+        {
+          "hits": 103426,
+          "misses": 82334,
+          "fills": 0
+        },
+        {
+          "hits": 6324,
+          "misses": 12876,
+          "fills": 0
+        }
+      ]
+    },
+    {
+      "name": "cold_lru170",
+      "core_experts": 0,
+      "device_slots": 8160,
+      "slots_per_layer": [
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170,
+        170
+      ],
+      "resident_expert_capacity": 8160,
+      "hits": 4525971,
+      "misses": 566349,
+      "hit_rate": 0.8887836978037515,
+      "misses_per_token": 53.383825054199264,
+      "idealized_fills_per_token": 53.383825054199264,
+      "evictions": 374609,
+      "host_payload_bytes_estimate": 64172851200,
+      "device_expert_payload_bytes_estimate": 21307392000,
+      "zero_copy_miss_MiB_per_token_estimate": 132.93823621895325,
+      "fill_MiB_per_token_estimate": 132.93823621895325,
+      "requests": [
+        {
+          "hits": 221167,
+          "misses": 24593,
+          "fills": 24593
+        },
+        {
+          "hits": 224454,
+          "misses": 21306,
+          "fills": 21306
+        },
+        {
+          "hits": 216269,
+          "misses": 29491,
+          "fills": 29491
+        },
+        {
+          "hits": 199467,
+          "misses": 21333,
+          "fills": 21333
+        },
+        {
+          "hits": 221105,
+          "misses": 24655,
+          "fills": 24655
+        },
+        {
+          "hits": 223644,
+          "misses": 22116,
+          "fills": 22116
+        },
+        {
+          "hits": 221822,
+          "misses": 23938,
+          "fills": 23938
+        },
+        {
+          "hits": 96938,
+          "misses": 13942,
+          "fills": 13942
+        },
+        {
+          "hits": 222061,
+          "misses": 23699,
+          "fills": 23699
+        },
+        {
+          "hits": 213265,
+          "misses": 32495,
+          "fills": 32495
+        },
+        {
+          "hits": 214239,
+          "misses": 31521,
+          "fills": 31521
+        },
+        {
+          "hits": 215811,
+          "misses": 29949,
+          "fills": 29949
+        },
+        {
+          "hits": 74650,
+          "misses": 10790,
+          "fills": 10790
+        },
+        {
+          "hits": 222610,
+          "misses": 23150,
+          "fills": 23150
+        },
+        {
+          "hits": 217018,
+          "misses": 28742,
+          "fills": 28742
+        },
+        {
+          "hits": 106959,
+          "misses": 13521,
+          "fills": 13521
+        },
+        {
+          "hits": 220457,
+          "misses": 25303,
+          "fills": 25303
+        },
+        {
+          "hits": 215445,
+          "misses": 30315,
+          "fills": 30315
+        },
+        {
+          "hits": 215406,
+          "misses": 30354,
+          "fills": 30354
+        },
+        {
+          "hits": 219318,
+          "misses": 26442,
+          "fills": 26442
+        },
+        {
+          "hits": 217210,
+          "misses": 28550,
+          "fills": 28550
+        },
+        {
+          "hits": 151534,
+          "misses": 20306,
+          "fills": 20306
+        },
+        {
+          "hits": 160797,
+          "misses": 24963,
+          "fills": 24963
+        },
+        {
+          "hits": 14325,
+          "misses": 4875,
+          "fills": 4875
+        }
+      ]
+    },
+    {
+      "name": "core25_warm_lru",
+      "core_experts": 2184,
+      "device_slots": 6553,
+      "slots_per_layer": [
+        218,
+        201,
+        178,
+        116,
+        142,
+        164,
+        184,
+        186,
+        130,
+        134,
+        154,
+        129,
+        172,
+        162,
+        138,
+        97,
+        85,
+        147,
+        165,
+        133,
+        132,
+        169,
+        176,
+        117,
+        143,
+        126,
+        141,
+        125,
+        141,
+        141,
+        119,
+        100,
+        102,
+        136,
+        149,
+        122,
+        121,
+        137,
+        153,
+        100,
+        106,
+        113,
+        130,
+        94,
+        109,
+        88,
+        113,
+        115
+      ],
+      "resident_expert_capacity": 8737,
+      "hits": 4596331,
+      "misses": 495989,
+      "hit_rate": 0.9026005828384704,
+      "misses_per_token": 46.75172023753417,
+      "idealized_fills_per_token": 46.75172023753417,
+      "evictions": 495989,
+      "host_payload_bytes_estimate": 58469990400,
+      "device_expert_payload_bytes_estimate": 22814054400,
+      "zero_copy_miss_MiB_per_token_estimate": 116.42274082589076,
+      "fill_MiB_per_token_estimate": 116.42274082589076,
+      "requests": [
+        {
+          "hits": 223240,
+          "misses": 22520,
+          "fills": 22520
+        },
+        {
+          "hits": 226723,
+          "misses": 19037,
+          "fills": 19037
+        },
+        {
+          "hits": 220573,
+          "misses": 25187,
+          "fills": 25187
+        },
+        {
+          "hits": 201672,
+          "misses": 19128,
+          "fills": 19128
+        },
+        {
+          "hits": 223226,
+          "misses": 22534,
+          "fills": 22534
+        },
+        {
+          "hits": 226797,
+          "misses": 18963,
+          "fills": 18963
+        },
+        {
+          "hits": 224863,
+          "misses": 20897,
+          "fills": 20897
+        },
+        {
+          "hits": 99965,
+          "misses": 10915,
+          "fills": 10915
+        },
+        {
+          "hits": 224772,
+          "misses": 20988,
+          "fills": 20988
+        },
+        {
+          "hits": 215049,
+          "misses": 30711,
+          "fills": 30711
+        },
+        {
+          "hits": 219574,
+          "misses": 26186,
+          "fills": 26186
+        },
+        {
+          "hits": 218330,
+          "misses": 27430,
+          "fills": 27430
+        },
+        {
+          "hits": 77511,
+          "misses": 7929,
+          "fills": 7929
+        },
+        {
+          "hits": 225598,
+          "misses": 20162,
+          "fills": 20162
+        },
+        {
+          "hits": 220966,
+          "misses": 24794,
+          "fills": 24794
+        },
+        {
+          "hits": 110336,
+          "misses": 10144,
+          "fills": 10144
+        },
+        {
+          "hits": 223177,
+          "misses": 22583,
+          "fills": 22583
+        },
+        {
+          "hits": 216626,
+          "misses": 29134,
+          "fills": 29134
+        },
+        {
+          "hits": 219310,
+          "misses": 26450,
+          "fills": 26450
+        },
+        {
+          "hits": 221775,
+          "misses": 23985,
+          "fills": 23985
+        },
+        {
+          "hits": 221242,
+          "misses": 24518,
+          "fills": 24518
+        },
+        {
+          "hits": 154875,
+          "misses": 16965,
+          "fills": 16965
+        },
+        {
+          "hits": 164167,
+          "misses": 21593,
+          "fills": 21593
+        },
+        {
+          "hits": 15964,
+          "misses": 3236,
+          "fills": 3236
+        }
+      ]
+    },
+    {
+      "name": "core50_warm_lru",
+      "core_experts": 4368,
+      "device_slots": 4369,
+      "slots_per_layer": [
+        161,
+        143,
+        132,
+        84,
+        90,
+        116,
+        133,
+        137,
+        101,
+        94,
+        102,
+        84,
+        119,
+        119,
+        97,
+        61,
+        55,
+        95,
+        106,
+        80,
+        80,
+        112,
+        115,
+        73,
+        103,
+        84,
+        98,
+        88,
+        112,
+        92,
+        76,
+        60,
+        61,
+        85,
+        97,
+        66,
+        71,
+        91,
+        100,
+        59,
+        69,
+        70,
+        74,
+        51,
+        70,
+        53,
+        74,
+        76
+      ],
+      "resident_expert_capacity": 8737,
+      "hits": 4491323,
+      "misses": 600997,
+      "hit_rate": 0.8819797263329877,
+      "misses_per_token": 56.649731360165895,
+      "idealized_fills_per_token": 56.649731360165895,
+      "evictions": 600997,
+      "host_payload_bytes_estimate": 52767129600,
+      "device_expert_payload_bytes_estimate": 22814054400,
+      "zero_copy_miss_MiB_per_token_estimate": 141.07110836760063,
+      "fill_MiB_per_token_estimate": 141.07110836760063,
+      "requests": [
+        {
+          "hits": 215737,
+          "misses": 30023,
+          "fills": 30023
+        },
+        {
+          "hits": 222087,
+          "misses": 23673,
+          "fills": 23673
+        },
+        {
+          "hits": 217678,
+          "misses": 28082,
+          "fills": 28082
+        },
+        {
+          "hits": 195208,
+          "misses": 25592,
+          "fills": 25592
+        },
+        {
+          "hits": 217999,
+          "misses": 27761,
+          "fills": 27761
+        },
+        {
+          "hits": 223111,
+          "misses": 22649,
+          "fills": 22649
+        },
+        {
+          "hits": 219753,
+          "misses": 26007,
+          "fills": 26007
+        },
+        {
+          "hits": 97290,
+          "misses": 13590,
+          "fills": 13590
+        },
+        {
+          "hits": 218736,
+          "misses": 27024,
+          "fills": 27024
+        },
+        {
+          "hits": 210904,
+          "misses": 34856,
+          "fills": 34856
+        },
+        {
+          "hits": 216319,
+          "misses": 29441,
+          "fills": 29441
+        },
+        {
+          "hits": 211273,
+          "misses": 34487,
+          "fills": 34487
+        },
+        {
+          "hits": 75976,
+          "misses": 9464,
+          "fills": 9464
+        },
+        {
+          "hits": 221895,
+          "misses": 23865,
+          "fills": 23865
+        },
+        {
+          "hits": 217147,
+          "misses": 28613,
+          "fills": 28613
+        },
+        {
+          "hits": 108247,
+          "misses": 12233,
+          "fills": 12233
+        },
+        {
+          "hits": 217799,
+          "misses": 27961,
+          "fills": 27961
+        },
+        {
+          "hits": 209701,
+          "misses": 36059,
+          "fills": 36059
+        },
+        {
+          "hits": 215920,
+          "misses": 29840,
+          "fills": 29840
+        },
+        {
+          "hits": 216649,
+          "misses": 29111,
+          "fills": 29111
+        },
+        {
+          "hits": 216513,
+          "misses": 29247,
+          "fills": 29247
+        },
+        {
+          "hits": 149216,
+          "misses": 22624,
+          "fills": 22624
+        },
+        {
+          "hits": 160213,
+          "misses": 25547,
+          "fills": 25547
+        },
+        {
+          "hits": 15952,
+          "misses": 3248,
+          "fills": 3248
+        }
+      ]
+    },
+    {
+      "name": "core75_warm_lru",
+      "core_experts": 6552,
+      "device_slots": 2185,
+      "slots_per_layer": [
+        80,
+        67,
+        64,
+        37,
+        59,
+        60,
+        72,
+        75,
+        47,
+        51,
+        46,
+        48,
+        50,
+        67,
+        50,
+        23,
+        30,
+        48,
+        57,
+        50,
+        40,
+        57,
+        56,
+        35,
+        53,
+        47,
+        48,
+        45,
+        47,
+        41,
+        31,
+        38,
+        32,
+        39,
+        52,
+        36,
+        39,
+        51,
+        54,
+        29,
+        33,
+        33,
+        27,
+        21,
+        28,
+        21,
+        33,
+        38
+      ],
+      "resident_expert_capacity": 8737,
+      "hits": 4267230,
+      "misses": 825090,
+      "hit_rate": 0.8379736544443397,
+      "misses_per_token": 77.77264586671694,
+      "idealized_fills_per_token": 77.77264586671694,
+      "evictions": 825090,
+      "host_payload_bytes_estimate": 47064268800,
+      "device_expert_payload_bytes_estimate": 22814054400,
+      "zero_copy_miss_MiB_per_token_estimate": 193.6721161720002,
+      "fill_MiB_per_token_estimate": 193.6721161720002,
+      "requests": [
+        {
+          "hits": 197342,
+          "misses": 48418,
+          "fills": 48418
+        },
+        {
+          "hits": 212806,
+          "misses": 32954,
+          "fills": 32954
+        },
+        {
+          "hits": 212121,
+          "misses": 33639,
+          "fills": 33639
+        },
+        {
+          "hits": 185130,
+          "misses": 35670,
+          "fills": 35670
+        },
+        {
+          "hits": 205307,
+          "misses": 40453,
+          "fills": 40453
+        },
+        {
+          "hits": 212481,
+          "misses": 33279,
+          "fills": 33279
+        },
+        {
+          "hits": 209372,
+          "misses": 36388,
+          "fills": 36388
+        },
+        {
+          "hits": 92590,
+          "misses": 18290,
+          "fills": 18290
+        },
+        {
+          "hits": 207644,
+          "misses": 38116,
+          "fills": 38116
+        },
+        {
+          "hits": 202316,
+          "misses": 43444,
+          "fills": 43444
+        },
+        {
+          "hits": 209842,
+          "misses": 35918,
+          "fills": 35918
+        },
+        {
+          "hits": 200054,
+          "misses": 45706,
+          "fills": 45706
+        },
+        {
+          "hits": 71850,
+          "misses": 13590,
+          "fills": 13590
+        },
+        {
+          "hits": 211775,
+          "misses": 33985,
+          "fills": 33985
+        },
+        {
+          "hits": 208932,
+          "misses": 36828,
+          "fills": 36828
+        },
+        {
+          "hits": 103758,
+          "misses": 16722,
+          "fills": 16722
+        },
+        {
+          "hits": 205536,
+          "misses": 40224,
+          "fills": 40224
+        },
+        {
+          "hits": 198250,
+          "misses": 47510,
+          "fills": 47510
+        },
+        {
+          "hits": 209932,
+          "misses": 35828,
+          "fills": 35828
+        },
+        {
+          "hits": 205917,
+          "misses": 39843,
+          "fills": 39843
+        },
+        {
+          "hits": 203340,
+          "misses": 42420,
+          "fills": 42420
+        },
+        {
+          "hits": 134653,
+          "misses": 37187,
+          "fills": 37187
+        },
+        {
+          "hits": 150676,
+          "misses": 35084,
+          "fills": 35084
+        },
+        {
+          "hits": 15606,
+          "misses": 3594,
+          "fills": 3594
+        }
+      ]
+    }
+  ]
+}

@@ -16,9 +16,7 @@ use crate::gpu_forward::Qwen4ForwardScratchMode;
 use crate::weights::{Qwen4BandScope, Qwen4EpPlacement};
 use crate::Qwen4Config;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
-use rdna_compute::uma_memory::{
-    amdgpu_gtt_used_bytes, read_sysfs_u64, TTM_PAGES_LIMIT, TTM_PAGE_BYTES,
-};
+use rdna_compute::uma_memory::{amdgpu_gtt_used_bytes, TTM_PAGES_LIMIT, TTM_PAGE_BYTES};
 
 /// `N` keeps the routed experts of trunk layers `0..N` in VRAM; `auto` picks
 /// the largest `N` that fits the card's free VRAM. Unset keeps every expert
@@ -3648,25 +3646,105 @@ pub struct GttBudget {
     pub used_bytes: u64,
 }
 
-/// The GTT budget when host-mapped memory is GTT-backed, i.e. when
-/// `HSA_USERPTR_FOR_PAGED_MEM` is `0` (hip-bridge's default). It is `None`
-/// under userptr, or when sysfs does not expose TTM's limit. `used_bytes`
-/// sums `mem_info_gtt_used` over every amdgpu device.
+const AMDTTM_PAGES_LIMIT: &str = "/sys/module/amdttm/parameters/pages_limit";
+
+// A present but malformed/overflowing cap must not silently disable admission.
+// Missing sysfs remains unknown; zero from a selected provider is a real cap.
+fn parse_gtt_limit(value: Option<&str>, unit_bytes: u64) -> Option<u64> {
+    value.map(|value| {
+        value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(unit_bytes))
+            .unwrap_or(0)
+    })
+}
+
+fn read_gtt_limit(path: &std::path::Path, unit_bytes: u64) -> Option<u64> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => parse_gtt_limit(Some(&value), unit_bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(0),
+    }
+}
+
+/// AMD DKMS supplies `amdttm`, while vanilla amdgpu uses `ttm`. Holder links,
+/// not nonzero values or module presence, identify the active provider (the
+/// same selection rule as the earlier isolated TTM-provider fix). Without
+/// holder evidence, retain every exposed cap as a conservative candidate.
+fn effective_gtt_limit(
+    ttm: Option<u64>,
+    amdttm: Option<u64>,
+    ttm_active: bool,
+    amdttm_active: bool,
+    device_total: Option<u64>,
+) -> Option<u64> {
+    let known_active = ttm_active || amdttm_active;
+    [
+        ttm.filter(|_| !known_active || ttm_active),
+        amdttm.filter(|_| !known_active || amdttm_active),
+        device_total,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+// Match the aggregate used-byte convention: a host allocation may be charged
+// to a different amdgpu card. Only primary cardN nodes expose one total each;
+// connector/render aliases must not duplicate it. A bad exposed total refuses.
+fn amdgpu_gtt_total_bytes(drm: &std::path::Path) -> Option<u64> {
+    let mut total = None;
+    for card in std::fs::read_dir(drm).ok()?.flatten() {
+        let name = card.file_name();
+        let is_card = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("card"))
+            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()));
+        if !is_card {
+            continue;
+        }
+        if let Some(bytes) = read_gtt_limit(&card.path().join("device/mem_info_gtt_total"), 1) {
+            let Some(sum) = total.unwrap_or(0u64).checked_add(bytes) else {
+                return Some(0);
+            };
+            // Do not hide an invalid/zero device limit behind another card.
+            if bytes == 0 {
+                return Some(0);
+            }
+            total = Some(sum);
+        }
+    }
+    total
+}
+
+/// GTT-backed host-mapped memory's effective limit: the active TTM provider's
+/// pages_limit, clamped by the aggregate amdgpu GTT total wherever exposed.
+/// `used_bytes` sums `mem_info_gtt_used` over every amdgpu device. `None` means
+/// userptr or no exposed limit; malformed exposed limits conservatively give
+/// a zero budget. An unused in-tree TTM module is not the DKMS provider.
 pub fn gtt_budget() -> Option<GttBudget> {
     if !host_mapped_is_gtt() {
         return None;
     }
-    let limit_bytes = read_sysfs_u64(TTM_PAGES_LIMIT.as_ref())?.checked_mul(TTM_PAGE_BYTES)?;
+    let limit_bytes = effective_gtt_limit(
+        read_gtt_limit(TTM_PAGES_LIMIT.as_ref(), TTM_PAGE_BYTES),
+        read_gtt_limit(AMDTTM_PAGES_LIMIT.as_ref(), TTM_PAGE_BYTES),
+        std::path::Path::new("/sys/module/ttm/holders/amdgpu").is_dir(),
+        std::path::Path::new("/sys/module/amdttm/holders/amdgpu").is_dir(),
+        amdgpu_gtt_total_bytes("/sys/class/drm".as_ref()),
+    )?;
     Some(GttBudget {
         limit_bytes,
         used_bytes: amdgpu_gtt_used_bytes()?,
     })
 }
 
-/// Refuse before any allocation when GTT-backed host-mapped experts would not
-/// fit under TTM's `pages_limit` beside what amdgpu devices already hold.
-/// Past it `hipHostMalloc` fails, after the load has uploaded the VRAM
-/// weights. `None` (userptr, or no TTM limit in sysfs) skips the check.
+/// Refuse before allocation when GTT-backed host experts exceed the effective
+/// cap beside device usage. The budget may be supplied by another caller, so
+/// diagnostics name the effective byte limit, never misattribute it to one
+/// module's pages_limit or reinterpret a device byte limit as raw page data.
 pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), String> {
     let Some(GttBudget {
         limit_bytes,
@@ -3678,14 +3756,14 @@ pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), S
     let free = limit_bytes.saturating_sub(used_bytes);
     if host_bytes > free {
         return Err(format!(
-            "routed experts need {:.1} GiB of GTT-backed host RAM, but TTM's GTT cap \
-             ({TTM_PAGES_LIMIT} = {} pages, {:.1} GiB) has {:.1} GiB left beside the {:.1} GiB \
-             amdgpu devices already hold; keep more expert layers in VRAM \
-             ({EXPERT_VRAM_LAYERS_ENV}), raise ttm.pages_limit, or set \
+            "routed experts need {:.1} GiB of GTT-backed host RAM, but the effective GTT cap \
+             ({:.1} GiB; active TTM pages_limit and amdgpu mem_info_gtt_total bounds where \
+             available) has {:.1} GiB left beside the {:.1} GiB amdgpu devices already hold; \
+             keep more expert layers in VRAM ({EXPERT_VRAM_LAYERS_ENV}), check the active \
+             TTM provider's pages_limit and amdgpu GTT capacity, or set \
              HSA_USERPTR_FOR_PAGED_MEM=1 for pageable userptr host memory, which host-memory \
              pressure can stall (ROCm/rocm-systems#12528)",
             host_bytes as f64 / GIB,
-            limit_bytes / TTM_PAGE_BYTES,
             limit_bytes as f64 / GIB,
             free as f64 / GIB,
             used_bytes as f64 / GIB
@@ -6822,6 +6900,135 @@ mod tests {
     }
 
     #[test]
+    fn gtt_limit_vanilla_keeps_active_zero_and_device_bound() {
+        assert_eq!(
+            effective_gtt_limit(Some(100), Some(200), true, false, Some(150)),
+            Some(100)
+        );
+        assert_eq!(
+            effective_gtt_limit(Some(100), None, true, false, Some(80)),
+            Some(80)
+        );
+        assert_eq!(
+            effective_gtt_limit(Some(0), Some(200), true, false, Some(150)),
+            Some(0)
+        );
+        assert!(check_gtt_cap(
+            1,
+            Some(GttBudget {
+                limit_bytes: 0,
+                used_bytes: 0
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gtt_limit_dkms_ignores_only_the_inactive_provider() {
+        let amd = parse_gtt_limit(Some("16475590\n"), TTM_PAGE_BYTES).unwrap();
+        assert_eq!(amd, 67_484_016_640);
+        assert_eq!(
+            effective_gtt_limit(Some(0), Some(amd), false, true, Some(amd)),
+            Some(amd)
+        );
+        assert_eq!(
+            effective_gtt_limit(Some(1), Some(amd), false, true, Some(amd - 4096)),
+            Some(amd - 4096)
+        );
+        // A true zero from the active provider is never treated as unlimited.
+        assert_eq!(
+            effective_gtt_limit(Some(100), Some(0), false, true, Some(amd)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn gtt_limit_ambiguous_providers_keep_the_smaller_cap() {
+        assert_eq!(
+            effective_gtt_limit(Some(100), Some(80), true, true, Some(120)),
+            Some(80)
+        );
+        assert_eq!(
+            effective_gtt_limit(Some(100), Some(80), false, false, Some(120)),
+            Some(80)
+        );
+        assert_eq!(
+            effective_gtt_limit(Some(0), Some(80), false, false, Some(120)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn gtt_limit_missing_invalid_and_overflow_never_become_unlimited() {
+        assert_eq!(parse_gtt_limit(None, TTM_PAGE_BYTES), None);
+        assert_eq!(effective_gtt_limit(None, None, false, false, None), None);
+        assert_eq!(
+            effective_gtt_limit(None, None, false, true, Some(120)),
+            Some(120)
+        );
+        for bad in [
+            "",
+            "-1",
+            "garbage",
+            "18446744073709551616",
+            "18446744073709551615",
+        ] {
+            let parsed = parse_gtt_limit(Some(bad), TTM_PAGE_BYTES);
+            assert_eq!(parsed, Some(0), "{bad}");
+            assert_eq!(
+                effective_gtt_limit(None, parsed, false, true, Some(120)),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            parse_gtt_limit(Some(" 12\n"), TTM_PAGE_BYTES),
+            Some(12 * TTM_PAGE_BYTES)
+        );
+        assert_eq!(parse_gtt_limit(Some("bad"), 1), Some(0));
+    }
+
+    #[test]
+    fn gtt_device_totals_use_primary_nodes_and_checked_sums() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-gtt-total-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(amdgpu_gtt_total_bytes(&root), None);
+        for name in ["card0", "card1", "card0-DP-1", "renderD128"] {
+            std::fs::create_dir_all(root.join(name).join("device")).unwrap();
+            std::fs::write(root.join(name).join("device/mem_info_gtt_total"), "100").unwrap();
+        }
+        assert_eq!(amdgpu_gtt_total_bytes(&root), Some(200));
+        let first = root.join("card0/device/mem_info_gtt_total");
+        std::fs::write(&first, "invalid").unwrap();
+        assert_eq!(amdgpu_gtt_total_bytes(&root), Some(0));
+        std::fs::write(&first, u64::MAX.to_string()).unwrap();
+        assert_eq!(amdgpu_gtt_total_bytes(&root), Some(0));
+        std::fs::remove_file(&first).unwrap();
+        assert_eq!(amdgpu_gtt_total_bytes(&root), Some(100));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gtt_cap_diagnostic_does_not_claim_a_specific_provider_path() {
+        let error = check_gtt_cap(
+            1,
+            Some(GttBudget {
+                limit_bytes: 0,
+                used_bytes: 0,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("effective GTT cap"));
+        assert!(!error.contains(TTM_PAGES_LIMIT));
+        assert!(!error.contains(AMDTTM_PAGES_LIMIT));
+        assert!(!error.contains(" pages,"));
+    }
+
+    #[test]
     fn gtt_cap_counts_what_devices_already_hold() {
         // This host: pages_limit 16108144 (61.4 GiB); N=12 host-maps 46.1 GiB.
         let limit_bytes = 16_108_144 * TTM_PAGE_BYTES;
@@ -6834,7 +7041,7 @@ mod tests {
         assert!(check_gtt_cap(limit_bytes - fresh.used_bytes, Some(fresh)).is_ok());
         let error = check_gtt_cap(limit_bytes - fresh.used_bytes + 1, Some(fresh)).unwrap_err();
         assert!(
-            error.contains("pages_limit") && error.contains("16108144 pages"),
+            error.contains("effective GTT cap") && error.contains("61.4 GiB"),
             "{error}"
         );
         // A second load beside one already holding 46 GiB of GTT is refused.

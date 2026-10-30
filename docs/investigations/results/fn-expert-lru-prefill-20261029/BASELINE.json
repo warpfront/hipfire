@@ -1,0 +1,9 @@
+{
+  "draft_pr": "https://github.com/warpfront/hipfire/pull/1022",
+  "tested_head": "db5abf9b5b619f1858cab66851503e6725b12ced",
+  "worktree": "/home/husrcf/Code/hipfire-fn-lru-prefill-20261029",
+  "focus": "prefill donor restoration cost only",
+  "old_binaries": "../update-f85ea28/beta-6c99/runtime",
+  "measured_restore_bytes_per_request": 10486579200,
+  "measured_restore_wall_seconds_approx": 0.372
+}

@@ -1,0 +1,229 @@
+{
+  "frozen_manifest": {
+    "base_pr_head": "db5abf9b5b619f1858cab66851503e6725b12ced",
+    "base_beta": "6c99bef7f8fcb966c4104aab2583e894f20c9d10",
+    "candidate_branch": "feat/flash-next-lru-prefill-20261029",
+    "source_patch_sha256": "d200892c813bc08a8dd78b80e67d4bce06b05514244b54ca72f15f9d5f4c7ce8",
+    "source_patch_bytes": 36894,
+    "created_utc": "2026-10-29T12:53:40.408100+00:00",
+    "scope": "existing immutable core/host short-prefill tables; long-stage restore retained; host metadata reserve128MiB; cache route unchanged",
+    "model_parameters_unchanged": true,
+    "source_clean": false,
+    "build": "cargo build --release --locked -p hipfire-cli -p hipfire-daemon",
+    "binaries": {
+      "hipfire": {
+        "size": 102852208,
+        "sha256": "88838a950a2beff25149082a531505e1dfeee6e273441957467057dbb70b6b3e",
+        "md5": "512e5d26868971cf0600e6e1c619115f"
+      },
+      "daemon_lru_new": {
+        "size": 112715288,
+        "sha256": "7560b2b9a7881c05309efaa48db774ed7122e2d0a6fcad928495639cc36dbf3c",
+        "md5": "de80c4158d49647faf7e471dc1c10f10"
+      }
+    },
+    "model": {
+      "path": "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+      "size": 125288544792,
+      "mtime_ns": 1792424439201838153,
+      "sha256_from_verified_bound_hotset": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+      "full_file_rehashed": false
+    }
+  },
+  "name": "B3",
+  "cache": "1",
+  "variant": "new",
+  "env": {
+    "HIPFIRE_CLI_BIN": "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/runtime-new/hipfire",
+    "HIPFIRE_DAEMON_BIN": "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/runtime-new/daemon_lru_new",
+    "HIPFIRE_MODELS_DIR": "/home/husrcf/.hipfire/models",
+    "HIPFIRE_MTP_MODE": "off",
+    "HIPFIRE_OFFLOAD_EXEC": "pcie",
+    "HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT": "50",
+    "HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT": "64",
+    "HIPFIRE_QWEN4_DECODE_SHARE": "off",
+    "HIPFIRE_QWEN4_D2_DEFAULT": "0",
+    "HIPFIRE_PLE_FORMAT": "q4",
+    "HIPFIRE_PREFILL_CHUNK_ROWS": "4096",
+    "HIPFIRE_QWEN4_EXPERT_HOT_BUDGET_MIB": "20000",
+    "HIPFIRE_DN_STATE_EF": "1",
+    "HIPFIRE_KERNEL_CACHE": "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/update-f85ea28/shared-kernel-cache",
+    "HIPFIRE_QWEN4_EXPERT_CACHE": "1",
+    "HIPFIRE_HOME": "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B3/parent-home"
+  },
+  "phase_order": [
+    "warmup",
+    "battery"
+  ],
+  "phase_results": [
+    {
+      "phase": "warmup",
+      "arguments": [
+        "scripts/serve_harness.py",
+        "--model",
+        "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+        "--tag",
+        "qwen3.8:flash-next",
+        "--registry",
+        "/home/husrcf/Code/hipfire-fn-lru-prefill-20261029/registry/models.json",
+        "--speculation",
+        "off",
+        "--thinking",
+        "off",
+        "--max-tokens",
+        "16",
+        "--max-seq",
+        "16384",
+        "--sampling",
+        "greedy",
+        "--seed",
+        "123",
+        "--mode",
+        "battery",
+        "--port",
+        "11588",
+        "--home",
+        "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B3/home",
+        "--serve-warm-timeout-secs",
+        "1800",
+        "--serve-log",
+        "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B3/serve.log",
+        "--out",
+        "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B3/warmup.json",
+        "--replay-route-proof-log"
+      ],
+      "elapsed_seconds": 41.78561069400166,
+      "rows": 5,
+      "status": "PASS"
+    },
+    {
+      "phase": "battery",
+      "arguments": [
+        "scripts/serve_harness.py",
+        "--model",
+        "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+        "--tag",
+        "qwen3.8:flash-next",
+        "--registry",
+        "/home/husrcf/Code/hipfire-fn-lru-prefill-20261029/registry/models.json",
+        "--speculation",
+        "off",
+        "--thinking",
+        "off",
+        "--max-tokens",
+        "512",
+        "--max-seq",
+        "16384",
+        "--sampling",
+        "greedy",
+        "--seed",
+        "123",
+        "--mode",
+        "battery",
+        "--port",
+        "11588",
+        "--home",
+        "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B3/home",
+        "--serve-warm-timeout-secs",
+        "1800",
+        "--serve-log",
+        "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B3/serve.log",
+        "--out",
+        "/home/husrcf/Code/hipfireQC/tmpOutput/expert-lru-beta-20261025/prefill-restore-20261029/serve-B3/battery.json",
+        "--replay-route-proof-log",
+        "--no-spawn"
+      ],
+      "elapsed_seconds": 22.988439809996635,
+      "rows": 5,
+      "status": "PASS"
+    }
+  ],
+  "memory_sampling_interval_seconds": 0.1,
+  "memory_sampling_claim": "observed sampled peak, not exact allocator peak",
+  "staged_prompt_md5s": [
+    "d3768bd6479ce9aae08c9e0152b39e06",
+    "092f8f3205a1c46a9829cd73426e54d6"
+  ],
+  "elapsed_seconds": 64.77461910899729,
+  "observed_sampled_peaks": {
+    "vram_used_bytes": 31128993792,
+    "gtt_used_bytes": 55354802176
+  },
+  "observed_backend_receipts": [
+    {
+      "phase": "warmup",
+      "kv_backend": null,
+      "kv_backend_legacy": null,
+      "row_backend_fields": [
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        },
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        },
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        },
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        },
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        }
+      ]
+    },
+    {
+      "phase": "battery",
+      "kv_backend": null,
+      "kv_backend_legacy": null,
+      "row_backend_fields": [
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        },
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        },
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        },
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        },
+        {
+          "kv_mode": null,
+          "kv_backend": null,
+          "kv_backend_legacy": false,
+          "kv_backend_reason": null
+        }
+      ]
+    }
+  ],
+  "status": "PASS"
+}

@@ -142,3 +142,11 @@ required-features = ["lab", "reference-parity"]
 [[test]]
 name = "slowlink_prefill_hw"
 required-features = ["lab", "reference-parity"]
+
+[[example]]
+name = "fn_expert_cache_publication"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_mtp_lru_oracle"
+required-features = ["lab", "reference-parity"]

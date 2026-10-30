@@ -1,0 +1,216 @@
+[
+  {
+    "name": "maps",
+    "command": [
+      "python3",
+      "scripts/check-crate-maps.py",
+      "hipfire-arch-qwen4",
+      "hipfire-dispatch",
+      "hipfire-runtime",
+      "hipfire-loader",
+      "hipfire-config",
+      "rdna-compute",
+      "hipfire-generate"
+    ],
+    "exit_code": 0,
+    "seconds": 0.261
+  },
+  {
+    "name": "lifecycle",
+    "command": [
+      "python3",
+      "scripts/check-lifecycle.py",
+      "--write"
+    ],
+    "exit_code": 0,
+    "seconds": 3.921
+  },
+  {
+    "name": "cache-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "hipfire-arch-qwen4",
+      "--lib",
+      "expert_cache_",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 28.574
+  },
+  {
+    "name": "gtt-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "hipfire-arch-qwen4",
+      "--lib",
+      "expert_residency::tests::gtt_",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 0.159
+  },
+  {
+    "name": "decode-share-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "hipfire-arch-qwen4",
+      "--lib",
+      "decode_share_",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 5.251
+  },
+  {
+    "name": "slot-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "hipfire-runtime",
+      "--lib",
+      "weight_pager::tests::slot_cache_",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 28.428
+  },
+  {
+    "name": "mutable-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "hipfire-dispatch",
+      "--lib",
+      "families::moe::mutable_residency::tests::",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 11.699
+  },
+  {
+    "name": "sealed-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "hipfire-dispatch",
+      "--lib",
+      "pipeline::sealed_moe::tests::",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 0.144
+  },
+  {
+    "name": "state-failure-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "hipfire-generate",
+      "--lib",
+      "redline_snapshot_tests::qwen4_",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 20.093
+  },
+  {
+    "name": "quiescence-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "rdna-compute",
+      "--lib",
+      "quiescence",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 7.389
+  },
+  {
+    "name": "placement-cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "hipfire-loader",
+      "--lib",
+      "expert_cache_placement_keeps_the_pin_and_charges_its_mirror_and_queues",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 10.389
+  },
+  {
+    "name": "publication-build",
+    "command": [
+      "cargo",
+      "build",
+      "--release",
+      "--locked",
+      "-p",
+      "hipfire-arch-qwen4",
+      "--features",
+      "lab",
+      "--example",
+      "fn_expert_cache_publication"
+    ],
+    "exit_code": 0,
+    "seconds": 82.489
+  },
+  {
+    "name": "s0-build",
+    "command": [
+      "cargo",
+      "build",
+      "--release",
+      "--locked",
+      "-p",
+      "rdna-compute",
+      "--features",
+      "lab",
+      "--example",
+      "fn_expert_table_indirection"
+    ],
+    "exit_code": 0,
+    "seconds": 59.991
+  },
+  {
+    "name": "precommit-product",
+    "command": [
+      "bash",
+      "scripts/pre-commit-ci.sh",
+      "origin/beta"
+    ],
+    "exit_code": 0,
+    "seconds": 80.433
+  }
+]

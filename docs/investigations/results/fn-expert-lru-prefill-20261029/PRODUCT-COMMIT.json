@@ -1,0 +1,6 @@
+{
+  "product_commit": "86672248c3c6441bdfab708f52147dfecf1a3389",
+  "base": "6c99bef7f8fcb966c4104aab2583e894f20c9d10",
+  "old_tested_pr_head": "db5abf9b5b619f1858cab66851503e6725b12ced",
+  "working_source_matches_frozen_patch": true
+}
