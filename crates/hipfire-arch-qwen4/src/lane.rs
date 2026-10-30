@@ -53,6 +53,7 @@ use crate::gpu_forward_lanes::{
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::lane_exec::LanePhase;
 use crate::lane_rank::{DecodeAdmission, LaneProto};
+use crate::mesh_rank_copy::HeadLagStore;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState, MTP_FILL_ROWS};
 use crate::mtp_lanes::PendingWindow;
 use crate::mtp_spec::{
@@ -65,6 +66,7 @@ use crate::weights::{
     Qwen4TierRecipe, Qwen4Weights, TensorRef,
 };
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
+use hipfire_runtime::ngram_mod::NgramModConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::expert_capabilities::{self, ExpertQt, Route};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -908,6 +910,32 @@ pub struct LaneSpecConfig {
     pub end_of_turn: Option<u32>,
 }
 
+/// The opt-in copy lane of a store (lab/oracle only: the default store stages
+/// none). Arming it widens every lane's verify rows and GDN ring to
+/// `1 + max(k, take cap)` rows, gives each spec lane `head_lag_rows` owed
+/// head rows of storage and arms the root's copy lane
+/// ([`crate::mesh_lane_protocol::MeshRoot::with_copy_lane`]) for every spec
+/// request. [`crate::mesh_rank_copy::copy_budget`] is the one place that
+/// derives the budget the allocator and the census both read.
+#[derive(Clone, Copy, Debug)]
+pub struct LaneCopyConfig {
+    /// The copy context's n-gram config (`mtp_spec::qwen4_ngram_mod_config`).
+    pub ngram: NgramModConfig,
+    /// Owed head rows one retired lane may hold before the root flushes them
+    /// (`WindowBudgets.head_lag_rows`; at least 1).
+    pub head_lag_rows: usize,
+}
+
+/// A store's resolved copy lane: the request and what its budget resolved to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StoreCopy {
+    pub config: LaneCopyConfig,
+    /// Copy candidates one window verifies at most.
+    pub take_cap: usize,
+    /// Verify rows one lane holds: `1 + max(k, take_cap)`.
+    pub verify_rows: usize,
+}
+
 /// Counters of one MTP lane's windows (read after the request, or at any
 /// step boundary).
 #[derive(Clone, Copy, Debug, Default)]
@@ -922,6 +950,34 @@ pub struct LaneSpecStats {
     pub accepted: u64,
     /// The lane's floor retired it to head-free AR.
     pub retired: bool,
+    /// Copy windows (final source `Copy`, after any confirmation).
+    pub copy_windows: u64,
+    /// Copy candidates verified.
+    pub copy_drafts: u64,
+    /// Copy candidates accepted.
+    pub copy_accepted: u64,
+    /// Confirmed first candidates / missed confirmations of copy plans.
+    pub copy_confirmed: u64,
+    pub copy_missed: u64,
+    /// Forced advances executed.
+    pub forced_windows: u64,
+}
+
+/// Where a lane's head stands against its target and the root's record
+/// (lab: the oracle's head self-consistency check).
+#[cfg(feature = "lab")]
+#[derive(Clone, Debug)]
+pub struct LabHeadFacts {
+    /// The lane's head position (rows it holds).
+    pub head_position: usize,
+    /// The lane's target position.
+    pub target_position: usize,
+    /// Owed head rows the rank holds, and where they start.
+    pub owed_rows: usize,
+    pub owed_start: usize,
+    /// The root's record of the head: its state and the owed tokens.
+    pub root_head: crate::mesh_lane_protocol::HeadState,
+    pub root_owed: Vec<u32>,
 }
 
 /// Lab route modes of the store's window router.
@@ -947,6 +1003,9 @@ pub struct LaneSpec {
     pub pending_hidden: GpuTensor,
     /// The routed window between `draft_step` and `commit_step`.
     pub(crate) window: Option<PendingWindow>,
+    /// Owed head rows of a retired lane with a copy future (`None`: the
+    /// store stages no copy lane, a retired lane is head-free).
+    pub(crate) lag: Option<HeadLagStore>,
     pub stats: LaneSpecStats,
 }
 
@@ -954,12 +1013,16 @@ impl LaneSpec {
     /// A fresh spec state: the head is built on the resident head's backend
     /// and context bound. The trunk state's verify ring is the payload's
     /// ([`new_payload`]), owned by every band that owns target layers.
+    /// `lag_rows > 0` also allocates the owed-row storage
+    /// ([`crate::mesh_rank_copy::lag_allocation_sizes`], what the census
+    /// charges).
     fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         spec: LaneSpecConfig,
         head_max_seq: usize,
         backend: Qwen4KvBackend,
+        lag_rows: usize,
     ) -> Result<Self, String> {
         let config = &bundle.config;
         let head = MtpGpuState::new_with_backend(gpu, config, head_max_seq, backend)
@@ -975,17 +1038,31 @@ impl LaneSpec {
                 return Err(format!("lane pending hidden: {error}"));
             }
         };
+        let lag = if lag_rows > 0 {
+            match HeadLagStore::new(gpu, config, lag_rows) {
+                Ok(lag) => Some(lag),
+                Err(error) => {
+                    let _ = head.free_gpu(gpu);
+                    let _ = gpu.free_tensor(pending_hidden);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             head,
             draft: DraftHeadRequestState::default(),
             pending_hidden,
             window: None,
+            lag,
             stats: LaneSpecStats::default(),
         })
     }
 
     /// Back to a request's start: empty head, zero pending hidden, no
-    /// window, fresh counters (the window router lives at the root).
+    /// window, no owed rows, fresh counters (the window router lives at the
+    /// root).
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.head
             .reset(gpu)
@@ -995,14 +1072,18 @@ impl LaneSpec {
             .memset(&self.pending_hidden.buf, 0, self.pending_hidden.buf.size())
             .map_err(|e| format!("lane pending hidden reset: {e}"))?;
         self.window = None;
+        if let Some(lag) = self.lag.as_mut() {
+            lag.clear();
+        }
         self.stats = LaneSpecStats::default();
         Ok(())
     }
 
     /// Start this (kept or fresh) lane spec from a promoted singleton's
-    /// `parts`: its pending hidden copied in, no window, fresh counters. The
-    /// head and draft request state are the singleton's own and swap in at
-    /// commit; its agreement and retirement seed the root's lane policy.
+    /// `parts`: its pending hidden copied in, no window, no owed rows, fresh
+    /// counters. The head and draft request state are the singleton's own and
+    /// swap in at commit; its agreement and retirement seed the root's lane
+    /// policy.
     fn promote(&mut self, gpu: &mut Gpu, parts: &Qwen4PromotionParts<'_>) -> Result<(), String> {
         let bytes = self.pending_hidden.byte_size();
         if parts.pending_hidden.byte_size() != bytes {
@@ -1015,10 +1096,18 @@ impl LaneSpec {
             .map_err(|e| format!("pending hidden copy: {e}"))?;
         self.draft = DraftHeadRequestState::default();
         self.window = None;
+        if let Some(lag) = self.lag.as_mut() {
+            lag.clear();
+        }
         self.stats = LaneSpecStats::default();
         Ok(())
     }
 }
+
+/// What a slot's spec payload is built from: the lane config, the resident
+/// head's context bound and backend, and the owed head rows of storage
+/// (`0`: none, the store stages no copy lane).
+type SpecAlloc = (LaneSpecConfig, usize, Qwen4KvBackend, usize);
 
 /// A fresh slot's payload: a lane trunk state with its `ring_rows`-row GDN
 /// capture ring (every band that owns target layers; `0`: AR lanes arm no
@@ -1029,7 +1118,7 @@ fn new_payload(
     bundle: &Qwen4Bundle,
     slot: usize,
     ring_rows: usize,
-    spec_cfg: Option<(LaneSpecConfig, usize, Qwen4KvBackend)>,
+    spec_cfg: Option<SpecAlloc>,
 ) -> Result<(Qwen4State, Option<LaneSpec>), String> {
     let mut state = bundle
         .new_lane_state(gpu)
@@ -1044,8 +1133,8 @@ fn new_payload(
     }
     let spec = match spec_cfg {
         None => None,
-        Some((config, head_max_seq, backend)) => {
-            match LaneSpec::new(gpu, bundle, config, head_max_seq, backend) {
+        Some((config, head_max_seq, backend, lag_rows)) => {
+            match LaneSpec::new(gpu, bundle, config, head_max_seq, backend, lag_rows) {
                 Ok(spec) => Some(spec),
                 Err(error) => {
                     let _ = state.free_gpu(gpu);
@@ -1443,6 +1532,8 @@ pub(crate) struct SpecStore {
     /// The resident head's context bound: every lane head is built with it.
     pub head_max_seq: usize,
     pub backend: Qwen4KvBackend,
+    /// Owed head rows of storage each lane holds (`0`: no copy lane).
+    pub lag_rows: usize,
     /// F32, `rows_cap * hc_count * hidden`: the wide hidden of every decode
     /// row of a step (the lane forward's capture).
     pub hidden: GpuTensor,
@@ -1466,6 +1557,7 @@ impl SpecStore {
         config: LaneSpecConfig,
         max_lanes: usize,
         rows_cap: usize,
+        lag_rows: usize,
     ) -> Result<Self, String> {
         let mtp = bundle
             .mtp
@@ -1512,6 +1604,7 @@ impl SpecStore {
             config,
             head_max_seq,
             backend,
+            lag_rows,
             hidden,
             draft_top1,
             draft_top1_host: vec![0; top1_bytes],
@@ -1587,6 +1680,8 @@ pub struct Qwen4LaneStore {
     /// The lane protocol's root, rank session and in-flight step; taken out
     /// for the duration of a step entry (see [`crate::lane_rank`]).
     proto: Option<LaneProto>,
+    /// The copy lane this store was staged with (`None`: the default store).
+    copy: Option<StoreCopy>,
 }
 
 impl Qwen4LaneStore {
@@ -1599,6 +1694,7 @@ impl Qwen4LaneStore {
         max_lanes: usize,
         row_budget: usize,
         spec: Option<LaneSpecConfig>,
+        copy: Option<LaneCopyConfig>,
     ) -> Result<Self, String> {
         if !bundle.config.profile.is_flash_next() {
             return Err(format!(
@@ -1655,6 +1751,7 @@ impl Qwen4LaneStore {
         // A head owner (the single scope, every EP rank, the PP output band)
         // holds the MTP head; any other band that owns target layers holds
         // only its lanes' verify rings (target-only ownership).
+        let proto = LaneProto::new(copy.map(|c| c.ngram))?;
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -1677,9 +1774,45 @@ impl Qwen4LaneStore {
                 );
             }
         }
-        let rows_cap = match spec {
-            Some(spec) => max_lanes * (spec.k + 1),
-            None => max_lanes,
+        // The copy lane (opt-in) widens every lane's verify rows and ring to
+        // `1 + max(k, take cap)` and adds the owed-row storage; without it the
+        // store keeps its `k + 1`-row shape exactly.
+        let (ring_rows, rows_cap, lag_rows, copy_arming) = match (spec, copy) {
+            (Some(spec), Some(copy)) => {
+                if !scope.output {
+                    return Err(
+                        "lane store: the copy lane needs a head-owning band (single card)"
+                            .to_string(),
+                    );
+                }
+                let row_exact = bundle.row_exact_verify_rows(gpu);
+                // Only the non-context fields are read here; the census
+                // reads the same function with the real context.
+                let budget = crate::mesh_rank_copy::copy_budget(
+                    max_lanes,
+                    spec.k,
+                    &copy,
+                    row_exact,
+                    Qwen4ContextCommit::legacy(1),
+                    1,
+                )
+                .map_err(|e| format!("lane store: {e}"))?;
+                (
+                    budget.capture_rows_per_lane,
+                    budget.step_rows(),
+                    budget.head_lag_rows,
+                    Some(StoreCopy {
+                        config: copy,
+                        take_cap: budget.copy_take_cap,
+                        verify_rows: budget.verify_rows_per_lane,
+                    }),
+                )
+            }
+            (None, Some(_)) => {
+                return Err("lane store: the copy lane needs MTP lanes (spec)".to_string());
+            }
+            (Some(spec), None) => (spec.k + 1, max_lanes * (spec.k + 1), 0, None),
+            (None, None) => (0, max_lanes, 0, None),
         };
         let rows = rows_cap + max_lanes;
         let vocab = bundle.lane_vocab();
@@ -1705,7 +1838,7 @@ impl Qwen4LaneStore {
         };
         let spec_store = match spec {
             Some(config) if scope.output => {
-                match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap) {
+                match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap, lag_rows) {
                     Ok(store) => Some(store),
                     Err(error) => {
                         for tensor in [logits, top1].into_iter().flatten() {
@@ -1720,7 +1853,7 @@ impl Qwen4LaneStore {
         Ok(Self {
             table: LaneTable::new(max_lanes),
             row_budget: row_budget.min(max_lanes),
-            ring_rows: spec.map_or(0, |spec| spec.k + 1),
+            ring_rows,
             format: bundle.state_format(),
             backend: bundle.state.qsa_backend(),
             policy,
@@ -1741,7 +1874,8 @@ impl Qwen4LaneStore {
             phase: LanePhase::Idle,
             next_step_id: 0,
             step_started: None,
-            proto: Some(LaneProto::new()?),
+            proto: Some(proto),
+            copy: copy_arming,
         })
     }
 
@@ -1817,6 +1951,43 @@ impl Qwen4LaneStore {
         census.total()
     }
 
+    /// [`Self::device_bytes`] of a copy-armed store: the census of the
+    /// widened budget ([`crate::mesh_rank_copy::copy_budget`]: `1 + max(k,
+    /// take cap)` verify rows and ring rows per lane, `head_lag_rows` owed
+    /// rows per lane) that [`Self::new`] allocates, so census == allocation.
+    /// `row_exact_rows` is the arch's row-exact verify width.
+    pub fn device_bytes_with_copy(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+        max_lanes: usize,
+        spec_k: usize,
+        row_exact_rows: usize,
+        copy: &LaneCopyConfig,
+    ) -> Option<u64> {
+        let scope = Qwen4BandScope::single(config);
+        let append_scratch = (mtp_fill_scratch_requested()
+            && MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).is_some())
+        .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
+        let inputs = census::CensusInputs {
+            config,
+            format,
+            scope: &scope,
+            rank: 0,
+            append_scratch,
+        };
+        let budget = crate::mesh_rank_copy::copy_budget(
+            max_lanes,
+            spec_k,
+            copy,
+            row_exact_rows,
+            *context,
+            1,
+        )
+        .ok()?;
+        census::lane_spec_census(&budget, &inputs).ok()?.total()
+    }
+
     /// Admit `epoch` with its canonical `prompt` into the lowest free lane
     /// and return its slot. A slot that held a request before resets its
     /// state in place (an MTP lane also its head, draft policy, pending
@@ -1832,7 +2003,7 @@ impl Qwen4LaneStore {
         let spec_cfg = self
             .spec
             .as_ref()
-            .map(|s| (s.config, s.head_max_seq, s.backend));
+            .map(|s| (s.config, s.head_max_seq, s.backend, s.lag_rows));
         self.table
             .admit(epoch, prompt, |slot, existing| match existing {
                 Some(cell) => {
@@ -1883,7 +2054,7 @@ impl Qwen4LaneStore {
         let spec_cfg = self
             .spec
             .as_ref()
-            .map(|s| (s.config, s.head_max_seq, s.backend));
+            .map(|s| (s.config, s.head_max_seq, s.backend, s.lag_rows));
         match (spec_cfg.is_some(), parts.is_some()) {
             (true, false) => {
                 return Err(
@@ -1928,6 +2099,9 @@ impl Qwen4LaneStore {
                         if let Some(spec) = spec {
                             let _ = spec.head.free_gpu(gpu);
                             let _ = gpu.free_tensor(spec.pending_hidden);
+                            if let Some(lag) = spec.lag {
+                                let _ = lag.free_gpu(gpu);
+                            }
                         }
                         return Err(format!("admit_promoted: lane {slot}: {error}"));
                     }
@@ -1938,9 +2112,9 @@ impl Qwen4LaneStore {
         // The root learns the promoted request: the singleton's agreement
         // seeds the lane policy and its retirement is kept (the floor is
         // never reset by a promotion).
-        let k = spec_cfg.map(|(config, _, _)| config.k);
+        let k = spec_cfg.map(|(config, _, _, _)| config.k);
         let eos = spec_cfg
-            .and_then(|(config, _, _)| config.end_of_turn)
+            .and_then(|(config, _, _, _)| config.end_of_turn)
             .unwrap_or(bundle.config.eos_token_id);
         let promoted = parts.as_ref().map(|p| (p.agreement, p.retired));
         let admitted = self.proto_mut()?.admit_decoding(DecodeAdmission {
@@ -1997,6 +2171,24 @@ impl Qwen4LaneStore {
     /// The lab route mode of the window router (the floor on AR stores).
     pub(crate) fn routes(&self) -> LabRoutes {
         self.spec.as_ref().map_or(LabRoutes::Floor, |s| s.routes)
+    }
+
+    /// The copy lane this store was staged with (`None`: the default store,
+    /// copy off on every lane).
+    pub(crate) fn copy(&self) -> Option<StoreCopy> {
+        self.copy
+    }
+
+    /// Whether the store runs the copy lane.
+    pub fn copy_armed(&self) -> bool {
+        self.copy.is_some()
+    }
+
+    /// Verify rows one lane holds at most: `1 + max(k, take cap)` with the
+    /// copy lane, else the row-exact guard ([`LANE_MAX_ROWS`], the plan's
+    /// historical bound).
+    pub(crate) fn verify_rows_per_lane(&self) -> usize {
+        self.copy.map_or(LANE_MAX_ROWS, |c| c.verify_rows)
     }
 
     /// Whether this store was staged to admit sampled lanes
@@ -2236,6 +2428,24 @@ impl Qwen4LaneStore {
         Ok(items)
     }
 
+    /// Where `epoch`'s head stands against its target and the root's record
+    /// (the oracle's head self-consistency check): `None` for an AR lane or an
+    /// unknown epoch.
+    #[cfg(feature = "lab")]
+    pub fn lab_head_facts(&self, epoch: &RequestEpoch) -> Option<LabHeadFacts> {
+        let (head_position, target_position, owed_rows, owed_start) =
+            crate::mesh_rank_copy::head_facts(self.lane(epoch)?)?;
+        let (root_head, root_owed) = self.proto.as_ref()?.root.head_state(*epoch)?;
+        Some(LabHeadFacts {
+            head_position,
+            target_position,
+            owed_rows,
+            owed_start,
+            root_head,
+            root_owed: root_owed.to_vec(),
+        })
+    }
+
     /// Disjoint borrows of the `epochs` lanes (plan order) and the step
     /// output buffers. Only a store with output buffers
     /// ([`Self::has_step_outputs`]: the single scope or the output band)
@@ -2408,6 +2618,7 @@ impl Qwen4LaneStore {
             if let Some(LaneSpec {
                 head,
                 pending_hidden,
+                lag,
                 ..
             }) = spec
             {
@@ -2416,6 +2627,11 @@ impl Qwen4LaneStore {
                 }
                 if let Err(error) = gpu.free_tensor(pending_hidden) {
                     first.get_or_insert(format!("lane pending hidden: {error}"));
+                }
+                if let Some(lag) = lag {
+                    if let Err(error) = lag.free_gpu(gpu) {
+                        first.get_or_insert(error);
+                    }
                 }
             }
         }

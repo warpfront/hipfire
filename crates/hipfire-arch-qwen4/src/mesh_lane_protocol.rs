@@ -1887,6 +1887,15 @@ impl MeshRoot {
             .map(|l| l.policy.as_ref().is_some_and(LaneSpecPolicy::retired))
     }
 
+    /// The published step awaiting its price held a copy window: such a
+    /// price settles through the next [`Self::plan_window`]'s prior evidence,
+    /// never [`Self::settle_evidence`] (which refuses it).
+    pub fn pending_prices_copy(&self) -> bool {
+        self.pending_obs
+            .as_ref()
+            .is_some_and(|p| p.lanes.iter().any(|o| o.source == ProposalSource::Copy))
+    }
+
     // ---- 1. plan_window -------------------------------------------------
 
     /// Root-only, pure host policy transition. `prior_evidence` is the

@@ -220,7 +220,8 @@ pub enum CensusComponent {
     HeadState,
     /// Per lane, head owners: the pending target hidden row.
     PendingHidden,
-    /// Per lane, head owners: owed head-lag hidden rows and tokens.
+    /// Per lane, head owners: owed head-lag hidden rows (the owed tokens are
+    /// host values, not device bytes).
     HeadLag,
     /// Shared, LM-head bands: step logits (`(rows + lanes) * vocab` F32).
     StepLogits,
@@ -585,20 +586,16 @@ pub fn lane_spec_census(
             allocations: vec![wide_u64],
         });
         if budget.head_lag_rows > 0 {
-            let hidden = wide
-                .checked_mul(budget.head_lag_rows)
-                .ok_or_else(|| overflow("head-lag hidden"))?;
-            let tokens = budget
-                .head_lag_rows
-                .checked_mul(std::mem::size_of::<u32>())
-                .ok_or_else(|| overflow("head-lag tokens"))?;
+            // Owed hidden rows only: the lane's owed tokens are host values.
+            // The list is the allocator's own (`HeadLagStore::new`).
             lines.push(CensusLine {
                 component: CensusComponent::HeadLag,
                 copies: lanes,
-                allocations: vec![
-                    u64::try_from(hidden).map_err(|_| overflow("head-lag hidden"))?,
-                    u64::try_from(tokens).map_err(|_| overflow("head-lag tokens"))?,
-                ],
+                allocations: crate::mesh_rank_copy::lag_allocation_sizes(
+                    config,
+                    budget.head_lag_rows,
+                )
+                .ok_or_else(|| overflow("head-lag hidden"))?,
             });
         }
     }
@@ -827,7 +824,7 @@ mod tests {
                                     );
                                     expected += n * sum(&head_state) + n * wide;
                                     let lag = budget.head_lag_rows as u64;
-                                    expected += n * (lag * wide + lag * 4);
+                                    expected += n * lag * wide;
                                     expected += budget.step_rows() as u64 * wide;
                                     expected += n * Gpu::TOPK8_OUT_BYTES as u64;
                                     let append =
