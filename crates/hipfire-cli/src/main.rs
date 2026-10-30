@@ -909,6 +909,14 @@ struct QuantizeArgs {
     /// Override the output filename stem.
     stem: Option<String>,
     #[arg(long)]
+    /// Symmetric per-128 MQ4V2 grid (qt44, header zero = f16(-8*d)); forwarded to
+    /// `hipfire-quantize --mq4v2-symmetric`. Requires `--format mq4`. Models with a
+    /// dedicated recipe (Raon-1-mini) require `--mq4v2-symmetric --tier xt`.
+    mq4v2_symmetric: bool,
+    #[arg(long, value_parser = ["xt", "base", "pro"])]
+    /// Product tier forwarded to `hipfire-quantize --tier`. Requires `--format mq4`.
+    tier: Option<String>,
+    #[arg(long)]
     /// Upload completed artifacts to owner/repo on Hugging Face.
     upload: Option<String>,
     #[arg(long)]
@@ -9269,6 +9277,33 @@ fn derived_packs(trunk: &std::path::Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Arguments the public `hipfire quantize` passes to `hipfire-quantize`: the
+/// historical `--input/--output/--format`, plus the recipe controls when given.
+fn quantizer_argv(
+    input: &str,
+    output: &Path,
+    format: &str,
+    mq4v2_symmetric: bool,
+    tier: Option<&str>,
+) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = vec![
+        "--input".into(),
+        input.into(),
+        "--output".into(),
+        output.as_os_str().to_owned(),
+        "--format".into(),
+        format.into(),
+    ];
+    if mq4v2_symmetric {
+        argv.push("--mq4v2-symmetric".into());
+    }
+    if let Some(tier) = tier {
+        argv.push("--tier".into());
+        argv.push(tier.into());
+    }
+    argv
+}
+
 fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     let quantizer = find_workspace_binary(paths, "hipfire-quantize").ok_or_else(|| {
         anyhow!(
@@ -9311,6 +9346,9 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
             bail!("GGUF input supports hf4, hf6, mq4, or mq6");
         }
     }
+    if (args.mq4v2_symmetric || args.tier.is_some()) && args.formats.iter().any(|f| f != "mq4") {
+        bail!("--mq4v2-symmetric and --tier apply to --format mq4 only");
+    }
     if args.output.is_some() && args.formats.len() != 1 {
         bail!("--output requires exactly one format; use --output-dir for multiple formats");
     }
@@ -9342,13 +9380,13 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
             .unwrap_or_else(|| output_dir.join(format!("{stem}.{format}")));
         eprintln!("quantizing {input} -> {} ({format})", output.display());
         run_checked(
-            Command::new(&quantizer)
-                .arg("--input")
-                .arg(&input)
-                .arg("--output")
-                .arg(&output)
-                .arg("--format")
-                .arg(format),
+            Command::new(&quantizer).args(quantizer_argv(
+                &input,
+                &output,
+                format,
+                args.mq4v2_symmetric,
+                args.tier.as_deref(),
+            )),
             "hipfire-quantize",
         )?;
         if !output.is_file() {
@@ -10978,6 +11016,80 @@ mod tests {
             root,
             config,
         }
+    }
+
+    /// Run `quantize_command` against a recording stand-in for `hipfire-quantize`
+    /// and return the argv it was launched with.
+    #[cfg(unix)]
+    fn recorded_quantizer_argv(label: &str, extra: &[&str]) -> Result<Vec<String>> {
+        use std::os::unix::fs::PermissionsExt;
+        let paths = test_paths(label);
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin)?;
+        let record = paths.root.join("argv.txt");
+        let script = bin.join("hipfire-quantize");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --output ]; then : > \"$2\"; fi\n  shift\ndone\n",
+                record.display()
+            ),
+        )?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+        let input = paths.root.join("model");
+        fs::create_dir_all(&input)?;
+        let out = paths.root.join("out.hfq");
+        let mut argv = vec![
+            "hipfire".to_string(),
+            "quantize".into(),
+            input.display().to_string(),
+            "--output".into(),
+            out.display().to_string(),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        let cli = Cli::try_parse_from(argv)?;
+        let Some(Commands::Quantize(args)) = cli.command else {
+            panic!("expected quantize subcommand");
+        };
+        quantize_command(&paths, args)?;
+        let lines = fs::read_to_string(&record)?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let _ = fs::remove_dir_all(&paths.root);
+        Ok(lines)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quantize_forwards_symmetric_and_tier_recipe_controls() {
+        let argv = recorded_quantizer_argv("q-recipe", &["--mq4v2-symmetric", "--tier", "xt"])
+            .expect("quantize with recipe controls");
+        let tail = &argv[argv.len() - 5..];
+        assert_eq!(
+            tail,
+            ["--format", "mq4", "--mq4v2-symmetric", "--tier", "xt"],
+            "argv: {argv:?}"
+        );
+        assert_eq!(&argv[0], "--input");
+        assert_eq!(&argv[2], "--output");
+
+        // Without the controls the historical three-flag forwarding is unchanged.
+        let plain = recorded_quantizer_argv("q-plain", &[]).expect("plain quantize");
+        assert_eq!(plain.len(), 6, "argv: {plain:?}");
+        assert_eq!(&plain[4], "--format");
+        assert!(!plain
+            .iter()
+            .any(|a| a == "--mq4v2-symmetric" || a == "--tier"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quantize_recipe_controls_require_mq4_and_a_known_tier() {
+        let err = recorded_quantizer_argv("q-badfmt", &["--format", "q8", "--mq4v2-symmetric"])
+            .unwrap_err();
+        assert!(err.to_string().contains("--format mq4 only"), "{err:#}");
+        assert!(Cli::try_parse_from(["hipfire", "quantize", "m", "--tier", "bogus"]).is_err());
     }
     #[test]
     fn run_stats_are_authoritative_and_missing_is_not_wall_rate() {

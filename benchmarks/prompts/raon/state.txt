@@ -1,0 +1,69 @@
+# Notes on Running Hybrid Language Models
+
+Modern language models no longer rely on a single attention mechanism. A hybrid model alternates cheap recurrent layers with a smaller number of layers that attend over the whole context. The recurrent layers carry a fixed-size state from token to token; the attention layers keep a cache of past keys and values. Together they let a model remember details from far back in a document without paying the full memory cost at every layer.
+
+When an engineer ports such a model to a new inference engine, the first question is always the same: does the new implementation reproduce the reference numbers? The practical answer is to feed the same text to both implementations and compare the intermediate tensors layer by layer. If the recurrent state after the last token agrees to within rounding error, and so does the cache, then the two engines are computing the same function. Differences usually trace back to one of a handful of causes: a transposed matrix, a missing normalization epsilon, a gate applied before rather than after an activation, or an accumulator that was kept in the wrong precision.
+
+Here is a small reference routine that updates a decayed state with a rank-one correction, written the way a first prototype might be:
+
+```python
+import numpy as np
+
+def step(state, k, v, decay, beta):
+    """One recurrent update: S <- decay * S + beta * outer(v - S @ k, k)."""
+    pred = state @ k                      # what the state currently predicts for key k
+    delta = beta * (v - pred)             # error signal, scaled by the write strength
+    state = decay[:, None] * state        # per-row exponential forgetting
+    return state + np.outer(delta, k)     # rank-one write
+
+rng = np.random.default_rng(1234)
+S = np.zeros((64, 128), dtype=np.float32)
+for t in range(1000):
+    k = rng.standard_normal(128).astype(np.float32)
+    k /= np.linalg.norm(k) + 1e-6
+    v = rng.standard_normal(64).astype(np.float32)
+    S = step(S, k, v, decay=np.full(64, 0.97, np.float32), beta=0.5)
+print(S.shape, float(np.abs(S).mean()))
+```
+
+The loop above processes 1000 tokens with a state of 64 x 128 = 8192 values, so the memory footprint does not grow with the sequence length. By contrast, a cache of 1000 tokens with 8 heads of dimension 128, in 16-bit precision, takes 1000 x 8 x 128 x 2 x 2 = 4,096,000 bytes per layer, and that figure keeps growing linearly.
+
+## 한국어 문단
+
+하이브리드 모델은 순환 계층과 어텐션 계층을 번갈아 쌓아서 긴 문맥을 효율적으로 처리합니다. 순환 계층은 토큰마다 고정된 크기의 상태를 갱신하므로 문장이 길어져도 메모리 사용량이 늘어나지 않습니다. 반면 어텐션 계층은 과거의 키와 값을 모두 저장하기 때문에 정확한 회상이 필요한 곳에 소수만 배치합니다. 새로운 추론 엔진을 만들 때에는 참조 구현과 같은 입력을 넣고 계층별 출력과 상태를 비교하여 오차가 반올림 수준인지 확인해야 합니다. 2024년 현재 많은 연구팀이 8비트와 4비트 양자화를 함께 사용하여 약 29억 개에서 290억 개의 매개변수를 가진 모델을 한 장의 그래픽 카드에서 실행하고 있습니다.
+
+## 日本語の段落
+
+ハイブリッドモデルでは、再帰型の層と注意機構の層を交互に重ねます。再帰型の層は一つひとつのトークンごとに固定サイズの状態を更新するため、文章が長くなってもメモリの使用量は増えません。一方、注意機構の層は過去のキーと値をすべて保存するので、正確な想起が必要な場所にだけ少数を配置します。新しい推論エンジンを移植するときは、同じ入力を参照実装と新しい実装の両方に与え、各層の出力と状態を比較して、誤差が丸め誤差の範囲内かどうかを確かめます。2024年には、多くの研究チームが量子化を活用して大規模なモデルを一枚のグラフィックスカードで動かしています。
+
+## Numbers and Measurements
+
+| Card | Memory (GB) | Bandwidth (GB/s) | Decode tok/s | Note |
+|------|------------:|-----------------:|-------------:|------|
+| Card A | 24 | 960 | 286.4 | 4-bit weights |
+| Card B | 32 | 640 | 39.9 | long context |
+| Card C | 96 | 256 | 15.08 | shared memory |
+| Card D | 16 | 448 | 3,141 | tiny model |
+
+Selected constants: pi = 3.14159265358979, e = 2.71828182845905, 2^32 = 4294967296, 2^64 = 18446744073709551616, 1e-6 = 0.000001. Dates: 2026-10-30, 2025/03/15, 07:45:12 UTC. Version strings: v0.4.3-rc2, 1.2.3.4. Phone: +82-2-123-4567. Identifier: ABC_123_def_4567.
+
+## A Short Exchange
+
+User: Can you remind me why the recurrent state is rank-one updated?
+Assistant: Sure. Each token writes one key-value association into the state. The correction term subtracts what the state already predicts for that key, so repeated writes to the same key overwrite instead of piling up.
+User: And the decay?
+Assistant: The decay lets old associations fade, so the state keeps room for recent ones. Without it, the memory would saturate after a few thousand tokens.
+User: Thanks! That's clear.
+Assistant: You're welcome. Let me know if you would like to walk through the kernel next.
+
+## A Longer Worked Example
+
+Suppose a document begins with the sentence "The quick brown fox jumps over the lazy dog, then trots across the frozen river toward the distant pines." A recurrent layer reads this sentence one token at a time. After "fox" the state holds an association between the subject and its description; after "jumps" it adds an action; and by the time it reaches "pines" the earliest words have faded a little, because every update multiplies the old state by a decay factor slightly below one. A later question such as "What did the fox jump over?" must be answered from this compressed summary, or from an attention layer that still holds the exact keys and values for the word "dog".
+
+Engineers sometimes describe the trade-off with a table of costs. For a context of 4096 tokens the recurrent state costs the same 8192 values as for 40 tokens, while the cache costs 4096 x 8 x 128 x 2 x 2 = 16,777,216 bytes. At 32768 tokens the cache reaches 134,217,728 bytes per layer, which is why long-context serving on a single card quickly becomes limited by memory capacity rather than by arithmetic throughput.
+
+Checklist for a port: (1) load the weights and verify every tensor shape; (2) check the embedding lookup against the reference for a few token ids; (3) run one layer on fixed random input and compare; (4) run the full stack on this text; (5) compare the final logits and the argmax at every position; (6) only then measure speed.
+
+## Closing
+
+Careful parity testing is tedious but pays for itself: once the state and the logits match the reference on a varied piece of text like this one, performance work can proceed with confidence that every optimization is checked against a known-good answer.

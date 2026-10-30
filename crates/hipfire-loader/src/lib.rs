@@ -34,6 +34,7 @@ use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_arch_raon as raon;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::device_mesh::DimKind;
@@ -375,6 +376,7 @@ pub enum BenchDecodeRoute {
     Gemma4,
     MuseGlimmer,
     Qwen4,
+    Raon,
     Unsupported,
 }
 pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
@@ -385,6 +387,7 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         13 => BenchDecodeRoute::Gemma4,
         14 => BenchDecodeRoute::MuseGlimmer,
         16 => BenchDecodeRoute::Qwen4,
+        19 => BenchDecodeRoute::Raon,
         _ => BenchDecodeRoute::Unsupported,
     }
 }
@@ -406,6 +409,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         16 => "qwen4",
         17 => "qwen3_5_embed",
         18 => "embedding_gemma2",
+        19 => "raon1_mini",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -586,6 +590,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &FluxDiffusionCarrier,
     &Qwen35EmbedCarrier,
     &EmbeddingGemma2Carrier,
+    &RaonCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -897,6 +902,7 @@ pub struct Deepseek4HeterogeneousBundle {
 /// (orphan rule). Field-identical to the prior loader-local struct. `eos_tok` is
 /// resolved at load time and rides along so the generate path doesn't re-tokenize.
 pub use lfm2moe::Lfm2MoeBundle;
+pub use raon::RaonBundle;
 
 /// MiniMax-M2 (arch_id=10) GPU bundle. Re-exported from the arch crate, which
 /// owns it so `impl SpecTarget for MiniMaxBundle` (the n-gram verify seam) can
@@ -1384,6 +1390,19 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Lfm2MoeBundle>())
+    }
+
+    /// Raon-1-mini bundle if this model is arch_id=19, else None.
+    pub fn raon(&self) -> Option<&RaonBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<RaonBundle>())
+    }
+
+    pub fn raon_mut(&mut self) -> Option<&mut RaonBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<RaonBundle>())
     }
 
     /// MiniMax-M2 bundle if this model is arch_id=10, else None.
@@ -7238,6 +7257,7 @@ mod registry_tests {
             (10, false, "minimax"),
             (11, false, "lfm2moe"),
             (12, false, "cohere2moe"),
+            (19, false, "raon1_mini"),
             (40, false, "flux"),
             (40, true, "flux"),
             (45, false, "flux"),
@@ -7445,7 +7465,13 @@ mod registry_tests {
             );
             covered.push(label);
         }
-        for label in ["qwen3_5", "qwen3_5_moe", "qwen4", "muse_glimmer"] {
+        for label in [
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen4",
+            "muse_glimmer",
+            "raon1_mini",
+        ] {
             assert!(covered.contains(&label), "{label} not covered: {covered:?}");
         }
     }
@@ -7526,6 +7552,14 @@ mod registry_tests {
         );
         assert_eq!(caps_of("cohere2moe"), text_only);
         assert_eq!(
+            caps_of("raon1_mini"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::QwenJinja,
+                semantic_contract_version: Some(2),
+                ..text_only
+            }
+        );
+        assert_eq!(
             caps_of("gemma4"),
             ArchCaps {
                 reasoning_contract: ReasoningContract::GemmaBoolean,
@@ -7566,8 +7600,8 @@ mod registry_tests {
             );
         }
 
-        // ── bench_decode_route: 9, 11, 5|6, 13, 14, 16; everything else Unsupported ──
-        for id in 0u32..=16 {
+        // ── bench_decode_route: 9, 11, 5|6, 13, 14, 16, 19; everything else Unsupported ──
+        for id in 0u32..=22 {
             let want = match id {
                 9 => BenchDecodeRoute::Deepseek4,
                 11 => BenchDecodeRoute::Lfm2Moe,
@@ -7575,6 +7609,7 @@ mod registry_tests {
                 13 => BenchDecodeRoute::Gemma4,
                 14 => BenchDecodeRoute::MuseGlimmer,
                 16 => BenchDecodeRoute::Qwen4,
+                19 => BenchDecodeRoute::Raon,
                 _ => BenchDecodeRoute::Unsupported,
             };
             assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");

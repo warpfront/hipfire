@@ -1153,6 +1153,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "raon-decode-mode-retained-replay",
+        predicates: &[ReplayEnabled],
+        condition: "hipfire-arch-raon bundle.rs DecodeMode::resolve, run once at bundle load: `HIPFIRE_GRAPH=0` selects Eager; otherwise an enabled retained-replay controller (`gpu.replay.is_enabled()`, which owns the launch stream) selects Eager; CPU-executed host weights select Eager; else Graph (whole decode step captured once per context bucket and replayed)",
+        effect: ProcessRoute,
+        switches: "Graph: decode step recorded in gpu.graphs and replayed per token; Eager: per-launch dispatch of the same kernels (the oracle/control route)",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "decided once at load from the process backend request and never re-read per forward, so the eager and recorded forward of one process agree; both modes dispatch the same launchers on the same buffers. No railgun default program is a Raon program",
+        reaches: &[],
+    },
+    Decision {
         id: "dspark-capture-safe-verify-body",
         predicates: &[DeclaredCaptureBody, IsRecording, CaptureMode],
         condition: "DS4 DSpark verify body parameter `capture_safe` (spec_impl.rs:155-230; forward.rs forward_prefill_batch_chunk_impl, carried by rows_program.rs RowsWindow into push_attention / compressed_attention_rows and the hipfire-dispatch pipeline/mla/{rows,attention}.rs operations) and dspark_requires_typed_device_copy = is_recording() || capture_mode || force_blob_path (forward.rs)",
@@ -1704,6 +1715,12 @@ pub const DECISIONS: &[Decision] = &[
     },
 ];
 pub const SITES: &[Site] = &[
+    Site {
+        file: "hipfire-arch-raon/src/bundle.rs",
+        function: "resolve",
+        occurrences: 1,
+        decisions: &["raon-decode-mode-retained-replay"],
+    },
     Site {
         file: "rdna-compute/src/mq6_railgun.rs",
         function: "check_gpu",

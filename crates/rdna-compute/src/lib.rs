@@ -12,6 +12,7 @@ pub mod cdna;
 pub mod code_object;
 pub mod compile_jobs;
 mod compiler;
+pub mod device_counter;
 pub mod device_wait;
 pub mod dflash_draft_fusion;
 pub mod dflash_gdn_pre;
@@ -31,6 +32,7 @@ pub mod expert_capabilities;
 pub mod fa_prefill_pm;
 pub mod fa_qprep_pm;
 pub mod feature_flags;
+pub mod ffn_activation;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
 pub mod flux_fused;
@@ -38,6 +40,8 @@ pub mod flux_fused;
 pub mod fn_gdn_dense;
 pub mod fp8_e4m3;
 pub mod gap_timing;
+#[cfg(feature = "deltanet")]
+pub mod gated_delta_vector;
 pub mod gdn_chunk_prep_pm;
 #[cfg(test)]
 mod gdn_q8ef_reference;
@@ -69,6 +73,11 @@ pub mod lane_fa;
 pub mod lane_gdn;
 pub mod lane_proj;
 pub mod lane_rows_pm;
+pub mod latent_attention;
+pub mod latent_attention_absorb;
+pub mod latent_attention_decode;
+pub mod latent_attention_flash;
+pub mod latent_attention_tiled;
 pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;
@@ -79,6 +88,7 @@ pub mod moe_slot_ops;
 pub mod norm_fold;
 pub mod residual_lanes;
 pub mod slab_admission;
+pub mod stream_mix;
 pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,
     SlabLayerCodecError,

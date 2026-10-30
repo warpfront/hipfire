@@ -1447,6 +1447,14 @@ pub fn fail_closed_reset_target_and_spec(
                 push_reset_err(&mut first_err, "cohere2moe.reset", e);
             }
         }
+        if let Some(b) = m.raon_mut() {
+            // Zeroes RDA recurrent state + conv history and rewinds the MLA
+            // latent cursor: a failed/aborted turn never leaves future-state
+            // behind a truncated cache (PLAN 3.5).
+            if let Err(e) = b.reset(gpu) {
+                push_reset_err(&mut first_err, "raon.reset", e);
+            }
+        }
         if let Some(bundle) = m.gemma4_mut() {
             // Gemma4State::reset is cursor-only (n_tokens = 0); the
             // captured decode hipGraph stays valid across resets (position

@@ -31,6 +31,13 @@ pub mod slab_moe_decode;
 pub mod slab_route;
 pub mod slowlink_prefill;
 pub mod sp_layer;
+pub use moe_program::{
+    execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
+    GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
+    GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
+    GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, RouterKind,
+    SharedExpertPolicy,
+};
 pub use moe_program::{MoeStage, SealedMoeOp};
 pub(crate) mod draft_head;
 pub mod moe_dump;
@@ -46,12 +53,14 @@ pub mod batched_moe;
 pub mod gated_mlp;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
+pub mod latent_attention;
 pub(crate) mod layer_ops;
 pub mod mla;
 pub mod projection_split;
 pub mod sandwich;
 pub mod step_graph;
 pub(crate) mod steps;
+pub mod stream_mix;
 pub use layer_ops::{
     execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,
     execute_gated_delta_net, execute_gated_delta_net_arena, execute_gated_delta_net_core_rows,

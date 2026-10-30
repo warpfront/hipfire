@@ -37,6 +37,7 @@ hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2", optional = true }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4", optional = true }
 # Non-optional arch deps — LoadedModel struct references these types.
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
+hipfire-arch-raon = { path = "../hipfire-arch-raon" }
 # Public accessor types (Lfm2MoeBundle.vision_* fields are lfm2-vl types).
 hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }

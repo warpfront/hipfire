@@ -34,6 +34,7 @@ members = [
     "crates/hipfire-arch-toy",
     "crates/hipfire-arch-qwen2",
     "crates/hipfire-arch-lfm2moe",
+    "crates/hipfire-arch-raon",
     "crates/hipfire-arch-lfm2-vl",
     "crates/hipfire-arch-minimax",
     "crates/hipfire-arch-cohere2moe",

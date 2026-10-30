@@ -378,6 +378,8 @@ pub(crate) enum Route {
     EarlySpecial,
     /// Deprecated GGUF weight input.
     Gguf,
+    /// Raon-1-mini (`model_type: raon1_mini`) symmetric qt44 control artifact.
+    Raon,
     /// `--reap-overlay` selective re-quant.
     ReapOverlay,
     /// The safetensors quantize pipeline (including `--reap-bake`).
@@ -394,6 +396,7 @@ const EVERY: &[Route] = &[
     FinalCodes,
     EarlySpecial,
     Gguf,
+    Raon,
     ReapOverlay,
     Main,
 ];
@@ -406,6 +409,7 @@ const EVERY: &[Route] = &[
     FinalCodes,
     EarlySpecial,
     Gguf,
+    Raon,
     ReapOverlay,
     Main,
 ];
@@ -422,6 +426,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
             FinalCodes,
             EarlySpecial,
             Gguf,
+            Raon,
             ReapOverlay,
             Main,
         ],
@@ -436,6 +441,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
             FinalCodes,
             EarlySpecial,
             Gguf,
+            Raon,
             ReapOverlay,
             Main,
         ],
@@ -447,7 +453,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("recipe", &[Qwen4StockFp8]),
     #[cfg(feature = "qwen4-dev-profiles")]
     ("qwen4_dev_tiny", &[Qwen4DevTiny]),
-    ("format", &[EarlySpecial, Gguf, Main]),
+    ("format", &[EarlySpecial, Gguf, Raon, Main]),
     ("head_quant", &[EarlySpecial]),
     ("head_only", &[EarlySpecial]),
     ("arch_id", &[Gguf, ReapOverlay, Main]),
@@ -465,7 +471,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     // flag for a Qwen4 route until `crate::qwen4` actually reads it.
     ("imatrix", &[Main]),
     ("awq_alpha", &[Main]),
-    ("mq4v2_symmetric", &[Main]),
+    ("mq4v2_symmetric", &[Raon, Main]),
     ("hessian_dir", &[Main]),
     ("tier_ratio", &[Main]),
     ("q8_router", &[Main]),
@@ -495,7 +501,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("vision_quant", &[Main]),
     ("include_prefix", &[Main]),
     ("vision_only", &[Main]),
-    ("tier", &[Gguf, Main]),
+    ("tier", &[Gguf, Raon, Main]),
     ("fixed_tier", &[Gguf, Main]),
 ];
 
@@ -509,6 +515,7 @@ fn route_label(route: Route) -> &'static str {
         FinalCodes => "--mq*v2-final-codes",
         EarlySpecial => "this --format",
         Gguf => "GGUF weight input",
+        Raon => "the Raon-1-mini converter",
         ReapOverlay => "--reap-overlay",
         Main => "the safetensors quantize path",
     }

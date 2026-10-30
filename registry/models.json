@@ -1727,6 +1727,21 @@
       "desc": "LFM2.5 1.2B Thinking dense (Q8, reasoning)",
       "quant_recipe": "v3-awq-f1"
     },
+    "raon-1-mini-preview": {
+      "repo": "hipfire-models/raon-1-mini-preview",
+      "file": "raon-1-mini-preview.mq4-xts",
+      "size_gb": 17.7,
+      "min_vram_gb": 20.0,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "desc": "KRAFTON Raon-1-mini-preview 28.8B/4.3B-active MoE (arch_id=19; RDA gated-delta + MLA + mHC, SiTU experts). MQ4 XTS (~17.7GB): routed/shared/dense experts symmetric MQ4v2 qt44 with AWQ+GPTQ refit, attention and lm_head Q8F16; 20 GB-card fit pending real-hardware measurement (32K+ context admitted under 7900 XT capacity emulation). Reasoning model (<think>, QwenJinja template; thinking on by default), XML <tool_call> tools. Card defaults temp=1.0/top_p=0.95/top_k=20/presence_penalty=1.5 (presence applies to generated tokens only)."
+    },
     "qwen3.5:2b-mq3": {
       "repo": "hipfire-models/qwen3.5-2b",
       "file": "qwen3.5-2b.mq3",

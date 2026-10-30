@@ -53,5 +53,6 @@ hipfire-arch-qwen4         debt        9     0   F32 lm_head GEMM in program.rs 
 hipfire-arch-diffusion     debt       17     0   arch 40/45 image-diffusion trunk; direct f16 WMMA LDS GEMM + VAE/text-encoder kernel calls
 hipfire-arch-maple         debt        4     0   arch 15; no registry use to reconcile
 hipfire-arch-qwen2         debt        2     0
+hipfire-arch-raon          debt        2     0   Raon-1-mini-preview arch; 2 direct rdna-compute launcher calls (bypass debt owned by the Raon bring-up)
 hipfire-arch-lfm2-vl       debt        2     0   arch 11; tower/projector GEMMs (gemm_f16_wmma_mb8, gemm_f16)
 hipfire-arch-qwen35-vl     debt        5     0   arch 5 vision tower linears; +3 = LDS-tiled WMMA GEMM (gfx1201 split1 packed + pitched for the padded fc2, gfx11 lds_auto_ld), the same entry points qwen35-embed uses

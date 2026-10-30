@@ -133,6 +133,98 @@ pub fn end_timer(hip: &HipRuntime, timer: Option<Timer>) -> HipResult<()> {
     Ok(())
 }
 
+// ─── Launch-level timing (every kernel through the launch funnels) ─────────
+//
+// `begin_timer` only covers launchers that call it by hand; kernels without a
+// call site (e.g. latent attention, hc row fold, grouped ops) are invisible to
+// it. The launch funnels (`launch_maybe_blob*`, `launch_blob_recorded`) also
+// bracket each launch with an event pair while launch-level timing is active,
+// so a profile of an arch whose kernels were never individually instrumented is
+// complete by construction. Same discipline as `Timer`: one event pair per
+// launch, synchronized immediately, so per-kernel times are isolated GPU spans
+// and the profiled wall time is inflated. Independent of `start`/`stop`
+// (`begin_timer` entries and launch entries never share a collector, so a
+// kernel is never counted twice). Inactive cost: one thread-local read.
+
+/// One launch observed by launch-level timing.
+#[derive(Debug, Clone)]
+pub struct LaunchEntry {
+    pub kernel: String,
+    pub time_us: f64,
+}
+
+thread_local! {
+    static LAUNCH_PROFILE: RefCell<Option<Vec<LaunchEntry>>> = const { RefCell::new(None) };
+}
+
+/// Start launch-level collection. Clears any prior state.
+pub fn start_launches() {
+    LAUNCH_PROFILE.with(|p| *p.borrow_mut() = Some(Vec::with_capacity(8192)));
+}
+
+/// Stop launch-level collection and return the entries (None if not started).
+pub fn stop_launches() -> Option<Vec<LaunchEntry>> {
+    LAUNCH_PROFILE.with(|p| p.borrow_mut().take())
+}
+
+/// True while launch-level timing is collecting.
+#[inline]
+pub fn launches_active() -> bool {
+    LAUNCH_PROFILE.with(|p| p.borrow().is_some())
+}
+
+/// Start/stop events of one funnel launch. Consumed by `finish`.
+pub struct LaunchTimer {
+    kernel: String,
+    start: Event,
+    stop: Event,
+}
+
+impl LaunchTimer {
+    /// Record the stop event on `stream`, wait for it and store the span.
+    /// Event errors are swallowed (profiling never fails a forward).
+    pub fn finish(self, hip: &HipRuntime, stream: Option<&Stream>) {
+        let _ = hip.event_record(&self.stop, stream);
+        let _ = hip.event_synchronize(&self.stop);
+        let ms = hip.event_elapsed_ms(&self.start, &self.stop).unwrap_or(0.0);
+        LAUNCH_PROFILE.with(|p| {
+            if let Some(entries) = &mut *p.borrow_mut() {
+                entries.push(LaunchEntry {
+                    kernel: self.kernel,
+                    time_us: ms as f64 * 1000.0,
+                });
+            }
+        });
+        let _ = hip.event_destroy(self.start);
+        let _ = hip.event_destroy(self.stop);
+    }
+}
+
+/// Begin a launch-level span on `stream`; `None` when launch-level timing is
+/// off (the hot-path case).
+#[inline]
+pub fn begin_launch_timer(
+    hip: &HipRuntime,
+    kernel: &str,
+    stream: Option<&Stream>,
+) -> Option<LaunchTimer> {
+    if !launches_active() {
+        return None;
+    }
+    let start = hip.event_create().ok()?;
+    let stop = hip.event_create().ok()?;
+    if hip.event_record(&start, stream).is_err() {
+        let _ = hip.event_destroy(start);
+        let _ = hip.event_destroy(stop);
+        return None;
+    }
+    Some(LaunchTimer {
+        kernel: kernel.to_string(),
+        start,
+        stop,
+    })
+}
+
 // ─── Deferred (non-synchronizing) timer pairs ──────────────────────────────
 //
 // `Timer::finish` above synchronizes the stop event immediately — exactly
