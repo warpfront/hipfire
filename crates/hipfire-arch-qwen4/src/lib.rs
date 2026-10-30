@@ -62,6 +62,7 @@ pub mod kv_backend;
 pub mod lab_window;
 pub mod lane;
 pub mod lane_exec;
+pub(crate) mod lane_rank;
 pub(crate) mod lane_token_ring;
 pub mod measured_identity;
 pub mod measured_resources;

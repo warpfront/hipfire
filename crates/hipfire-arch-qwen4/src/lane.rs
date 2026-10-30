@@ -52,8 +52,9 @@ use crate::gpu_forward_lanes::{
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::lane_exec::LanePhase;
+use crate::lane_rank::{DecodeAdmission, LaneProto};
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState, MTP_FILL_ROWS};
-use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy, PendingWindow};
+use crate::mtp_lanes::PendingWindow;
 use crate::mtp_spec::{
     mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture,
     Qwen4PromotionParts,
@@ -943,7 +944,6 @@ pub struct LaneSpec {
     pub draft: DraftHeadRequestState,
     /// `[hc_count * hidden]` F32: the next window's row-0 head hidden.
     pub pending_hidden: GpuTensor,
-    pub(crate) policy: LaneSpecPolicy,
     /// The routed window between `draft_step` and `commit_step`.
     pub(crate) window: Option<PendingWindow>,
     pub stats: LaneSpecStats,
@@ -982,15 +982,14 @@ impl LaneSpec {
             head,
             draft: DraftHeadRequestState::default(),
             pending_hidden,
-            policy: LaneSpecPolicy::new(spec.k),
             window: None,
             stats: LaneSpecStats::default(),
         })
     }
 
-    /// Back to a request's start: empty head, default draft policy, zero
-    /// pending hidden, fresh window policy and counters, no window.
-    fn reset(&mut self, gpu: &mut Gpu, k: usize) -> Result<(), String> {
+    /// Back to a request's start: empty head, zero pending hidden, no
+    /// window, fresh counters (the window router lives at the root).
+    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.head
             .reset(gpu)
             .map_err(|e| format!("lane head reset: {e}"))?;
@@ -998,20 +997,18 @@ impl LaneSpec {
         gpu.hip
             .memset(&self.pending_hidden.buf, 0, self.pending_hidden.buf.size())
             .map_err(|e| format!("lane pending hidden reset: {e}"))?;
-        self.policy = LaneSpecPolicy::new(k);
         self.window = None;
         self.stats = LaneSpecStats::default();
         Ok(())
     }
 
     /// Start this (kept or fresh) lane spec from a promoted singleton's
-    /// `parts`: its pending hidden copied in, the window policy started from
-    /// its agreement and retirement, no window, fresh counters. The head and
-    /// draft request state are the singleton's own and swap in at commit.
+    /// `parts`: its pending hidden copied in, no window, fresh counters. The
+    /// head and draft request state are the singleton's own and swap in at
+    /// commit; its agreement and retirement seed the root's lane policy.
     fn promote(
         &mut self,
         gpu: &mut Gpu,
-        k: usize,
         parts: &Qwen4PromotionParts<'_>,
     ) -> Result<(), String> {
         let bytes = self.pending_hidden.byte_size();
@@ -1024,7 +1021,6 @@ impl LaneSpec {
         gpu.copy_d2d(parts.pending_hidden, &self.pending_hidden, bytes)
             .map_err(|e| format!("pending hidden copy: {e}"))?;
         self.draft = DraftHeadRequestState::default();
-        self.policy = LaneSpecPolicy::promoted(k, parts.agreement, parts.retired);
         self.window = None;
         self.stats = LaneSpecStats::default();
         Ok(())
@@ -1454,7 +1450,6 @@ pub(crate) struct SpecStore {
     /// Shared prompt-fill append scratch (`None` when neither batched fill nor
     /// the DET prompt fill wants it, or the head does not support it).
     pub append_scratch: Option<MtpAppendScratch>,
-    pub cost: LaneCostModel,
     pub routes: LabRoutes,
     /// Lab negative control: a rejected verify keeps its full rows.
     pub skip_rollback: bool,
@@ -1517,7 +1512,6 @@ impl SpecStore {
             draft_top1,
             draft_top1_host: vec![0; top1_bytes],
             append_scratch,
-            cost: LaneCostModel::new(),
             routes: LabRoutes::Floor,
             skip_rollback: false,
         })
@@ -1586,6 +1580,9 @@ pub struct Qwen4LaneStore {
     /// Start of the step's wall clock: set by `draft_step` (or provision when
     /// no draft ran), taken by the forward.
     pub(crate) step_started: Option<Instant>,
+    /// The lane protocol's root, rank session and in-flight step; taken out
+    /// for the duration of a step entry (see [`crate::lane_rank`]).
+    proto: Option<LaneProto>,
 }
 
 impl Qwen4LaneStore {
@@ -1738,6 +1735,7 @@ impl Qwen4LaneStore {
             phase: LanePhase::Idle,
             next_step_id: 0,
             step_started: None,
+            proto: Some(LaneProto::new()?),
         })
     }
 
@@ -1853,8 +1851,8 @@ impl Qwen4LaneStore {
                         .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
                     cell.state.row_capture_armed = false;
                     match (spec_cfg, cell.spec.as_mut()) {
-                        (Some((config, _, _)), Some(spec)) => spec
-                            .reset(gpu, config.k)
+                        (Some(_), Some(spec)) => spec
+                            .reset(gpu)
                             .map_err(|e| format!("admit: reset lane {slot}: {e}"))?,
                         (None, None) => {}
                         _ => {
@@ -1885,6 +1883,7 @@ impl Qwen4LaneStore {
         prompt: Vec<u32>,
         generated: Vec<u32>,
         pending_seed: u32,
+        position: usize,
         parts: Option<Qwen4PromotionParts<'_>>,
     ) -> Result<usize, String> {
         if self.phase != LanePhase::Idle {
@@ -1905,7 +1904,9 @@ impl Qwen4LaneStore {
             }
             _ => {}
         }
-        self.table
+        let root_prompt = prompt.clone();
+        let slot = self
+            .table
             .admit_decoding(
                 epoch,
                 prompt,
@@ -1914,8 +1915,8 @@ impl Qwen4LaneStore {
                 |slot, existing| match existing {
                     Some(cell) => {
                         match (spec_cfg, cell.spec.as_mut(), parts.as_ref()) {
-                            (Some((config, _, _)), Some(spec), Some(parts)) => spec
-                                .promote(gpu, config.k, parts)
+                            (Some(_), Some(spec), Some(parts)) => spec
+                                .promote(gpu, parts)
                                 .map_err(|e| format!("admit_promoted: lane {slot}: {e}"))?,
                             (None, None, None) => {}
                             _ => {
@@ -1930,8 +1931,8 @@ impl Qwen4LaneStore {
                     None => {
                         let (state, mut spec) = new_payload(gpu, bundle, slot, spec_cfg)?;
                         let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
-                            (Some((config, _, _)), Some(spec), Some(parts)) => {
-                                spec.promote(gpu, config.k, parts)
+                            (Some(_), Some(spec), Some(parts)) => {
+                                spec.promote(gpu, parts)
                             }
                             _ => Ok(()),
                         };
@@ -1946,12 +1947,39 @@ impl Qwen4LaneStore {
                         Ok(Some((state, spec)))
                     }
                 },
-            )
+            )?;
+        // The root learns the promoted request: the singleton's agreement
+        // seeds the lane policy and its retirement is kept (the floor is
+        // never reset by a promotion).
+        let k = spec_cfg.map(|(config, _, _)| config.k);
+        let eos = spec_cfg
+            .and_then(|(config, _, _)| config.end_of_turn)
+            .unwrap_or(bundle.config.eos_token_id);
+        let promoted = parts.as_ref().map(|p| (p.agreement, p.retired));
+        let admitted = self.proto_mut()?.admit_decoding(DecodeAdmission {
+            epoch,
+            position,
+            seed: pending_seed,
+            eos,
+            rng_seed: 0,
+            prompt: &root_prompt,
+            spec_k: k,
+            promoted,
+        });
+        if let Err(error) = admitted {
+            let _ = self.table.release(&epoch);
+            return Err(format!("admit_promoted: {error}"));
+        }
+        Ok(slot)
     }
 
     /// Free `epoch`'s lane (its device state stays allocated for reuse).
     pub fn release(&mut self, epoch: &RequestEpoch) -> Result<(), String> {
-        self.table.release(epoch)
+        self.table.release(epoch)?;
+        if let Some(proto) = self.proto.as_mut() {
+            proto.release(epoch);
+        }
+        Ok(())
     }
 
     pub fn poison(&mut self, epoch: &RequestEpoch) {
@@ -1969,7 +1997,19 @@ impl Qwen4LaneStore {
     /// Replace a Decoding lane's next AR token (the singleton's think-budget
     /// forced close tokens); `generated` is untouched.
     pub fn force_seed(&mut self, epoch: &RequestEpoch, token: u32) -> Result<(), String> {
-        self.table.force_seed(epoch, token)
+        self.table.force_seed(epoch, token)?;
+        // A PP band's lane is driven by the PP executor and never reaches
+        // the single-card root; its host mirror is its whole state.
+        let proto = self.proto_mut()?;
+        if proto.root.has_lane(*epoch) {
+            proto.force_seed(epoch, token)?;
+        }
+        Ok(())
+    }
+
+    /// The lab route mode of the window router (the floor on AR stores).
+    pub(crate) fn routes(&self) -> LabRoutes {
+        self.spec.as_ref().map_or(LabRoutes::Floor, |s| s.routes)
     }
 
     /// Whether this store was staged to admit sampled lanes
@@ -2097,13 +2137,51 @@ impl Qwen4LaneStore {
         self.spec.as_ref().map(|s| s.config)
     }
 
-    /// `epoch`'s window counters (`None`: unknown lane or an AR lane).
+    /// `epoch`'s window counters (`None`: unknown lane or an AR lane); the
+    /// retirement is the root's.
     pub fn lane_spec_stats(&self, epoch: &RequestEpoch) -> Option<LaneSpecStats> {
         let spec = self.lane(epoch)?.spec.as_ref()?;
         Some(LaneSpecStats {
-            retired: spec.policy.retired(),
+            retired: self
+                .proto
+                .as_ref()
+                .and_then(|p| p.root.lane_retired(*epoch))
+                .unwrap_or(false),
             ..spec.stats
         })
+    }
+
+    /// The lane's next AR row token as the root holds it (`LaneHost::
+    /// pending_seed` mirrors it). `None`: no such lane at the root.
+    pub fn root_seed(&self, epoch: &RequestEpoch) -> Option<u32> {
+        self.proto
+            .as_ref()?
+            .root
+            .lane_position(*epoch)
+            .map(|(_, seed)| seed)
+    }
+
+    pub(crate) fn proto_mut(&mut self) -> Result<&mut LaneProto, String> {
+        self.proto
+            .as_mut()
+            .ok_or_else(|| "lane protocol state is checked out".to_string())
+    }
+
+    /// Check the protocol state out for one step entry (the entry puts it
+    /// back with [`Self::put_proto`]).
+    pub(crate) fn take_proto(&mut self) -> Result<LaneProto, String> {
+        self.proto
+            .take()
+            .ok_or_else(|| "lane protocol state is checked out".to_string())
+    }
+
+    pub(crate) fn put_proto(&mut self, proto: LaneProto) {
+        self.proto = Some(proto);
+    }
+
+    /// Lab negative control: a rejected verify keeps its full rows.
+    pub(crate) fn skip_rollback(&self) -> bool {
+        self.spec.as_ref().is_some_and(|s| s.skip_rollback)
     }
 
     /// Choose the window router (lab): the floor (default), a fixed cycle or

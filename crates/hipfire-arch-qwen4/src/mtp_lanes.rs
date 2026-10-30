@@ -198,7 +198,7 @@ impl LaneCostModel {
 
 /// `HIPFIRE_MTP_AR_FLOOR` (`0` opts out), read the way the drafter's
 /// `configure_request` reads it.
-fn floor_env_enabled() -> bool {
+pub(crate) fn floor_env_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0")
 }
 
@@ -259,11 +259,7 @@ impl LaneSpecPolicy {
     /// `agreement` seeds the lane (performance only); `retired` (the
     /// singleton's floor retired it) keeps the lane `ArRetired`, otherwise
     /// the lane floor starts fresh like any admitted lane.
-    pub(crate) fn promoted(k: usize, agreement: &[(f32, f32)], retired: bool) -> Self {
-        Self::promoted_with_floor(k, agreement, retired, floor_env_enabled())
-    }
-
-    fn promoted_with_floor(
+    pub(crate) fn promoted_with_floor(
         k: usize,
         agreement: &[(f32, f32)],
         retired: bool,
@@ -395,8 +391,9 @@ pub(crate) struct PendingWindow {
     /// The target ticket taken before the verify forward (`Batched`). Lanes
     /// run on one card: always [`TargetTicket::Local`].
     pub target_ticket: Option<TargetTicket>,
-    /// Set by the forward once the window is finished; consumed by commit.
-    pub outcome: Option<MtpWindow>,
+    /// The prepared window of the step's Verify (live tickets), between the
+    /// rank's `prepare_commit` and `publish_commit`.
+    pub prepared: Option<PreparedLaneWindow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -412,202 +409,11 @@ pub(crate) fn lane_call<R>(
         .map_err(|error| error.to_string())
 }
 
-/// One lane's drafting state inside the step-synchronous loop.
-struct Drafting {
-    lane: usize,
-    position: usize,
-    k_max: usize,
-    input: u32,
-    /// Probability the whole draft prefix is accepted.
-    prefix: f32,
-    drafts: Vec<u32>,
-    steps: usize,
-    done: bool,
-}
-
-/// Route the next window of every listed Decoding lane and run the batched
-/// draft of the `Batched` ones. See `Qwen4LaneExecutor::draft_step`.
-pub(crate) fn draft_lanes(
-    bundle: &mut Qwen4Bundle,
-    gpu: &mut Gpu,
-    store: &mut Qwen4LaneStore,
-    requests: &[(RequestEpoch, usize)],
-) -> Result<Vec<LaneDraft>, String> {
-    let epochs: Vec<RequestEpoch> = requests.iter().map(|(epoch, _)| *epoch).collect();
-    let (mut lanes, mut spec_store) = store.draft_parts(&epochs)?;
-    let routes = spec_store.as_ref().map(|s| s.routes);
-    let mut out: Vec<LaneDraft> = Vec::with_capacity(requests.len());
-    let mut drafting: Vec<Drafting> = Vec::new();
-
-    for (index, ((epoch, budget), lane)) in requests.iter().zip(lanes.iter_mut()).enumerate() {
-        let Qwen4LaneState { host, state, spec } = &mut **lane;
-        if host.status != crate::lane::LaneStatus::Decoding {
-            return Err(format!(
-                "draft_step: lane {epoch:?} is {:?}, not Decoding",
-                host.status
-            ));
-        }
-        let seed = host
-            .pending_seed
-            .ok_or_else(|| format!("draft_step: lane {epoch:?} has no pending seed"))?;
-        let Some(spec) = spec.as_mut() else {
-            out.push(LaneDraft {
-                epoch: *epoch,
-                route: LaneRoute::Ar,
-                drafts: Vec::new(),
-            });
-            continue;
-        };
-        if spec.window.is_some() {
-            return Err(format!(
-                "draft_step: lane {epoch:?} has an unconsumed window (commit or abort the step first)"
-            ));
-        }
-        let route = spec.policy.route(*budget, routes.unwrap_or_default());
-        let position = state.position;
-        spec.window = Some(PendingWindow {
-            route,
-            position,
-            seed,
-            drafts: Vec::new(),
-            steps: 0,
-            budget: (*budget).min(spec.policy.max_k()),
-            head_ticket: None,
-            target_ticket: None,
-            outcome: None,
-        });
-        out.push(LaneDraft {
-            epoch: *epoch,
-            route,
-            drafts: Vec::new(),
-        });
-        let LaneRoute::Batched { k_max } = route else {
-            continue;
-        };
-        // I1: the head sits at the lane's frontier.
-        if state.position != spec.head.position() {
-            return Err(format!(
-                "draft_step: lane {epoch:?} I1: trunk position {} != head position {}",
-                state.position,
-                spec.head.position()
-            ));
-        }
-        // The head's last draft step and its full-accept append reach
-        // `position + k_max`; the verify's rows end at the same bound.
-        let end = position
-            .checked_add(k_max + 1)
-            .ok_or_else(|| "draft_step: position overflow".to_string())?;
-        spec.head
-            .ensure_mapped_capacity(gpu, end)
-            .map_err(|e| format!("draft_step: map head arenas of {epoch:?}: {e}"))?;
-        state
-            .ensure_mapped_capacity(gpu, end)
-            .map_err(|e| format!("draft_step: map trunk arenas of {epoch:?}: {e}"))?;
-        let ticket = lane_call(bundle.with_lane(
-            state,
-            Some((&mut spec.head, &mut spec.draft)),
-            |b| b.mtp_snapshot(gpu),
-        ))
-        .map_err(|e| format!("draft_step: head snapshot of {epoch:?}: {e}"))?;
-        if let Some(window) = spec.window.as_mut() {
-            window.head_ticket = Some(HeadTicket::Local(ticket));
-        }
-        drafting.push(Drafting {
-            lane: index,
-            position,
-            k_max,
-            input: seed,
-            prefix: 1.0,
-            drafts: Vec::with_capacity(k_max),
-            steps: 0,
-            done: false,
-        });
-    }
-
-    let slot_bytes = Gpu::TOPK8_OUT_BYTES;
-    let max_steps = drafting.iter().map(|d| d.k_max).max().unwrap_or(0);
-    for j in 0..max_steps {
-        let active: Vec<usize> = (0..drafting.len()).filter(|&d| !drafting[d].done).collect();
-        if active.is_empty() {
-            break;
-        }
-        let store = spec_store
-            .as_mut()
-            .ok_or_else(|| "draft_step: batched window in a store without MTP lanes".to_string())?;
-        // Every still-drafting lane enqueues its draft step, in slot order.
-        for (slot, &d) in active.iter().enumerate() {
-            let st = &drafting[d];
-            let Qwen4LaneState { state, spec, .. } = &mut *lanes[st.lane];
-            let spec = spec
-                .as_mut()
-                .ok_or_else(|| "draft_step: drafting lane lost its MTP state".to_string())?;
-            let LaneSpec {
-                head,
-                draft,
-                pending_hidden,
-                ..
-            } = spec;
-            let top1 = store.draft_top1.sub_offset(slot * slot_bytes, slot_bytes);
-            let hidden = (j == 0).then_some(&*pending_hidden);
-            let (input, position) = (st.input, st.position + j);
-            lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                b.mtp_forward_token_deferred(gpu, input, hidden, position, j == 0, &top1)
-            }))
-            .map_err(|e| format!("draft_step: draft step {j}: {e}"))?;
-        }
-        // One D2H for every active lane.
-        let bytes = active.len() * slot_bytes;
-        gpu.hip
-            .memcpy_dtoh(&mut store.draft_top1_host[..bytes], &store.draft_top1.buf)
-            .map_err(|e| format!("draft_step: draft download: {e}"))?;
-        gpu.take_device_wait_error()
-            .map_err(|e| format!("draft_step: draft download: {e}"))?;
-        for (slot, &d) in active.iter().enumerate() {
-            let top = &store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
-            let st = &mut drafting[d];
-            let Qwen4LaneState { state, spec, .. } = &mut *lanes[st.lane];
-            let spec = spec
-                .as_mut()
-                .ok_or_else(|| "draft_step: drafting lane lost its MTP state".to_string())?;
-            let LaneSpec { head, draft, .. } = spec;
-            let (token, margin) = lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                let token = b.mtp_draft_finish(top)?;
-                Ok::<_, BundleError>((token, b.mtp_draft_margin()))
-            }))
-            .map_err(|e| format!("draft_step: draft finish {j}: {e}"))?;
-            // The singleton's early stop, statement for statement.
-            st.input = token;
-            st.steps += 1;
-            st.prefix *= draft_accept_estimate(margin);
-            if j > 0 && st.prefix < MTP_ROW_WORTH {
-                st.done = true;
-                continue;
-            }
-            st.drafts.push(token);
-            if st.prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH || j + 1 >= st.k_max {
-                st.done = true;
-            }
-        }
-    }
-
-    for st in drafting {
-        let lane = &mut *lanes[st.lane];
-        let window = lane
-            .spec
-            .as_mut()
-            .and_then(|spec| spec.window.as_mut())
-            .ok_or_else(|| "draft_step: window vanished".to_string())?;
-        window.steps = st.steps;
-        window.drafts = st.drafts.clone();
-        out[st.lane].drafts = st.drafts;
-    }
-    Ok(out)
-}
-
 /// A lane window whose every fallible operation succeeded and whose tickets
 /// validated but are still live; [`publish_lane_window`] consumes them.
 pub(crate) struct PreparedLaneWindow {
-    /// The window outcome (the lane's `window.outcome` is the caller's to set).
+    /// The window outcome (the root decided it; the lane's pending window
+    /// holds it until the publish).
     pub result: MtpWindow,
     /// The native prepared handle (live tickets, committed position).
     pub native: PreparedNativeWindow,
@@ -771,31 +577,6 @@ pub(crate) fn publish_lane_window(
     }))
     .map_err(|e| format!("finish_lane_window: {e}"))?;
     Ok(result)
-}
-
-/// [`prepare_lane_window`] then [`publish_lane_window`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn finish_lane_window(
-    bundle: &mut Qwen4Bundle,
-    gpu: &mut Gpu,
-    lane: &mut Qwen4LaneState,
-    config: LaneSpecConfig,
-    hidden: &GpuTensor,
-    row_begin: usize,
-    picks: &[u32],
-    skip_rollback: bool,
-) -> Result<MtpWindow, String> {
-    let prepared = prepare_lane_window(
-        bundle,
-        gpu,
-        lane,
-        config,
-        hidden,
-        row_begin,
-        picks,
-        skip_rollback,
-    )?;
-    publish_lane_window(bundle, gpu, lane, prepared)
 }
 
 /// The head work of an `ArSynced` lane after its AR row: append the seed

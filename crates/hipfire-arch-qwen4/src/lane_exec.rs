@@ -99,21 +99,19 @@
 //!   refuses ends past `state.max_seq_len`.
 
 use crate::bundle::Qwen4Bundle;
-use crate::gpu_forward_lanes::{
-    forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, LANE_MAX_ROWS,
-};
+use crate::gpu_forward_lanes::LANE_MAX_ROWS;
 use crate::lane::{
-    download_lane_rows, lane_sample_step, LaneHost, LaneSampleOutcome, LaneSpecConfig, LaneStatus,
-    Qwen4LaneState, Qwen4LaneStore, SpecStore, StepParts,
+    download_lane_rows, lane_sample_step, LaneHost, LaneStatus, Qwen4LaneState, Qwen4LaneStore,
+    StepParts,
 };
-use crate::mtp_gpu::MtpAppendScratch;
-use crate::mtp_lanes::{
-    ar_synced_head, draft_lanes, finish_lane_window, prefill_tile, LaneCostModel,
+use crate::lane_rank::{
+    plan_and_draft, DecodeAdmission, LaneProto, LocalLaneRank,
 };
+use crate::mesh_lane_protocol::{ControllerInterval, GreedyRule, LaneMeshExecutor};
+use crate::mtp_lanes::prefill_tile;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, StepOutput,
 };
-use hipfire_runtime::spec::MtpWindow;
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{Gpu, GpuTensor};
 use std::time::Instant;
@@ -520,16 +518,6 @@ pub(crate) fn commit_host(host: &mut LaneHost, r: &RequestRows, pick: u32) -> Op
     Some(pick)
 }
 
-/// Lane bookkeeping of one committed Verify window: its committed tokens
-/// (accepted drafts and the bonus, the seed excluded) extend the lane and
-/// the last one is the next seed.
-fn commit_verify(host: &mut LaneHost, committed: &[u32]) -> Option<u32> {
-    let last = *committed.last()?;
-    host.generated.extend_from_slice(committed);
-    host.pending_seed = Some(last);
-    Some(last)
-}
-
 /// The lane executor: borrows the bundle (weights, forward program) and its
 /// staged [`Qwen4LaneStore`].
 pub struct Qwen4LaneExecutor<'a> {
@@ -593,10 +581,14 @@ impl Qwen4LaneExecutor<'_> {
         let result = match store.phase.check_draft() {
             Ok(()) => {
                 store.step_started = Some(Instant::now());
-                let drafted = draft_lanes(self.bundle, gpu, &mut store, requests);
+                let drafted = plan_and_draft(self.bundle, gpu, &mut store, requests);
                 if drafted.is_err() {
-                    for (epoch, _) in requests {
+                    let epochs: Vec<RequestEpoch> = requests.iter().map(|(e, _)| *e).collect();
+                    for epoch in &epochs {
                         store.poison(epoch);
+                    }
+                    if let Ok(proto) = store.proto_mut() {
+                        proto.discard(&epochs);
                     }
                     store.step_started = None;
                 }
@@ -636,38 +628,14 @@ impl Qwen4LaneExecutor<'_> {
                 |host| bundle.lane_prefill_tile_len(&host.prompt, host.prefilled),
             )?
         };
-        let store = self
+        let mut store = self
             .bundle
             .lanes
-            .as_mut()
+            .take()
             .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
-        // A step with no draft phase starts its wall clock here.
-        store.step_started.get_or_insert_with(Instant::now);
-        for (r, &end) in plan.requests.iter().zip(&ends) {
-            let lane = store
-                .lane_mut(&r.epoch)
-                .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
-            lane.state.ensure_mapped_capacity(gpu, end).map_err(|e| {
-                format!("provision_step: map {end} positions for {:?}: {e}", r.epoch)
-            })?;
-            if let Some(spec) = lane.spec.as_mut() {
-                // A retired lane's head lags the trunk and is never touched.
-                let retired = spec
-                    .window
-                    .as_ref()
-                    .is_some_and(|w| w.route == LaneRoute::ArRetired);
-                if !retired {
-                    spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
-                        format!(
-                            "provision_step: map {end} head positions for {:?}: {e}",
-                            r.epoch
-                        )
-                    })?;
-                }
-            }
-        }
-        store.phase = LanePhase::Provisioned(StepKey::of(plan));
-        Ok(())
+        let result = provision_inner(self.bundle, gpu, &mut store, plan, &ends);
+        self.bundle.lanes = Some(store);
+        result
     }
 
     /// Per-request decode map-ahead for a Decoding lane, once, before its
@@ -788,8 +756,12 @@ impl Qwen4LaneExecutor<'_> {
                 })
             }
             Err(error) => {
-                for r in &plan.requests {
-                    store.poison(&r.epoch);
+                let epochs: Vec<RequestEpoch> = plan.requests.iter().map(|r| r.epoch).collect();
+                for epoch in &epochs {
+                    store.poison(epoch);
+                }
+                if let Ok(proto) = store.proto_mut() {
+                    proto.discard(&epochs);
                 }
                 store.step_started = None;
                 store.phase = LanePhase::Idle;
@@ -818,87 +790,18 @@ impl Qwen4LaneExecutor<'_> {
 
     fn commit_step_local(
         &mut self,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
         plan: &BatchStepPlan,
         output: StepOutput,
     ) -> Result<Vec<RequestAdvance>, String> {
-        let store = self
+        let mut store = self
             .bundle
             .lanes
-            .as_mut()
+            .take()
             .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
-        store
-            .phase
-            .check_commit(&StepKey::of(plan), output.step_id)?;
-        if output.target_picks.len() != plan.total_rows() {
-            return Err("commit_step: pick count != planned rows".to_string());
-        }
-        for r in &plan.requests {
-            let lane = match store.lane(&r.epoch) {
-                Some(lane) if lane.host.status != LaneStatus::Poisoned => lane,
-                _ => {
-                    return Err(format!(
-                        "commit_step: epoch {:?} no longer owns its lane",
-                        r.epoch
-                    ));
-                }
-            };
-            if r.rows.len == 0 || r.rows.end() > output.target_picks.len() {
-                return Err(format!("commit_step: bad row range {:?}", r.rows));
-            }
-            if wants_pick(&lane.host, r) && output.target_picks[r.rows.end() - 1] == u32::MAX {
-                return Err("commit_step: head row without a target pick".to_string());
-            }
-            let window = lane.spec.as_ref().and_then(|spec| spec.window.as_ref());
-            match (r.kind, window) {
-                (RequestStepKind::Verify { .. }, Some(w)) => {
-                    if w.outcome.as_ref().map_or(true, |o| o.committed.is_empty()) {
-                        return Err(format!(
-                            "commit_step: Verify window of {:?} never finished",
-                            r.epoch
-                        ));
-                    }
-                }
-                (RequestStepKind::Verify { .. }, None) => {
-                    return Err(format!(
-                        "commit_step: Verify of {:?} has no window",
-                        r.epoch
-                    ));
-                }
-                _ => {}
-            }
-        }
-        let mut advances = Vec::with_capacity(plan.requests.len());
-        for r in &plan.requests {
-            let pick = output.target_picks[r.rows.end() - 1];
-            let lane = store.lane_mut(&r.epoch).expect("validated above");
-            let window = lane.spec.as_mut().and_then(|spec| spec.window.take());
-            let (committed_ids, accepted_drafts, verified_rows) = match r.kind {
-                RequestStepKind::Verify { draft_len } => {
-                    let outcome: MtpWindow =
-                        window.and_then(|w| w.outcome).expect("validated above");
-                    commit_verify(&mut lane.host, &outcome.committed);
-                    (outcome.committed, outcome.accepted, draft_len + 1)
-                }
-                _ => (
-                    commit_host(&mut lane.host, r, pick).into_iter().collect(),
-                    0,
-                    0,
-                ),
-            };
-            let position = lane.state.position;
-            advances.push(RequestAdvance {
-                epoch: r.epoch,
-                committed_ids,
-                committed_position: position,
-                accepted_drafts,
-                verified_rows,
-                finish: (position >= lane.state.max_seq_len).then(|| "length".to_string()),
-            });
-        }
-        store.step_started = None;
-        store.phase = LanePhase::Idle;
-        Ok(advances)
+        let result = commit_inner(self.bundle, gpu, &mut store, plan, &output);
+        self.bundle.lanes = Some(store);
+        result
     }
 
     /// Drop the step: every participant is poisoned (its device state may be
@@ -914,8 +817,12 @@ impl Qwen4LaneExecutor<'_> {
 
     fn abort_step_local(&mut self, plan: &BatchStepPlan) {
         if let Some(store) = self.bundle.lanes.as_mut() {
-            for r in &plan.requests {
-                store.poison(&r.epoch);
+            let epochs: Vec<RequestEpoch> = plan.requests.iter().map(|r| r.epoch).collect();
+            for epoch in &epochs {
+                store.poison(epoch);
+            }
+            if let Ok(proto) = store.proto_mut() {
+                proto.discard(&epochs);
             }
             store.step_started = None;
             store.phase = LanePhase::Idle;
@@ -923,17 +830,98 @@ impl Qwen4LaneExecutor<'_> {
     }
 }
 
-/// One planned request inside a forward.
-struct Entry<'a> {
-    r: &'a RequestRows,
-    lane: &'a mut Qwen4LaneState,
-    /// First decode row of a decode request (`None` for a prefill tile).
-    dec: Option<usize>,
-}
-
 pub(crate) fn pick_at(host: &[u8], row: usize) -> u32 {
     let b = &host[row * 4..row * 4 + 4];
     u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Map the lanes of a provisioned plan through the step's end (I4/I9) and
+/// check the plan against the step the draft phase sealed. An AR store has
+/// no draft phase of its own: its decode lanes are planned through the same
+/// reducer here (route `Ar`, no drafts).
+fn provision_inner(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    ends: &[usize],
+) -> Result<(), String> {
+    // A step with no draft phase starts its wall clock here.
+    store.step_started.get_or_insert_with(Instant::now);
+    let decode: Vec<RequestEpoch> = plan
+        .requests
+        .iter()
+        .filter(|r| r.kind != RequestStepKind::Prefill)
+        .map(|r| r.epoch)
+        .collect();
+    if store.spec().is_none() && !decode.is_empty() && !store.proto_mut()?.has_flight() {
+        let requests: Vec<(RequestEpoch, usize)> = decode.iter().map(|e| (*e, 0)).collect();
+        plan_and_draft(bundle, gpu, store, &requests)?;
+    }
+    check_sealed(plan, store.proto_mut()?)?;
+    for (r, &end) in plan.requests.iter().zip(ends) {
+        let lane = store
+            .lane_mut(&r.epoch)
+            .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
+        lane.state.ensure_mapped_capacity(gpu, end).map_err(|e| {
+            format!("provision_step: map {end} positions for {:?}: {e}", r.epoch)
+        })?;
+        if let Some(spec) = lane.spec.as_mut() {
+            // A retired lane's head lags the trunk and is never touched.
+            let retired = spec
+                .window
+                .as_ref()
+                .is_some_and(|w| w.route == LaneRoute::ArRetired);
+            if !retired {
+                spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
+                    format!(
+                        "provision_step: map {end} head positions for {:?}: {e}",
+                        r.epoch
+                    )
+                })?;
+            }
+        }
+    }
+    store.phase = LanePhase::Provisioned(StepKey::of(plan));
+    Ok(())
+}
+
+/// The plan's decode requests must be exactly the sealed verify of the
+/// drafted step: same lanes in the same order, same rows, same positions.
+fn check_sealed(plan: &BatchStepPlan, proto: &LaneProto) -> Result<(), String> {
+    let decode: Vec<&RequestRows> = plan
+        .requests
+        .iter()
+        .filter(|r| r.kind != RequestStepKind::Prefill)
+        .collect();
+    let sealed = proto.flight.as_ref().and_then(|f| f.verify.as_ref());
+    let Some(sealed) = sealed else {
+        return if decode.is_empty() {
+            Ok(())
+        } else {
+            Err("provision_step: the decode rows have no drafted step (draft_step first)".into())
+        };
+    };
+    if sealed.lanes.len() != decode.len() {
+        return Err(format!(
+            "provision_step: the drafted step holds {} lanes, the plan {}",
+            sealed.lanes.len(),
+            decode.len()
+        ));
+    }
+    for (v, r) in sealed.lanes.iter().zip(&decode) {
+        let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
+        if v.key.request_epoch != r.epoch
+            || v.rows != tokens
+            || i64::from(plan.batch.positions[r.rows.begin]) != v.position as i64
+        {
+            return Err(format!(
+                "provision_step: the plan's rows of {:?} differ from the drafted step's sealed rows",
+                r.epoch
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The forward of a provisioned plan; the store is out of the bundle so the
@@ -944,287 +932,153 @@ fn forward_inner(
     store: &mut Qwen4LaneStore,
     plan: &BatchStepPlan,
 ) -> Result<Vec<u32>, String> {
-    let vocab = bundle.lane_vocab();
-    let epochs: Vec<RequestEpoch> = plan.requests.iter().map(|r| r.epoch).collect();
-    let started = store.step_started.take().unwrap_or_else(Instant::now);
-    let spec_config: Option<LaneSpecConfig> = store.spec();
-    let StepParts {
-        lanes,
-        logits,
-        top1,
-        policy,
-        top1_host,
-        rows_cap,
-        sample_host,
-        spec,
-    } = store.step_parts(&epochs)?;
-    let mut hidden: Option<&GpuTensor> = None;
-    let mut append: Option<&mut Option<MtpAppendScratch>> = None;
-    let mut cost: Option<&mut LaneCostModel> = None;
-    let mut skip_rollback = false;
-    if let Some(spec) = spec {
-        let SpecStore {
-            hidden: h,
-            append_scratch,
-            cost: c,
-            skip_rollback: skip,
-            ..
-        } = spec;
-        hidden = Some(&*h);
-        append = Some(append_scratch);
-        cost = Some(c);
-        skip_rollback = *skip;
-    }
+    let mut proto = store.take_proto()?;
+    let result = forward_with_proto(bundle, gpu, store, &mut proto, plan);
+    store.put_proto(proto);
+    result
+}
 
-    // Plan order, with each decode request's first row among the step's
-    // decode rows.
-    let mut entries: Vec<Entry<'_>> = Vec::with_capacity(plan.requests.len());
-    let (mut n_dec, mut n_prefill, mut decode_lanes, mut verify_windows, mut verified) =
-        (0usize, 0usize, 0usize, 0usize, 0usize);
-    // Row counts of the decode requests in entry order: what `forward_lanes`
-    // groups into once-over-all-rows launches.
-    let mut dec_rows: Vec<usize> = Vec::with_capacity(plan.requests.len());
-    for (r, lane) in plan.requests.iter().zip(lanes) {
-        let dec = match r.kind {
-            RequestStepKind::Ar | RequestStepKind::Verify { .. } => {
-                if let RequestStepKind::Verify { draft_len } = r.kind {
-                    verify_windows += 1;
-                    verified += draft_len;
-                }
-                let first = n_dec;
-                n_dec += r.rows.len;
-                dec_rows.push(r.rows.len);
-                decode_lanes += 1;
-                Some(first)
-            }
-            RequestStepKind::Prefill => {
-                n_prefill += 1;
-                None
-            }
+fn forward_with_proto(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    proto: &mut LaneProto,
+    plan: &BatchStepPlan,
+) -> Result<Vec<u32>, String> {
+    let started = store.step_started.take().unwrap_or_else(Instant::now);
+    let spec_config = store.spec();
+    let mut picks = vec![u32::MAX; plan.total_rows()];
+    let (mut decode_lanes, mut n_prefill) = (0usize, 0usize);
+    for r in &plan.requests {
+        match r.kind {
+            RequestStepKind::Ar | RequestStepKind::Verify { .. } => decode_lanes += 1,
+            RequestStepKind::Prefill => n_prefill += 1,
             RequestStepKind::Forced => {
                 return Err(format!("{:?} rows are not admitted on AR lanes", r.kind));
             }
-        };
-        entries.push(Entry { r, lane, dec });
-    }
-    if n_dec > rows_cap {
-        return Err(format!(
-            "{n_dec} decode rows exceed the step buffers ({rows_cap})"
-        ));
-    }
-
-    // Arm the ring, then take the target ticket, of every Verify lane.
-    for e in entries.iter_mut() {
-        let RequestStepKind::Verify { draft_len } = e.r.kind else {
-            continue;
-        };
-        let rows = draft_len + 1;
-        let tokens = &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()];
-        let Qwen4LaneState { state, spec, .. } = &mut *e.lane;
-        let window = spec
-            .as_mut()
-            .and_then(|spec| spec.window.as_mut())
-            .ok_or_else(|| format!("Verify lane {:?} has no window", e.r.epoch))?;
-        if !matches!(window.route, LaneRoute::Batched { .. })
-            || window.seed != tokens[0]
-            || window.drafts != tokens[1..]
-            || window.position != state.position
-        {
-            return Err(format!(
-                "Verify lane {:?} disagrees with its window",
-                e.r.epoch
-            ));
-        }
-        if window.target_ticket.is_some() {
-            return Err(format!(
-                "Verify lane {:?} already holds a target ticket",
-                e.r.epoch
-            ));
-        }
-        if state.row_capture_rows() < rows {
-            return Err(format!(
-                "Verify lane {:?}: the ring holds {} rows, the verify needs {rows}",
-                e.r.epoch,
-                state.row_capture_rows()
-            ));
-        }
-        // Armed before the snapshot: the GDN states then need no copy.
-        state.row_capture_armed = true;
-        let ticket =
-            crate::mtp_lanes::lane_call(bundle.with_lane(state, None, |b| b.snapshot(gpu)));
-        match ticket {
-            Ok(ticket) => window.target_ticket = Some(crate::mtp_spec::TargetTicket::Local(ticket)),
-            Err(error) => {
-                state.row_capture_armed = false;
-                return Err(format!("target snapshot of {:?}: {error}", e.r.epoch));
-            }
         }
     }
 
-    // One exact trunk step over every decode row, in plan order.
-    if n_dec > 0 {
-        let mut rows: Vec<LaneRows<'_>> = Vec::new();
-        for e in entries.iter_mut() {
-            let kind = match e.r.kind {
-                RequestStepKind::Ar => LaneRowKind::Ar,
-                RequestStepKind::Verify { draft_len } => LaneRowKind::Verify { draft_len },
-                _ => continue,
-            };
-            rows.push(LaneRows {
-                state: &mut e.lane.state,
-                tokens: &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()],
-                kind,
-            });
-        }
-        let out = LaneOutputs {
-            logits: &logits.sub_offset(0, n_dec * vocab),
-            top1: &top1.sub_offset(0, n_dec * std::mem::size_of::<i32>()),
-            wide_hidden: hidden,
-        };
-        let forwarded =
-            forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string());
-        drop(rows);
-        // I3: disarmed on every path out of the forward.
-        for e in entries.iter_mut() {
-            if matches!(e.r.kind, RequestStepKind::Verify { .. }) {
-                e.lane.state.row_capture_armed = false;
-            }
-        }
-        forwarded?;
-        gpu.hip
-            .memcpy_dtoh(
-                &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
-                &top1.buf,
-            )
-            .map_err(|e| e.to_string())?;
-        gpu.take_device_wait_error().map_err(|e| e.to_string())?;
-    }
-    let mut picks = vec![u32::MAX; plan.total_rows()];
-    for e in &entries {
-        if let Some(first) = e.dec {
-            for j in 0..e.r.rows.len {
-                picks[e.r.rows.begin + j] = pick_at(top1_host, first + j);
-            }
-        }
-    }
-
-    // Verify windows, then the head appends of the ArSynced lanes. A sampled
-    // lane's argmax picks are replaced by its sampler's draws first
-    // (`lane_sample_step`: one D2H of the request's logits rows); a greedy lane
-    // takes the unchanged argmax path.
-    let lane_eos = spec_config
-        .and_then(|config| config.end_of_turn)
-        .unwrap_or(bundle.config.eos_token_id);
-    for e in entries.iter_mut() {
-        let Some(first) = e.dec else {
-            continue;
-        };
-        let mut lane_picks: Vec<u32> = (0..e.r.rows.len)
-            .map(|j| pick_at(top1_host, first + j))
-            .collect();
-        let mut naive = None;
-        if e.lane.host.sampling.is_some() {
-            let rows = e.r.rows.len;
-            let drafts = matches!(e.r.kind, RequestStepKind::Verify { .. })
-                .then(|| &plan.batch.tokens[e.r.rows.begin + 1..e.r.rows.end()]);
-            let gpu_ref: &Gpu = gpu;
-            let logits_ref: &GpuTensor = logits;
-            let sampled = lane_sample_step(
-                &mut e.lane.host,
-                drafts,
-                &mut lane_picks,
-                lane_eos,
-                vocab,
-                sample_host,
-                |scratch| download_lane_rows(gpu_ref, logits_ref, first, rows, vocab, scratch),
-            )
-            .map_err(|error| format!("lane {:?}: {error}", e.r.epoch))?;
-            if let LaneSampleOutcome::Naive(window) = sampled {
-                naive = Some(window);
-            }
-            // The step output's picks are the draws too.
-            picks[e.r.rows.begin..e.r.rows.end()].copy_from_slice(&lane_picks);
-        }
-        let route = e
-            .lane
-            .spec
+    // The decode rows: verify, decide, prepare (the protocol's phases).
+    if decode_lanes > 0 {
+        let LaneProto { root, rank, flight } = &mut *proto;
+        let verify = flight
             .as_ref()
-            .and_then(|spec| spec.window.as_ref())
-            .map(|w| w.route);
-        let outcome = match (e.r.kind, route) {
-            (RequestStepKind::Verify { .. }, _) => {
-                let config = spec_config
-                    .ok_or_else(|| "Verify row in a store without MTP lanes".to_string())?;
-                let hidden =
-                    hidden.ok_or_else(|| "Verify row without a hidden capture".to_string())?;
-                let window = finish_lane_window(
-                    bundle,
-                    gpu,
-                    &mut *e.lane,
-                    config,
-                    hidden,
-                    first,
-                    &lane_picks,
-                    skip_rollback,
-                )?;
-                if let Some(naive) = &naive {
-                    if window.committed != naive.committed || window.accepted != naive.accepted {
-                        return Err(format!(
-                            "sampled Verify lane {:?}: the finish committed {:?} (accepted {}) \
-                             but the naive window is {:?} (accepted {})",
-                            e.r.epoch,
-                            window.committed,
-                            window.accepted,
-                            naive.committed,
-                            naive.accepted
-                        ));
-                    }
-                }
-                window
-            }
-            (RequestStepKind::Ar, Some(route)) => {
-                if route == LaneRoute::ArSynced {
-                    let hidden = hidden
-                        .ok_or_else(|| "ArSynced row without a hidden capture".to_string())?;
-                    ar_synced_head(bundle, gpu, &mut *e.lane, hidden, first)?;
-                }
-                MtpWindow {
-                    committed: lane_picks,
-                    accepted: 0,
-                    drafts_generated: 0,
-                }
-            }
-            _ => continue,
+            .and_then(|f| f.verify.clone())
+            .ok_or_else(|| "the decode rows have no sealed verify".to_string())?;
+        let mut exec = LocalLaneRank {
+            bundle: &mut *bundle,
+            gpu: &mut *gpu,
+            store: &mut *store,
+            session: rank,
+            flight,
         };
-        if let Some(window) = e.lane.spec.as_mut().and_then(|spec| spec.window.as_mut()) {
-            window.outcome = Some(outcome);
+        let verified = exec.run_verify(&verify).map_err(|e| e.reason)?;
+        root.collect_verify(&[verified]).map_err(|e| e.to_string())?;
+        let decision = root.decide_commit(&mut GreedyRule).map_err(|e| e.to_string())?;
+        let receipt = exec.prepare_commit(&decision).map_err(|e| e.reason)?;
+        root.collect_prepared(&[receipt]).map_err(|e| e.to_string())?;
+        let fl = exec
+            .flight
+            .as_ref()
+            .ok_or_else(|| "the step's flight vanished".to_string())?;
+        for r in &plan.requests {
+            if r.kind == RequestStepKind::Prefill {
+                continue;
+            }
+            let i = fl
+                .lane_index(&r.epoch)
+                .ok_or_else(|| format!("{:?} is not in the sealed step", r.epoch))?;
+            picks[r.rows.begin..r.rows.end()].copy_from_slice(fl.picks(i));
         }
     }
 
     // Prefill tiles.
-    // (prefill ordinal, plan row of its pick, entry index) of AR-lane
-    // completing tiles.
-    let mut final_tiles: Vec<(usize, usize, usize)> = Vec::new();
-    let mut ordinal = 0usize;
-    for (entry, e) in entries.iter_mut().enumerate() {
-        if e.r.kind != RequestStepKind::Prefill {
-            continue;
-        }
-        let i = ordinal;
-        ordinal += 1;
-        let tokens = &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()];
-        let completes = wants_pick(&e.lane.host, e.r);
-        if e.lane.spec.is_some() {
+    run_prefill_tiles(bundle, gpu, store, plan, &mut picks)?;
+    let prefill_ran = n_prefill > 0;
+
+    // The step's wall clock feeds the cost model only on a pure-decode step
+    // (draft start to the synchronized end): it is the controller interval
+    // the rank's receipt is merged with at commit.
+    if spec_config.is_some() && decode_lanes > 0 {
+        let wall_us = if prefill_ran {
+            f64::NAN
+        } else {
+            gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+            started.elapsed().as_secs_f64() * 1e6
+        };
+        let fl = proto
+            .flight
+            .as_mut()
+            .ok_or_else(|| "the step's flight vanished".to_string())?;
+        let decision = fl
+            .decision
+            .clone()
+            .ok_or_else(|| "the step was never decided".to_string())?;
+        let receipt = fl.receipt(&decision);
+        fl.evidence = Some((
+            receipt,
+            ControllerInterval {
+                wall_us,
+                prefill_ran,
+            },
+        ));
+    }
+    Ok(picks)
+}
+
+/// Each prefill tile of the plan through the singleton chunk program on the
+/// lane's own state (an MTP lane's tile also fills its head); the
+/// prompt-completing tile's pick lands in `picks`.
+fn run_prefill_tiles(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    picks: &mut [u32],
+) -> Result<(), String> {
+    let tiles: Vec<&RequestRows> = plan
+        .requests
+        .iter()
+        .filter(|r| r.kind == RequestStepKind::Prefill)
+        .collect();
+    if tiles.is_empty() {
+        return Ok(());
+    }
+    let vocab = bundle.lane_vocab();
+    let spec_config = store.spec();
+    let lane_eos = spec_config
+        .and_then(|config| config.end_of_turn)
+        .unwrap_or(bundle.config.eos_token_id);
+    let epochs: Vec<RequestEpoch> = tiles.iter().map(|r| r.epoch).collect();
+    let StepParts {
+        mut lanes,
+        logits,
+        top1,
+        top1_host,
+        rows_cap,
+        sample_host,
+        spec,
+        ..
+    } = store.step_parts(&epochs)?;
+    let mut append = spec.map(|spec| &mut spec.append_scratch);
+    let n_prefill = tiles.len();
+    // (prefill ordinal, plan row of its pick) of AR-lane completing tiles.
+    let mut final_tiles: Vec<(usize, usize)> = Vec::new();
+    for (i, (r, lane)) in tiles.iter().zip(lanes.iter_mut()).enumerate() {
+        let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
+        let completes = wants_pick(&lane.host, r);
+        if lane.spec.is_some() {
             let scratch = append.as_deref_mut().and_then(Option::as_mut);
-            let pick = prefill_tile(bundle, gpu, &mut *e.lane, tokens, scratch, sample_host)?;
+            let pick = prefill_tile(bundle, gpu, &mut **lane, tokens, scratch, sample_host)?;
             if completes {
-                picks[e.r.rows.end() - 1] =
+                picks[r.rows.end() - 1] =
                     pick.ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
             }
         } else if completes {
             let row = logits.sub_offset((rows_cap + i) * vocab, vocab);
             bundle
-                .lane_prefill_tile(gpu, &mut e.lane.state, tokens, Some(&row))
+                .lane_prefill_tile(gpu, &mut lane.state, tokens, Some(&row))
                 .map_err(|e| e.to_string())?;
             let slot = top1.sub_offset(
                 (rows_cap + i) * std::mem::size_of::<i32>(),
@@ -1240,26 +1094,25 @@ fn forward_inner(
                 },
             )
             .map_err(|e| e.to_string())?;
-            final_tiles.push((i, e.r.rows.end() - 1, entry));
+            final_tiles.push((i, r.rows.end() - 1));
         } else {
             bundle
-                .lane_prefill_tile(gpu, &mut e.lane.state, tokens, None)
+                .lane_prefill_tile(gpu, &mut lane.state, tokens, None)
                 .map_err(|e| e.to_string())?;
         }
     }
-    let prefill_ran = ordinal > 0;
     if !final_tiles.is_empty() {
         let used = (rows_cap + n_prefill) * std::mem::size_of::<i32>();
         gpu.hip
             .memcpy_dtoh(&mut top1_host[..used], &top1.buf)
             .map_err(|e| e.to_string())?;
         gpu.take_device_wait_error().map_err(|e| e.to_string())?;
-        for &(i, row, entry) in &final_tiles {
+        for &(i, row) in &final_tiles {
             picks[row] = pick_at(top1_host, rows_cap + i);
             // A sampled lane's prompt-completing pick is its first draw, from
             // the tile's final logits row (one D2H); a greedy lane keeps the
             // argmax.
-            let lane = &mut *entries[entry].lane;
+            let lane = &mut *lanes[i];
             if lane.host.sampling.is_some() {
                 let gpu_ref: &Gpu = gpu;
                 let logits_ref: &GpuTensor = logits;
@@ -1280,59 +1133,221 @@ fn forward_inner(
             }
         }
     }
+    Ok(())
+}
 
-    // The step's wall clock feeds the cost model only on a pure-decode
-    // step; every MTP lane's policy observes its window either way.
-    if let Some(cost) = cost {
-        if decode_lanes > 0 {
-            // Row groups beyond the first are the step's spill; each Batched
-            // window is priced at its share of it.
-            let spill = row_group_count(&dec_rows).saturating_sub(1);
-            let spill_per_window = spill as f64 / verify_windows.max(1) as f64;
-            if !prefill_ran {
-                gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
-                let wall_us = started.elapsed().as_secs_f64() * 1e6;
-                cost.observe(decode_lanes, spill, verified, wall_us as f32);
+/// Apply a published step's lane bookkeeping: the prefill tiles' commits, the
+/// decode lanes' mirrors of the root's published IDs and seeds, the window
+/// counters, and the step's price. Mutates only after every check passed.
+fn commit_inner(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    output: &StepOutput,
+) -> Result<Vec<RequestAdvance>, String> {
+    store
+        .phase
+        .check_commit(&StepKey::of(plan), output.step_id)?;
+    if output.target_picks.len() != plan.total_rows() {
+        return Err("commit_step: pick count != planned rows".to_string());
+    }
+    let mut decode_requests = 0usize;
+    for r in &plan.requests {
+        let lane = match store.lane(&r.epoch) {
+            Some(lane) if lane.host.status != LaneStatus::Poisoned => lane,
+            _ => {
+                return Err(format!(
+                    "commit_step: epoch {:?} no longer owns its lane",
+                    r.epoch
+                ));
             }
-            for e in entries.iter_mut() {
-                if e.dec.is_none() {
-                    continue;
-                }
-                let Some(spec) = e.lane.spec.as_mut() else {
+        };
+        if r.rows.len == 0 || r.rows.end() > output.target_picks.len() {
+            return Err(format!("commit_step: bad row range {:?}", r.rows));
+        }
+        if wants_pick(&lane.host, r) && output.target_picks[r.rows.end() - 1] == u32::MAX {
+            return Err("commit_step: head row without a target pick".to_string());
+        }
+        if r.kind != RequestStepKind::Prefill {
+            decode_requests += 1;
+        }
+    }
+    let spec_config = store.spec();
+    let eos = spec_config
+        .and_then(|config| config.end_of_turn)
+        .unwrap_or(bundle.config.eos_token_id);
+    let mut proto = store.take_proto()?;
+    let result = commit_with_proto(
+        bundle,
+        gpu,
+        store,
+        &mut proto,
+        plan,
+        output,
+        decode_requests,
+        eos,
+    );
+    store.put_proto(proto);
+    if result.is_ok() {
+        store.step_started = None;
+        store.phase = LanePhase::Idle;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_with_proto(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    proto: &mut LaneProto,
+    plan: &BatchStepPlan,
+    output: &StepOutput,
+    decode_requests: usize,
+    eos: u32,
+) -> Result<Vec<RequestAdvance>, String> {
+    let spec_config = store.spec();
+    // Publish: the root applies the staged IDs/seeds/policy/RNG exactly once,
+    // then the rank consumes its validated tickets.
+    let published = if decode_requests > 0 {
+        let LaneProto { root, rank, flight } = &mut *proto;
+        let decision = flight
+            .as_ref()
+            .and_then(|f| f.decision.clone())
+            .ok_or_else(|| "commit_step: the step was never decided".to_string())?;
+        if decision.lanes.len() != decode_requests {
+            return Err(format!(
+                "commit_step: the root decided {} lanes, the plan has {decode_requests}",
+                decision.lanes.len()
+            ));
+        }
+        let out = root.publish_commit().map_err(|e| e.to_string())?;
+        let mut exec = LocalLaneRank {
+            bundle: &mut *bundle,
+            gpu: &mut *gpu,
+            store: &mut *store,
+            session: rank,
+            flight,
+        };
+        exec.publish_commit(&decision);
+        if let Some(error) = exec.flight.as_mut().and_then(|f| f.take_publish_error()) {
+            return Err(error);
+        }
+        Some((out, decision))
+    } else {
+        None
+    };
+    // The step's price: the rank's receipt merged with the controller
+    // interval (one rank: the wall is the interval), settled over every lane.
+    if let Some((_, decision)) = &published {
+        if spec_config.is_some() {
+            let (receipt, interval) = proto
+                .flight
+                .as_mut()
+                .and_then(|f| f.evidence.take())
+                .ok_or_else(|| "commit_step: the step has no cost evidence".to_string())?;
+            let merged = proto
+                .root
+                .merge_evidence(&[receipt], interval)
+                .map_err(|e| format!("commit_step: cost evidence: {e:?}"))?;
+            proto
+                .root
+                .settle_evidence(Some(&merged))
+                .map_err(|e| e.to_string())?;
+            let routes: Vec<(RequestEpoch, LaneRoute)> = proto
+                .flight
+                .as_ref()
+                .map(|f| {
+                    f.start
+                        .lanes
+                        .iter()
+                        .map(|l| (l.key.request_epoch, l.route))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for ((epoch, route), d) in routes.iter().zip(&decision.lanes) {
+                let retired = proto.root.lane_retired(*epoch).unwrap_or(false);
+                let Some(spec) = store.lane_mut(epoch).and_then(|l| l.spec.as_mut()) else {
                     continue;
                 };
-                let (Some(window), policy, stats) =
-                    (spec.window.as_ref(), &mut spec.policy, &mut spec.stats)
-                else {
-                    continue;
-                };
-                let Some(outcome) = window.outcome.as_ref() else {
-                    continue;
-                };
-                match window.route {
-                    LaneRoute::Batched { k_max } => {
-                        let units = cost.window_units(
-                            decode_lanes,
-                            outcome.drafts_generated,
-                            spill_per_window,
-                        );
-                        policy.observe_batched(outcome, units, k_max, window.budget);
+                let stats = &mut spec.stats;
+                match route {
+                    LaneRoute::Batched { .. } => {
                         stats.windows += 1;
-                        stats.drafts += outcome.drafts_generated as u64;
-                        stats.accepted += outcome.accepted as u64;
+                        stats.drafts += d.source.offered as u64;
+                        stats.accepted += d.source.accepted as u64;
                     }
-                    LaneRoute::ArSynced => {
-                        policy.observe_ar_synced(outcome, window.budget);
-                        stats.windows += 1;
-                    }
+                    LaneRoute::ArSynced => stats.windows += 1,
                     LaneRoute::ArRetired => stats.ar_windows += 1,
                     LaneRoute::Ar => {}
                 }
-                stats.retired = policy.retired();
+                stats.retired = retired;
             }
+        } else {
+            // An AR store keeps no price: the step's is dropped.
+            proto
+                .root
+                .settle_evidence(None)
+                .map_err(|e| e.to_string())?;
         }
     }
-    Ok(picks)
+    proto.flight = None;
+    let published = published.map(|(out, _)| out);
+
+    let mut advances = Vec::with_capacity(plan.requests.len());
+    for r in &plan.requests {
+        let pick = output.target_picks[r.rows.end() - 1];
+        let lane = store.lane_mut(&r.epoch).expect("validated above");
+        let (committed_ids, accepted_drafts, verified_rows) = match r.kind {
+            RequestStepKind::Prefill => {
+                let completes = wants_pick(&lane.host, r);
+                let ids: Vec<u32> = commit_host(&mut lane.host, r, pick).into_iter().collect();
+                if completes {
+                    // The prompt-completing pick is the request's first seed:
+                    // the root learns the lane here.
+                    proto.admit_decoding(DecodeAdmission {
+                        epoch: r.epoch,
+                        position: lane.state.position,
+                        seed: pick,
+                        eos,
+                        rng_seed: lane.host.sampling.map_or(0, |s| u64::from(s.seed)),
+                        prompt: &lane.host.prompt,
+                        spec_k: spec_config.map(|config| config.k),
+                        promoted: None,
+                    })?;
+                }
+                (ids, 0, 0)
+            }
+            RequestStepKind::Ar | RequestStepKind::Verify { .. } => {
+                let out = published
+                    .as_ref()
+                    .and_then(|p| p.lanes.iter().find(|o| o.key.request_epoch == r.epoch))
+                    .ok_or_else(|| {
+                        format!("commit_step: {:?} has no published window", r.epoch)
+                    })?;
+                // The host table mirrors the root's published state.
+                lane.host.generated.extend_from_slice(&out.emitted);
+                lane.host.pending_seed = Some(out.next_seed);
+                let verified = match r.kind {
+                    RequestStepKind::Verify { draft_len } => draft_len + 1,
+                    _ => 0,
+                };
+                (out.emitted.clone(), out.source.accepted, verified)
+            }
+            RequestStepKind::Forced => unreachable!("refused by the forward"),
+        };
+        let position = lane.state.position;
+        advances.push(RequestAdvance {
+            epoch: r.epoch,
+            committed_ids,
+            committed_position: position,
+            accepted_drafts,
+            verified_rows,
+            finish: (position >= lane.state.max_seq_len).then(|| "length".to_string()),
+        });
+    }
+    Ok(advances)
 }
 
 #[cfg(test)]

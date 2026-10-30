@@ -143,6 +143,9 @@ pub enum StepPhase {
 pub enum MeshKind {
     Ep,
     Pp,
+    /// One rank that is root, target, head and sampler (the single-card
+    /// lanes). No gathers, no pipeline edges.
+    Single,
 }
 
 /// What a rank owns. Device ordinal and layer order are NOT identity:
@@ -190,6 +193,21 @@ impl RankOwnership {
     }
 }
 
+impl RankOwnership {
+    /// Single card: the one rank owns target, head and sampling and is the
+    /// root.
+    pub const fn single() -> Self {
+        Self {
+            rank: 0,
+            kind: MeshKind::Single,
+            target: true,
+            head: true,
+            sampler: true,
+            root: true,
+        }
+    }
+}
+
 fn validate_world(world: &[RankOwnership]) -> Result<RankOwnership, ProtocolError> {
     let bad = |m: &str| Err(ProtocolError::Config(m.to_string()));
     if world.is_empty() {
@@ -221,6 +239,9 @@ fn validate_world(world: &[RankOwnership]) -> Result<RankOwnership, ProtocolErro
     }
     if world[0].kind == MeshKind::Pp && world.iter().any(|r| r.head && !r.root) {
         return bad("PP: only the output band owns the head");
+    }
+    if world[0].kind == MeshKind::Single && world.len() != 1 {
+        return bad("Single: exactly one rank");
     }
     Ok(root)
 }
@@ -933,6 +954,11 @@ pub struct MergedCostEvidence {
     pub synchronized: bool,
     /// Whether the controller wall may train the fit.
     pub priced: bool,
+    /// Whether the floor may price this step's windows at the cost model's
+    /// units. `false` (NaN units: probe budget spent unpriced) only when a
+    /// rank did not complete or a warm bind ran; a prefill tile in the
+    /// interval leaves it `true` while `priced` is `false`.
+    pub units_valid: bool,
     pub unpriced_reason: Option<&'static str>,
 }
 
@@ -1047,7 +1073,7 @@ pub fn merge_evidence(
             ));
         }
         match kind {
-            MeshKind::Ep => {
+            MeshKind::Ep | MeshKind::Single => {
                 if c.edge_count != 0 || c.edge_bytes != 0 {
                     return incoherent(format!("EP rank {} reports pipeline edges", w.rank));
                 }
@@ -1140,6 +1166,13 @@ pub fn merge_evidence(
         critical_path_us: critical,
         synchronized,
         priced: reason.is_none(),
+        // The floor's model units stay valid unless a rank is incomplete or
+        // a warm bind polluted the step: a prefill tile or an unusable wall
+        // only keeps the wall out of the fit (the singleton lane rule).
+        units_valid: !matches!(
+            reason,
+            Some("a rank did not complete the step" | "warm bind or first-seen depth")
+        ),
         unpriced_reason: reason,
     })
 }
@@ -1272,6 +1305,9 @@ pub struct MeshRoot {
     phase: StepPhase,
     aborted: Option<AbortRecord>,
     counters: RootCounters,
+    /// Single-card legacy: the driver owns request termination (see
+    /// [`MeshRoot::set_driver_terminates`]).
+    driver_terminates: bool,
 }
 
 impl MeshRoot {
@@ -1302,6 +1338,7 @@ impl MeshRoot {
             phase: StepPhase::Idle,
             aborted: None,
             counters: RootCounters::default(),
+            driver_terminates: false,
         })
     }
 
@@ -1414,6 +1451,14 @@ impl MeshRoot {
 
     /// Admit a request at Idle/Published. Returns what ranks mirror.
     pub fn admit_lane(&mut self, a: LaneAdmission) -> Result<LaneAdmit, ProtocolError> {
+        self.admit_with(a, None)
+    }
+
+    fn admit_with(
+        &mut self,
+        a: LaneAdmission,
+        policy_seed: Option<LaneSpecPolicy>,
+    ) -> Result<LaneAdmit, ProtocolError> {
         self.check_live()?;
         if !matches!(self.phase, StepPhase::Idle | StepPhase::Published) {
             return Err(ProtocolError::Phase {
@@ -1443,9 +1488,10 @@ impl MeshRoot {
         }
         let generation = self.next_lane_generation;
         self.next_lane_generation += 1;
-        let policy = a
-            .spec_k
-            .map(|k| LaneSpecPolicy::with_floor(k, self.cfg.floor_enabled));
+        let policy = policy_seed.or_else(|| {
+            a.spec_k
+                .map(|k| LaneSpecPolicy::with_floor(k, self.cfg.floor_enabled))
+        });
         self.lanes.insert(
             a.epoch,
             RootLane {
@@ -1734,6 +1780,14 @@ impl MeshRoot {
                                 }
                             }
                         }
+                    }
+                    // A window of a retired lane never touches the head
+                    // (copy is the only reason a retired lane keeps one).
+                    if route == LaneRoute::ArRetired
+                        && plan.source == ProposalSource::None
+                        && plan.head == HeadState::Aligned
+                    {
+                        plan.head = HeadState::Free;
                     }
                 }
             }
@@ -2049,6 +2103,7 @@ impl MeshRoot {
             ));
         }
         let n_ops = round.ops.len();
+        let driver_terminates = self.driver_terminates;
         let s = self.step_mut();
         for p in &proposals {
             let i = s
@@ -2059,13 +2114,16 @@ impl MeshRoot {
                 .expect("keys checked against the round");
             let max_depth = s.start.lanes[i].max_depth;
             let eos = s.start.lanes[i].eos;
+            let past_eos = driver_terminates;
             let d = &mut s.draft[i];
             if p.drop_last {
                 // A dropped token never enters the window.
                 d.active = false;
             } else {
                 d.drafts.push(p.token);
-                d.active = p.keep_going && d.drafts.len() < max_depth && eos != Some(p.token);
+                d.active = p.keep_going
+                    && d.drafts.len() < max_depth
+                    && (past_eos || eos != Some(p.token));
             }
         }
         s.round += 1;
@@ -2128,13 +2186,13 @@ impl MeshRoot {
         let ledger = OpLedger {
             row_groups: groups.len(),
             target_exchanges: match self.world[0].kind {
-                MeshKind::Pp => 0,
+                MeshKind::Pp | MeshKind::Single => 0,
                 MeshKind::Ep if s.start.stage.moe_once => s.start.stage.moe_layers * groups.len(),
                 MeshKind::Ep => s.start.stage.moe_layers * lanes.len(),
             },
             microbatches: match self.world[0].kind {
                 MeshKind::Pp => microbatches.len(),
-                MeshKind::Ep => 0,
+                MeshKind::Ep | MeshKind::Single => 0,
             },
             head_draft_calls: s.head_calls,
         };
@@ -2528,7 +2586,7 @@ impl MeshRoot {
                 lane.seed = up.seed;
                 lane.generated.extend_from_slice(&up.emitted);
                 lane.copy.tokens.extend_from_slice(&up.emitted);
-                if up.terminal {
+                if up.terminal && !self.driver_terminates {
                     lane.status = LaneStatus::Terminal;
                 }
             }
@@ -2575,6 +2633,172 @@ impl MeshRoot {
     }
 }
 
+/// The single-card route's additions (a [`MeshKind::Single`] root).
+impl MeshRoot {
+    /// The driver owns request termination and drafting rules of the
+    /// singleton lane route: an EOS or length completion never closes a
+    /// lane at the root (the driver releases it, and today still forwards
+    /// an EOS pending seed once), and a native draft chain runs through an
+    /// EOS draft (the verify truncates at it). Off by default (mesh
+    /// topologies close lanes at the root and stop drafting at EOS).
+    pub fn set_driver_terminates(&mut self, on: bool) {
+        self.driver_terminates = on;
+    }
+
+    /// Whether `HIPFIRE_MTP_AR_FLOOR` is on for the lanes admitted from now
+    /// on (the singleton lane route reads it at every admission).
+    pub fn set_floor_enabled(&mut self, on: bool) {
+        self.cfg.floor_enabled = on;
+    }
+
+    /// Whether the root holds `epoch`'s lane.
+    pub fn has_lane(&self, epoch: RequestEpoch) -> bool {
+        self.lanes.contains_key(&epoch)
+    }
+
+    /// Admit a promoted singleton as an already-decoding lane: its drafter's
+    /// per-depth `agreement` seeds the lane policy (`retired` keeps it
+    /// `ArRetired` for good). The floor is not reset.
+    pub fn admit_promoted(
+        &mut self,
+        a: LaneAdmission,
+        agreement: &[(f32, f32)],
+        retired: bool,
+    ) -> Result<LaneAdmit, ProtocolError> {
+        let policy = a.spec_k.map(|k| {
+            LaneSpecPolicy::promoted_with_floor(k, agreement, retired, self.cfg.floor_enabled)
+        });
+        self.admit_with(a, policy)
+    }
+
+    /// Replace a live lane's pending seed (the emitter's forced close
+    /// tokens): not a proposal, no RNG draw, no policy observation; the
+    /// generated IDs and the position are untouched.
+    pub fn force_seed(&mut self, epoch: RequestEpoch, token: u32) -> Result<(), ProtocolError> {
+        self.check_live()?;
+        if self.in_flight(epoch) {
+            return Err(ProtocolError::Phase {
+                op: "force_seed (in-flight step)",
+                actual: self.phase,
+            });
+        }
+        let lane = self
+            .lanes
+            .get_mut(&epoch)
+            .ok_or(ProtocolError::UnknownLane(epoch))?;
+        if lane.status != LaneStatus::Live {
+            return Err(ProtocolError::LaneNotLive(epoch));
+        }
+        lane.seed = token;
+        Ok(())
+    }
+
+    /// Apply the previous published step's price now, to the cost model and
+    /// to every lane still held (not only the next step's lanes: a lane
+    /// that skips the next step, or ends, is still observed exactly as the
+    /// singleton lane route observes at the end of its forward). `None`
+    /// drops the price (probe budget spent unpriced). Idle/Published only;
+    /// stale evidence changes nothing.
+    pub fn settle_evidence(
+        &mut self,
+        merged: Option<&MergedCostEvidence>,
+    ) -> Result<(), ProtocolError> {
+        self.check_live()?;
+        if !matches!(self.phase, StepPhase::Idle | StepPhase::Published) {
+            return Err(ProtocolError::Phase {
+                op: "settle_evidence",
+                actual: self.phase,
+            });
+        }
+        match (&self.pending_obs, merged) {
+            (None, None) => return Ok(()),
+            (None, Some(m)) => {
+                return Err(ProtocolError::StaleEvidence(format!(
+                    "evidence for step {} but no step awaits a price",
+                    m.key.step_seq
+                )))
+            }
+            (Some(p), Some(m)) if m.key != p.key => {
+                return Err(ProtocolError::StaleEvidence(format!(
+                    "evidence is for step {} (gen {}), pending is step {} (gen {})",
+                    m.key.step_seq,
+                    m.key.topology_generation,
+                    p.key.step_seq,
+                    p.key.topology_generation
+                )))
+            }
+            _ => {}
+        }
+        let p = self.pending_obs.take().expect("checked above");
+        let Some(m) = merged else {
+            self.counters.observations_dropped += 1;
+            return Ok(());
+        };
+        if m.priced {
+            self.cost
+                .observe(p.decode_lanes, p.spill, p.verified, m.wall_us as f32);
+        }
+        let spill_per_window = p.spill as f64 / p.verify_windows.max(1) as f64;
+        for o in &p.lanes {
+            let Some(policy) = self
+                .lanes
+                .get_mut(&o.epoch)
+                .and_then(|l| l.policy.as_mut())
+            else {
+                continue; // released since: nothing to teach
+            };
+            observe_lane(&self.cost, policy, &p, o, m, spill_per_window);
+        }
+        self.counters.observations_applied += 1;
+        Ok(())
+    }
+
+    /// Single-rank recovery from a step that failed (a device error, a
+    /// cancelled participant): drop the in-flight step, its staged state and
+    /// its pending price, forget `epochs` (the poisoned participants) and
+    /// return to Idle. Other lanes keep their state: on one card nothing
+    /// but the participants' own device state is uncertain, so the mesh-wide
+    /// quarantine of [`Self::abort_step`] does not apply. Refused on a mesh
+    /// topology (use `abort_step` and quarantine there).
+    pub fn discard_step(&mut self, epochs: &[RequestEpoch]) -> Result<(), ProtocolError> {
+        if self.own.kind != MeshKind::Single {
+            return Err(ProtocolError::Config(
+                "discard_step is the single-rank recovery; a mesh quarantines".to_string(),
+            ));
+        }
+        self.step = None;
+        self.pending_obs = None;
+        self.aborted = None;
+        self.phase = StepPhase::Idle;
+        for e in epochs {
+            self.lanes.remove(e);
+        }
+        Ok(())
+    }
+}
+
+impl RankSession {
+    /// Single-rank recovery: drop the in-flight step and clear quarantine
+    /// (see [`MeshRoot::discard_step`]). Refused unless this rank is a
+    /// [`MeshKind::Single`] rank.
+    pub fn discard_step(&mut self) -> Result<(), RankError> {
+        if self.own.kind != MeshKind::Single {
+            return Err(RankError::new(
+                self.own.rank,
+                "discard_step is the single-rank recovery",
+            ));
+        }
+        self.step = None;
+        self.aborted = false;
+        Ok(())
+    }
+
+    /// Forget a lane without the idle check (a lane poisoned mid-step).
+    pub fn forget_lane(&mut self, epoch: &RequestEpoch) {
+        self.live.remove(epoch);
+    }
+}
+
 /// Whether a lane's window touches the head on head owners (a head-free
 /// lane or non-spec lane allocates/uses none).
 fn lane_needs_head(l: &LanePlan) -> bool {
@@ -2609,18 +2833,31 @@ fn apply_evidence(
         let Some(policy) = sl.policy.as_mut() else {
             continue;
         };
-        match o.route {
-            LaneRoute::Batched { k_max } if o.source == ProposalSource::Native => {
-                let units = if m.priced {
-                    cost.window_units(p.decode_lanes, o.window.drafts_generated, spill_per_window)
-                } else {
-                    f32::NAN
-                };
-                policy.observe_batched(&o.window, units, k_max, o.budget);
-            }
-            LaneRoute::ArSynced => policy.observe_ar_synced(&o.window, o.budget),
-            _ => {}
+        observe_lane(cost, policy, p, o, m, spill_per_window);
+    }
+}
+
+/// One lane's floor observation of a finished window, priced at the cost
+/// model's units (NaN when the step's units are not valid).
+fn observe_lane(
+    cost: &LaneCostModel,
+    policy: &mut LaneSpecPolicy,
+    p: &PendingObservation,
+    o: &PendingLaneObs,
+    m: &MergedCostEvidence,
+    spill_per_window: f64,
+) {
+    match o.route {
+        LaneRoute::Batched { k_max } if o.source == ProposalSource::Native => {
+            let units = if m.units_valid {
+                cost.window_units(p.decode_lanes, o.window.drafts_generated, spill_per_window)
+            } else {
+                f32::NAN
+            };
+            policy.observe_batched(&o.window, units, k_max, o.budget);
         }
+        LaneRoute::ArSynced => policy.observe_ar_synced(&o.window, o.budget),
+        _ => {}
     }
 }
 
@@ -3458,6 +3695,7 @@ mod tests {
 
     fn world(kind: MeshKind) -> Vec<RankOwnership> {
         match kind {
+            MeshKind::Single => vec![RankOwnership::single()],
             MeshKind::Ep => vec![RankOwnership::ep(0), RankOwnership::ep(1)],
             // The output band (root) is rank 1 on purpose: device/layer
             // order is not identity.

@@ -4830,7 +4830,16 @@ impl Qwen4Bundle {
                 .map_err(|e| BundleError::Forward(format!("promotion: resident ring: {e}")))?;
         }
         self.with_lanes(|store, bundle| {
-            store.admit_promoted(gpu, bundle, epoch, prompt, generated, pending_seed, parts)
+            store.admit_promoted(
+                gpu,
+                bundle,
+                epoch,
+                prompt,
+                generated,
+                pending_seed,
+                position,
+                parts,
+            )
         })
     }
 
