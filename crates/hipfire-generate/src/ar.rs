@@ -1745,11 +1745,16 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // penalized sampled request keeps the MTP route. A penalized
             // greedy request, adaptive KV, or a force-AR switch keeps the
             // request on the ordinary Qwen4 producer (penalize-then-argmax).
-            // Qwen4 PP uses the same native driver for greedy, unpenalized
-            // requests. Sampled or penalized requests explicitly keep the PP
-            // AR producer; they never enter the Qwen3.5-only PP route.
-            let mtp_ok = (i.pp <= 1 || (i.temp <= 1e-6 && !i.nonneutral_penalties))
-                && i.speculator_is_mtp
+            // Qwen4 PP uses the same native driver for greedy requests and
+            // for unpenalized sampled Leviathan requests (distribution-exact;
+            // `supports_temp_swor` is false for `speculation.mtp_sampled = 0`
+            // and, under PP, for `HIPFIRE_MTP_SAMPLED_MODE=naive`, whose draws
+            // come from the process-wide sampler: those stay on the PP AR
+            // producer). Penalized requests stay on the PP AR producer too:
+            // the GPU penalty prepass refuses the mesh. Neither enters the
+            // Qwen3.5-only PP route.
+            let mtp_ok = i.speculator_is_mtp
+                && (i.pp <= 1 || !i.nonneutral_penalties)
                 && (i.temp <= 1e-6 || i.supports_temp_swor)
                 && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor));
             // The other Qwen4 speculator is DFlash2 (`--spec dflash`, single
@@ -2496,10 +2501,20 @@ pub fn generate(
         .as_ref()
         .map(|s| !s.requires_greedy())
         .unwrap_or(false);
-    let supports_temp_swor = m
-        .speculator
-        .as_ref()
-        .is_some_and(|s| s.supports_temp_verify());
+    // Under PP the native drafter's naive sampled mode (SpecInfer draws from the
+    // process-wide AR sampler RNG, not band-deterministic) is refused by the
+    // mesh driver, so it must not advertise sampled verification to the
+    // selector: such requests decode on the PP AR producer instead.
+    let pp_naive_sampled_mtp = m.pp > 1
+        && m.speculator
+            .as_mut()
+            .and_then(|s| s.drafter_any_mut())
+            .and_then(|any| any.downcast_ref::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+            .is_some_and(|drafter| drafter.sampled_mode_is_naive());
+    let supports_temp_swor = !pp_naive_sampled_mtp
+        && m.speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_temp_verify());
     let supports_chain_nucleus_verify = m
         .speculator
         .as_ref()
@@ -2547,7 +2562,9 @@ pub fn generate(
             std::sync::atomic::AtomicBool::new(false);
         if !QWEN4_PP_MTP_AR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
-                "[hipfire] PP native MTP is greedy-only; sampled/penalized requests decode AR"
+                "[hipfire] PP native MTP: penalized requests, sampled requests with \
+                 HIPFIRE_MTP_SAMPLED=0 and sampled requests with HIPFIRE_MTP_SAMPLED_MODE=naive \
+                 decode AR (greedy and unpenalized sampled leviathan requests run MTP)"
             );
         }
     }
@@ -7092,7 +7109,7 @@ mod qwen4_pp_route_tests {
     }
 
     #[test]
-    fn qwen4_native_greedy_mtp_uses_the_same_route_under_pp() {
+    fn qwen4_native_mtp_uses_the_same_route_under_pp() {
         let mut single = inputs(16, 1);
         single.has_speculator = true;
         single.speculator_is_mtp = true;
@@ -7100,19 +7117,39 @@ mod qwen4_pp_route_tests {
         for pp in 2..=8 {
             let mut i = single;
             i.pp = pp;
+            // Greedy, unpenalized: native MTP.
             assert_eq!(
                 select_generation_route(&i),
                 GenerationRoute::Qwen4Spec,
                 "pp {pp}"
             );
-            // Sampling-capable Single support does not qualify PP sampling.
-            i.supports_temp_swor = true;
+            // Sampled without `supports_temp_verify` (`HIPFIRE_MTP_SAMPLED=0`,
+            // or PP + `HIPFIRE_MTP_SAMPLED_MODE=naive`): the PP AR producer.
             i.temp = 0.7;
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
-            i.temp = 0.0;
+            // Sampled, unpenalized, sampled verification available (leviathan):
+            // native MTP, exactly as on one card.
+            i.supports_temp_swor = true;
+            assert_eq!(
+                select_generation_route(&i),
+                GenerationRoute::Qwen4Spec,
+                "pp {pp}"
+            );
+            // Explicit top_p/top_k/min_p do not demote a sampled request.
+            i.user_explicit_sampling = true;
+            i.min_p = Some(0.05);
+            assert_eq!(
+                select_generation_route(&i),
+                GenerationRoute::Qwen4Spec,
+                "pp {pp}"
+            );
+            i.user_explicit_sampling = false;
+            i.min_p = None;
+            // Penalized requests stay on the PP AR producer (the GPU penalty
+            // prepass refuses the mesh), greedy or sampled.
             i.nonneutral_penalties = true;
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
-            i.temp = 0.7;
+            i.temp = 0.0;
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
         }
     }
