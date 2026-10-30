@@ -948,7 +948,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1836
+**Count:** 1839
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1399,6 +1399,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_KV_SEQ` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
 | `HIPFIRE_EP_LAB_RESIDENT_LAYERS` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_MTP_LANES` | crates/hipfire-daemon/src/main.rs, crates/hipfire-generate/src/fn_batch.rs | developer |
+| `HIPFIRE_EP_MTP_LANE_COPY` | crates/hipfire-arch-qwen4/src/ep.rs | developer |
+| `HIPFIRE_EP_MTP_LANE_K` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-loader/src/batch_staging.rs | developer |
+| `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` | crates/hipfire-arch-qwen4/src/lane_switch.rs | developer |
 | `HIPFIRE_EP_ORACLE_DUMP` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs, tools/ep_bisect.py | harness |
 | `HIPFIRE_EP_ORACLE_DUMP_PRE_STEP` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |

@@ -3529,6 +3529,7 @@ fn real_main() -> R<bool> {
         Some(LaneSpecConfig {
             k: args.k,
             end_of_turn: None,
+            spec_lanes: None,
         })
     } else {
         None

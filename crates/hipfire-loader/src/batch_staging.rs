@@ -694,6 +694,14 @@ fn stage_qwen4_lanes(
         .then_some(hipfire_arch_qwen4::lane::LaneSpecConfig {
             k: spec_k,
             end_of_turn,
+            // EP mixed store: MTP state only for the lanes the concurrency
+            // switch ever runs natively; the rest are AR-only lanes.
+            spec_lanes: (topology == "ep").then(|| {
+                hipfire_arch_qwen4::lane_switch::spec_lane_count(
+                    requested,
+                    hipfire_arch_qwen4::lane_switch::max_active(),
+                )
+            }),
         });
     let spec_on_k = spec.as_ref().map(|s| s.k);
     if bundle.state.qsa_backend() != Qwen4KvBackend::Vmm {

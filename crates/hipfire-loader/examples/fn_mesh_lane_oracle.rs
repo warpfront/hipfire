@@ -2209,6 +2209,7 @@ fn drive_mtp_ep(
             Some(LaneSpecConfig {
                 k: depth,
                 end_of_turn: None,
+                spec_lanes: None,
             }),
             copy_cfg,
         )

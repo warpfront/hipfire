@@ -295,7 +295,8 @@ impl Qwen4Bundle {
                     eos: Some(eos),
                     rng_seed: request.epoch.request_tag,
                     prompt: lane.host.prompt.clone(),
-                    spec_k: Some(spec_k),
+                    // An AR-only lane of a mixed store joins the root as an AR lane.
+                    spec_k: lane.spec.is_some().then_some(spec_k),
                 })
             };
             if let Some(admission) = admission {

@@ -928,6 +928,12 @@ pub struct LaneSpecConfig {
     pub k: usize,
     /// The end-of-turn token a window stops at; `None` uses the model's EOS.
     pub end_of_turn: Option<u32>,
+    /// Mixed store: only the first `spec_lanes` slots carry MTP state (target
+    /// ring, head, window); every later slot is an AR-only lane that holds
+    /// neither. `None`: every lane is an MTP lane. The slot a request takes is
+    /// the lowest free one, so low concurrency lands on MTP lanes. Multi-card
+    /// serve sizes it with [`crate::lane_switch::spec_lane_count`].
+    pub spec_lanes: Option<usize>,
 }
 
 /// The opt-in copy lane of a store (lab/oracle only: the default store stages
@@ -2019,13 +2025,25 @@ impl Qwen4LaneStore {
         epoch: RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, String> {
-        let ring_rows = self.ring_rows;
-        let spec_cfg = self
+        let store_ring_rows = self.ring_rows;
+        let store_spec_cfg = self
             .spec
             .as_ref()
             .map(|s| (s.config, s.head_max_seq, s.backend, s.lag_rows));
-        self.table
-            .admit(epoch, prompt, |slot, existing| match existing {
+        let spec_lanes = self
+            .spec
+            .as_ref()
+            .and_then(|s| s.config.spec_lanes)
+            .unwrap_or(usize::MAX);
+        self.table.admit(epoch, prompt, |slot, existing| {
+            // A slot past the mixed store's MTP lanes is an AR-only lane:
+            // no capture ring, no head.
+            let (ring_rows, spec_cfg) = if slot < spec_lanes {
+                (store_ring_rows, store_spec_cfg)
+            } else {
+                (0, None)
+            };
+            match existing {
                 Some(cell) => {
                     cell.state
                         .reset(gpu)
@@ -2045,7 +2063,8 @@ impl Qwen4LaneStore {
                     Ok(None)
                 }
                 None => new_payload(gpu, bundle, slot, ring_rows, spec_cfg).map(Some),
-            })
+            }
+        })
     }
 
     /// Admit `epoch` straight into Decoding (a promoted singleton): `prompt`

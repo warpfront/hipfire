@@ -1819,6 +1819,56 @@ pub fn ep_lane_store_device_bytes(
     }
 }
 
+/// [`ep_lane_store_device_bytes`] of a mixed store: with `spec_lanes =
+/// Some(n)` (and `spec_k`) only the first `n` lanes carry MTP state (target
+/// ring, head); the other `lanes - n` are AR-only lanes. Each AR-only lane
+/// saves the per-lane difference between the MTP and the AR store, measured
+/// from the one census as the byte cost of one more lane in each. `None` on
+/// overflow, or when the MTP store is not larger than the AR store (a census
+/// inconsistency refuses rather than under-reserves).
+#[allow(clippy::too_many_arguments)]
+pub fn ep_lane_store_device_bytes_mixed(
+    config: &crate::Qwen4Config,
+    format: crate::Qwen4StateFormat,
+    backend: crate::Qwen4KvBackend,
+    max_seq: usize,
+    chunk_rows: usize,
+    granularity: usize,
+    lanes: usize,
+    row_budget: usize,
+    spec_k: Option<usize>,
+    copy: Option<&crate::lane::LaneCopyConfig>,
+    spec_lanes: Option<usize>,
+) -> Option<u64> {
+    let full = |n: usize, k: Option<usize>, c: Option<&crate::lane::LaneCopyConfig>| {
+        ep_lane_store_device_bytes(
+            config,
+            format,
+            backend,
+            max_seq,
+            chunk_rows,
+            granularity,
+            n,
+            row_budget,
+            k,
+            c,
+        )
+    };
+    let total = full(lanes, spec_k, copy)?;
+    let (Some(k), Some(n)) = (spec_k, spec_lanes) else {
+        return Some(total);
+    };
+    if n >= lanes || lanes < 2 {
+        return Some(total);
+    }
+    let spec_lane = total.checked_sub(full(lanes - 1, Some(k), copy)?)?;
+    let ar_lane = full(lanes, None, None)?.checked_sub(full(lanes - 1, None, None)?)?;
+    let saved = spec_lane
+        .checked_sub(ar_lane)?
+        .checked_mul((lanes - n) as u64)?;
+    total.checked_sub(saved)
+}
+
 /// A lane-entry error as the plain text every rank compares.
 fn bundle_text(error: BundleError) -> String {
     match error {
@@ -1858,7 +1908,7 @@ fn stage_rank_lanes(
         .forward_scratch_mode()
         .unwrap_or(crate::gpu_forward::Qwen4ForwardScratchMode::Full);
     let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, mode);
-    let need = ep_lane_store_device_bytes(
+    let need = ep_lane_store_device_bytes_mixed(
         &bundle.config,
         bundle.state_format(),
         bundle.state.qsa_backend(),
@@ -1869,6 +1919,7 @@ fn stage_rank_lanes(
         row_budget,
         spec.map(|spec| spec.k),
         copy.as_ref(),
+        spec.and_then(|spec| spec.spec_lanes),
     )
     .ok_or_else(|| format!("rank {rank}: lane store device bytes overflow"))?;
     let free = gpu

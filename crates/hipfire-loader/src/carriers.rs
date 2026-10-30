@@ -2878,7 +2878,7 @@ pub fn qwen4_ep_vram_layers(
         .then(|| hipfire_arch_qwen4::ep::ep_default_copy_config(gpu.arch.as_str()))
         .flatten();
     let lane = qwen4_ep_lane_request(batch, shared.backend, |lanes, row_budget| {
-        hipfire_arch_qwen4::ep::ep_lane_store_device_bytes(
+        hipfire_arch_qwen4::ep::ep_lane_store_device_bytes_mixed(
             &config,
             state_format,
             shared.backend,
@@ -2889,6 +2889,12 @@ pub fn qwen4_ep_vram_layers(
             row_budget,
             spec_k,
             copy.as_ref(),
+            spec_k.map(|_| {
+                hipfire_arch_qwen4::lane_switch::spec_lane_count(
+                    lanes,
+                    hipfire_arch_qwen4::lane_switch::max_active(),
+                )
+            }),
         )
     });
     let mut plan = hipfire_arch_qwen4::expert_residency::ep_vram_plan(
