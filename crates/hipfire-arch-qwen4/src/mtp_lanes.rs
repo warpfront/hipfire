@@ -35,6 +35,8 @@ use crate::lane::{
     download_lane_rows, lane_sample_step, LabRoutes, LaneSpec, LaneSpecConfig, Qwen4LaneState,
 };
 use crate::lane_exec::LaneRoute;
+use crate::mesh_lane_protocol::ProposalSource;
+use crate::mesh_rank_copy::{verify_capable, PreparedRankLane, ProbeOutcome};
 use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
     accept_native_greedy, floor_with_call_log, mtp_prefill_chunk, mtp_prefill_chunk_needs_pick,
@@ -43,6 +45,7 @@ use crate::mtp_spec::{
     TargetTicket, MTP_WINDOW_COST,
 };
 
+use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::spec::{GreedyAccept, MtpWindow};
 use hipfire_runtime::spec_economics::{
     observe_agreement, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
@@ -451,19 +454,36 @@ pub(crate) struct PendingWindow {
     /// The lane's `state.position` when the window was routed (the seed's).
     pub position: usize,
     pub seed: u32,
-    /// The kept drafts (`Batched` only).
+    /// The kept proposals: the native drafts, the copy candidates or the
+    /// forced tokens `f1..f_{n-1}` (the sealed rows after the seed); empty
+    /// for an AR row.
     pub drafts: Vec<u32>,
-    /// Draft steps the head ran (one more than `drafts` when the last step
-    /// drafted a dropped token).
+    /// Draft steps the head ran and that are still in effect (one more than
+    /// `drafts` when the last step drafted a dropped token; 0 again after an
+    /// abandoned confirmation probe). `head_at_start = (steps == 0)`.
     pub steps: usize,
-    /// The head ticket taken before the draft steps (`Batched`).
+    /// The head ticket: before the draft steps of a native window, and
+    /// (after the plan's catch-up) before a copy confirmation probe or a copy
+    /// or forced window's finish.
     pub head_ticket: Option<HeadTicket>,
-    /// The target ticket taken before the verify forward (`Batched`). Lanes
+    /// The target ticket taken before the verify forward (`rows > 1`). Lanes
     /// run on one card: always [`TargetTicket::Local`].
     pub target_ticket: Option<TargetTicket>,
-    /// The prepared window of the step's Verify (live tickets), between the
-    /// rank's `prepare_commit` and `publish_commit`.
-    pub prepared: Option<PreparedLaneWindow>,
+    /// The prepared window of the step (live tickets), between the rank's
+    /// `prepare_commit` and `publish_commit`.
+    pub prepared: Option<PreparedRankLane>,
+    /// The root's planned source (a copy plan may still fall back after its
+    /// confirmation).
+    pub source: ProposalSource,
+    /// An emitter-forced window (`LaneKind::Forced`).
+    pub forced: bool,
+    /// The plan's head is live (aligned or lagging): its arenas map with the
+    /// window's, its rows are appended at prepare.
+    pub head_live: bool,
+    /// The head's request state saved before a confirmation probe's Draft.
+    pub probe_saved: Option<DraftHeadRequestState>,
+    /// What the confirmation probe decided (`None`: no probe ran).
+    pub probe: Option<ProbeOutcome>,
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +509,25 @@ pub(crate) struct PreparedLaneWindow {
     pub native: PreparedNativeWindow,
 }
 
+/// How a lane window's tail differs from the greedy native window.
+pub(crate) struct LaneFinish {
+    /// The acceptance, when the root fixes it without the target's picks (a
+    /// forced advance keeps every row: [`crate::mesh_rank_copy::forced_acceptance`]);
+    /// `None`: greedy accept over the lane's picks.
+    pub acceptance: Option<GreedyAccept>,
+    /// `NativeFinish.head_at_start` (`mesh_rank_copy::head_at_start(steps)`):
+    /// no head Draft step is in effect, so the seed's row is appended.
+    pub head_at_start: bool,
+}
+
+impl LaneFinish {
+    /// A native window: greedy accept, the draft chain's row 0 kept.
+    pub(crate) const NATIVE: Self = Self {
+        acceptance: None,
+        head_at_start: false,
+    };
+}
+
 /// Prepare a Verify lane after the trunk forward: greedy accept over the
 /// lane's picks, then every fallible operation of the singleton's window tail
 /// on the lane's own states, ending in a non-consuming ticket validation.
@@ -505,6 +544,36 @@ pub(crate) fn prepare_lane_window(
     row_begin: usize,
     picks: &[u32],
     skip_rollback: bool,
+) -> Result<PreparedLaneWindow, String> {
+    prepare_lane_window_with(
+        bundle,
+        gpu,
+        lane,
+        config,
+        hidden,
+        row_begin,
+        picks,
+        skip_rollback,
+        LaneFinish::NATIVE,
+    )
+}
+
+/// [`prepare_lane_window`] for any verify window of a lane (native, copy,
+/// forced): `finish` carries the acceptance a forced window fixes and the
+/// `head_at_start` rule. The head must already stand where the finish
+/// expects it (`window.position + window.steps`): a catch-up or an owed-row
+/// flush has run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_lane_window_with(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    lane: &mut Qwen4LaneState,
+    config: LaneSpecConfig,
+    hidden: &GpuTensor,
+    row_begin: usize,
+    picks: &[u32],
+    skip_rollback: bool,
+    finish: LaneFinish,
 ) -> Result<PreparedLaneWindow, String> {
     let wide = bundle
         .config
@@ -525,7 +594,7 @@ pub(crate) fn prepare_lane_window(
     let window = window
         .as_ref()
         .ok_or_else(|| "finish_lane_window: lane has no pending window".to_string())?;
-    if !matches!(window.route, LaneRoute::Batched { .. }) {
+    if !verify_capable(window.route, window.source, window.forced) {
         return Err(format!(
             "finish_lane_window: window routed {:?} has no verify",
             window.route
@@ -563,6 +632,12 @@ pub(crate) fn prepare_lane_window(
             window.steps
         ));
     }
+    if finish.head_at_start != (window.steps == 0) {
+        return Err(format!(
+            "finish_lane_window: head_at_start {} disagrees with {} draft steps in effect",
+            finish.head_at_start, window.steps
+        ));
+    }
     let target_snapshot = window
         .target_ticket
         .ok_or_else(|| "finish_lane_window: no target ticket".to_string())?;
@@ -571,7 +646,11 @@ pub(crate) fn prepare_lane_window(
         .ok_or_else(|| "finish_lane_window: no head ticket".to_string())?;
     let eos = config.end_of_turn.unwrap_or(bundle.config.eos_token_id);
     let drafts = window.drafts.clone();
-    let acceptance = accept_native_greedy(&drafts, picks, Some(eos))?;
+    let forced = finish.acceptance.is_some();
+    let acceptance = match finish.acceptance {
+        Some(acceptance) => acceptance,
+        None => accept_native_greedy(&drafts, picks, Some(eos))?,
+    };
     let mut block = Vec::with_capacity(rows);
     block.push(window.seed);
     block.extend_from_slice(&drafts);
@@ -589,7 +668,7 @@ pub(crate) fn prepare_lane_window(
     // Lab negative control: a rejected verify finishes as a full accept, so
     // the lane keeps every verified row (the rejected tail included) while
     // the stream still follows the true acceptance.
-    let finish_acceptance = if skip_rollback && acceptance.accepted < drafts.len() {
+    let finish_acceptance = if skip_rollback && !forced && acceptance.accepted < drafts.len() {
         GreedyAccept {
             committed: drafts
                 .iter()
@@ -616,7 +695,7 @@ pub(crate) fn prepare_lane_window(
                 verify_hidden: &verify_hidden,
                 ple_normed: Some(&ple_normed),
                 retain: false,
-                head_at_start: false,
+                head_at_start: finish.head_at_start,
             },
             None,
         )
@@ -874,17 +953,38 @@ mod tests {
             let rest = &rank_src[start..];
             &rest[..rest.find("\n    }\n").expect("method end")]
         };
+        // The rank's phases call the shared rank helper
+        // (`mesh_rank_copy::{prepare,publish}_rank_lane`), which holds the
+        // prepare/publish split of the lane window.
         let prepare = method("prepare_commit");
-        assert!(
-            prepare.contains("prepare_lane_window(") && !prepare.contains("publish_lane_window(")
-        );
+        assert!(prepare.contains("prepare_rank_lane(") && !prepare.contains("publish_rank_lane("));
         let publish = method("publish_commit");
+        assert!(publish.contains("publish_rank_lane(") && !publish.contains("prepare_rank_lane("));
+        let copy_src = include_str!("mesh_rank_copy.rs");
+        let helper = |name: &str| {
+            let head = format!("pub(crate) fn {name}(");
+            let start = copy_src
+                .find(&head)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            let rest = &copy_src[start..];
+            &rest[..rest.find("\n}\n").expect("fn end")]
+        };
+        let prepare = helper("prepare_rank_lane");
         assert!(
-            publish.contains("publish_lane_window(") && !publish.contains("prepare_lane_window(")
+            prepare.contains("prepare_lane_window_with(")
+                && !prepare.contains("publish_lane_window(")
         );
-        let prepare = fn_body(LANES_SRC, "prepare_lane_window");
+        let publish = helper("publish_rank_lane");
+        assert!(
+            publish.contains("publish_lane_window(") && !publish.contains("prepare_lane_window")
+        );
+        let prepare = fn_body(LANES_SRC, "prepare_lane_window_with");
         assert!(prepare.contains("prepare_native_window("));
         assert!(!prepare.contains("publish_native_window("));
+        let wrapper = fn_body(LANES_SRC, "prepare_lane_window");
+        assert!(
+            wrapper.contains("prepare_lane_window_with(") && wrapper.contains("LaneFinish::NATIVE")
+        );
     }
 
     #[test]

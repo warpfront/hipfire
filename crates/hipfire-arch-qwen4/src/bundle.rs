@@ -4483,9 +4483,40 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
+        self.stage_lanes_with_copy(gpu, max_lanes, row_budget, spec, None)
+    }
+
+    /// [`Self::stage_lanes`] with the opt-in copy lane (lab/oracle only; the
+    /// default staging passes `None` and is unchanged): every lane's verify
+    /// rows and ring widen to `1 + max(k, take cap)`, each lane gets
+    /// `copy.head_lag_rows` owed head rows of storage and the root plans copy
+    /// windows, forced advances and retired-lane head lag
+    /// ([`crate::mesh_rank_copy`]). Single card only: the EP adapter and the
+    /// PP bands refuse copy at preflight until they call the same rank
+    /// helper. Refused without MTP lanes or with CPU-spliced experts.
+    pub fn stage_lanes_with_copy(
+        &mut self,
+        gpu: &mut Gpu,
+        max_lanes: usize,
+        row_budget: usize,
+        spec: Option<crate::lane::LaneSpecConfig>,
+        copy: Option<crate::lane::LaneCopyConfig>,
+    ) -> Result<(), BundleError> {
         self.pp_refuse("continuous-batch lanes")?;
         if self.ep.is_some() {
+            if copy.is_some() {
+                return Err(BundleError::Forward(
+                    "Qwen4 copy lanes are single-card only: the EP lane adapter does not run copy windows yet"
+                        .to_string(),
+                ));
+            }
             return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec);
+        }
+        if copy.is_some() && (spec.is_none() || self.has_cpu_deferred_experts()) {
+            return Err(BundleError::Forward(
+                "Qwen4 copy lanes need MTP lanes and a load without CPU-spliced experts"
+                    .to_string(),
+            ));
         }
         if self.lanes.is_some() {
             return Err(BundleError::Forward(
@@ -4535,8 +4566,9 @@ impl Qwen4Bundle {
             let chunk = self.spec_chunk_rows().unwrap_or(1).max(1);
             self.ensure_spec_hidden(gpu, (spec.k + 1).max(chunk))?;
         }
-        let store = crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget, spec)
-            .map_err(BundleError::Forward)?;
+        let store =
+            crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget, spec, copy)
+                .map_err(BundleError::Forward)?;
         self.lanes = Some(store);
         Ok(())
     }

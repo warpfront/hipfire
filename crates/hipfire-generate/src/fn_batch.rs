@@ -689,11 +689,11 @@ fn plan_step(
             LaneStatus::Decoding if chosen.contains(&slot) => {
                 let position = lane.state.position;
                 match drafts.iter().find(|d| d.epoch == epoch) {
-                    Some(LaneDraft {
-                        route: LaneRoute::Batched { .. },
-                        drafts,
-                        ..
-                    }) => {
+                    // A batched window, or (a copy-armed store only) any
+                    // window that carries the root's copy candidates.
+                    Some(LaneDraft { route, drafts, .. })
+                        if matches!(route, LaneRoute::Batched { .. }) || !drafts.is_empty() =>
+                    {
                         if drafts.is_empty() {
                             return Err("qwen4 batched lane window drafted no tokens".into());
                         }

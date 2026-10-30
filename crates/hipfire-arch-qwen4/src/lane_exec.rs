@@ -105,7 +105,9 @@ use crate::lane::{
     StepParts,
 };
 use crate::lane_rank::{plan_and_draft, DecodeAdmission, LaneProto, LocalLaneRank};
-use crate::mesh_lane_protocol::{ControllerInterval, GreedyRule, LaneMeshExecutor};
+use crate::mesh_lane_protocol::{
+    ConfirmOutcome, ControllerInterval, GreedyRule, LaneMeshExecutor, ProposalSource,
+};
 use crate::mtp_lanes::prefill_tile;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, StepOutput,
@@ -204,6 +206,11 @@ struct WindowView<'a> {
     position: usize,
     seed: u32,
     drafts: &'a [u32],
+    /// The window may verify more than one row: a native route, a copy
+    /// window (any route: it overrides it) or a forced advance.
+    verify: bool,
+    /// An emitter-forced advance (its one-row form is an `Ar` request).
+    forced: bool,
 }
 
 /// What plan validation reads of an MTP lane.
@@ -235,6 +242,8 @@ pub(crate) fn view_of(lane: &Qwen4LaneState) -> LaneView<'_> {
                 position: w.position,
                 seed: w.seed,
                 drafts: &w.drafts,
+                verify: crate::mesh_rank_copy::verify_capable(w.route, w.source, w.forced),
+                forced: w.forced,
             }),
         }),
     }
@@ -333,7 +342,9 @@ pub(crate) fn validate_plan<'a>(
                             r.epoch
                         )
                     })?;
-                    if !matches!(window.route, LaneRoute::ArSynced | LaneRoute::ArRetired) {
+                    if !matches!(window.route, LaneRoute::ArSynced | LaneRoute::ArRetired)
+                        && !window.forced
+                    {
                         return Err(format!(
                             "provision_step: AR row for MTP lane {:?} whose window is routed {:?}",
                             r.epoch, window.route
@@ -377,9 +388,9 @@ pub(crate) fn validate_plan<'a>(
                         r.epoch
                     )
                 })?;
-                if !matches!(window.route, LaneRoute::Batched { .. }) {
+                if !window.verify {
                     return Err(format!(
-                        "provision_step: Verify rows for MTP lane {:?} whose window is routed {:?}, not Batched",
+                        "provision_step: Verify rows for MTP lane {:?} whose window is routed {:?}, not Batched, copy or forced",
                         r.epoch, window.route
                     ));
                 }
@@ -551,25 +562,46 @@ impl Qwen4LaneExecutor<'_> {
     /// drafts allowed this window; 0 = AR) and run the step-synchronous
     /// batched draft for the `Batched` ones (one D2H per draft step for all
     /// lanes). Must precede `provision_step` whenever the plan holds an MTP
-    /// lane's decode row, and every listed lane must then be planned:
-    /// `Verify` for a `Batched` window (its kept drafts), `Ar` for the
-    /// others. Non-spec lanes answer `Ar`. A failure poisons every listed
-    /// lane.
+    /// lane's decode row, and every listed lane must then be planned: a lane
+    /// whose returned [`LaneDraft`] carries drafts is `Verify` (a `Batched`
+    /// window's kept drafts, or, on a copy-armed store, the root's copy
+    /// candidates, whatever the route), the others `Ar`. Non-spec lanes
+    /// answer `Ar`. A failure poisons every listed lane.
     pub fn draft_step(
         &mut self,
         gpu: &mut Gpu,
         requests: &[(RequestEpoch, usize)],
     ) -> Result<Vec<LaneDraft>, String> {
+        self.draft_step_forced(gpu, requests, &[])
+    }
+
+    /// [`Self::draft_step`] with emitter-forced advances: each `(epoch,
+    /// tokens)` of `forced` (a subset of `requests`, `1..=` the store's
+    /// verify rows tokens) is a forced window: rows `[seed, f1..f_{n-1}]`,
+    /// all consumed, no sampling and no RNG, the head (live or lagging)
+    /// teacher-forced exactly as the singleton's forced advance does, and
+    /// `f_n` the next pending seed. The lane's [`LaneDraft`] carries
+    /// `f1..f_{n-1}` (`Verify`; an `Ar` row for `n == 1`). Single card only.
+    pub fn draft_step_forced(
+        &mut self,
+        gpu: &mut Gpu,
+        requests: &[(RequestEpoch, usize)],
+        forced: &[(RequestEpoch, Vec<u32>)],
+    ) -> Result<Vec<LaneDraft>, String> {
         if self.bundle.ep.is_some() {
+            if !forced.is_empty() {
+                return Err("draft_step_forced: forced advances are single-card only".to_string());
+            }
             return self.bundle.ep_lane_draft_step(gpu, requests);
         }
-        self.draft_step_local(gpu, requests)
+        self.draft_step_local(gpu, requests, forced)
     }
 
     fn draft_step_local(
         &mut self,
         gpu: &mut Gpu,
         requests: &[(RequestEpoch, usize)],
+        forced: &[(RequestEpoch, Vec<u32>)],
     ) -> Result<Vec<LaneDraft>, String> {
         let mut store = self
             .bundle
@@ -579,7 +611,7 @@ impl Qwen4LaneExecutor<'_> {
         let result = match store.phase.check_draft() {
             Ok(()) => {
                 store.step_started = Some(Instant::now());
-                let drafted = plan_and_draft(self.bundle, gpu, &mut store, requests);
+                let drafted = plan_and_draft(self.bundle, gpu, &mut store, requests, forced);
                 if drafted.is_err() {
                     let epochs: Vec<RequestEpoch> = requests.iter().map(|(e, _)| *e).collect();
                     for epoch in &epochs {
@@ -854,7 +886,7 @@ fn provision_inner(
         .collect();
     if store.spec().is_none() && !decode.is_empty() && !store.proto_mut()?.has_flight() {
         let requests: Vec<(RequestEpoch, usize)> = decode.iter().map(|e| (*e, 0)).collect();
-        plan_and_draft(bundle, gpu, store, &requests)?;
+        plan_and_draft(bundle, gpu, store, &requests, &[])?;
     }
     check_sealed(plan, store.proto_mut()?)?;
     for (r, &end) in plan.requests.iter().zip(ends) {
@@ -865,12 +897,11 @@ fn provision_inner(
             .ensure_mapped_capacity(gpu, end)
             .map_err(|e| format!("provision_step: map {end} positions for {:?}: {e}", r.epoch))?;
         if let Some(spec) = lane.spec.as_mut() {
-            // A retired lane's head lags the trunk and is never touched.
-            let retired = spec
-                .window
-                .as_ref()
-                .is_some_and(|w| w.route == LaneRoute::ArRetired);
-            if !retired {
+            // A head-free (retired, no copy future) lane's head lags the
+            // trunk and is never touched; a lagging head (copy future) is
+            // mapped like a live one: its owed rows are appended at prepare.
+            let head_live = spec.window.as_ref().is_none_or(|w| w.head_live);
+            if head_live {
                 spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
                     format!(
                         "provision_step: map {end} head positions for {:?}: {e}",
@@ -959,7 +990,9 @@ fn forward_with_proto(
 
     // The decode rows: verify, decide, prepare (the protocol's phases).
     if decode_lanes > 0 {
-        let LaneProto { root, rank, flight } = &mut *proto;
+        let LaneProto {
+            root, rank, flight, ..
+        } = &mut *proto;
         let verify = flight
             .as_ref()
             .and_then(|f| f.verify.clone())
@@ -1213,7 +1246,9 @@ fn commit_with_proto(
     // Publish: the root applies the staged IDs/seeds/policy/RNG exactly once,
     // then the rank consumes its validated tickets.
     let published = if decode_requests > 0 {
-        let LaneProto { root, rank, flight } = &mut *proto;
+        let LaneProto {
+            root, rank, flight, ..
+        } = &mut *proto;
         let decision = flight
             .as_ref()
             .and_then(|f| f.decision.clone())
@@ -1253,10 +1288,17 @@ fn commit_with_proto(
                 .root
                 .merge_evidence(&[receipt], interval)
                 .map_err(|e| format!("commit_step: cost evidence: {e:?}"))?;
-            proto
-                .root
-                .settle_evidence(Some(&merged))
-                .map_err(|e| e.to_string())?;
+            // A step that held a copy window settles through the next
+            // `plan_window` (its shadow and warm-depth accounting live in
+            // the staged plan); any other price settles now, over every lane.
+            if proto.root.pending_prices_copy() {
+                proto.prior = Some(merged);
+            } else {
+                proto
+                    .root
+                    .settle_evidence(Some(&merged))
+                    .map_err(|e| e.to_string())?;
+            }
             let routes: Vec<(RequestEpoch, LaneRoute)> = proto
                 .flight
                 .as_ref()
@@ -1274,15 +1316,28 @@ fn commit_with_proto(
                     continue;
                 };
                 let stats = &mut spec.stats;
-                match route {
-                    LaneRoute::Batched { .. } => {
+                // Counted by the window's final source (a copy plan whose
+                // confirmation missed ran as native or AR).
+                match (d.source.source, route) {
+                    _ if d.forced => stats.forced_windows += 1,
+                    (ProposalSource::Copy, _) => {
+                        stats.copy_windows += 1;
+                        stats.copy_drafts += d.source.offered as u64;
+                        stats.copy_accepted += d.source.accepted as u64;
+                    }
+                    (ProposalSource::Native, _) => {
                         stats.windows += 1;
                         stats.drafts += d.source.offered as u64;
                         stats.accepted += d.source.accepted as u64;
                     }
-                    LaneRoute::ArSynced => stats.windows += 1,
-                    LaneRoute::ArRetired => stats.ar_windows += 1,
-                    LaneRoute::Ar => {}
+                    (ProposalSource::None, LaneRoute::ArSynced) => stats.windows += 1,
+                    (ProposalSource::None, LaneRoute::ArRetired) => stats.ar_windows += 1,
+                    (ProposalSource::None, _) => {}
+                }
+                match d.source.confirm {
+                    ConfirmOutcome::Confirmed => stats.copy_confirmed += 1,
+                    ConfirmOutcome::Missed => stats.copy_missed += 1,
+                    ConfirmOutcome::NotAsked => {}
                 }
                 stats.retired = retired;
             }
@@ -1532,6 +1587,8 @@ mod tests {
                             position: w.position,
                             seed: w.seed,
                             drafts: &w.drafts,
+                            verify: matches!(w.route, LaneRoute::Batched { .. }),
+                            forced: false,
                         }),
                     }),
                 })

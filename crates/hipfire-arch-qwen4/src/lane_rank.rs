@@ -42,7 +42,7 @@
 
 use crate::bundle::Qwen4Bundle;
 use crate::gpu_forward_lanes::{
-    forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, LANE_MAX_ROWS,
+    forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows,
 };
 use crate::lane::{
     download_lane_rows, lane_sample_step, LaneSampleOutcome, LaneSpec, LaneSpecConfig, LaneStatus,
@@ -50,16 +50,20 @@ use crate::lane::{
 };
 use crate::lane_exec::{pick_at, LaneDraft, LaneRoute};
 use crate::mesh_lane_protocol::{
-    CommitDecision, ControllerInterval, DraftProposal, DraftRound, LaneAdmission, LaneMeshExecutor,
-    LaneRequest, MeshRoot, MeshStepKey, OpCounts, PreparedReceipt, ProtocolError, RankCostEvidence,
-    RankDraftResult, RankError, RankOwnership, RankReady, RankSession, RankVerifyResult,
-    RootConfig, SamplerOutput, SamplingMode, StagePolicy, StepPhase, VerifyPlan, WindowBudgets,
-    WindowStart,
+    CommitDecision, ControllerInterval, DraftProposal, DraftRound, LaneAdmission, LaneKind,
+    LaneMeshExecutor, LaneRequest, MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts,
+    PreparedReceipt, ProtocolError, RankCostEvidence, RankDraftResult, RankError, RankOwnership,
+    RankReady, RankSession, RankVerifyResult, RootConfig, SamplerOutput, SamplingMode, StagePolicy,
+    StepPhase, VerifyPlan, WindowBudgets, WindowStart,
 };
-use crate::mtp_lanes::{
-    ar_synced_head, lane_call, prepare_lane_window, publish_lane_window, PendingWindow,
+use crate::mesh_rank_copy::{
+    arm_lane_verify, begin_lane_window, catch_up_lane, head_ticket_point, is_probe_op,
+    native_keep_cap, prepare_rank_lane, probe_outcome, publish_rank_lane, save_probe_state,
+    settle_probe, take_head_ticket, HeadTicketPoint, RankPrepare,
 };
+use crate::mtp_lanes::{lane_call, PendingWindow};
 use crate::mtp_spec::{draft_accept_estimate, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH};
+use hipfire_runtime::ngram_mod::NgramModConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::GreedyAccept;
 use rdna_compute::{Gpu, GpuTensor};
@@ -71,6 +75,12 @@ pub(crate) struct LaneProto {
     pub(crate) root: MeshRoot,
     pub(crate) rank: RankSession,
     pub(crate) flight: Option<LaneFlight>,
+    /// The store stages the opt-in copy lane (every spec admission arms it).
+    copy_armed: bool,
+    /// The merged price of a published step that held a copy window: it
+    /// settles through the next `plan_window` ([`MeshRoot::plan_window`]'s
+    /// prior evidence), never eagerly.
+    pub(crate) prior: Option<MergedCostEvidence>,
 }
 
 /// One step between `draft_step` and `commit_step`.
@@ -92,6 +102,8 @@ pub(crate) struct LaneFlight {
     /// Owed plus retained head rows the rank appended (the session's
     /// accounting of the decision).
     head_append_rows: usize,
+    /// Owed head rows the catch-ups of round 0 appended.
+    catch_up_rows: usize,
     pub(crate) decision: Option<CommitDecision>,
     /// The rank's receipt and the controller interval of the step.
     pub(crate) evidence: Option<(RankCostEvidence, ControllerInterval)>,
@@ -128,7 +140,10 @@ pub(crate) struct DecodeAdmission<'a> {
 }
 
 impl LaneProto {
-    pub(crate) fn new() -> Result<Self, String> {
+    /// The protocol of a store. `copy`: the n-gram config of the opt-in copy
+    /// lane ([`MeshRoot::with_copy_lane`]); `None` leaves copy off on every
+    /// lane (the default store).
+    pub(crate) fn new(copy: Option<NgramModConfig>) -> Result<Self, String> {
         let own = RankOwnership::single();
         let mut root = MeshRoot::new(
             own,
@@ -145,10 +160,17 @@ impl LaneProto {
         )
         .map_err(|e| format!("lane protocol root: {e}"))?;
         root.set_driver_terminates(true);
+        if let Some(ngram) = copy {
+            root = root
+                .with_copy_lane(ngram)
+                .map_err(|e| format!("lane protocol copy lane: {e}"))?;
+        }
         Ok(Self {
             root,
             rank: RankSession::new(own),
             flight: None,
+            copy_armed: copy.is_some(),
+            prior: None,
         })
     }
 
@@ -174,8 +196,10 @@ impl LaneProto {
             } else {
                 crate::mesh_lane_protocol::HeadState::Aligned
             },
-            // Copy stays off on the single-card lanes.
-            copy: false,
+            // The copy lane is opt-in per store (lab/oracle): a spec lane of
+            // a copy-armed store arms it, except a promoted request the
+            // floor already retired (it has no live head to confirm with).
+            copy: self.copy_armed && a.spec_k.is_some() && !retired,
             head_lag: Vec::new(),
         };
         let admit = match a.promoted {
@@ -204,6 +228,7 @@ impl LaneProto {
     /// Drop the in-flight step and forget the poisoned participants.
     pub(crate) fn discard(&mut self, participants: &[RequestEpoch]) {
         self.flight = None;
+        self.prior = None;
         let _ = self.root.discard_step(participants);
         let _ = self.rank.discard_step();
         for epoch in participants {
@@ -229,9 +254,11 @@ pub(crate) struct LocalLaneRank<'a> {
 }
 
 impl LocalLaneRank<'_> {
-    /// Mapping, head snapshots and the pending window of every lane, before
+    /// Mapping, head tickets and the pending window of every lane, before
     /// any draft (the capacity half of `begin_window`). A failure rejects the
-    /// whole step.
+    /// whole step. The device work of one lane is
+    /// [`crate::mesh_rank_copy::begin_lane_window`], shared with the EP/PP
+    /// ranks.
     fn preflight(&mut self, start: &WindowStart) -> Result<(), String> {
         let Self {
             bundle, gpu, store, ..
@@ -241,69 +268,19 @@ impl LocalLaneRank<'_> {
             let lane = store
                 .lane_mut(&epoch)
                 .ok_or_else(|| format!("draft_step: unknown or stale epoch {epoch:?}"))?;
-            let Qwen4LaneState { host, state, spec } = lane;
-            if host.status != LaneStatus::Decoding {
+            if lane.host.status != LaneStatus::Decoding {
                 return Err(format!(
                     "draft_step: lane {epoch:?} is {:?}, not Decoding",
-                    host.status
+                    lane.host.status
                 ));
             }
-            if host.pending_seed != Some(l.seed) || state.position != l.position {
+            if lane.host.pending_seed != Some(l.seed) || lane.state.position != l.position {
                 return Err(format!(
                     "draft_step: lane {epoch:?} (seed {:?}, position {}) disagrees with the root's plan (seed {}, position {})",
-                    host.pending_seed, state.position, l.seed, l.position
+                    lane.host.pending_seed, lane.state.position, l.seed, l.position
                 ));
             }
-            let Some(spec) = spec.as_mut() else {
-                continue;
-            };
-            if spec.window.is_some() {
-                return Err(format!(
-                    "draft_step: lane {epoch:?} has an unconsumed window (commit or abort the step first)"
-                ));
-            }
-            let position = state.position;
-            spec.window = Some(PendingWindow {
-                route: l.route,
-                position,
-                seed: l.seed,
-                drafts: Vec::new(),
-                steps: 0,
-                head_ticket: None,
-                target_ticket: None,
-                prepared: None,
-            });
-            let LaneRoute::Batched { k_max } = l.route else {
-                continue;
-            };
-            // I1: the head sits at the lane's frontier.
-            if state.position != spec.head.position() {
-                return Err(format!(
-                    "draft_step: lane {epoch:?} I1: trunk position {} != head position {}",
-                    state.position,
-                    spec.head.position()
-                ));
-            }
-            // The head's last draft step and its full-accept append reach
-            // `position + k_max`; the verify's rows end at the same bound.
-            let end = position
-                .checked_add(k_max + 1)
-                .ok_or_else(|| "draft_step: position overflow".to_string())?;
-            spec.head
-                .ensure_mapped_capacity(gpu, end)
-                .map_err(|e| format!("draft_step: map head arenas of {epoch:?}: {e}"))?;
-            state
-                .ensure_mapped_capacity(gpu, end)
-                .map_err(|e| format!("draft_step: map trunk arenas of {epoch:?}: {e}"))?;
-            let ticket = lane_call(bundle.with_lane(
-                state,
-                Some((&mut spec.head, &mut spec.draft)),
-                |b| b.mtp_snapshot(gpu),
-            ))
-            .map_err(|e| format!("draft_step: head snapshot of {epoch:?}: {e}"))?;
-            if let Some(window) = spec.window.as_mut() {
-                window.head_ticket = Some(crate::mtp_spec::HeadTicket::Local(ticket));
-            }
+            begin_lane_window(bundle, gpu, lane, l)?;
         }
         Ok(())
     }
@@ -319,6 +296,7 @@ impl LocalLaneRank<'_> {
     fn verify_device(
         &mut self,
         plan: &VerifyPlan,
+        forced: &[bool],
     ) -> Result<(Vec<Vec<u32>>, Vec<Option<GreedyAccept>>, usize), String> {
         let Self {
             bundle, gpu, store, ..
@@ -349,48 +327,13 @@ impl LocalLaneRank<'_> {
         }
         let dec_rows: Vec<usize> = plan.lanes.iter().map(|l| l.rows.len()).collect();
 
-        // Arm the ring, then take the target ticket, of every Verify lane.
+        // Arm the ring, then take the target ticket, of every Verify lane
+        // (native, copy and forced windows alike).
         for (vl, lane) in plan.lanes.iter().zip(lanes.iter_mut()) {
             if vl.rows.len() == 1 {
                 continue;
             }
-            let epoch = vl.key.request_epoch;
-            let rows = vl.rows.len();
-            let Qwen4LaneState { state, spec, .. } = &mut **lane;
-            let window = spec
-                .as_mut()
-                .and_then(|spec| spec.window.as_mut())
-                .ok_or_else(|| format!("Verify lane {epoch:?} has no window"))?;
-            if !matches!(window.route, LaneRoute::Batched { .. })
-                || window.seed != vl.rows[0]
-                || window.drafts != vl.rows[1..]
-                || window.position != state.position
-            {
-                return Err(format!("Verify lane {epoch:?} disagrees with its window"));
-            }
-            if window.target_ticket.is_some() {
-                return Err(format!(
-                    "Verify lane {epoch:?} already holds a target ticket"
-                ));
-            }
-            if state.row_capture_rows() < rows {
-                return Err(format!(
-                    "Verify lane {epoch:?}: the ring holds {} rows, the verify needs {rows}",
-                    state.row_capture_rows()
-                ));
-            }
-            // Armed before the snapshot: the GDN states then need no copy.
-            state.row_capture_armed = true;
-            let ticket = lane_call(bundle.with_lane(state, None, |b| b.snapshot(gpu)));
-            match ticket {
-                Ok(ticket) => {
-                    window.target_ticket = Some(crate::mtp_spec::TargetTicket::Local(ticket))
-                }
-                Err(error) => {
-                    state.row_capture_armed = false;
-                    return Err(format!("target snapshot of {epoch:?}: {error}"));
-                }
-            }
+            arm_lane_verify(bundle, gpu, &mut **lane, vl)?;
         }
 
         // One exact trunk step over every decode row, in plan order.
@@ -439,12 +382,13 @@ impl LocalLaneRank<'_> {
         let mut picks: Vec<Vec<u32>> = Vec::with_capacity(plan.lanes.len());
         let mut naive: Vec<Option<GreedyAccept>> = Vec::with_capacity(plan.lanes.len());
         let mut first = 0usize;
-        for (vl, lane) in plan.lanes.iter().zip(lanes.iter_mut()) {
+        for (i, (vl, lane)) in plan.lanes.iter().zip(lanes.iter_mut()).enumerate() {
             let rows = vl.rows.len();
             let mut lane_picks: Vec<u32> =
                 (0..rows).map(|j| pick_at(top1_host, first + j)).collect();
             let mut window = None;
-            if lane.host.sampling.is_some() {
+            // A forced advance draws nothing: no sampling, no RNG.
+            if lane.host.sampling.is_some() && !forced[i] {
                 let drafts = (rows > 1).then(|| &vl.rows[1..]);
                 let gpu_ref: &Gpu = gpu;
                 let logits_ref: &GpuTensor = logits;
@@ -502,6 +446,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                 naive: Vec::new(),
                 row_groups: 0,
                 head_append_rows: 0,
+                catch_up_rows: 0,
                 decision: None,
                 evidence: None,
                 publish_error: None,
@@ -527,6 +472,54 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         let flight = flight
             .as_mut()
             .ok_or_else(|| rank_error("no lane step in flight"))?;
+        // Round 0: the plan's owed-row catch-ups run before any Draft op, and
+        // the head tickets that follow a catch-up are taken right after it
+        // (the ticket is the head as the catch-up left it).
+        let mut catch_rows = 0usize;
+        if !round.catch_up.is_empty() {
+            let epochs: Vec<RequestEpoch> = round
+                .catch_up
+                .iter()
+                .map(|(key, _)| key.request_epoch)
+                .collect();
+            let (mut lanes, _) = store.draft_parts(&epochs).map_err(rank_error)?;
+            for ((key, catch_up), lane) in round.catch_up.iter().zip(lanes.iter_mut()) {
+                catch_rows +=
+                    catch_up_lane(bundle, gpu, &mut **lane, catch_up).map_err(rank_error)?;
+                let plan = flight
+                    .start
+                    .lanes
+                    .iter()
+                    .find(|l| l.key == *key)
+                    .ok_or_else(|| rank_error("catch-up for a lane outside the plan"))?;
+                if head_ticket_point(plan) == HeadTicketPoint::AfterCatchUp {
+                    take_head_ticket(bundle, gpu, &mut **lane).map_err(rank_error)?;
+                }
+            }
+        }
+        if catch_rows != result.catch_up_rows {
+            return Err(rank_error(format!(
+                "the rank appended {catch_rows} owed head rows, the round scheduled {}",
+                result.catch_up_rows
+            )));
+        }
+        flight.catch_up_rows += catch_rows;
+        if round.ops.is_empty() {
+            result.proposals = Some(Vec::new());
+            return Ok(result);
+        }
+        let plan_of: Vec<usize> = round
+            .ops
+            .iter()
+            .map(|op| {
+                flight
+                    .start
+                    .lanes
+                    .iter()
+                    .position(|l| l.key == op.key)
+                    .ok_or_else(|| rank_error("draft op for a lane outside the plan"))
+            })
+            .collect::<Result<_, _>>()?;
         let epochs: Vec<RequestEpoch> = round.ops.iter().map(|o| o.key.request_epoch).collect();
         let (mut lanes, spec_store) = store.draft_parts(&epochs).map_err(rank_error)?;
         let spec_store = spec_store
@@ -534,6 +527,11 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         let slot_bytes = Gpu::TOPK8_OUT_BYTES;
         // Every still-drafting lane enqueues its draft step, in plan order.
         for (slot, (op, lane)) in round.ops.iter().zip(lanes.iter_mut()).enumerate() {
+            // The confirmation probe's Draft is abandoned on a hit: save the
+            // head's request state it is about to move.
+            if is_probe_op(&flight.start.lanes[plan_of[slot]], op.position) {
+                save_probe_state(&mut **lane);
+            }
             let Qwen4LaneState { state, spec, .. } = &mut **lane;
             let spec = spec
                 .as_mut()
@@ -573,30 +571,42 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         let mut proposals = Vec::with_capacity(round.ops.len());
         for (slot, (op, lane)) in round.ops.iter().zip(lanes.iter_mut()).enumerate() {
             let top = &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
-            let i = flight
-                .start
-                .lanes
-                .iter()
-                .position(|l| l.key == op.key)
-                .ok_or_else(|| rank_error("draft op for a lane outside the plan"))?;
-            let k_max = flight.start.lanes[i].max_depth;
-            let Qwen4LaneState { state, spec, .. } = &mut **lane;
-            let spec = spec
+            let i = plan_of[slot];
+            let plan = &flight.start.lanes[i];
+            let k_max = native_keep_cap(plan);
+            let (token, margin) = {
+                let Qwen4LaneState { state, spec, .. } = &mut **lane;
+                let spec = spec
+                    .as_mut()
+                    .ok_or_else(|| rank_error("draft_step: drafting lane lost its MTP state"))?;
+                let LaneSpec { head, draft, .. } = spec;
+                lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+                    let token = b.mtp_draft_finish(top)?;
+                    Ok::<_, crate::bundle::BundleError>((token, b.mtp_draft_margin()))
+                }))
+                .map_err(|e| rank_error(format!("draft_step: draft finish {}: {e}", round.round)))?
+            };
+            // The probe: the head's argmax at the seed against the first
+            // candidate (the root's own rule). A hit, or a miss with no
+            // native route, abandons the probe's head step.
+            if is_probe_op(plan, op.position) {
+                let outcome = probe_outcome(&plan.copy_drafts, token, plan.native_depth);
+                settle_probe(bundle, gpu, &mut **lane, outcome).map_err(rank_error)?;
+                if outcome.restores_head() {
+                    proposals.push(DraftProposal {
+                        key: op.key,
+                        token,
+                        keep_going: false,
+                        drop_last: false,
+                        read: None,
+                    });
+                    continue;
+                }
+            }
+            let window = lane
+                .spec
                 .as_mut()
-                .ok_or_else(|| rank_error("draft_step: drafting lane lost its MTP state"))?;
-            let LaneSpec {
-                head,
-                draft,
-                window,
-                ..
-            } = spec;
-            let (token, margin) = lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                let token = b.mtp_draft_finish(top)?;
-                Ok::<_, crate::bundle::BundleError>((token, b.mtp_draft_margin()))
-            }))
-            .map_err(|e| rank_error(format!("draft_step: draft finish {}: {e}", round.round)))?;
-            let window = window
-                .as_mut()
+                .and_then(|s| s.window.as_mut())
                 .ok_or_else(|| rank_error("draft_step: window vanished"))?;
             let j = op.position - window.position;
             // The singleton's early stop, statement for statement.
@@ -628,7 +638,14 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
 
     fn run_verify(&mut self, plan: &VerifyPlan) -> Result<RankVerifyResult, RankError> {
         let mut result = self.session.on_verify(plan)?;
-        let (picks, naive, row_groups) = self.verify_device(plan).map_err(rank_error)?;
+        let forced: Vec<bool> = self
+            .flight_mut()?
+            .start
+            .lanes
+            .iter()
+            .map(|l| matches!(l.kind, LaneKind::Forced(_)))
+            .collect();
+        let (picks, naive, row_groups) = self.verify_device(plan, &forced).map_err(rank_error)?;
         if row_groups != plan.ledger.row_groups {
             return Err(rank_error(format!(
                 "the forward ran {row_groups} row groups, the sealed plan {}",
@@ -675,62 +692,63 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         } = store.step_parts(&epochs).map_err(rank_error)?;
         let hidden: Option<&GpuTensor> = spec.as_ref().map(|s| &s.hidden);
         let mut first = 0usize;
+        // Head rows the rank appended: round 0's catch-ups plus every lane's
+        // prepare schedule; the session's receipt counts the decision's.
+        let mut head_rows = flight.catch_up_rows;
         for (i, (d, lane)) in decision.lanes.iter().zip(lanes.iter_mut()).enumerate() {
             let vl = &verify.lanes[i];
             let rows = vl.rows.len();
             let epoch = vl.key.request_epoch;
             let lane_picks = &flight.picks[i];
-            let route = flight.start.lanes[i].route;
+            let plan = &flight.start.lanes[i];
             if lane.spec.is_some() {
-                if rows > 1 {
-                    let config = spec_config
-                        .ok_or_else(|| rank_error("Verify row in a store without MTP lanes"))?;
-                    let hidden =
-                        hidden.ok_or_else(|| rank_error("Verify row without a hidden capture"))?;
-                    let prepared = prepare_lane_window(
-                        bundle,
-                        gpu,
-                        &mut *lane,
+                let config = spec_config
+                    .ok_or_else(|| rank_error("MTP lane in a store without MTP lanes"))?;
+                let hidden =
+                    hidden.ok_or_else(|| rank_error("MTP lane without a hidden capture"))?;
+                let prepared = prepare_rank_lane(
+                    bundle,
+                    gpu,
+                    &mut *lane,
+                    RankPrepare {
+                        plan,
+                        decision: d,
+                        verify: vl,
                         config,
                         hidden,
-                        first,
-                        lane_picks,
+                        row_begin: first,
+                        picks: lane_picks,
                         skip_rollback,
-                    )
-                    .map_err(rank_error)?;
-                    let window = &prepared.result;
-                    if window.committed != d.emitted || window.accepted != d.accepted {
+                    },
+                )
+                .map_err(rank_error)?;
+                head_rows += prepared.head_rows;
+                if let Some(naive) = &flight.naive[i] {
+                    if d.emitted != naive.committed || d.accepted != naive.accepted {
                         return Err(rank_error(format!(
-                            "Verify lane {epoch:?}: the window finished {:?} (accepted {}) but the root decided {:?} (accepted {})",
-                            window.committed, window.accepted, d.emitted, d.accepted
+                            "sampled Verify lane {epoch:?}: the root decided {:?} (accepted {}) \
+                             but the naive window is {:?} (accepted {})",
+                            d.emitted, d.accepted, naive.committed, naive.accepted
                         )));
                     }
-                    if let Some(naive) = &flight.naive[i] {
-                        if window.committed != naive.committed || window.accepted != naive.accepted
-                        {
-                            return Err(rank_error(format!(
-                                "sampled Verify lane {epoch:?}: the finish committed {:?} (accepted {}) \
-                                 but the naive window is {:?} (accepted {})",
-                                window.committed, window.accepted, naive.committed, naive.accepted
-                            )));
-                        }
-                    }
-                    if let Some(w) = lane.spec.as_mut().and_then(|s| s.window.as_mut()) {
-                        w.prepared = Some(prepared);
-                    }
-                } else if route == LaneRoute::ArSynced {
-                    let hidden = hidden
-                        .ok_or_else(|| rank_error("ArSynced row without a hidden capture"))?;
-                    ar_synced_head(bundle, gpu, &mut *lane, hidden, first).map_err(rank_error)?;
+                }
+                if let Some(w) = lane.spec.as_mut().and_then(|s| s.window.as_mut()) {
+                    w.prepared = Some(prepared.lane);
                 }
             }
-            if rows == 1 && d.emitted != lane_picks[..1] {
+            if rows == 1 && !d.forced && d.emitted != lane_picks[..1] {
                 return Err(rank_error(format!(
                     "AR lane {epoch:?}: the root decided {:?}, the target picked {:?}",
                     d.emitted, lane_picks
                 )));
             }
             first += rows;
+        }
+        if head_rows != receipt.head_append_rows {
+            return Err(rank_error(format!(
+                "the rank appended {head_rows} head rows, the decision's schedule is {}",
+                receipt.head_append_rows
+            )));
         }
         flight.decision = Some(decision.clone());
         flight.head_append_rows = receipt.head_append_rows;
@@ -759,7 +777,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                 else {
                     continue;
                 };
-                if let Err(error) = publish_lane_window(bundle, gpu, lane, prepared) {
+                if let Err(error) = publish_rank_lane(bundle, gpu, lane, prepared) {
                     flight.publish_error.get_or_insert(error);
                 }
             }
@@ -838,12 +856,13 @@ pub(crate) fn plan_and_draft(
     gpu: &mut Gpu,
     store: &mut Qwen4LaneStore,
     requests: &[(RequestEpoch, usize)],
+    forced: &[(RequestEpoch, Vec<u32>)],
 ) -> Result<Vec<LaneDraft>, String> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
     let mut proto = store.take_proto()?;
-    let result = plan_and_draft_with(bundle, gpu, store, &mut proto, requests);
+    let result = plan_and_draft_with(bundle, gpu, store, &mut proto, requests, forced);
     store.put_proto(proto);
     result
 }
@@ -854,6 +873,7 @@ fn plan_and_draft_with(
     store: &mut Qwen4LaneStore,
     proto: &mut LaneProto,
     requests: &[(RequestEpoch, usize)],
+    forced: &[(RequestEpoch, Vec<u32>)],
 ) -> Result<Vec<LaneDraft>, String> {
     let mut order: Vec<(usize, RequestEpoch, usize, SamplingMode)> =
         Vec::with_capacity(requests.len());
@@ -883,26 +903,45 @@ fn plan_and_draft_with(
     // already folded in): `budget + 1` tokens and positions remain.
     let lane_requests: Vec<LaneRequest> = order
         .iter()
-        .map(|&(_, epoch, budget, sampling)| LaneRequest {
-            epoch,
-            remaining: budget + 1,
-            context_left: budget + 1,
-            forced: None,
-            sampling,
+        .map(|&(_, epoch, budget, sampling)| {
+            let forced = forced
+                .iter()
+                .find(|(e, _)| *e == epoch)
+                .map(|(_, tokens)| tokens.clone());
+            // A forced advance verifies its own `n` rows (`n` tokens and
+            // positions remain at least).
+            let left = forced.as_ref().map_or(0, Vec::len).max(budget + 1);
+            LaneRequest {
+                epoch,
+                remaining: left,
+                context_left: left,
+                forced,
+                sampling,
+            }
         })
         .collect();
+    let copy = store.copy();
+    let verify_rows = store.verify_rows_per_lane();
     let budgets = WindowBudgets {
         max_lanes: store.max_lanes(),
-        verify_rows_per_lane: LANE_MAX_ROWS,
-        max_rows: store.max_lanes() * LANE_MAX_ROWS,
-        copy_take_cap: 0,
+        verify_rows_per_lane: verify_rows,
+        max_rows: store.max_lanes() * verify_rows,
+        copy_take_cap: copy.map_or(0, |c| c.take_cap),
         lab: store.routes(),
         pp_microbatch_lanes: None,
-        head_lag_rows: 0,
+        head_lag_rows: copy.map_or(0, |c| c.config.head_lag_rows),
     };
-    let LaneProto { root, rank, flight } = &mut *proto;
+    let LaneProto {
+        root,
+        rank,
+        flight,
+        prior,
+        ..
+    } = &mut *proto;
+    // The price of a published copy window settles here (never eagerly).
+    let prior_evidence = prior.take();
     let start = root
-        .plan_window(None, &lane_requests, &budgets)
+        .plan_window(prior_evidence.as_ref(), &lane_requests, &budgets)
         .map_err(|e| format!("draft_step: {e}"))?;
     let mut exec = LocalLaneRank {
         bundle,
@@ -944,11 +983,10 @@ fn plan_and_draft_with(
             .position(|l| &l.key.request_epoch == epoch)
             .ok_or_else(|| format!("draft_step: {epoch:?} is not in the plan"))?;
         let route = start.lanes[i].route;
-        let drafts = match route {
-            LaneRoute::Batched { .. } => sealed.lanes[i].rows[1..].to_vec(),
-            _ => Vec::new(),
-        };
-        if matches!(route, LaneRoute::Batched { .. }) {
+        // The sealed rows after the seed are the window's proposals whatever
+        // their source: native drafts, copy candidates, forced tokens.
+        let drafts = sealed.lanes[i].rows[1..].to_vec();
+        if !drafts.is_empty() {
             let window = exec
                 .store
                 .lane_mut(epoch)
@@ -976,7 +1014,7 @@ mod tests {
     //! singleton lane route (per-lane policy + pooled cost model observed at
     //! the end of each forward) decided.
     use super::*;
-    use crate::gpu_forward_lanes::row_group_count;
+    use crate::gpu_forward_lanes::{row_group_count, LANE_MAX_ROWS};
     use crate::lane::LabRoutes;
     use crate::mesh_lane_protocol::scripted::{FailAt, Script, ScriptedExecutor, WindowScript};
     use crate::mesh_lane_protocol::{

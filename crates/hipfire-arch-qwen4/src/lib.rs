@@ -72,6 +72,9 @@ pub mod mesh_bindings;
 pub mod mesh_lane_copy;
 /// Host-only speculative-window transaction of the multicard lanes (EP2/PP2).
 pub mod mesh_lane_protocol;
+/// Rank-side device helper of copy windows, forced advances, head lag,
+/// catch-up and copy confirmation (single card, EP and PP ranks share it).
+pub(crate) mod mesh_rank_copy;
 pub mod mesh_tp;
 pub mod mtp_gpu;
 pub mod mtp_lanes;
