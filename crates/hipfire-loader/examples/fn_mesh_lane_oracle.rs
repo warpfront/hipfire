@@ -855,9 +855,17 @@ struct LocalLanes<'a> {
 impl LaneBackend for LocalLanes<'_> {
     fn stage(&mut self, max_lanes: usize, row_budget: usize) -> R<()> {
         self.gpu.bind_thread().map_err(e)?;
+        let before = self.gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
         self.bundle
             .stage_lanes(self.gpu, max_lanes, row_budget, None)
-            .map_err(e)
+            .map_err(e)?;
+        let after = self.gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
+        eprintln!(
+            "[{TOOL}] lane stage (AR) consumed {} MiB on rank 0 ({} MiB free after)",
+            before.saturating_sub(after) >> 20,
+            after >> 20
+        );
+        Ok(())
     }
 
     fn stage_policy(&self) -> R<LaneStagePolicy> {
@@ -1771,6 +1779,14 @@ fn merged_json(m: &hipfire_arch_qwen4::mesh_lane_protocol::MergedCostEvidence) -
     })
 }
 
+fn median(v: &mut [f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    Some(v[v.len() / 2])
+}
+
 struct MtpKRun {
     run: KRun,
     windows: Vec<Value>,
@@ -1898,6 +1914,8 @@ fn drive_mtp_inner(
     };
     let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
     let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
+    let (mut ev_wall, mut ev_crit, mut ev_ex, mut ev_head, mut ev_bytes, mut ev_priced) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::<bool>::new());
     let (mut total_windows, mut total_offered, mut total_accepted, mut total_emitted) =
         (0u64, 0u64, 0u64, 0u64);
     loop {
@@ -2046,6 +2064,12 @@ fn drive_mtp_inner(
             }));
         }
         if let Some(prior) = mesh.last_evidence() {
+            ev_wall.push(prior.wall_us);
+            ev_crit.push(prior.critical_path_us);
+            ev_ex.push(prior.counts.target_exchanges as f64);
+            ev_head.push(prior.counts.head_draft_calls as f64);
+            ev_bytes.push(prior.counts.gather_bytes as f64);
+            ev_priced.push(prior.priced);
             windows.push(json!({
                 "k": k, "kind": "evidence-of-previous-step",
                 "prior_priced": report.prior_priced,
@@ -2079,6 +2103,14 @@ fn drive_mtp_inner(
         // Accepted drafts per window (the wire `tau`) and emitted per window.
         "tau": if total_windows > 0 { total_accepted as f64 / total_windows as f64 } else { 0.0 },
         "yield": if total_windows > 0 { total_emitted as f64 / total_windows as f64 } else { 0.0 },
+        // Merged rank evidence of the priced steps (median over steps).
+        "evidence_steps": ev_wall.len(),
+        "evidence_priced_steps": ev_priced.iter().filter(|p| **p).count(),
+        "step_wall_us_median": median(&mut ev_wall.clone()),
+        "step_critical_path_us_median": median(&mut ev_crit.clone()),
+        "target_exchanges_median": median(&mut ev_ex.clone()),
+        "head_draft_calls_median": median(&mut ev_head.clone()),
+        "gather_bytes_median": median(&mut ev_bytes.clone()),
         "per_lane": lanes.iter().map(|l| json!({
             "windows": l.windows, "offered": l.offered, "accepted": l.accepted,
         })).collect::<Vec<_>>(),
@@ -2121,6 +2153,7 @@ fn drive_mtp_ep(
         return Err("--logits is not available with --spec mtp (verify rows are not AR rows)".into());
     }
     gpu.bind_thread().map_err(e)?;
+    let before = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
     bundle
         .stage_lanes(
             gpu,
@@ -2132,6 +2165,12 @@ fn drive_mtp_ep(
             }),
         )
         .map_err(e)?;
+    let after = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
+    eprintln!(
+        "[{TOOL}] lane stage (MTP k={depth}) consumed {} MiB on rank 0 ({} MiB free after)",
+        before.saturating_sub(after) >> 20,
+        after >> 20
+    );
     let mut mesh = EpMeshLanes::new(bundle, 1, routes == RoutesArg::Floor)?;
     let cfg = DriveCfg {
         prompts,

@@ -2884,14 +2884,30 @@ pub fn qwen4_ep_vram_layers(
             batch.spec_k,
         )
     });
-    Ok(hipfire_arch_qwen4::expert_residency::ep_vram_plan(
+    let mut plan = hipfire_arch_qwen4::expert_residency::ep_vram_plan(
         &config,
         free_per_rank,
         non_expert,
         layer_experts,
         reserve,
         lane,
-    ))
+    );
+    // Lab measurement knob: cap the resident MoE layers (every rank) to hold a
+    // placement fixed across arms with different lane reservations. Never
+    // raises the plan; unset in production.
+    if let Some(cap) = std::env::var("HIPFIRE_EP_LAB_RESIDENT_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if cap < plan.layers {
+            eprintln!(
+                "qwen4 EP lab: resident MoE layers capped {} -> {cap} (HIPFIRE_EP_LAB_RESIDENT_LAYERS)",
+                plan.layers
+            );
+            plan.layers = cap;
+        }
+    }
+    Ok(plan)
 }
 
 /// The AR-lane reservation a load's [`BatchLoadRequest`] asks of an
