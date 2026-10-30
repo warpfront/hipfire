@@ -1590,4 +1590,483 @@ mod tests {
         assert!(publish.contains("publish_lane_window("));
         assert!(!publish.contains("flush_owed_head_rows("));
     }
+
+    // ---- the rank's host model against the real root ---------------------------------
+
+    use crate::lane::LabRoutes;
+    use crate::mesh_lane_protocol::scripted::{Script, ScriptedExecutor, WindowScript};
+    use crate::mesh_lane_protocol::{
+        CommitDecision, GreedyRule, HeadEnd, LaneAdmission, LaneMeshExecutor, LaneRequest,
+        MeshRoot, RankOwnership, RootConfig, StagePolicy, WindowBudgets, WindowStart,
+    };
+    use crate::mtp_lanes::LaneSpecPolicy;
+    use hipfire_runtime::ngram_mod::NgramModConfig;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn epoch(tag: u64) -> RequestEpoch {
+        RequestEpoch {
+            request_tag: tag,
+            owner_generation: 1,
+        }
+    }
+
+    /// The rank's host-visible state of one lane: where its head stands and
+    /// which rows it owes (what the device does is pinned by source text and
+    /// the GPU gate; this is the arithmetic that drives it).
+    #[derive(Default)]
+    struct Sim {
+        head: usize,
+        lag_start: usize,
+        lag: Vec<u32>,
+    }
+
+    impl Sim {
+        fn flush(&mut self) -> usize {
+            let n = self.lag.len();
+            if n > 0 {
+                assert_eq!(
+                    self.head, self.lag_start,
+                    "the head stands at the lag start"
+                );
+                self.head += n;
+                self.lag.clear();
+            }
+            n
+        }
+    }
+
+    /// The facts of one driven window the tests assert on.
+    struct Driven {
+        start: WindowStart,
+        decision: CommitDecision,
+        rows: Vec<u32>,
+        prep: HeadPrepare,
+        steps: usize,
+        probe: Option<ProbeOutcome>,
+        catch_rows: usize,
+    }
+
+    struct Harness {
+        root: MeshRoot,
+        exec: ScriptedExecutor,
+        script: Rc<RefCell<Script>>,
+        sim: Sim,
+    }
+
+    const LAG_ROWS: usize = 4;
+
+    fn copy_cfg() -> NgramModConfig {
+        NgramModConfig {
+            capacity: 1 << 10,
+            n_match: 3,
+            n_min: 2,
+            n_max: 7,
+        }
+    }
+
+    fn cycle_prompt() -> Vec<u32> {
+        (20..80).chain(20..80).collect()
+    }
+
+    fn budgets() -> WindowBudgets {
+        WindowBudgets {
+            max_lanes: 8,
+            verify_rows_per_lane: 8,
+            max_rows: 64,
+            copy_take_cap: 7,
+            lab: LabRoutes::Batched,
+            pp_microbatch_lanes: None,
+            head_lag_rows: LAG_ROWS,
+        }
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let own = RankOwnership::single();
+            let root = MeshRoot::new(
+                own,
+                &[own],
+                RootConfig {
+                    topology_generation: 1,
+                    stage: StagePolicy {
+                        moe_layers: 0,
+                        moe_once: false,
+                        stream_bf16: false,
+                    },
+                    floor_enabled: false,
+                },
+            )
+            .unwrap()
+            .with_copy_lane(copy_cfg())
+            .unwrap();
+            let script = Rc::new(RefCell::new(Script::default()));
+            Self {
+                root,
+                exec: ScriptedExecutor::new(own, script.clone()),
+                script,
+                sim: Sim::default(),
+            }
+        }
+
+        fn admit(&mut self, position: usize, seed: u32, prompt: Vec<u32>, retired: bool) {
+            let e = epoch(1);
+            let a = self
+                .root
+                .admit_lane(LaneAdmission {
+                    epoch: e,
+                    position,
+                    seed,
+                    eos: None,
+                    rng_seed: 7,
+                    prompt,
+                    spec_k: Some(3),
+                    head: HeadState::Aligned,
+                    copy: true,
+                    head_lag: Vec::new(),
+                })
+                .unwrap();
+            self.exec.admit_lane(&a).unwrap();
+            if retired {
+                self.root.test_set_policy(
+                    e,
+                    LaneSpecPolicy::promoted_with_floor(
+                        3,
+                        &[hipfire_runtime::spec_economics::AGREEMENT_PRIOR; 3],
+                        true,
+                        false,
+                    ),
+                );
+            }
+            self.sim = Sim {
+                head: position,
+                ..Sim::default()
+            };
+        }
+
+        fn script(&self, seq: u64, drafts: &[u32], picks: &[u32]) {
+            self.script.borrow_mut().windows.insert(
+                (1, seq),
+                WindowScript {
+                    drafts: drafts.to_vec(),
+                    picks: picks.to_vec(),
+                    keep_going: Vec::new(),
+                    drop_last: Vec::new(),
+                },
+            );
+        }
+
+        /// One whole step of the lane, with the rank's host model applying
+        /// exactly what `prepare_rank_lane` / `run_draft_round` apply.
+        fn drive(&mut self, forced: Option<Vec<u32>>) -> Driven {
+            let e = epoch(1);
+            let req = LaneRequest {
+                epoch: e,
+                remaining: 99,
+                context_left: 99,
+                forced,
+                sampling: SamplingMode::Greedy,
+            };
+            let start = self.root.plan_window(None, &[req], &budgets()).unwrap();
+            let plan = start.lanes[0].clone();
+            let ready = self.exec.begin_window(&start);
+            self.root.collect_ready(&[ready]).unwrap();
+            // begin_lane_window: I1 against the plan.
+            if let Some(expect) = expected_head_position(&plan) {
+                assert_eq!(self.sim.head, expect, "the head stands where the plan says");
+            }
+            let mut steps = 0usize;
+            let mut probe = None;
+            let mut catch_rows = 0usize;
+            while let Some(round) = self.root.next_draft_round().unwrap() {
+                for (_, c) in &round.catch_up {
+                    assert_eq!(c.from, self.sim.lag_start);
+                    assert_eq!(
+                        c.tokens, self.sim.lag,
+                        "the rank holds the plan's owed rows"
+                    );
+                    catch_rows += self.sim.flush();
+                    assert_eq!(self.sim.head, plan.position);
+                    assert_eq!(head_ticket_point(&plan), HeadTicketPoint::AfterCatchUp);
+                }
+                let res = self.exec.run_draft_round(&round).unwrap();
+                assert_eq!(res.catch_up_rows, catch_rows);
+                let proposals = res.proposals.clone().unwrap();
+                for (op, prop) in round.ops.iter().zip(&proposals) {
+                    if is_probe_op(&plan, op.position) {
+                        let outcome =
+                            probe_outcome(&plan.copy_drafts, prop.token, plan.native_depth);
+                        probe = Some(outcome);
+                        steps = usize::from(!outcome.restores_head());
+                    } else {
+                        steps += 1;
+                    }
+                }
+                self.root.collect_draft(&round, &[res]).unwrap();
+            }
+            if steps > 0 {
+                // The draft steps advanced a head that stood at the window.
+                assert_eq!(self.sim.head, plan.position);
+                self.sim.head = plan.position + steps;
+            }
+            let sealed = self.root.seal_verify().unwrap();
+            let v = self.exec.run_verify(&sealed).unwrap();
+            self.root.collect_verify(&[v]).unwrap();
+            let decision = self.root.decide_commit(&mut GreedyRule).unwrap();
+            let d = decision.lanes[0].clone();
+            let rows = sealed.lanes[0].rows.clone();
+            // prepare_rank_lane's schedule over the rank's own record.
+            let prep = head_prepare(
+                plan.head,
+                rows.len(),
+                d.consumed_rows,
+                d.head_append,
+                steps,
+                self.sim.lag.len(),
+            )
+            .unwrap_or_else(|e| panic!("{e}: plan {plan:?} decision {d:?}"));
+            match prep {
+                HeadPrepare::TargetOnly => {}
+                HeadPrepare::OweRow => {
+                    if self.sim.lag.is_empty() {
+                        self.sim.lag_start = plan.position;
+                        assert_eq!(self.sim.head, plan.position, "the head is aligned");
+                    }
+                    assert_eq!(
+                        self.sim.lag_start + self.sim.lag.len(),
+                        plan.position,
+                        "the owed rows continue"
+                    );
+                    self.sim.lag.push(plan.seed);
+                }
+                HeadPrepare::SyncRow { owed } => {
+                    assert_eq!(self.sim.flush(), owed);
+                    assert_eq!(self.sim.head, plan.position);
+                    self.sim.head = plan.position + 1;
+                }
+                HeadPrepare::Window {
+                    owed,
+                    head_at_start: at_start,
+                } => {
+                    assert_eq!(self.sim.flush(), owed);
+                    // prepare_lane_window_with's own I1 and head_at_start checks.
+                    assert_eq!(self.sim.head, plan.position + steps);
+                    assert_eq!(at_start, steps == 0);
+                    self.sim.head = plan.position + d.consumed_rows;
+                }
+            }
+            let receipt = self.exec.prepare_commit(&decision).unwrap();
+            assert_eq!(
+                catch_rows + prepared_head_rows(prep, d.consumed_rows),
+                receipt.head_append_rows,
+                "the rank's rows are the decision's schedule"
+            );
+            self.root.collect_prepared(&[receipt]).unwrap();
+            self.root.publish_commit().unwrap();
+            self.exec.publish_commit(&decision);
+            // The root and the rank agree on the head afterwards.
+            let (state, owed) = self.root.head_state(e).unwrap();
+            match state {
+                HeadState::Aligned => {
+                    let (position, _) = self.root.lane_position(e).unwrap();
+                    assert!(self.sim.lag.is_empty() && owed.is_empty());
+                    assert_eq!(self.sim.head, position);
+                    assert_eq!(
+                        d.head_end,
+                        HeadEnd::Aligned { end: position },
+                        "the decision's head end"
+                    );
+                }
+                HeadState::Lag { from } => {
+                    assert_eq!(self.sim.lag_start, from);
+                    assert_eq!(self.sim.lag, owed);
+                    assert_eq!(self.sim.head, from, "an owing head is not touched");
+                }
+                HeadState::Free => assert_eq!(d.head_end, HeadEnd::Free),
+            }
+            Driven {
+                start,
+                decision,
+                rows,
+                prep,
+                steps,
+                probe,
+                catch_rows,
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_rank_copy_rank_model_follows_a_retired_lane_through_lag_catch_up_and_a_confirmed_takeover(
+    ) {
+        let mut h = Harness::new();
+        h.admit(30, 5, (1..=30).collect(), true);
+        // Three retired AR tokens owe their rows; the head is not touched.
+        for (seq, pick) in [6u32, 7, 8].into_iter().enumerate() {
+            h.script(seq as u64, &[], &[pick]);
+            let w = h.drive(None);
+            assert_eq!(w.prep, HeadPrepare::OweRow, "window {seq}");
+            assert_eq!(h.sim.lag.len(), seq + 1);
+        }
+        assert_eq!(h.sim.lag, vec![5, 6, 7]);
+        // The copy source takes the next window: catch-up first, then the
+        // probe confirms and the window finishes from the window's start.
+        h.script(3, &[9], &[9, 10, 11, 12, 13, 14, 15, 16]);
+        let w = h.drive(None);
+        assert_eq!(w.catch_rows, 3);
+        assert_eq!(w.probe, Some(ProbeOutcome::Confirmed));
+        assert_eq!(w.steps, 0, "the abandoned probe is not a step in effect");
+        let consumed = w.decision.lanes[0].consumed_rows;
+        assert_eq!(
+            w.prep,
+            HeadPrepare::Window {
+                owed: 0,
+                head_at_start: true
+            }
+        );
+        assert_eq!(w.rows.len(), 1 + w.decision.lanes[0].source.offered);
+        assert_eq!(h.sim.head, 33 + consumed);
+        assert!(h.sim.lag.is_empty());
+    }
+
+    #[test]
+    fn mesh_rank_copy_rank_model_a_missed_probe_owes_a_fresh_row_after_its_catch_up() {
+        let mut h = Harness::new();
+        h.admit(30, 5, (1..=30).collect(), true);
+        for (seq, pick) in [6u32, 7, 8].into_iter().enumerate() {
+            h.script(seq as u64, &[], &[pick]);
+            h.drive(None);
+        }
+        // The head's row-0 draft (777) is not the first candidate: an AR
+        // window that already caught up, so the head owes only this row.
+        h.script(3, &[777], &[501, 502]);
+        let w = h.drive(None);
+        assert_eq!(w.probe, Some(ProbeOutcome::MissedAr));
+        assert_eq!(w.steps, 0);
+        assert_eq!(w.catch_rows, 3);
+        assert_eq!(w.prep, HeadPrepare::OweRow);
+        assert_eq!((h.sim.lag_start, h.sim.lag.clone()), (33, vec![8]));
+    }
+
+    #[test]
+    fn mesh_rank_copy_rank_model_lag_flushes_at_capacity_with_the_row_that_fills_it() {
+        let mut h = Harness::new();
+        h.admit(30, 5, (1..=30).collect(), true);
+        let mut flushes = 0;
+        for seq in 0..9u64 {
+            // Never a repeated 3-gram: no copy proposal, pure lag growth.
+            h.script(seq, &[], &[1000 + seq as u32]);
+            let w = h.drive(None);
+            match w.prep {
+                HeadPrepare::OweRow => assert!(h.sim.lag.len() < LAG_ROWS),
+                HeadPrepare::SyncRow { owed } => {
+                    flushes += 1;
+                    assert_eq!(owed, LAG_ROWS - 1, "window {seq}");
+                    assert!(h.sim.lag.is_empty());
+                    assert_eq!(h.sim.head, w.start.lanes[0].position + 1);
+                }
+                other => panic!("window {seq}: {other:?}"),
+            }
+        }
+        assert_eq!(flushes, 2, "windows 3 and 7 fill the 4-row record");
+    }
+
+    #[test]
+    fn mesh_rank_copy_rank_model_live_lane_runs_native_confirmed_and_established_copy_windows() {
+        let mut h = Harness::new();
+        h.admit(120, 20, cycle_prompt(), false);
+        let (mut at_start, mut kept_row0, mut established) = (0, 0, 0);
+        let mut seen_probe = false;
+        for seq in 0..12u64 {
+            let (_, v) = h.root.lane_position(epoch(1)).unwrap();
+            let drafts: Vec<u32> = (1..=7).map(|i| v + i).collect();
+            let picks: Vec<u32> = (1..=8).map(|i| v + i).collect();
+            h.script(seq, &drafts, &picks);
+            let w = h.drive(None);
+            seen_probe |= w.probe.is_some();
+            let plan = &w.start.lanes[0];
+            if plan.source == ProposalSource::Copy && !plan.copy_confirm {
+                established += 1;
+                assert_eq!(w.steps, 0, "an established copy window runs no head Draft");
+            }
+            match w.prep {
+                HeadPrepare::Window { head_at_start, .. } => {
+                    if head_at_start {
+                        at_start += 1;
+                    } else {
+                        kept_row0 += 1;
+                    }
+                }
+                other => panic!("window {seq}: {other:?}"),
+            }
+        }
+        assert!(
+            seen_probe && established >= 1 && at_start >= 1,
+            "{at_start} {established}"
+        );
+        let _ = kept_row0;
+    }
+
+    #[test]
+    fn mesh_rank_copy_rank_model_a_missed_probe_continues_as_native_drafts() {
+        let mut h = Harness::new();
+        h.admit(120, 20, cycle_prompt(), false);
+        h.script(0, &[999, 998, 997], &[500, 501, 502, 503]);
+        let w = h.drive(None);
+        assert_eq!(w.probe, Some(ProbeOutcome::MissedNative));
+        assert_eq!(w.steps, 3, "the probe is the first native draft");
+        assert_eq!(
+            w.prep,
+            HeadPrepare::Window {
+                owed: 0,
+                head_at_start: false
+            }
+        );
+        assert_eq!(w.rows, vec![20, 999, 998, 997]);
+    }
+
+    #[test]
+    fn mesh_rank_copy_rank_model_forced_advances_realign_a_lagging_head_and_never_draw() {
+        // An aligned head: rows [seed, f1, f2], all consumed, appended from
+        // the start.
+        let mut h = Harness::new();
+        h.admit(120, 20, cycle_prompt(), false);
+        h.script(0, &[], &[1, 2, 3]);
+        let w = h.drive(Some(vec![41, 42, 43]));
+        assert_eq!(w.rows, vec![20, 41, 42]);
+        let d = &w.decision.lanes[0];
+        assert!(d.forced && d.consumed_rows == 3 && d.emitted == vec![41, 42, 43]);
+        assert_eq!(d.next_seed, 43);
+        assert_eq!(
+            w.prep,
+            HeadPrepare::Window {
+                owed: 0,
+                head_at_start: true
+            }
+        );
+        assert_eq!(h.sim.head, 123);
+        // One forced token is a single AR-style row the head keeps up with.
+        h.script(1, &[], &[9]);
+        let w = h.drive(Some(vec![44]));
+        assert_eq!(w.prep, HeadPrepare::SyncRow { owed: 0 });
+        // A lagging head: the owed rows flush first, then the forced rows.
+        let mut h = Harness::new();
+        h.admit(30, 5, (1..=30).collect(), true);
+        for (seq, pick) in [6u32, 7].into_iter().enumerate() {
+            h.script(seq as u64, &[], &[pick]);
+            assert_eq!(h.drive(None).prep, HeadPrepare::OweRow);
+        }
+        h.script(2, &[], &[1, 2, 3]);
+        let w = h.drive(Some(vec![71, 72, 73]));
+        assert_eq!(
+            w.prep,
+            HeadPrepare::Window {
+                owed: 2,
+                head_at_start: true
+            },
+            "owed rows ahead of the forced rows"
+        );
+        assert_eq!(h.sim.head, 32 + 3);
+        assert!(h.sim.lag.is_empty());
+    }
 }
