@@ -66,6 +66,8 @@ pub(crate) mod lane_token_ring;
 pub mod measured_identity;
 pub mod measured_resources;
 pub mod mesh_bindings;
+/// Host-only speculative-window transaction of the multicard lanes (EP2/PP2).
+pub mod mesh_lane_protocol;
 pub mod mesh_tp;
 pub mod mtp_gpu;
 pub mod mtp_lanes;
