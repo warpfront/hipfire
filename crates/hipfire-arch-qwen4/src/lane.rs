@@ -963,6 +963,23 @@ pub struct LaneSpecStats {
     pub forced_windows: u64,
 }
 
+/// Where a lane's head stands against its target and the root's record
+/// (lab: the oracle's head self-consistency check).
+#[cfg(feature = "lab")]
+#[derive(Clone, Debug)]
+pub struct LabHeadFacts {
+    /// The lane's head position (rows it holds).
+    pub head_position: usize,
+    /// The lane's target position.
+    pub target_position: usize,
+    /// Owed head rows the rank holds, and where they start.
+    pub owed_rows: usize,
+    pub owed_start: usize,
+    /// The root's record of the head: its state and the owed tokens.
+    pub root_head: crate::mesh_lane_protocol::HeadState,
+    pub root_owed: Vec<u32>,
+}
+
 /// Lab route modes of the store's window router.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LabRoutes {
@@ -2409,6 +2426,24 @@ impl Qwen4LaneStore {
             pending.iter().flat_map(|v| v.to_le_bytes()).collect(),
         ));
         Ok(items)
+    }
+
+    /// Where `epoch`'s head stands against its target and the root's record
+    /// (the oracle's head self-consistency check): `None` for an AR lane or an
+    /// unknown epoch.
+    #[cfg(feature = "lab")]
+    pub fn lab_head_facts(&self, epoch: &RequestEpoch) -> Option<LabHeadFacts> {
+        let (head_position, target_position, owed_rows, owed_start) =
+            crate::mesh_rank_copy::head_facts(self.lane(epoch)?)?;
+        let (root_head, root_owed) = self.proto.as_ref()?.root.head_state(*epoch)?;
+        Some(LabHeadFacts {
+            head_position,
+            target_position,
+            owed_rows,
+            owed_start,
+            root_head,
+            root_owed: root_owed.to_vec(),
+        })
     }
 
     /// Disjoint borrows of the `epochs` lanes (plan order) and the step

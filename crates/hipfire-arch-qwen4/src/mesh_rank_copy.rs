@@ -1077,6 +1077,7 @@ pub(crate) fn publish_rank_lane(
 
 /// The head's lab-readable consistency facts of one lane, for the oracle:
 /// (head position, target position, owed rows held, owed-record start).
+#[cfg(feature = "lab")]
 pub(crate) fn head_facts(lane: &Qwen4LaneState) -> Option<(usize, usize, usize, usize)> {
     let spec = lane.spec.as_ref()?;
     let (owed, start) = spec
