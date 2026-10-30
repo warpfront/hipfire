@@ -236,6 +236,9 @@ struct Args {
     soak_seed: Option<u64>,
     /// Injected abort point (`--spec mtp` only, exclusive with the soak).
     fault_point: Option<FaultPoint>,
+    /// `--copy` (`--spec mtp` only): stage the lanes with the copy lane armed
+    /// (default-copy budget: widened rings/rows, head-lag storage).
+    copy: bool,
 }
 
 fn parse_ks(value: &str) -> R<Vec<usize>> {
@@ -431,6 +434,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut policies = None;
     let mut tokens_sweep = None;
     let mut reserve_lanes = None;
+    let mut copy = false;
     let mut spec = SpecMode::Ar;
     let mut k = None;
     let mut routes = None;
@@ -460,6 +464,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
                 reserve_lanes = Some(value("--reserve-lanes")?.parse::<usize>().map_err(e)?)
             }
             "--spec" => spec = SpecMode::parse(&value("--spec")?)?,
+            "--copy" => copy = true,
             "--k" => k = Some(value("--k")?.parse::<usize>().map_err(e)?),
             "--routes" => routes = Some(RoutesArg::parse(&value("--routes")?)?),
             "--soak-seconds" => {
@@ -517,6 +522,9 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         }
         routes.get_or_insert(RoutesArg::Cycle);
     }
+    if copy && spec != SpecMode::Mtp {
+        return Err("--copy needs --spec mtp".into());
+    }
     if soak_seconds == Some(0) {
         return Err("--soak-seconds must be at least 1".into());
     }
@@ -557,6 +565,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         soak_seconds,
         soak_seed,
         fault_point,
+        copy,
     })
 }
 
@@ -1903,15 +1912,7 @@ fn drive_mtp_inner(
             accepted: 0,
         });
     }
-    let budgets = WindowBudgets {
-        max_lanes: cfg.max_lanes,
-        verify_rows_per_lane: depth + 1,
-        max_rows: cfg.max_lanes * (depth + 1),
-        copy_take_cap: 0,
-        head_lag_rows: 0,
-        lab: lab_routes(routes),
-        pp_microbatch_lanes: None,
-    };
+    let budgets: WindowBudgets = mesh.window_budgets(bundle, lab_routes(routes))?;
     let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
     let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
     let (mut ev_wall, mut ev_crit, mut ev_ex, mut ev_head, mut ev_bytes, mut ev_priced) =
@@ -2148,14 +2149,29 @@ fn drive_mtp_ep(
 ) -> R<Vec<PolicyOutcome>> {
     let depth = args.k.unwrap_or(DEFAULT_K);
     let routes = args.routes.unwrap_or(RoutesArg::Cycle);
-    let label = format!("mtp:k={depth},routes={}", routes.name());
+    let label = format!(
+        "mtp:k={depth},routes={}{}",
+        routes.name(),
+        if args.copy { ",copy" } else { "" }
+    );
     if args.logits {
         return Err("--logits is not available with --spec mtp (verify rows are not AR rows)".into());
     }
     gpu.bind_thread().map_err(e)?;
+    let copy_cfg = if args.copy {
+        let ngram = hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
+            hipfire_config::ngram_mod_copy_triple(),
+        )?;
+        Some(hipfire_arch_qwen4::lane::LaneCopyConfig {
+            ngram,
+            head_lag_rows: 8,
+        })
+    } else {
+        None
+    };
     let before = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
     bundle
-        .stage_lanes(
+        .stage_lanes_with_copy(
             gpu,
             max_lanes,
             row_budget,
@@ -2163,6 +2179,7 @@ fn drive_mtp_ep(
                 k: depth,
                 end_of_turn: None,
             }),
+            copy_cfg,
         )
         .map_err(e)?;
     let after = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
@@ -2398,6 +2415,9 @@ fn expanded_argv(args: &Args, cwd: &Path) -> Vec<String> {
     }
     if let Some(point) = args.fault_point {
         push("--fault-point", point.name().to_string());
+    }
+    if args.copy {
+        argv.push("--copy".to_string());
     }
     if args.skip_model_hash {
         argv.push("--skip-model-hash".to_string());
@@ -2648,6 +2668,7 @@ fn load_with_lane_reservation(
             .unwrap_or_else(|| *args.ks.last().expect("ks is non-empty")),
         // `--spec mtp` stages spec lanes: the EP plan charges that store.
         spec_k: (args.spec == SpecMode::Mtp).then(|| args.k.unwrap_or(DEFAULT_K)),
+        spec_copy: args.spec == SpecMode::Mtp && args.copy,
     };
     let warning = legacy_warning(admission.kv_backend, admission.kv_backend_reason.as_deref());
     let loaded = hipfire_loader::load_admitted_with_gemma4_drafter(

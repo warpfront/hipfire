@@ -645,6 +645,7 @@ fn stage_qwen4_lanes(
             requested,
             row_budget,
             spec_on_k,
+            None,
         ) else {
             return refuse("lane store device bytes overflow");
         };

@@ -2387,6 +2387,7 @@ fn main() {
                     // EP stages AR lanes under serve (the topology override);
                     // mesh spec lanes are staged by the oracle/driver.
                     spec_k: None,
+                    spec_copy: false,
                 };
                 // Only tp>1 EP loads defer prior retirement. Every single-device
                 // or pp load (Qwen4/Flash-Next included) is unload-first: after

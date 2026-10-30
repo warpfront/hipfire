@@ -55,9 +55,10 @@ use crate::ep::{gather_tally, GatherTally};
 use crate::gpu_forward_lanes::{
     forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, StageName, StageShare,
 };
-use crate::lane::{LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
-use crate::lane_exec::{pick_at, LaneRoute};
+use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
+use crate::lane_exec::pick_at;
 use crate::mesh_lane_protocol::{
+    LaneWindowKey,
     AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DraftProposal, DraftRound,
     EvidenceError, HeadState, LaneAdmission, LaneAdmit, LaneKind, LaneMeshExecutor,
     LanePlan, LaneRequest, MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts,
@@ -67,13 +68,13 @@ use crate::mesh_lane_protocol::{
     VerifyPlan, WindowBudgets, WindowStart,
 };
 use crate::mtp_lanes::lane_call;
-use crate::mtp_spec::{
-    draft_accept_estimate, prepare_native_window, publish_native_window, target_commit_accept_len,
-    HeadTicket, NativeFinish, PreparedNativeWindow, Qwen4Ops, TargetTicket, DRAFT_ACCEPT_MAX,
-    MTP_ROW_WORTH,
+use crate::mesh_rank_copy::{
+    arm_lane_verify, begin_lane_window, catch_up_lane, head_ticket_point, is_probe_op,
+    native_keep_cap, prepare_rank_lane, probe_outcome, publish_rank_lane, save_probe_state,
+    settle_probe, take_head_ticket, HeadTicketPoint, RankPrepare,
 };
+use crate::mtp_spec::{draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH};
 use hipfire_runtime::slot_batch::RequestEpoch;
-use hipfire_runtime::spec::GreedyAccept;
 use rdna_compute::{Gpu, GpuTensor};
 use std::collections::HashSet;
 use std::time::Instant;
@@ -108,16 +109,15 @@ pub struct RankLaneStats {
 }
 
 /// One lane's window on this rank.
+/// One lane's window on this rank. The device window itself (tickets, head
+/// steps, the prepared repair) lives in the lane's `spec.window`
+/// ([`crate::mesh_rank_copy`]); this is the rank-protocol side.
 struct LaneWin {
     plan: LanePlan,
-    head_ticket: Option<HeadTicket>,
-    target_ticket: Option<TargetTicket>,
-    /// Head draft steps run so far this window.
-    steps: usize,
     /// Probability the draft prefix is accepted (the singleton's early stop;
     /// read on the root only).
     prefix: f32,
-    /// Tokens this rank's own head read, per draft step.
+    /// Tokens this rank's own head read for kept draft steps.
     local_drafts: Vec<u32>,
     /// The sealed verify rows.
     rows: Vec<u32>,
@@ -125,38 +125,18 @@ struct LaneWin {
     row_begin: usize,
     /// This rank's own target picks (the root's are the decision's input).
     picks: Vec<u32>,
-    prepared: Option<PreparedNativeWindow>,
 }
 
 impl LaneWin {
     fn new(plan: &LanePlan) -> Self {
         Self {
             plan: plan.clone(),
-            head_ticket: None,
-            target_ticket: None,
-            steps: 0,
             prefix: 1.0,
             local_drafts: Vec::new(),
             rows: Vec::new(),
             row_begin: 0,
             picks: Vec::new(),
-            prepared: None,
         }
-    }
-
-    fn native(&self) -> bool {
-        self.plan.source == ProposalSource::Native
-    }
-
-    /// The lane's head takes an AR-row append after its window (a spec lane's
-    /// `ArSynced` row; a retired lane whose head the root keeps aligned).
-    fn ar_head_append(&self) -> bool {
-        !self.native()
-            && self.plan.head == HeadState::Aligned
-            && matches!(
-                self.plan.route,
-                LaneRoute::ArSynced | LaneRoute::ArRetired
-            )
     }
 }
 
@@ -169,6 +149,8 @@ struct ExecStep {
     draft_tally: GatherTally,
     verify_tally: GatherTally,
     head_calls: usize,
+    catch_up_rows: usize,
+    verify: Option<VerifyPlan>,
     row_groups: usize,
     totals: Option<(usize, usize, usize, usize)>,
     completed: StepPhase,
@@ -260,25 +242,49 @@ fn lane_mut<'a>(store: &'a mut Qwen4LaneStore, epoch: &RequestEpoch) -> R<&'a mu
 
 /// Release a lane's window tickets unconsumed-by-effect: the state is
 /// unchanged since the snapshot, so committing a valid ticket only retires it.
-fn release_lane_tickets(bundle: &mut Qwen4Bundle, lane: &mut Qwen4LaneState, win: &mut LaneWin) {
+/// Drop a lane's pending window: release its tickets (the state is unchanged
+/// since the snapshots, so committing a valid ticket only retires it) and
+/// disarm the ring. Used for a rejected or aborted window.
+fn clear_window(bundle: &mut Qwen4Bundle, lane: &mut Qwen4LaneState) {
     let Qwen4LaneState { state, spec, .. } = lane;
     state.row_capture_armed = false;
-    if let Some(TargetTicket::Local(ticket)) = win.target_ticket.take() {
+    let Some(spec) = spec.as_mut() else {
+        return;
+    };
+    let LaneSpec {
+        head,
+        draft,
+        window,
+        ..
+    } = spec;
+    let Some(w) = window.take() else {
+        return;
+    };
+    if let Some(TargetTicket::Local(ticket)) = w.target_ticket {
         let _ = bundle.with_lane(state, None, |b| {
             if b.validate_commit(ticket).is_ok() {
                 b.commit_validated(ticket);
             }
         });
     }
-    if let (Some(HeadTicket::Local(ticket)), Some(spec)) = (win.head_ticket.take(), spec.as_mut())
-    {
-        let LaneSpec { head, draft, .. } = spec;
+    if let Some(HeadTicket::Local(ticket)) = w.head_ticket {
         let _ = bundle.with_lane(state, Some((head, draft)), |b| {
             if b.mtp_validate_commit(ticket).is_ok() {
                 b.mtp_commit_validated(ticket);
             }
         });
     }
+}
+
+/// What one draft op read on a rank.
+struct OpRead {
+    token: u32,
+    margin: f32,
+    /// Draft steps in effect before this op (`op.position - window.position`).
+    j: usize,
+    /// The confirmation probe abandoned its head step (a hit, or a miss with
+    /// no native route).
+    abandoned: bool,
 }
 
 impl RankLane<'_> {
@@ -290,23 +296,27 @@ impl RankLane<'_> {
         self.exec.session.ownership()
     }
 
-    // ---- begin_window ---------------------------------------------------
-
-    /// The host-and-mapping checks of a plan: nothing here changes lane state
-    /// (mapping only grows capacity).
+    /// The host-and-mapping checks of a plan and the device half of every
+    /// lane's `begin_window` ([`begin_lane_window`]: the pending window, the
+    /// head's position, arenas and the head ticket where the plan wants it).
+    /// Nothing here moves lane state beyond mapping and tickets.
     fn preflight(&mut self, start: &WindowStart) -> R<()> {
         let Self { bundle, gpu, .. } = self;
-        let store = bundle
-            .lanes
-            .as_mut()
-            .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
-        let spec_k = store.spec().map(|spec| spec.k);
-        let rows_cap = store.prefill_logits_row();
-        if start.lanes.len() > store.max_lanes() {
+        let (spec_k, rows_cap, max_lanes) = {
+            let store = bundle
+                .lanes
+                .as_ref()
+                .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
+            (
+                store.spec().map(|spec| spec.k),
+                store.prefill_logits_row(),
+                store.max_lanes(),
+            )
+        };
+        if start.lanes.len() > max_lanes {
             return Err(format!(
-                "{} lanes exceed the staged {}",
-                start.lanes.len(),
-                store.max_lanes()
+                "{} lanes exceed the staged {max_lanes}",
+                start.lanes.len()
             ));
         }
         let total: usize = start.lanes.iter().map(LanePlan::max_rows).sum();
@@ -315,174 +325,81 @@ impl RankLane<'_> {
                 "{total} verify rows exceed the store's {rows_cap} step rows"
             ));
         }
-        for plan in &start.lanes {
-            let epoch = plan.key.request_epoch;
-            if matches!(plan.kind, LaneKind::Forced(_)) {
-                return Err(format!(
-                    "{epoch:?}: forced advances are not supported by the EP lane executor"
-                ));
-            }
-            if plan.source == ProposalSource::Copy {
-                return Err(format!(
-                    "{epoch:?}: copy proposals are not supported by the EP lane executor"
-                ));
-            }
-            if plan.catch_up.is_some() || plan.copy_confirm {
-                return Err(format!(
-                    "{epoch:?}: head catch-up and copy confirmation are not supported by the EP lane executor"
-                ));
-            }
-            if matches!(plan.head, HeadState::Lag { .. }) {
-                return Err(format!(
-                    "{epoch:?}: head-lag lanes are not supported by the EP lane executor"
-                ));
-            }
-            let lane = store
-                .lane_mut(&epoch)
-                .ok_or_else(|| format!("unknown or stale epoch {epoch:?}"))?;
-            if lane.host.status != LaneStatus::Decoding {
-                return Err(format!(
-                    "{epoch:?} is {:?}, not Decoding",
-                    lane.host.status
-                ));
-            }
-            if lane.host.pending_seed != Some(plan.seed) {
-                return Err(format!(
-                    "{epoch:?}: pending seed {:?} != planned {}",
-                    lane.host.pending_seed, plan.seed
-                ));
-            }
-            if lane.state.position != plan.position {
-                return Err(format!(
-                    "{epoch:?}: lane position {} != planned {}",
-                    lane.state.position, plan.position
-                ));
-            }
-            let end = plan
-                .position
-                .checked_add(plan.max_rows())
-                .ok_or_else(|| "position overflow".to_string())?;
-            if end > lane.state.max_seq_len {
-                return Err(format!(
-                    "{epoch:?}: end position {end} exceeds the context {}",
-                    lane.state.max_seq_len
-                ));
-            }
-            let needs_head = plan.head == HeadState::Aligned
-                && (plan.source == ProposalSource::Native
-                    || matches!(plan.route, LaneRoute::ArSynced | LaneRoute::ArRetired));
-            match lane.spec.as_mut() {
-                None => {
-                    if plan.source != ProposalSource::None || needs_head {
+        with_store(bundle, |store, bundle| {
+            for plan in &start.lanes {
+                let epoch = plan.key.request_epoch;
+                let lane = lane_mut(store, &epoch)?;
+                if lane.host.status != LaneStatus::Decoding {
+                    return Err(format!("{epoch:?} is {:?}, not Decoding", lane.host.status));
+                }
+                if lane.host.pending_seed != Some(plan.seed) {
+                    return Err(format!(
+                        "{epoch:?}: pending seed {:?} != planned {}",
+                        lane.host.pending_seed, plan.seed
+                    ));
+                }
+                if lane.state.position != plan.position {
+                    return Err(format!(
+                        "{epoch:?}: lane position {} != planned {}",
+                        lane.state.position, plan.position
+                    ));
+                }
+                let end = plan
+                    .position
+                    .checked_add(plan.max_rows())
+                    .ok_or_else(|| "position overflow".to_string())?;
+                if end > lane.state.max_seq_len {
+                    return Err(format!(
+                        "{epoch:?}: end position {end} exceeds the context {}",
+                        lane.state.max_seq_len
+                    ));
+                }
+                if lane.spec.is_none() {
+                    if plan.source != ProposalSource::None
+                        || plan.head != HeadState::Free
+                        || matches!(plan.kind, LaneKind::Forced(_))
+                    {
                         return Err(format!("{epoch:?}: an AR lane cannot run a head window"));
                     }
-                }
-                Some(spec) => {
+                } else {
                     if spec_k.is_none() {
                         return Err(format!("{epoch:?}: lane has MTP state in an AR store"));
                     }
-                    if spec.window.is_some() {
+                    if plan.max_rows() > 1 && lane.state.row_capture_rows() < plan.max_rows() {
                         return Err(format!(
-                            "{epoch:?}: an unconsumed legacy window is pending"
+                            "{epoch:?}: ring holds {} rows, the window needs {} (stage the store with the copy budget for copy windows)",
+                            lane.state.row_capture_rows(),
+                            plan.max_rows()
                         ));
                     }
-                    if plan.source == ProposalSource::Native {
-                        if plan.max_depth > spec_k.unwrap_or(0) {
-                            return Err(format!(
-                                "{epoch:?}: depth {} exceeds the staged k {:?}",
-                                plan.max_depth, spec_k
-                            ));
-                        }
-                        if lane.state.row_capture_rows() < plan.max_rows() {
-                            return Err(format!(
-                                "{epoch:?}: ring holds {} rows, the window needs {}",
-                                lane.state.row_capture_rows(),
-                                plan.max_rows()
-                            ));
-                        }
-                    }
-                    if needs_head {
-                        if spec.head.position() != plan.position {
-                            return Err(format!(
-                                "{epoch:?}: head position {} != lane position {}",
-                                spec.head.position(),
-                                plan.position
-                            ));
-                        }
-                        spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
-                            format!("{epoch:?}: map {end} head positions: {e}")
-                        })?;
-                    }
                 }
-            }
-            lane.state
-                .ensure_mapped_capacity(gpu, end)
-                .map_err(|e| format!("{epoch:?}: map {end} positions: {e}"))?;
-        }
-        Ok(())
-    }
-
-    /// Take the head ticket and arm the ring, then the target ticket, of every
-    /// native lane.
-    fn arm(&mut self, start: &WindowStart) -> R<Vec<LaneWin>> {
-        let Self { bundle, gpu, .. } = self;
-        let mut wins: Vec<LaneWin> = start.lanes.iter().map(LaneWin::new).collect();
-        let result = with_store(bundle, |store, bundle| {
-            for win in wins.iter_mut().filter(|w| w.native()) {
-                let epoch = win.plan.key.request_epoch;
-                let lane = lane_mut(store, &epoch)?;
-                let Qwen4LaneState { state, spec, .. } = lane;
-                let spec = spec
-                    .as_mut()
-                    .ok_or_else(|| format!("{epoch:?}: native window on an AR lane"))?;
-                let LaneSpec { head, draft, .. } = spec;
-                let head_ticket = lane_call(bundle.with_lane(
-                    state,
-                    Some((head, draft)),
-                    |b| b.mtp_snapshot(gpu),
-                ))
-                .map_err(|e| format!("{epoch:?}: head snapshot: {e}"))?;
-                win.head_ticket = Some(HeadTicket::Local(head_ticket));
-                // Armed before the snapshot: the GDN states then need no copy.
-                state.row_capture_armed = true;
-                match lane_call(bundle.with_lane(state, None, |b| b.snapshot(gpu))) {
-                    Ok(ticket) => win.target_ticket = Some(TargetTicket::Local(ticket)),
-                    Err(error) => {
-                        state.row_capture_armed = false;
-                        return Err(format!("{epoch:?}: target snapshot: {error}"));
-                    }
-                }
+                lane.state
+                    .ensure_mapped_capacity(gpu, end)
+                    .map_err(|e| format!("{epoch:?}: map {end} positions: {e}"))?;
+                begin_lane_window(bundle, gpu, lane, plan)?;
             }
             Ok(())
-        });
-        match result {
-            Ok(()) => Ok(wins),
-            Err(error) => {
-                self.release_wins(&mut wins);
-                Err(error)
-            }
-        }
+        })
     }
 
-    /// Unwind every ticket of `wins` (an unexecuted or aborted window).
-    fn release_wins(&mut self, wins: &mut [LaneWin]) {
+    /// Unwind every lane window of `plan_lanes` (a rejected or aborted step).
+    fn clear_windows(&mut self, lanes: &[LanePlan]) {
         let Self { bundle, .. } = self;
         let _ = with_store(bundle, |store, bundle| {
-            for win in wins.iter_mut() {
-                if let Some(lane) = store.lane_mut(&win.plan.key.request_epoch) {
-                    release_lane_tickets(bundle, lane, win);
+            for plan in lanes {
+                if let Some(lane) = store.lane_mut(&plan.key.request_epoch) {
+                    clear_window(bundle, lane);
                 }
             }
             Ok(())
         });
     }
 
-    // ---- draft ----------------------------------------------------------
-
-    /// One head round on this rank: enqueue every op's deferred head step in
-    /// the root's order, then one download for all of them and the head's own
-    /// parse of each. Returns `(token, margin)` per op.
-    fn draft_round_device(&mut self, round: &DraftRound) -> R<Vec<(u32, f32)>> {
+    /// One head round on this rank: the plan's catch-ups (round 0, before any
+    /// Draft op), then every op's deferred head step in the root's order, one
+    /// download for all of them and the head's own parse of each. Returns the
+    /// catch-up rows appended and the reads per op.
+    fn draft_round_device(&mut self, round: &DraftRound) -> R<(usize, Vec<OpRead>)> {
         let Self {
             exec, bundle, gpu, ..
         } = self;
@@ -490,18 +407,32 @@ impl RankLane<'_> {
             .step
             .as_ref()
             .ok_or_else(|| "draft round without a begun window".to_string())?;
-        let mut epochs = Vec::with_capacity(round.ops.len());
-        let mut windows = Vec::with_capacity(round.ops.len());
-        for op in &round.ops {
-            let win = step
-                .lanes
+        let plan_of = |key: &LaneWindowKey| -> R<&LanePlan> {
+            step.lanes
                 .iter()
-                .find(|w| w.plan.key == op.key)
-                .ok_or_else(|| "draft op for a lane outside the plan".to_string())?;
-            epochs.push(op.key.request_epoch);
-            windows.push(win.plan.position);
-        }
+                .find(|w| w.plan.key == *key)
+                .map(|w| &w.plan)
+                .ok_or_else(|| "draft op for a lane outside the plan".to_string())
+        };
         with_store(bundle, |store, bundle| {
+            // Round 0: owed-row catch-ups, then the head tickets that follow one.
+            let mut catch_rows = 0usize;
+            if !round.catch_up.is_empty() {
+                let epochs: Vec<RequestEpoch> =
+                    round.catch_up.iter().map(|(k, _)| k.request_epoch).collect();
+                let (mut lanes, _) = store.draft_parts(&epochs)?;
+                for ((key, catch_up), lane) in round.catch_up.iter().zip(lanes.iter_mut()) {
+                    catch_rows += catch_up_lane(bundle, gpu, &mut **lane, catch_up)?;
+                    if head_ticket_point(plan_of(key)?) == HeadTicketPoint::AfterCatchUp {
+                        take_head_ticket(bundle, gpu, &mut **lane)?;
+                    }
+                }
+            }
+            if round.ops.is_empty() {
+                return Ok((catch_rows, Vec::new()));
+            }
+            let epochs: Vec<RequestEpoch> =
+                round.ops.iter().map(|o| o.key.request_epoch).collect();
             let (mut lanes, spec_store) = store.draft_parts(&epochs)?;
             let spec_store = spec_store
                 .ok_or_else(|| "head draft in a store without MTP lanes".to_string())?;
@@ -515,6 +446,11 @@ impl RankLane<'_> {
                 ));
             }
             for (slot, op) in round.ops.iter().enumerate() {
+                // The confirmation probe's Draft is abandoned on a hit: save
+                // the head's request state it is about to move.
+                if is_probe_op(plan_of(&op.key)?, op.position) {
+                    save_probe_state(&mut *lanes[slot]);
+                }
                 let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
                 let spec = spec
                     .as_mut()
@@ -523,10 +459,15 @@ impl RankLane<'_> {
                     head,
                     draft,
                     pending_hidden,
+                    window,
                     ..
                 } = spec;
+                let window_position = window
+                    .as_ref()
+                    .ok_or_else(|| "draft op without a pending window".to_string())?
+                    .position;
                 let top1 = spec_store.draft_top1.sub_offset(slot * slot_bytes, slot_bytes);
-                let j = op.position - windows[slot];
+                let j = op.position - window_position;
                 let hidden = (j == 0).then_some(&*pending_hidden);
                 lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
                     b.mtp_forward_token_deferred(gpu, op.input, hidden, op.position, j == 0, &top1)
@@ -542,28 +483,58 @@ impl RankLane<'_> {
             gpu.take_device_wait_error()
                 .map_err(|e| format!("draft download: {e}"))?;
             let mut reads = Vec::with_capacity(round.ops.len());
-            for slot in 0..round.ops.len() {
+            for (slot, op) in round.ops.iter().enumerate() {
                 let top = &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
-                let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
-                let spec = spec
-                    .as_mut()
-                    .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
-                let LaneSpec { head, draft, .. } = spec;
-                let read = lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                    let token = b.mtp_draft_finish(top)?;
-                    Ok::<_, BundleError>((token, b.mtp_draft_margin()))
-                }))
-                .map_err(|e| format!("draft finish: {e}"))?;
-                reads.push(read);
+                let plan = plan_of(&op.key)?;
+                let (token, margin) = {
+                    let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
+                    let spec = spec
+                        .as_mut()
+                        .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
+                    let LaneSpec { head, draft, .. } = spec;
+                    lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+                        let token = b.mtp_draft_finish(top)?;
+                        Ok::<_, BundleError>((token, b.mtp_draft_margin()))
+                    }))
+                    .map_err(|e| format!("draft finish: {e}"))?
+                };
+                let j = {
+                    let w = lanes[slot]
+                        .spec
+                        .as_ref()
+                        .and_then(|s| s.window.as_ref())
+                        .ok_or_else(|| "draft op without a pending window".to_string())?;
+                    op.position - w.position
+                };
+                // The probe: the head's argmax at the seed against the first
+                // candidate (the root's own rule, evaluated on this rank's
+                // read; the verify rows the root seals validate it). A hit,
+                // or a miss with no native route, abandons the probe's step.
+                let mut abandoned = false;
+                if is_probe_op(plan, op.position) {
+                    let outcome = probe_outcome(&plan.copy_drafts, token, plan.native_depth);
+                    settle_probe(bundle, gpu, &mut *lanes[slot], outcome)?;
+                    abandoned = outcome.restores_head();
+                }
+                if !abandoned {
+                    if let Some(w) = lanes[slot].spec.as_mut().and_then(|s| s.window.as_mut()) {
+                        w.steps += 1;
+                    }
+                }
+                reads.push(OpRead {
+                    token,
+                    margin,
+                    j,
+                    abandoned,
+                });
             }
-            Ok(reads)
+            Ok((catch_rows, reads))
         })
     }
 
-    // ---- verify ---------------------------------------------------------
-
-    /// The one trunk forward over every lane's sealed rows; the picks per lane
-    /// and each lane's resulting target position.
+    /// The one trunk forward over every lane's sealed rows (arming the ring and
+    /// taking the target ticket of every multi-row lane first); the picks per
+    /// lane and each lane's resulting target position.
     fn verify_device(&mut self, plan: &VerifyPlan) -> R<(Vec<Vec<u32>>, Vec<usize>)> {
         let Self { bundle, gpu, .. } = self;
         let vocab = bundle.lane_vocab();
@@ -585,6 +556,11 @@ impl RankLane<'_> {
                 return Err(format!(
                     "{n_dec} decode rows exceed the step buffers ({rows_cap})"
                 ));
+            }
+            for (vl, lane) in plan.lanes.iter().zip(lanes.iter_mut()) {
+                if vl.rows.len() > 1 && lane.spec.is_some() {
+                    arm_lane_verify(bundle, gpu, &mut **lane, vl)?;
+                }
             }
             let forwarded = {
                 let mut rows: Vec<LaneRows<'_>> = Vec::with_capacity(lanes.len());
@@ -632,159 +608,65 @@ impl RankLane<'_> {
         })
     }
 
-    // ---- prepare / publish ------------------------------------------------
-
-    /// Repair one lane to its decision: a native window's target rollback and
-    /// head rebuild ([`prepare_native_window`], tickets kept live), or an AR
-    /// lane's head append.
-    fn prepare_lane(&mut self, index: usize, d: &crate::mesh_lane_protocol::LaneDecision) -> R<()> {
+    /// Repair every lane to the decision ([`prepare_rank_lane`]: a window's
+    /// target rollback and head rebuild with its tickets kept live, a row's
+    /// head append or owed row, a target-only window's rollback) and store the
+    /// prepared window in the lane. Returns the head rows appended.
+    fn prepare_device(&mut self, decision: &CommitDecision) -> R<usize> {
         let Self {
             exec, bundle, gpu, ..
         } = self;
         let step = exec
             .step
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| "prepare without a begun window".to_string())?;
-        let win = &mut step.lanes[index];
-        let epoch = win.plan.key.request_epoch;
-        let (row_begin, rows) = (win.row_begin, win.rows.len());
-        let wide = bundle
-            .config
-            .hc_count
-            .checked_mul(bundle.config.hidden_size)
-            .ok_or_else(|| "hidden width overflow".to_string())?;
-        let want_native = win.native();
-        let want_ar_head = win.ar_head_append();
-        let (position, seed) = (win.plan.position, win.plan.seed);
-        let steps = win.steps;
-        let block = win.rows.clone();
-        let tickets = (win.target_ticket, win.head_ticket);
-        let prepared = with_store(bundle, |store, bundle| {
-            let hidden_tensor: Option<GpuTensor> = store
-                .step_parts(&[epoch])
-                .ok()
-                .and_then(|parts| parts.spec.map(|spec| spec.hidden.sub_offset(0, spec.hidden.numel())));
-            let lane = lane_mut(store, &epoch)?;
-            let Qwen4LaneState { state, spec, .. } = lane;
-            if want_native {
-                let spec = spec
-                    .as_mut()
-                    .ok_or_else(|| format!("{epoch:?}: native window on an AR lane"))?;
-                let LaneSpec {
-                    head,
-                    draft,
-                    pending_hidden,
-                    ..
-                } = spec;
-                let hidden = hidden_tensor
-                    .as_ref()
-                    .ok_or_else(|| "verify without a hidden capture".to_string())?;
-                let (Some(target_snapshot), Some(mtp_ticket)) = tickets else {
-                    return Err(format!("{epoch:?}: window holds no tickets"));
-                };
-                // I1 at prepare: the verify published every sealed row, the
-                // head ran `steps` draft steps from the window's frontier.
-                if state.position != position + rows {
-                    return Err(format!(
-                        "{epoch:?}: I1: trunk position {} != {} after the verify",
-                        state.position,
-                        position + rows
-                    ));
+        let verify = step
+            .verify
+            .as_ref()
+            .ok_or_else(|| "prepare: the verify was never sealed".to_string())?;
+        let epochs: Vec<RequestEpoch> = verify.lanes.iter().map(|l| l.key.request_epoch).collect();
+        let mut head_rows = step.catch_up_rows;
+        with_store(bundle, |store, bundle| {
+            let spec_config = store.spec();
+            let skip_rollback = store.skip_rollback();
+            let StepParts {
+                mut lanes, spec, ..
+            } = store.step_parts(&epochs)?;
+            let hidden: Option<&GpuTensor> = spec.as_deref().map(|s| &s.hidden);
+            for (i, (d, lane)) in decision.lanes.iter().zip(lanes.iter_mut()).enumerate() {
+                if lane.spec.is_none() {
+                    continue;
                 }
-                if head.position() != position + steps {
-                    return Err(format!(
-                        "{epoch:?}: I1: head position {} != {} after {steps} draft steps",
-                        head.position(),
-                        position + steps
-                    ));
+                let win = &step.lanes[i];
+                let config =
+                    spec_config.ok_or_else(|| "MTP lane in a store without MTP lanes".to_string())?;
+                let hidden =
+                    hidden.ok_or_else(|| "MTP lane without a hidden capture".to_string())?;
+                let prepared = prepare_rank_lane(
+                    bundle,
+                    gpu,
+                    &mut **lane,
+                    RankPrepare {
+                        plan: &win.plan,
+                        decision: d,
+                        verify: &verify.lanes[i],
+                        config,
+                        hidden,
+                        row_begin: win.row_begin,
+                        picks: &win.picks,
+                        skip_rollback,
+                    },
+                )?;
+                head_rows += prepared.head_rows;
+                if let Some(w) = lane.spec.as_mut().and_then(|s| s.window.as_mut()) {
+                    w.prepared = Some(prepared.lane);
                 }
-                let verify_hidden = hidden.sub_offset(row_begin * wide, rows * wide);
-                // Taken before `with_lane`: it names the forward scratch.
-                let ple_normed = bundle
-                    .lane_ple_normed_rows(row_begin, rows)
-                    .map_err(|e| format!("{epoch:?}: PLE rows: {e}"))?;
-                let acceptance = GreedyAccept {
-                    committed: d.emitted.clone(),
-                    accepted: d.accepted,
-                    hit_eos: d.hit_eos,
-                };
-                if 1 + target_commit_accept_len(&acceptance) != d.consumed_rows {
-                    return Err(format!(
-                        "{epoch:?}: decision consumes {} rows, its acceptance implies {}",
-                        d.consumed_rows,
-                        1 + target_commit_accept_len(&acceptance)
-                    ));
-                }
-                let native = lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                    prepare_native_window(
-                        b,
-                        &mut Qwen4Ops::Single(&mut *gpu),
-                        NativeFinish {
-                            position,
-                            block: &block,
-                            acceptance,
-                            target_snapshot,
-                            mtp_ticket,
-                            pending_hidden,
-                            verify_hidden: &verify_hidden,
-                            ple_normed: Some(&ple_normed),
-                            retain: false,
-                            head_at_start: false,
-                        },
-                        None,
-                    )
-                    .map_err(BundleError::Forward)
-                }))
-                .map_err(|e| format!("{epoch:?}: prepare: {e}"))?;
-                Ok(Some(native))
-            } else if want_ar_head {
-                let spec = spec
-                    .as_mut()
-                    .ok_or_else(|| format!("{epoch:?}: head append on an AR lane"))?;
-                let LaneSpec {
-                    head,
-                    draft,
-                    pending_hidden,
-                    ..
-                } = spec;
-                let hidden = hidden_tensor
-                    .as_ref()
-                    .ok_or_else(|| "verify without a hidden capture".to_string())?;
-                if state.position != position + 1 {
-                    return Err(format!(
-                        "{epoch:?}: lane position {} != {} after the AR row",
-                        state.position,
-                        position + 1
-                    ));
-                }
-                let row = hidden.sub_offset(row_begin * wide, wide);
-                // Fills use the same (token p, target hidden p - 1) pairing as
-                // drafting; `pending_hidden` stays intact until the append
-                // consumed it.
-                lane_call(bundle.with_lane(state, Some((&mut *head, draft)), |b| {
-                    b.mtp_append_token(gpu, seed, Some(pending_hidden), position)
-                }))
-                .map_err(|e| format!("{epoch:?}: head append: {e}"))?;
-                if head.position() != position + 1 {
-                    return Err(format!(
-                        "{epoch:?}: head ended at {}, expected {}",
-                        head.position(),
-                        position + 1
-                    ));
-                }
-                gpu.copy_d2d(&row, pending_hidden, pending_hidden.byte_size())
-                    .map_err(|e| format!("{epoch:?}: pending hidden copy: {e}"))?;
-                Ok(None)
-            } else {
-                Ok(None)
             }
-        })?;
-        win.prepared = prepared;
-        Ok(())
+            Ok(head_rows)
+        })
     }
 }
 
-/// Window state to evidence: the counts this rank actually executed.
 fn rank_counts(step: &ExecStep, rank_head: bool) -> OpCounts {
     let totals = step.totals.unwrap_or((0, 0, 0, 0));
     OpCounts {
@@ -800,6 +682,7 @@ fn rank_counts(step: &ExecStep, rank_head: bool) -> OpCounts {
         consumed_rows: totals.2,
     }
 }
+
 
 impl LaneMeshExecutor for RankLane<'_> {
     fn ownership(&self) -> RankOwnership {
@@ -846,45 +729,47 @@ impl LaneMeshExecutor for RankLane<'_> {
         } else {
             Ok(())
         };
-        let mut ready = self.exec.session.begin(start, capacity);
+        let failed_preflight = capacity.is_err();
+        let ready = self.exec.session.begin(start, capacity);
         if !matches!(ready.status, ReadyStatus::Ready { .. }) {
+            // Windows opened for lanes before the failing one (or before the
+            // reducer's refusal) are unwound: a rejected step leaves no ticket.
+            if self.exec.session.phase() == StepPhase::Idle || failed_preflight {
+                self.clear_windows(&start.lanes);
+            }
             return ready;
         }
-        match self.arm(start) {
-            Ok(lanes) => {
-                let unpriced = !self.exec.stepped
-                    || lanes
-                        .iter()
-                        .filter(|w| w.native())
-                        .any(|w| !self.exec.seen_depths.contains(&w.plan.max_depth));
-                self.exec.step = Some(ExecStep {
-                    key: start.key.clone(),
-                    lanes,
-                    draft_us: 0.0,
-                    verify_us: 0.0,
-                    prepare_us: 0.0,
-                    draft_tally: GatherTally::default(),
-                    verify_tally: GatherTally::default(),
-                    head_calls: 0,
-                    row_groups: 0,
-                    totals: None,
-                    completed: StepPhase::Armed,
-                    unpriced,
-                });
-            }
-            Err(reason) => {
-                self.exec.session.reject(&start.key);
-                ready.status = ReadyStatus::Rejected { reason };
-            }
-        }
+        let lanes: Vec<LaneWin> = start.lanes.iter().map(LaneWin::new).collect();
+        let unpriced = !self.exec.stepped
+            || lanes
+                .iter()
+                .filter(|w| w.plan.source == ProposalSource::Native)
+                .any(|w| !self.exec.seen_depths.contains(&w.plan.max_depth));
+        self.exec.step = Some(ExecStep {
+            key: start.key.clone(),
+            lanes,
+            draft_us: 0.0,
+            verify_us: 0.0,
+            prepare_us: 0.0,
+            draft_tally: GatherTally::default(),
+            verify_tally: GatherTally::default(),
+            head_calls: 0,
+            catch_up_rows: 0,
+            verify: None,
+            row_groups: 0,
+            totals: None,
+            completed: StepPhase::Armed,
+            unpriced,
+        });
         ready
     }
 
     fn reject_window(&mut self, key: &MeshStepKey) {
         self.exec.session.reject(key);
-        if let Some(mut step) = self.exec.step.take() {
+        if let Some(step) = self.exec.step.take() {
             if step.key == *key {
-                self.release_wins(&mut step.lanes);
+                let plans: Vec<LanePlan> = step.lanes.iter().map(|w| w.plan.clone()).collect();
+                self.clear_windows(&plans);
             } else {
                 self.exec.step = Some(step);
             }
@@ -897,10 +782,19 @@ impl LaneMeshExecutor for RankLane<'_> {
         let mut result = self.exec.session.on_draft_round(round)?;
         let before = gather_tally();
         let t0 = Instant::now();
-        let reads = self
+        let (catch_rows, reads) = self
             .draft_round_device(round)
             .map_err(|e| rank_err(rank, e))?;
         let tally = gather_tally().since(before);
+        if catch_rows != result.catch_up_rows {
+            return Err(rank_err(
+                rank,
+                format!(
+                    "the rank appended {catch_rows} owed head rows, the round scheduled {}",
+                    result.catch_up_rows
+                ),
+            ));
+        }
         let Some(step) = self.exec.step.as_mut() else {
             return Err(rank_err(rank, "draft round without a begun window"));
         };
@@ -911,28 +805,40 @@ impl LaneMeshExecutor for RankLane<'_> {
             bytes: step.draft_tally.bytes + tally.bytes,
         };
         step.head_calls += round.ops.len();
+        step.catch_up_rows += catch_rows;
         result.head_gathers = tally.head as usize;
         let mut proposals = Vec::with_capacity(round.ops.len());
-        for (op, (token, margin)) in round.ops.iter().zip(reads) {
+        for (op, read) in round.ops.iter().zip(reads) {
             let win = step
                 .lanes
                 .iter_mut()
                 .find(|w| w.plan.key == op.key)
                 .ok_or_else(|| rank_err(rank, "draft op for a lane outside the plan"))?;
-            let j = win.steps;
-            win.steps += 1;
-            win.local_drafts.push(token);
+            if read.abandoned {
+                // The probe's head step was abandoned: the root confirms (or
+                // falls back) from this token; no draft step stays.
+                proposals.push(DraftProposal {
+                    key: op.key,
+                    token: read.token,
+                    keep_going: false,
+                    drop_last: false,
+                    read: None,
+                });
+                continue;
+            }
+            win.local_drafts.push(read.token);
             // The singleton's early stop, statement for statement: a token
             // after the first whose prefix acceptance fell below the row worth
             // is drafted but not kept; deeper drafting stops once even the
             // best per-draft acceptance cannot make the next row worth it.
-            win.prefix *= draft_accept_estimate(margin);
-            let drop_last = j > 0 && win.prefix < MTP_ROW_WORTH;
-            let keep_going = !drop_last && win.prefix * DRAFT_ACCEPT_MAX >= MTP_ROW_WORTH;
+            win.prefix *= draft_accept_estimate(read.margin);
+            let drop_last = read.j > 0 && win.prefix < MTP_ROW_WORTH;
+            let done = win.prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH
+                || read.j + 1 >= native_keep_cap(&win.plan);
             proposals.push(DraftProposal {
                 key: op.key,
-                token,
-                keep_going,
+                token: read.token,
+                keep_going: !drop_last && !done,
                 drop_last,
                 // Greedy lanes propose the head's argmax; a sampled lane's
                 // distribution read (S4) is the sampler owner's alone.
@@ -961,6 +867,7 @@ impl LaneMeshExecutor for RankLane<'_> {
         step.verify_tally = tally;
         step.row_groups = row_group_count(&row_counts);
         step.completed = StepPhase::Verified;
+        step.verify = Some(plan.clone());
         let mut first = 0usize;
         let mut mismatches = 0u64;
         for ((win, v), lane_picks) in step.lanes.iter_mut().zip(&plan.lanes).zip(&picks) {
@@ -969,9 +876,11 @@ impl LaneMeshExecutor for RankLane<'_> {
             win.picks = lane_picks.clone();
             first += v.rows.len();
             // Evidence only: the rank's own head read vs the root's kept token.
-            for (kept, local) in v.rows[1..].iter().zip(&win.local_drafts) {
-                if kept != local {
-                    mismatches += 1;
+            if win.plan.source == ProposalSource::Native {
+                for (kept, local) in v.rows[1..].iter().zip(&win.local_drafts) {
+                    if kept != local {
+                        mismatches += 1;
+                    }
                 }
             }
         }
@@ -983,11 +892,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             .map(|(l, &end)| (l.key, end))
             .collect();
         result.ledger = OpLedger {
-            row_groups: self
-                .exec
-                .step
-                .as_ref()
-                .map_or(0, |s| s.row_groups),
+            row_groups: self.exec.step.as_ref().map_or(0, |s| s.row_groups),
             target_exchanges: tally.trunk as usize,
             microbatches: 0,
             head_draft_calls: plan.ledger.head_draft_calls,
@@ -1008,11 +913,25 @@ impl LaneMeshExecutor for RankLane<'_> {
         let rank = self.rank();
         let receipt = self.exec.session.on_prepare(decision)?;
         let t0 = Instant::now();
+        let head_rows = self
+            .prepare_device(decision)
+            .map_err(|e| rank_err(rank, e))?;
+        if head_rows != receipt.head_append_rows {
+            return Err(rank_err(
+                rank,
+                format!(
+                    "the rank appended {head_rows} head rows, the decision's schedule is {}",
+                    receipt.head_append_rows
+                ),
+            ));
+        }
+        // Evidence only: the emitted tokens against this rank's own picks.
         let mut mismatches = 0u64;
-        for (index, d) in decision.lanes.iter().enumerate() {
-            self.prepare_lane(index, d).map_err(|e| rank_err(rank, e))?;
-            // Evidence only: the emitted tokens against this rank's own picks.
-            if let Some(win) = self.exec.step.as_ref().map(|s| &s.lanes[index]) {
+        if let Some(step) = self.exec.step.as_ref() {
+            for (win, d) in step.lanes.iter().zip(&decision.lanes) {
+                if d.forced {
+                    continue;
+                }
                 for (i, token) in d.emitted.iter().enumerate() {
                     if win.picks.get(i).is_some_and(|p| p != token) {
                         mismatches += 1;
@@ -1045,27 +964,27 @@ impl LaneMeshExecutor for RankLane<'_> {
 
     fn publish_commit(&mut self, decision: &CommitDecision) {
         let rank = self.rank();
-        let Some(mut step) = self.exec.step.take() else {
+        let Some(step) = self.exec.step.take() else {
             return;
         };
         let Self {
             exec, bundle, gpu, ..
         } = self;
         let published = with_store(bundle, |store, bundle| {
-            for (win, d) in step.lanes.iter_mut().zip(&decision.lanes) {
+            for (win, d) in step.lanes.iter().zip(&decision.lanes) {
                 let epoch = win.plan.key.request_epoch;
                 let lane = lane_mut(store, &epoch)?;
-                if let Some(prepared) = win.prepared.take() {
-                    let Qwen4LaneState { state, spec, .. } = &mut *lane;
-                    let spec = spec
-                        .as_mut()
-                        .ok_or_else(|| format!("{epoch:?}: native window on an AR lane"))?;
-                    let LaneSpec { head, draft, .. } = spec;
-                    lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                        publish_native_window(b, &mut Qwen4Ops::Single(&mut *gpu), prepared)
-                            .map_err(BundleError::Forward)
-                    }))
-                    .map_err(|e| format!("{epoch:?}: publish: {e}"))?;
+                let prepared = lane
+                    .spec
+                    .as_mut()
+                    .and_then(|s| s.window.as_mut())
+                    .and_then(|w| w.prepared.take());
+                if let Some(prepared) = prepared {
+                    publish_rank_lane(bundle, gpu, lane, prepared)
+                        .map_err(|e| format!("{epoch:?}: publish: {e}"))?;
+                }
+                if let Some(spec) = lane.spec.as_mut() {
+                    spec.window = None;
                 }
                 // The lane's host metadata, as `commit_verify`/`commit_host`.
                 lane.host.generated.extend_from_slice(&d.emitted);
@@ -1081,8 +1000,17 @@ impl LaneMeshExecutor for RankLane<'_> {
         exec.session.on_publish(decision);
         exec.stepped = true;
         exec.stats.steps += 1;
-        exec.stats.native_windows += step.lanes.iter().filter(|w| w.native()).count() as u64;
-        for win in step.lanes.iter().filter(|w| w.native()) {
+        let native = step
+            .lanes
+            .iter()
+            .filter(|w| w.plan.source == ProposalSource::Native)
+            .count() as u64;
+        exec.stats.native_windows += native;
+        for win in step
+            .lanes
+            .iter()
+            .filter(|w| w.plan.source == ProposalSource::Native)
+        {
             exec.seen_depths.insert(win.plan.max_depth);
         }
         let own = exec.session.ownership();
@@ -1125,8 +1053,8 @@ impl LaneMeshExecutor for RankLane<'_> {
         }
         self.exec.session.on_abort();
         // A half-run window's device state is untrusted: poison every lane of
-        // the step (store.poison drops the legacy window, disarms the ring);
-        // the mesh is quarantined, nothing is retried in place.
+        // the step (store.poison drops the window and disarms the ring); the
+        // mesh is quarantined, nothing is retried in place.
         if let Some(step) = self.exec.step.take() {
             if let Some(store) = self.bundle.lanes.as_mut() {
                 for win in &step.lanes {
@@ -1140,6 +1068,7 @@ impl LaneMeshExecutor for RankLane<'_> {
         self.exec.last.clone().filter(|e| e.key == *key)
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Concurrent step driver
@@ -1535,6 +1464,7 @@ pub struct EpMeshLanes {
     root: MeshRoot,
     rank0: RankExec,
     ranks: usize,
+    copy_armed: bool,
     pending: Option<(MeshStepKey, Vec<RankCostEvidence>)>,
     interval_start: Option<Instant>,
     prefill_ran: bool,
@@ -1610,7 +1540,7 @@ impl EpMeshLanes {
             .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?;
         let moe_once = store.stage_policy().share(StageName::Moe) == StageShare::OnceAllRows;
         let world: Vec<RankOwnership> = (0..ranks).map(RankOwnership::ep).collect();
-        let root = MeshRoot::new(
+        let mut root = MeshRoot::new(
             RankOwnership::ep(0),
             &world,
             RootConfig {
@@ -1624,7 +1554,21 @@ impl EpMeshLanes {
             },
         )
         .map_err(|e| e.to_string())?;
+        // A store staged with the copy budget arms the root's copy lane (the
+        // request-local n-gram context, the take-length chooser and the head
+        // lag bookkeeping): the ranks run its windows through the shared rank
+        // helper ([`crate::mesh_rank_copy`]).
+        let copy_armed = match store.copy() {
+            Some(copy) => {
+                root = root
+                    .with_copy_lane(copy.config.ngram)
+                    .map_err(|e| e.to_string())?;
+                true
+            }
+            None => false,
+        };
         Ok(Self {
+            copy_armed,
             root,
             rank0: RankExec::new(RankOwnership::ep(0)),
             ranks,
@@ -1633,6 +1577,26 @@ impl EpMeshLanes {
             prefill_ran: false,
             last_merged: None,
             steps: 0,
+        })
+    }
+
+    /// The window budgets of the staged store (verify rows per lane, copy take
+    /// cap and head-lag rows from the store's own copy budget) with route
+    /// policy `lab`.
+    pub fn window_budgets(&self, bundle: &Qwen4Bundle, lab: LabRoutes) -> Result<WindowBudgets, String> {
+        let store = bundle
+            .lanes()
+            .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
+        let copy = store.copy();
+        let verify_rows = store.verify_rows_per_lane();
+        Ok(WindowBudgets {
+            max_lanes: store.max_lanes(),
+            verify_rows_per_lane: verify_rows,
+            max_rows: store.max_lanes() * verify_rows,
+            copy_take_cap: copy.map_or(0, |c| c.take_cap),
+            head_lag_rows: copy.map_or(0, |c| c.config.head_lag_rows),
+            lab,
+            pp_microbatch_lanes: None,
         })
     }
 
@@ -1689,7 +1653,7 @@ impl EpMeshLanes {
                 prompt: admission.prompt,
                 spec_k: admission.spec_k,
                 head,
-                copy: false,
+                copy: self.copy_armed && admission.spec_k.is_some(),
                 head_lag: Vec::new(),
             })
             .map_err(|e| e.to_string())?;

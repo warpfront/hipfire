@@ -1710,7 +1710,7 @@ impl Qwen4Bundle {
 
 // ───────────────────────────────── fn-lanes ─────────────────────────────────
 
-use crate::lane::{LaneSpecConfig, LaneStoreReceipt, Qwen4LaneStore};
+use crate::lane::{LaneCopyConfig, LaneSpecConfig, LaneStoreReceipt, Qwen4LaneStore};
 use crate::lane_exec::{LaneDraft, Qwen4LaneExecutor};
 use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, StepOutput};
 
@@ -1763,10 +1763,22 @@ pub fn ep_lane_store_device_bytes(
     lanes: usize,
     row_budget: usize,
     spec_k: Option<usize>,
+    copy: Option<&crate::lane::LaneCopyConfig>,
 ) -> Option<u64> {
     let context =
         crate::kv_backend::Qwen4ContextCommit::new(backend, max_seq, chunk_rows, granularity);
-    Qwen4LaneStore::device_bytes(config, format, &context, lanes, row_budget, spec_k)
+    match (spec_k, copy) {
+        (Some(k), Some(copy)) => Qwen4LaneStore::device_bytes_with_copy(
+            config,
+            format,
+            &context,
+            lanes,
+            k,
+            crate::gpu_forward_lanes::LANE_MAX_ROWS,
+            copy,
+        ),
+        _ => Qwen4LaneStore::device_bytes(config, format, &context, lanes, row_budget, spec_k),
+    }
 }
 
 /// A lane-entry error as the plain text every rank compares.
@@ -1795,6 +1807,7 @@ fn stage_rank_lanes(
     max_lanes: usize,
     row_budget: usize,
     spec: Option<LaneSpecConfig>,
+    copy: Option<LaneCopyConfig>,
     reserve: u64,
 ) -> Result<(), String> {
     let rank = bundle
@@ -1817,6 +1830,7 @@ fn stage_rank_lanes(
         max_lanes,
         row_budget,
         spec.map(|spec| spec.k),
+        copy.as_ref(),
     )
     .ok_or_else(|| format!("rank {rank}: lane store device bytes overflow"))?;
     let free = gpu
@@ -1825,7 +1839,7 @@ fn stage_rank_lanes(
         .map_err(|error| format!("rank {rank}: device memory query failed: {error}"))?;
     ep_lane_fit(rank, need, free, reserve)?;
     bundle
-        .stage_lanes(gpu, max_lanes, row_budget, spec)
+        .stage_lanes_with_copy(gpu, max_lanes, row_budget, spec, copy)
         .map_err(|error| format!("rank {rank}: {}", bundle_text(error)))
 }
 
@@ -1940,6 +1954,7 @@ impl Qwen4Bundle {
         max_lanes: usize,
         row_budget: usize,
         spec: Option<LaneSpecConfig>,
+        copy: Option<LaneCopyConfig>,
     ) -> Result<(), BundleError> {
         if let Some(spec) = spec {
             // Spec lanes decode only through the mesh lane protocol
@@ -1966,12 +1981,12 @@ impl Qwen4Bundle {
             false,
             |bundle| {
                 Ok(stage_rank_lanes(
-                    bundle, gpu, max_lanes, row_budget, spec, reserve,
+                    bundle, gpu, max_lanes, row_budget, spec, copy, reserve,
                 ))
             },
             &|bundle, peer_gpu, _| {
                 Ok(stage_rank_lanes(
-                    bundle, peer_gpu, max_lanes, row_budget, spec, reserve,
+                    bundle, peer_gpu, max_lanes, row_budget, spec, copy, reserve,
                 ))
             },
         );
@@ -2556,6 +2571,7 @@ mod tests {
                 lanes,
                 budget,
                 None,
+                None,
             );
             assert_eq!(
                 planned,
@@ -2580,6 +2596,7 @@ mod tests {
                 granularity,
                 usize::MAX,
                 usize::MAX,
+                None,
                 None,
             ),
             None

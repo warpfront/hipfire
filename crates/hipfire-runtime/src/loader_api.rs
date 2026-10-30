@@ -133,6 +133,10 @@ pub struct BatchLoadRequest {
     /// the EP lane reservation charges the spec lane store (target ring,
     /// head state, wide hidden) instead of the AR store. `None`: AR lanes.
     pub spec_k: Option<usize>,
+    /// With `spec_k`: the spec lanes are staged with the copy lane armed, so
+    /// the reservation charges the widened verify rows, rings and head-lag
+    /// storage (`stage_lanes_with_copy`).
+    pub spec_copy: bool,
 }
 
 impl BatchLoadRequest {
@@ -437,6 +441,7 @@ mod ep_lane_reservation_request_tests {
             continuous_batch_size: 1,
             row_budget: 4096,
             spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(one.lanes(), None);
         let no_vmm = BatchLoadRequest {
@@ -444,6 +449,7 @@ mod ep_lane_reservation_request_tests {
             continuous_batch_size: 8,
             row_budget: 4096,
             spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(no_vmm.lanes(), None);
         let zero = BatchLoadRequest {
@@ -451,6 +457,7 @@ mod ep_lane_reservation_request_tests {
             continuous_batch_size: 0,
             row_budget: 0,
             spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(zero.lanes(), None);
         let on = BatchLoadRequest {
@@ -458,6 +465,7 @@ mod ep_lane_reservation_request_tests {
             continuous_batch_size: 4,
             row_budget: 0,
             spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(on.lanes(), Some(4));
     }

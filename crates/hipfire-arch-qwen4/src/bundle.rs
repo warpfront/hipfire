@@ -4504,13 +4504,7 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         self.pp_refuse("continuous-batch lanes")?;
         if self.ep.is_some() {
-            if copy.is_some() {
-                return Err(BundleError::Forward(
-                    "Qwen4 copy lanes are single-card only: the EP lane adapter does not run copy windows yet"
-                        .to_string(),
-                ));
-            }
-            return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec);
+            return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec, copy);
         }
         if copy.is_some() && (spec.is_none() || self.has_cpu_deferred_experts()) {
             return Err(BundleError::Forward(

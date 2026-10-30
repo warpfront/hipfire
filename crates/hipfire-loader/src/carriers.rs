@@ -2871,6 +2871,18 @@ pub fn qwen4_ep_vram_layers(
     // The lane store the stage after this load commits on every rank, from
     // the same bytes helper `stage_rank_lanes` uses (same context commit:
     // backend, `max_seq`, requested chunk and VMM granularity).
+    let copy = (batch.spec_k.is_some() && batch.spec_copy)
+        .then(|| {
+            hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
+                hipfire_config::ngram_mod_copy_triple(),
+            )
+            .ok()
+            .map(|ngram| hipfire_arch_qwen4::lane::LaneCopyConfig {
+                ngram,
+                head_lag_rows: 8,
+            })
+        })
+        .flatten();
     let lane = qwen4_ep_lane_request(batch, shared.backend, |lanes, row_budget| {
         hipfire_arch_qwen4::ep::ep_lane_store_device_bytes(
             &config,
@@ -2882,6 +2894,7 @@ pub fn qwen4_ep_vram_layers(
             lanes,
             row_budget,
             batch.spec_k,
+            copy.as_ref(),
         )
     });
     let mut plan = hipfire_arch_qwen4::expert_residency::ep_vram_plan(
@@ -12938,6 +12951,7 @@ mod ep_lane_reservation_tests {
             continuous_batch_size: lanes,
             row_budget,
             spec_k: None,
+            spec_copy: false,
         }
     }
 
