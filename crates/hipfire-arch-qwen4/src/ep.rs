@@ -39,6 +39,7 @@ use hipfire_runtime::serve_contract::{
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
 use rdna_compute::moe::{Qwen4EpOwnerTables, QWEN4_EP_OWNER_EXPERTS};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -80,6 +81,9 @@ pub struct PeerMirrors {
     /// drafter fan-out ([`Qwen4Bundle::ep_drafter_fanout`]) and freed with the
     /// mirrors.
     drafter: Option<crate::mtp_spec::Qwen4MtpDrafter>,
+    /// This peer's native-MTP lane executor state (mesh lane protocol), built
+    /// on the first mesh lane call.
+    pub(crate) mesh_lanes: Option<crate::ep_mesh_lanes::RankExec>,
 }
 
 impl PeerMirrors {
@@ -224,6 +228,54 @@ fn sync_device(gpu: &mut Gpu) -> Result<(), String> {
 
 /// `last_buffer` before any invocation.
 const NO_BUFFER: usize = usize::MAX;
+
+/// Row-gather exchanges this thread's rank has crossed: the evidence of the
+/// mesh lane ledger. A rank's forward runs the hook synchronously on its own
+/// thread (rank 0 on the caller's, a peer on its worker's), so a thread-local
+/// tally is exactly that rank's count; [`gather_tally`] differences bracket a
+/// phase.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GatherTally {
+    /// Exchanges of the trunk's MoE layers.
+    pub trunk: u64,
+    /// Exchanges of the MTP head's MoE step.
+    pub head: u64,
+    /// Payload bytes this rank exchanged (`slots x row_bytes`, both kinds).
+    pub bytes: u64,
+}
+
+impl GatherTally {
+    pub(crate) fn since(self, earlier: Self) -> Self {
+        Self {
+            trunk: self.trunk.saturating_sub(earlier.trunk),
+            head: self.head.saturating_sub(earlier.head),
+            bytes: self.bytes.saturating_sub(earlier.bytes),
+        }
+    }
+}
+
+thread_local! {
+    static GATHER_TALLY: Cell<GatherTally> = const { Cell::new(GatherTally { trunk: 0, head: 0, bytes: 0 }) };
+}
+
+/// This thread's cumulative row-gather tally.
+pub(crate) fn gather_tally() -> GatherTally {
+    GATHER_TALLY.with(Cell::get)
+}
+
+fn note_gather(head: bool, bytes: u64) {
+    GATHER_TALLY.with(|cell| {
+        let mut tally = cell.get();
+        if head {
+            tally.head += 1;
+        } else {
+            tally.trunk += 1;
+        }
+        tally.bytes += bytes;
+        cell.set(tally);
+    });
+}
+
 
 /// The row-gather hook one rank installs into its forward
 /// (`Qwen4GpuForward::attach_ep`).
@@ -395,6 +447,12 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
                 slots,
             ),
         };
+        if result.is_ok() {
+            note_gather(
+                layer_idx as usize >= self.trunk_layers,
+                (slots * self.gather.spec().row_bytes) as u64,
+            );
+        }
         result.map_err(|error| {
             format!(
                 "qwen4 EP row gather layer {layer_idx} rank {}: {error}",
@@ -1736,6 +1794,7 @@ fn stage_rank_lanes(
     gpu: &mut Gpu,
     max_lanes: usize,
     row_budget: usize,
+    spec: Option<LaneSpecConfig>,
     reserve: u64,
 ) -> Result<(), String> {
     let rank = bundle
@@ -1757,7 +1816,7 @@ fn stage_rank_lanes(
         gpu.vmm_recommended_granularity().unwrap_or(1),
         max_lanes,
         row_budget,
-        None,
+        spec.map(|spec| spec.k),
     )
     .ok_or_else(|| format!("rank {rank}: lane store device bytes overflow"))?;
     let free = gpu
@@ -1766,7 +1825,7 @@ fn stage_rank_lanes(
         .map_err(|error| format!("rank {rank}: device memory query failed: {error}"))?;
     ep_lane_fit(rank, need, free, reserve)?;
     bundle
-        .stage_lanes(gpu, max_lanes, row_budget, None)
+        .stage_lanes(gpu, max_lanes, row_budget, spec)
         .map_err(|error| format!("rank {rank}: {}", bundle_text(error)))
 }
 
@@ -1882,10 +1941,13 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<LaneSpecConfig>,
     ) -> Result<(), BundleError> {
-        if spec.is_some() {
-            return Err(ep_err(
-                "native-MTP lanes are not supported yet; stage AR lanes (serve.batch_spec = false)",
-            ));
+        if let Some(spec) = spec {
+            // Spec lanes decode only through the mesh lane protocol
+            // ([`crate::ep_mesh_lanes`]); the staged store itself is the same on
+            // every rank (identical `spec`, so identical host tables).
+            if spec.k == 0 {
+                return Err(ep_err("native-MTP lanes need k >= 1"));
+            }
         }
         let reserve = QWEN4_EP_LANE_RESERVE_BYTES;
         let staged = self
@@ -1904,12 +1966,12 @@ impl Qwen4Bundle {
             false,
             |bundle| {
                 Ok(stage_rank_lanes(
-                    bundle, gpu, max_lanes, row_budget, reserve,
+                    bundle, gpu, max_lanes, row_budget, spec, reserve,
                 ))
             },
             &|bundle, peer_gpu, _| {
                 Ok(stage_rank_lanes(
-                    bundle, peer_gpu, max_lanes, row_budget, reserve,
+                    bundle, peer_gpu, max_lanes, row_budget, spec, reserve,
                 ))
             },
         );
@@ -2108,6 +2170,17 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         requests: &[(RequestEpoch, usize)],
     ) -> Result<Vec<LaneDraft>, String> {
+        // Every rank would run its own adaptive route chooser and compare only
+        // after the head gathers: a route/depth disagreement changes the number
+        // of gathers. EP native-MTP lanes plan on rank 0 alone and replay on the
+        // others ([`crate::ep_mesh_lanes`]).
+        if self.lanes.as_ref().is_some_and(|store| store.spec().is_some()) {
+            return Err(
+                "qwen4 EP: native-MTP lanes decode through the mesh lane protocol (EpMeshLanes), \
+                 not the per-rank draft_step"
+                    .to_string(),
+            );
+        }
         self.ep_lane_soft(
             "lane draft_step",
             |bundle| run_lane_exec(bundle, |exec| exec.draft_step(gpu, requests)),
