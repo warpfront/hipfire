@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: on gfx11 A8 prefill, `HIPFIRE_A8_FUSED_PROD=0` now runs the standalone A8 quantizer instead of handing the projections to IU4 (W4A4).** `Gpu::iu4_producer_sidecar_active` and `iu4_gfx11_producer_quant_fused_active` decline a shape A8 owns when the fused producers are off; with them on (the default) nothing changes. Qwen3.8-27B mq4-xts code24 on gfx1151 (`HIPFIRE_GFX11_A8_PREFILL=1`): the opt-out went from KLD 0.048487 (IU4 level) to 0.027297, and its `.kldseq` (`aec8f346`) is now bit-identical to the fused default, so the fused and unfused A8 producers agree.
+
 ## v0.4.5 — 2026-11-11 (re-cut)
 
 The v0.4.5 tag first pointed at `b30b46c1e2` (2026-10-30); that GitHub release was never published. v0.4.5 was re-cut at `7f7cf7f50f` and now includes everything below. If you fetched the October tag, run `git fetch --tags --force`.
