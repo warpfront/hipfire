@@ -58,10 +58,6 @@ impl CopyPool {
         })
     }
 
-    pub(crate) fn config(&self) -> &NgramModConfig {
-        &self.config
-    }
-
     /// A fresh request-local copy lane: history = the FULL `prompt` plus the
     /// admission `seed` (the first emitted token), indexed.
     pub(crate) fn checkout(&mut self, prompt: &[u32], seed: u32) -> Result<CopyLane, String> {
@@ -317,6 +313,147 @@ pub(crate) fn head_outcome(w: &HeadWindow<'_>) -> HeadOutcome {
             append: HeadAppend::default(),
             head: HeadState::Lag { from: book.start },
             lag: book,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(ratio: f32, weight: f32) -> Vec<(f32, f32)> {
+        vec![(ratio * weight, weight); 7]
+    }
+
+    fn input<'a>(
+        agreement: &'a [(f32, f32)],
+        retired: bool,
+        last_first_accepted: bool,
+    ) -> CopyTakeInput<'a> {
+        CopyTakeInput {
+            available: 7,
+            cap: 7,
+            n_min: 2,
+            agreement,
+            retired,
+            last_first_accepted,
+        }
+    }
+
+    #[test]
+    fn mesh_lane_protocol_copy_chooser_is_the_singletons_and_retired_lanes_compare_to_ar() {
+        let cost = |d: usize| crate::mtp_spec::MTP_WINDOW_COST[d];
+        let t = table(0.99, 20.0);
+        // A retired request's alternative is one AR row (1.0), and it only
+        // takes while the last shadow observation accepted its first
+        // candidate.
+        let cold = copy_take_decision(&input(&t, true, false), || 99.0, cost);
+        assert_eq!(cold.take, 0, "retired and cold: declined");
+        let warm = copy_take_decision(&input(&t, true, true), || 99.0, cost);
+        assert!(warm.take >= 2, "{warm:?}");
+        assert_eq!(warm.native_rate, 1.0, "AR is the comparator, not native");
+        // A live request compares with the native window.
+        let live = copy_take_decision(&input(&t, false, true), || 99.0, cost);
+        assert_eq!(live.take, 0, "native at 99 tokens per unit wins");
+        assert_eq!(live.native_rate, 99.0);
+        // Established: acceptance, evidence, first-candidate and take length.
+        assert!(
+            !warm.confirm,
+            "an established source omits the confirmation"
+        );
+        let fresh = table(0.8, 2.0);
+        let d = copy_take_decision(&input(&fresh, false, false), || 1.0, cost);
+        assert!(d.confirm, "an unestablished source must confirm: {d:?}");
+        let d = copy_take_decision(&input(&t, false, false), || 1.0, cost);
+        assert!(d.confirm, "never established without a first acceptance");
+    }
+
+    #[test]
+    fn mesh_lane_protocol_head_outcome_transitions_mirror_the_singletons_head_lag() {
+        let empty = HeadLag::default();
+        let w = |head, lag: &HeadLag, live, capacity| {
+            HeadWindow {
+                head,
+                lag,
+                position: 40,
+                seed: 9,
+                consumed: if live { 3 } else { 1 },
+                live,
+                capacity,
+            }
+            .clone_outcome()
+        };
+        // Head-free: nothing, ever.
+        let o = w(HeadState::Free, &empty, true, 4);
+        assert_eq!((o.end, o.head), (HeadEnd::Free, HeadState::Free));
+        // A live window on an aligned head: the retained rows only.
+        let o = w(HeadState::Aligned, &empty, true, 4);
+        assert_eq!(
+            o.append,
+            HeadAppend {
+                owed: 0,
+                retained: 3
+            }
+        );
+        assert_eq!(o.end, HeadEnd::Aligned { end: 43 });
+        // A retired AR token owes its row; the head is not touched.
+        let o = w(HeadState::Aligned, &empty, false, 4);
+        assert_eq!(o.append, HeadAppend::default());
+        assert_eq!(o.end, HeadEnd::Lag { from: 40, to: 41 });
+        assert_eq!((o.lag.start, o.lag.tokens.clone()), (40, vec![9]));
+        // It keeps growing, contiguous from the head position...
+        let lag = o.lag.clone();
+        let mut next = HeadWindow {
+            head: o.head,
+            lag: &lag,
+            position: 41,
+            seed: 10,
+            consumed: 1,
+            live: false,
+            capacity: 4,
+        };
+        let o2 = head_outcome(&next);
+        assert_eq!(o2.end, HeadEnd::Lag { from: 40, to: 42 });
+        assert_eq!(o2.lag.tokens, vec![9, 10]);
+        // ... a takeover flushes the owed rows first ...
+        next.live = true;
+        next.consumed = 4;
+        let o3 = head_outcome(&next);
+        assert_eq!(
+            o3.append,
+            HeadAppend {
+                owed: 1,
+                retained: 4
+            }
+        );
+        assert_eq!((o3.head, o3.lag.tokens.len()), (HeadState::Aligned, 0));
+        // ... and a full record flushes at capacity (one batched fill).
+        let o4 = head_outcome(
+            &HeadWindow {
+                capacity: 2,
+                ..next
+            }
+            .as_ar(),
+        );
+        assert_eq!(
+            o4.append,
+            HeadAppend {
+                owed: 1,
+                retained: 1
+            }
+        );
+        assert_eq!(o4.end, HeadEnd::Aligned { end: 42 });
+    }
+
+    impl<'a> HeadWindow<'a> {
+        fn clone_outcome(self) -> HeadOutcome {
+            head_outcome(&self)
+        }
+
+        fn as_ar(mut self) -> Self {
+            self.live = false;
+            self.consumed = 1;
+            self
         }
     }
 }

@@ -2025,9 +2025,7 @@ impl MeshRoot {
                 // work); without one it is truly head-free.
                 plan.head = match lane.head {
                     HeadState::Free => HeadState::Free,
-                    HeadState::Aligned
-                        if matches!(route, LaneRoute::ArRetired) && !copy_active =>
-                    {
+                    HeadState::Aligned if matches!(route, LaneRoute::ArRetired) && !copy_active => {
                         HeadState::Free
                     }
                     HeadState::Aligned => HeadState::Aligned,
@@ -2439,8 +2437,7 @@ impl MeshRoot {
                 let (source, copy_confirm, native_depth, max_depth, eos) =
                     (l.source, l.copy_confirm, l.native_depth, l.max_depth, l.eos);
                 let first_candidate = l.copy_drafts.first().copied();
-                if source == ProposalSource::Copy && copy_confirm && s.draft[i].confirm.is_none()
-                {
+                if source == ProposalSource::Copy && copy_confirm && s.draft[i].confirm.is_none() {
                     // The first-candidate confirmation: the head's own row-0
                     // argmax (`p.token`, before any sampled draw: nothing is
                     // drawn for an abandoned draft). A hit abandons the
@@ -3564,8 +3561,7 @@ impl RankSession {
             // head-free lane, no owed flush without a lagging head (or after
             // the plan's own catch-up), retained rows are all or none.
             let append = d.head_append;
-            let lag_possible =
-                matches!(l.head, HeadState::Lag { .. }) && l.catch_up.is_none();
+            let lag_possible = matches!(l.head, HeadState::Lag { .. }) && l.catch_up.is_none();
             let schedule_ok = if l.head == HeadState::Free {
                 append == HeadAppend::default() && d.head_end == HeadEnd::Free
             } else {
@@ -4182,7 +4178,7 @@ mod tests {
                 eos,
                 spec_k,
                 vec![1, 2, 3, tag as u32],
-                false,
+                true,
             )
         }
 
@@ -4346,6 +4342,34 @@ mod tests {
                 .iter_mut()
                 .filter_map(|r| r.evidence(key))
                 .collect()
+        }
+
+        /// One complete step in protocol order (manual stepping), after the
+        /// previous step's merged evidence `prior`.
+        fn step_p(
+            &mut self,
+            prior: Option<&MergedCostEvidence>,
+            reqs: &[LaneRequest],
+            b: &WindowBudgets,
+        ) -> (WindowStart, StepOutput) {
+            let start = self.s_plan(prior, reqs, b).unwrap();
+            self.s_ready().unwrap();
+            self.s_draft().unwrap();
+            self.s_verify().unwrap();
+            self.s_decide(&mut GreedyRule).unwrap();
+            self.s_prepare().unwrap();
+            let out = self.s_publish();
+            (start, out)
+        }
+
+        fn step(&mut self, reqs: &[LaneRequest], b: &WindowBudgets) -> (WindowStart, StepOutput) {
+            self.step_p(None, reqs, b)
+        }
+
+        /// The merged evidence of a published step.
+        fn merged(&mut self, out: &StepOutput) -> MergedCostEvidence {
+            let ev = self.evidence(&out.key);
+            self.root.merge_evidence(&ev, interval()).unwrap()
         }
     }
 
@@ -5390,7 +5414,7 @@ mod tests {
             (MeshKind::Pp, FailAt::Prepare, 0, StepPhase::Decided),
             (MeshKind::Pp, FailAt::Draft(0), 1, StepPhase::Armed),
         ] {
-            let mut m = Mesh::new(kind, false);
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
             for t in 1..=2 {
                 m.admit(t, 30, 7, None, Some(3));
                 script_matching(&m, t, 0, 8);
@@ -5427,7 +5451,7 @@ mod tests {
             assert!(m.root.generated(epoch(1)).unwrap().is_empty());
             assert_eq!(
                 m.root.copy_history(epoch(1)).unwrap().tokens(),
-                &[1, 2, 3, 1]
+                &[1, 2, 3, 1, 7]
             );
             // The mesh stays down.
             let again = m
@@ -5453,7 +5477,7 @@ mod tests {
 
     #[test]
     fn mesh_lane_protocol_nothing_published_until_all_prepared() {
-        let mut m = Mesh::new(MeshKind::Ep, false);
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
         m.admit(1, 10, 7, None, Some(3));
         script_matching(&m, 1, 0, 2);
         let e = epoch(1);
@@ -5464,7 +5488,7 @@ mod tests {
         let unchanged = |m: &Mesh| {
             m.root.generated(e).unwrap().is_empty()
                 && m.root.lane_position(e) == Some((10, 7))
-                && m.root.copy_history(e).unwrap().tokens() == &[1u32, 2, 3, 1][..]
+                && m.root.copy_history(e).unwrap().tokens() == &[1u32, 2, 3, 1, 7][..]
         };
         // Calling a later phase out of order is a caller error and changes nothing.
         assert_eq!(
@@ -5503,7 +5527,7 @@ mod tests {
 
     #[test]
     fn mesh_lane_protocol_publish_applies_all_staged_state_once() {
-        let mut m = Mesh::new(MeshKind::Ep, false);
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
         m.admit(1, 10, 7, None, Some(3));
         script_matching(&m, 1, 0, 2);
         let e = epoch(1);
@@ -5520,7 +5544,7 @@ mod tests {
         assert_eq!(m.root.generated(e).unwrap(), l.emitted.as_slice());
         assert_eq!(
             m.root.copy_history(e).unwrap().tokens().len(),
-            4 + l.emitted.len()
+            5 + l.emitted.len()
         );
         assert_eq!(
             m.root.lane_position(e).unwrap(),
@@ -5795,114 +5819,614 @@ mod tests {
         assert_ne!(a[&1].1, a[&2].1);
     }
 
+    // ---- copy lane + head lag (root state) ---------------------------------------------
+
+    fn copy_cfg() -> NgramModConfig {
+        NgramModConfig {
+            capacity: 1 << 10,
+            n_match: 3,
+            n_min: 2,
+            n_max: 7,
+        }
+    }
+
+    /// `20..80` twice: after the seed `20` the history continues as
+    /// `21, 22, ...` from an earlier occurrence, so a copy source proposes
+    /// the next tokens of the cycle and a script that emits the cycle
+    /// accepts them.
+    fn cycle_prompt() -> Vec<u32> {
+        (20..80).chain(20..80).collect()
+    }
+
+    /// Script one window of a lane whose pending seed is cycle value `v`: the
+    /// head's drafts and the target's picks both continue the cycle.
+    fn script_cycle(m: &Mesh, tag: u64, seq: u64, v: u32) {
+        let drafts: Vec<u32> = (1..=7).map(|i| v + i).collect();
+        let picks: Vec<u32> = (1..=8).map(|i| v + i).collect();
+        m.script_window(tag, seq, &drafts, &picks);
+    }
+
+    fn admit_cycle(m: &mut Mesh, tag: u64, eos: Option<u32>) -> RequestEpoch {
+        m.admit_with(tag, 120, 20, eos, Some(3), cycle_prompt(), true)
+    }
+
+    /// Native `K = 3` drafting with a copy depth cap of seven (eight rows).
+    fn cycle_budgets() -> WindowBudgets {
+        budgets(LabRoutes::Batched, 7)
+    }
+
+    fn retired_policy() -> LaneSpecPolicy {
+        LaneSpecPolicy::promoted(
+            3,
+            &[hipfire_runtime::spec_economics::AGREEMENT_PRIOR; 3],
+            true,
+        )
+    }
+
+    /// A lane at prompt `1..=30`, seed 5 at position 30, floor-retired.
+    fn admit_retired(m: &mut Mesh, copy: bool) -> RequestEpoch {
+        let e = m.admit_with(1, 30, 5, None, Some(3), (1..=30).collect(), copy);
+        m.root.test_set_policy(e, retired_policy());
+        assert_eq!(m.root.lane_retired(e), Some(true));
+        e
+    }
+
+    #[test]
+    fn mesh_lane_protocol_copy_is_off_without_a_root_copy_lane() {
+        let mut m = Mesh::new(MeshKind::Ep, false);
+        let e = m.admit_with(1, 120, 20, None, Some(3), cycle_prompt(), true);
+        assert!(m.root.copy_history(e).is_none(), "no context was built");
+        script_cycle(&m, 1, 0, 20);
+        let (start, out) = m.step(&[req(1, 99)], &cycle_budgets());
+        assert_ne!(start.lanes[0].source, ProposalSource::Copy);
+        assert!(start.lanes[0].copy_drafts.is_empty());
+        assert_ne!(lane_out(&out, 1).source.source, ProposalSource::Copy);
+    }
+
     #[test]
     fn mesh_lane_protocol_copy_history_never_crosses_epochs_and_keeps_retained_output_only() {
-        let mut m = Mesh::new(MeshKind::Ep, false);
-        let e1 = m.admit(1, 10, 7, None, Some(3));
-        script_matching(&m, 1, 0, 2);
-        let out = m
-            .run_greedy(&[req(1, 99)], &budgets(LabRoutes::Batched, 3))
-            .unwrap();
-        let emitted = lane_out(&out, 1).emitted.clone();
-        // prompt ++ retained output; rejected drafts / candidates are never history.
-        let mut want = vec![1, 2, 3, 1];
-        want.extend(&emitted);
-        assert_eq!(m.root.copy_history(e1).unwrap().tokens(), want.as_slice());
-        assert!(!want.contains(&12), "a rejected draft is not history");
+        use hipfire_runtime::spec_economics::AGREEMENT_PRIOR;
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+        let e1 = admit_cycle(&mut m, 1, None);
+        let prompt = cycle_prompt();
+        let mut want = prompt.clone();
+        want.push(20);
+        assert_eq!(
+            m.root.copy_history(e1).unwrap().tokens(),
+            want.as_slice(),
+            "the FULL prompt plus the admission seed"
+        );
         assert_eq!(m.root.copy_history(e1).unwrap().epoch(), e1);
-        // Release and reuse the tag at a new owner generation.
+
+        // Window 0: two candidates accepted, the third rejected (bonus 900).
+        let drafts: Vec<u32> = (21..=27).collect();
+        let mut picks: Vec<u32> = (21..=28).collect();
+        picks[2] = 900;
+        m.script_window(1, 0, &drafts, &picks);
+        let (start, out) = m.step(&[req(1, 99)], &cycle_budgets());
+        assert_eq!(start.lanes[0].source, ProposalSource::Copy);
+        assert_eq!(start.lanes[0].copy_drafts, vec![21, 22, 23, 24, 25]);
+        let l = lane_out(&out, 1);
+        assert_eq!(l.emitted, vec![21, 22, 900]);
+        assert_eq!(l.source.confirm, ConfirmOutcome::Confirmed);
+        // Retained output only: the rejected candidates 23.. never enter.
+        want.extend([21, 22, 900]);
+        assert_eq!(
+            m.root.copy_history(e1).unwrap().tokens(),
+            want.as_slice(),
+            "history grows only by the committed tokens, at publish"
+        );
+        // Low acceptance does not clear anything: the shadow decays, the
+        // source stays active and the prompt stays indexed history.
+        let (active, agreement, first) = m.root.copy_shadow(e1).unwrap();
+        assert!(active && first);
+        assert_ne!(agreement, vec![AGREEMENT_PRIOR; 7]);
+        assert!(m
+            .root
+            .copy_history(e1)
+            .unwrap()
+            .tokens()
+            .starts_with(&prompt));
+
+        // Release and reuse the tag at a new owner generation: a new epoch
+        // is a new context; nothing of epoch 1 crosses.
         m.root.release_lane(e1).unwrap();
         for r in &mut m.ranks {
             r.release_lane(&e1).unwrap();
         }
+        assert!(m.root.copy_history(e1).is_none());
         let e2 = RequestEpoch {
             request_tag: 1,
             owner_generation: 2,
         };
+        let b_prompt: Vec<u32> = (500..560).chain(500..560).collect();
         let a = m
             .root
             .admit_lane(LaneAdmission {
                 epoch: e2,
-                position: 10,
-                seed: 7,
+                position: 120,
+                seed: 500,
                 eos: None,
                 rng_seed: 77,
-                prompt: vec![9, 9],
+                prompt: b_prompt.clone(),
                 spec_k: Some(3),
                 head: HeadState::Aligned,
+                copy: true,
+                head_lag: Vec::new(),
             })
             .unwrap();
+        for r in &mut m.ranks {
+            r.admit_lane(&a).unwrap();
+        }
+        let mut want2 = b_prompt.clone();
+        want2.push(500);
         assert_eq!(
             m.root.copy_history(e2).unwrap().tokens(),
-            &[9, 9],
+            want2.as_slice(),
             "nothing of epoch 1 survives"
         );
-        assert!(m.root.copy_history(e1).is_none());
         assert_eq!(m.root.copy_history(e2).unwrap().epoch(), e2);
+        assert_eq!(
+            m.root.copy_shadow(e2).unwrap(),
+            (true, vec![AGREEMENT_PRIOR; 7], false),
+            "a fresh shadow: no acceptance history crosses either"
+        );
         assert!(a.lane_generation > out.lanes[0].key.lane_generation);
         assert_eq!(m.root.generated(e2).unwrap(), &[] as &[u32]);
-        assert_eq!(m.root.rng_probe(e2).unwrap(), {
-            let mut r = SpecRng::new(77);
-            r.next_u64()
-        });
+        // The recycled context proposes from epoch 2's history alone.
+        script_cycle(&m, 1, 0, 500);
+        let mut r2 = req(1, 99);
+        r2.epoch = e2;
+        let (start2, out2) = m.step(&[r2], &cycle_budgets());
+        let lane = &start2.lanes[0];
+        assert_eq!(lane.source, ProposalSource::Copy);
+        assert!(
+            lane.copy_drafts.iter().all(|t| (501..560).contains(t)),
+            "candidates come from epoch 2's prompt: {:?}",
+            lane.copy_drafts
+        );
+        assert!(lane_out(&out2, 1).emitted.iter().all(|&t| t >= 500));
     }
 
     #[test]
-    fn mesh_lane_protocol_copy_window_is_a_root_source_without_head_rounds() {
-        let mut m = Mesh::new(MeshKind::Ep, false);
-        m.admit(1, 10, 7, Some(21), Some(3));
-        // Cycle window 0 is Batched{K}, 1 Batched{1}, 2 ArSynced (copy overrides),
-        // 3 Batched{2}: walk to the ArSynced window.
-        let b = budgets(LabRoutes::Cycle, 3);
-        for seq in 0..2 {
-            script_matching(&m, 1, seq, 8);
-            m.run_greedy(&[req(1, 1000)], &b).unwrap();
-        }
-        let mut r = req(1, 1000);
-        r.copy_candidates = vec![30, 21, 99];
-        let start = m.root.plan_window(None, &[r.clone()], &b).unwrap();
+    fn mesh_lane_protocol_copy_candidates_truncate_at_eos() {
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+        admit_cycle(&mut m, 1, Some(23));
+        script_cycle(&m, 1, 0, 20);
+        let (start, out) = m.step(&[req(1, 99)], &cycle_budgets());
         let lane = &start.lanes[0];
-        assert_eq!(
-            lane.route,
-            LaneRoute::ArSynced,
-            "the native route survives for accounting"
-        );
         assert_eq!(lane.source, ProposalSource::Copy);
         assert_eq!(
             lane.copy_drafts,
-            vec![30, 21],
-            "truncated after the first EOS"
+            vec![21, 22, 23],
+            "the take is cut after the first EOS"
         );
-        assert_eq!(lane.max_depth, 2);
-        m.root
-            .abort_step(Some(&start.key), StepPhase::Planned, "probe")
-            .unwrap();
-
-        // Run it for real on a fresh mesh walked to the same point.
-        let mut m = Mesh::new(MeshKind::Ep, false);
-        m.admit(1, 10, 7, Some(21), Some(3));
-        for seq in 0..2 {
-            script_matching(&m, 1, seq, 8);
-            m.run_greedy(&[req(1, 1000)], &b).unwrap();
-        }
-        m.script_window(1, 2, &[], &[30, 21, 5]);
-        let calls_before = m.ranks[0].calls.len();
-        let out = m.run_greedy(&[r], &b).unwrap();
+        assert_eq!(lane.max_depth, 3);
+        assert_eq!(
+            m.verify.as_ref().unwrap().lanes[0].rows,
+            vec![20, 21, 22, 23]
+        );
         let l = lane_out(&out, 1);
         assert_eq!(l.source.source, ProposalSource::Copy);
-        assert_eq!(l.source.offered, 2);
-        assert_eq!(
-            l.emitted,
-            vec![30, 21],
-            "an accepted EOS candidate ends the window"
-        );
+        assert_eq!(l.emitted, vec![21, 22, 23]);
         assert!(l.terminal);
-        assert_eq!(l.consumed_rows, 2, "accepted EOS stays the pending seed");
-        assert!(
-            m.ranks[0].calls[calls_before..]
+        assert_eq!(l.consumed_rows, 3, "an accepted EOS stays the pending seed");
+    }
+
+    #[test]
+    fn mesh_lane_protocol_established_copy_window_runs_no_head_rounds() {
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+        admit_cycle(&mut m, 1, None);
+        let b = cycle_budgets();
+        let mut established = None;
+        for seq in 0..12u64 {
+            let (_, v) = m.root.lane_position(epoch(1)).unwrap();
+            script_cycle(&m, 1, seq, v);
+            let before = m.ranks[0].calls.len();
+            let (start, out) = m.step(&[req(1, 1000)], &b);
+            let lane = &start.lanes[0];
+            assert_eq!(lane.source, ProposalSource::Copy, "window {seq}");
+            let drafts = m.ranks[0].calls[before..]
                 .iter()
-                .all(|c| !matches!(c, Call::Draft(..))),
-            "copy proposals are root-known: no head round"
+                .filter(|c| matches!(c, Call::Draft(..)))
+                .count();
+            let l = lane_out(&out, 1);
+            if lane.copy_confirm {
+                assert_eq!(drafts, 1, "window {seq}: one confirmation head draft");
+                assert_eq!(l.source.confirm, ConfirmOutcome::Confirmed);
+            } else {
+                assert_eq!(drafts, 0, "an established source runs no head round");
+                assert_eq!(l.source.confirm, ConfirmOutcome::NotAsked);
+                assert_eq!(m.verify.as_ref().unwrap().ledger.head_draft_calls, 0);
+                assert!(lane.catch_up.is_none());
+                established = Some(seq);
+                break;
+            }
+        }
+        let seq = established.expect("the source establishes within a few windows");
+        assert!(
+            seq >= 3,
+            "not before the shadow evidence accumulated: {seq}"
+        );
+    }
+
+    #[test]
+    fn mesh_lane_protocol_unestablished_copy_needs_the_heads_first_draft_to_confirm() {
+        let b = cycle_budgets();
+        for kind in BOTH {
+            // The head's row-0 draft equals the first candidate: a copy window.
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            admit_cycle(&mut m, 1, None);
+            script_cycle(&m, 1, 0, 20);
+            let (start, out) = m.step(&[req(1, 99)], &b);
+            let lane = &start.lanes[0];
+            assert!(
+                lane.copy_confirm,
+                "an unestablished source must not skip the confirmation"
+            );
+            assert_eq!(lane.source, ProposalSource::Copy);
+            let l = lane_out(&out, 1);
+            assert_eq!(l.source.source, ProposalSource::Copy);
+            assert_eq!(l.source.confirm, ConfirmOutcome::Confirmed);
+            assert_eq!(l.source.offered, 5);
+            let head_rank = m.ranks.iter().find(|r| r.ownership().head).unwrap();
+            let rounds: Vec<&Call> = head_rank
+                .calls
+                .iter()
+                .filter(|c| matches!(c, Call::Draft(..)))
+                .collect();
+            assert_eq!(rounds.len(), 1, "{kind:?}: exactly the confirmation round");
+            assert!(matches!(rounds[0], Call::Draft(0, ops)
+                if ops.len() == 1 && ops[0].1 == 120 && ops[0].2 == 20));
+            assert_eq!(
+                m.verify.as_ref().unwrap().lanes[0].rows,
+                vec![20, 21, 22, 23, 24, 25],
+                "the head's abandoned draft is not part of the copy window"
+            );
+
+            // A miss falls back to the native route, with the head's drafts.
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            admit_cycle(&mut m, 1, None);
+            m.script_window(1, 0, &[999, 998, 997], &[500, 501, 502, 503]);
+            let (start, out) = m.step(&[req(1, 99)], &b);
+            assert!(start.lanes[0].copy_confirm);
+            let l = lane_out(&out, 1);
+            assert_eq!(l.source.confirm, ConfirmOutcome::Missed);
+            assert_eq!(l.source.source, ProposalSource::Native);
+            assert_eq!(l.source.offered, 3);
+            assert_eq!(
+                m.verify.as_ref().unwrap().lanes[0].rows,
+                vec![20, 999, 998, 997]
+            );
+            assert_eq!(l.emitted, vec![500]);
+            let mut want = cycle_prompt();
+            want.extend([20, 500]);
+            assert_eq!(
+                m.root.copy_history(epoch(1)).unwrap().tokens(),
+                want.as_slice(),
+                "neither the candidates nor the head's drafts are history"
+            );
+            // The copy shadow still observed the proposal (whichever source ran).
+            let (_, _, first) = m.root.copy_shadow(epoch(1)).unwrap();
+            assert!(
+                !first,
+                "the committed 500 is not the proposal's first token"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_lane_protocol_retired_lane_copy_takeover_stays_ar_retired_and_flushes_lag_first() {
+        let b = cycle_budgets();
+        for kind in BOTH {
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            let e = admit_retired(&mut m, true);
+            // Target-only AR tokens 6, 7, 8: the head owes a row per token.
+            for (seq, pick) in [6u32, 7, 8].into_iter().enumerate() {
+                m.script_window(1, seq as u64, &[], &[pick]);
+                let (start, out) = m.step(&[req(1, 99)], &b);
+                let lane = &start.lanes[0];
+                assert_eq!(lane.route, LaneRoute::ArRetired);
+                assert_eq!(lane.source, ProposalSource::None, "window {seq}");
+                assert!(lane.catch_up.is_none());
+                let head_rank = m.ranks.iter().find(|r| r.ownership().head).unwrap();
+                assert!(
+                    !head_rank.calls.iter().any(|c| matches!(c, Call::Draft(..))),
+                    "a retired AR window runs no head round"
+                );
+                assert_eq!(lane_out(&out, 1).source.source, ProposalSource::None);
+                let (head, owed) = m.root.head_state(e).unwrap();
+                assert_eq!(head, HeadState::Lag { from: 30 }, "window {seq}");
+                assert_eq!(owed, &[5u32, 6, 7][..=seq]);
+            }
+            let (_, _, first) = m.root.copy_shadow(e).unwrap();
+            assert!(
+                first,
+                "the AR token 8 equalled the declined proposal's first token"
+            );
+
+            // Window 3: the source resumed. The native chooser stays retired.
+            m.script_window(1, 3, &[9], &[9, 10, 11, 12, 13, 14, 15, 16]);
+            let start = m.s_plan(None, &[req(1, 99)], &b).unwrap();
+            let lane = start.lanes[0].clone();
+            assert_eq!(lane.route, LaneRoute::ArRetired);
+            assert_eq!(lane.source, ProposalSource::Copy);
+            assert!(lane.copy_confirm);
+            assert_eq!(lane.head, HeadState::Lag { from: 30 });
+            assert_eq!(
+                lane.catch_up,
+                Some(CatchUp {
+                    from: 30,
+                    tokens: vec![5, 6, 7]
+                }),
+                "the owed rows are flushed before the takeover's head work"
+            );
+            m.s_ready().unwrap();
+            let round = m.root.next_draft_round().unwrap().unwrap();
+            assert_eq!(round.catch_up.len(), 1);
+            // A rank refuses a catch-up that departs from the plan.
+            let mut bad = round.clone();
+            bad.catch_up[0].1.tokens.pop();
+            let rank = m.ranks.iter_mut().find(|r| r.ownership().head).unwrap();
+            let err = rank.run_draft_round(&bad).unwrap_err();
+            assert!(err.reason.contains("catch-up"), "{err:?}");
+            let mut res = Vec::new();
+            for r in m.ranks.iter_mut().filter(|r| r.ownership().head) {
+                res.push(r.run_draft_round(&round).unwrap());
+            }
+            assert!(res.iter().all(|r| r.catch_up_rows == 3));
+            m.root.collect_draft(&round, &res).unwrap();
+            m.s_draft().unwrap();
+            m.s_verify().unwrap();
+            let d = m.s_decide(&mut GreedyRule).unwrap();
+            m.s_prepare().unwrap();
+            let out = m.s_publish();
+            let l = lane_out(&out, 1);
+            assert_eq!(l.source.source, ProposalSource::Copy);
+            assert_eq!(l.source.confirm, ConfirmOutcome::Confirmed);
+            assert_eq!(l.consumed_rows, 1 + l.source.offered);
+            // The head ended aligned: the catch-up flushed the lag ahead of
+            // the window, the retained rows follow the takeover.
+            assert_eq!(
+                d.lanes[0].head_append,
+                HeadAppend {
+                    owed: 0,
+                    retained: l.consumed_rows
+                }
+            );
+            assert_eq!(
+                d.lanes[0].head_end,
+                HeadEnd::Aligned {
+                    end: 33 + l.consumed_rows
+                }
+            );
+            let (head, owed) = m.root.head_state(e).unwrap();
+            assert_eq!((head, owed.len()), (HeadState::Aligned, 0));
+            assert_eq!(m.root.lane_retired(e), Some(true), "copy never un-retires");
+            let head_rank = m.ranks.iter().find(|r| r.ownership().head).unwrap();
+            let tail: Vec<&Call> = head_rank
+                .calls
+                .iter()
+                .filter(|c| matches!(c, Call::CatchUp(_) | Call::HeadRepair(_)))
+                .rev()
+                .take(2)
+                .collect();
+            assert!(matches!(tail[1], Call::CatchUp(c) if c[0].1 == 30 && c[0].2 == 3));
+            // The evidence counts the catch-up and the retained rows.
+            let merged = m.merged(&out);
+            assert_eq!(merged.counts.head_append_rows, 3 + l.consumed_rows);
+
+            // The next plan prices the copy window as an external window and
+            // the lane stays retired.
+            let (_, seed) = m.root.lane_position(e).unwrap();
+            script_cycle(&m, 1, 4, seed);
+            let (start, _) = m.step_p(Some(&merged), &[req(1, 99)], &b);
+            assert_eq!(start.lanes[0].route, LaneRoute::ArRetired);
+            assert_eq!(m.root.counters().observations_applied, 1);
+            assert_eq!(m.root.lane_retired(e), Some(true));
+        }
+    }
+
+    #[test]
+    fn mesh_lane_protocol_missed_confirmation_on_a_retired_lane_owes_a_fresh_row() {
+        let b = cycle_budgets();
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+        let e = admit_retired(&mut m, true);
+        for (seq, pick) in [6u32, 7, 8].into_iter().enumerate() {
+            m.script_window(1, seq as u64, &[], &[pick]);
+            m.step(&[req(1, 99)], &b);
+        }
+        // The head's row-0 draft (777) is not the first candidate (9): the
+        // window is AR; the catch-up already ran, so the head sits at 33 and
+        // owes only this window's row.
+        m.script_window(1, 3, &[777], &[501, 502]);
+        let (start, out) = m.step(&[req(1, 99)], &b);
+        assert!(start.lanes[0].catch_up.is_some());
+        let l = lane_out(&out, 1);
+        assert_eq!(l.source.source, ProposalSource::None);
+        assert_eq!(l.source.confirm, ConfirmOutcome::Missed);
+        let d = m.decision.as_ref().unwrap();
+        assert_eq!(d.lanes[0].head_append, HeadAppend::default());
+        assert_eq!(d.lanes[0].head_end, HeadEnd::Lag { from: 33, to: 34 });
+        let (head, owed) = m.root.head_state(e).unwrap();
+        assert_eq!(head, HeadState::Lag { from: 33 });
+        assert_eq!(owed, &[8u32]);
+    }
+
+    #[test]
+    fn mesh_lane_protocol_retired_head_lag_grows_then_flushes_at_capacity() {
+        let b = cycle_budgets(); // head_lag_rows = 4
+        for kind in BOTH {
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            let e = admit_retired(&mut m, true);
+            for seq in 0..9u64 {
+                // Never a repeated 3-gram: no copy proposal, pure lag growth.
+                m.script_window(1, seq, &[], &[1000 + seq as u32]);
+                let (start, out) = m.step(&[req(1, 99)], &b);
+                let before = (seq % 4) as usize;
+                let d = m.decision.as_ref().unwrap().lanes[0].clone();
+                let l = lane_out(&out, 1);
+                assert_eq!(l.source.source, ProposalSource::None);
+                let (head, owed) = m.root.head_state(e).unwrap();
+                let position = start.lanes[0].position;
+                if before == 3 {
+                    assert_eq!(
+                        d.head_append,
+                        HeadAppend {
+                            owed: 3,
+                            retained: 1
+                        },
+                        "window {seq}: the full record is flushed"
+                    );
+                    assert_eq!(d.head_end, HeadEnd::Aligned { end: position + 1 });
+                    assert_eq!((head, owed.len()), (HeadState::Aligned, 0));
+                    assert_eq!(m.merged(&out).counts.head_append_rows, 4);
+                } else {
+                    assert_eq!(d.head_append, HeadAppend::default(), "window {seq}");
+                    let HeadEnd::Lag { from, to } = d.head_end else {
+                        panic!("window {seq}: {:?}", d.head_end)
+                    };
+                    assert_eq!(to, position + 1);
+                    assert_eq!(head, HeadState::Lag { from });
+                    assert_eq!(owed.len(), before + 1);
+                    assert_eq!(from + owed.len(), to);
+                    assert_eq!(m.merged(&out).counts.head_append_rows, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_lane_protocol_retired_lane_without_copy_future_is_head_free() {
+        let b = cycle_budgets();
+        for kind in BOTH {
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            let e = admit_retired(&mut m, false);
+            for seq in 0..3u64 {
+                m.script_window(1, seq, &[], &[1000 + seq as u32]);
+                let (start, out) = m.step(&[req(1, 99)], &b);
+                assert_eq!(start.lanes[0].route, LaneRoute::ArRetired);
+                assert_eq!(start.lanes[0].head, HeadState::Free, "no lag hidden copies");
+                for rd in &m.ready {
+                    let ReadyStatus::Ready { tickets } = &rd.status else {
+                        panic!("ready")
+                    };
+                    assert!(tickets[0].head.is_none(), "no head ticket is reserved");
+                }
+                let d = &m.decision.as_ref().unwrap().lanes[0];
+                assert_eq!(d.head_end, HeadEnd::Free);
+                assert_eq!(d.head_append, HeadAppend::default());
+                assert_eq!(m.merged(&out).counts.head_append_rows, 0);
+                assert_eq!(m.root.head_state(e).unwrap(), (HeadState::Free, &[][..]));
+                assert!(m.root.copy_history(e).is_none());
+            }
+            assert!(m.ranks.iter().all(|r| !r
+                .calls
+                .iter()
+                .any(|c| matches!(c, Call::HeadRepair(h) if !h.is_empty()))));
+        }
+    }
+
+    #[test]
+    fn mesh_lane_protocol_failure_before_prepare_leaves_lag_copy_and_rng_unpublished() {
+        let b = cycle_budgets();
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+        let e = admit_retired(&mut m, true);
+        for (seq, pick) in [6u32, 7].into_iter().enumerate() {
+            m.script_window(1, seq as u64, &[], &[pick]);
+            m.step(&[req(1, 99)], &b);
+        }
+        let snap = |m: &Mesh| {
+            let (head, owed) = m.root.head_state(e).unwrap();
+            (
+                m.root.copy_history(e).unwrap().tokens().to_vec(),
+                m.root.copy_shadow(e).unwrap(),
+                (head, owed.to_vec()),
+                m.root.rng_probe(e).unwrap(),
+                m.root.generated(e).unwrap().to_vec(),
+                m.root.lane_position(e).unwrap(),
+            )
+        };
+        let before = snap(&m);
+        // Window 2 would observe the copy shadow, extend the lag and the
+        // history: a repair failure on one rank publishes none of it.
+        m.script_window(1, 2, &[], &[8]);
+        m.ranks[1].fail_at = Some(FailAt::Prepare);
+        let err = m.run_greedy(&[req(1, 99)], &b).unwrap_err();
+        assert!(matches!(err, ProtocolError::Aborted(_)), "{err:?}");
+        assert_eq!(snap(&m), before, "nothing was published");
+    }
+
+    #[test]
+    fn mesh_lane_protocol_ep_calls_identical_across_ranks_with_copy_native_and_ar_lanes() {
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+        m.admit(1, 10, 7, None, Some(3)); // native, no copy
+        admit_cycle(&mut m, 2, None); // copy
+        m.admit(3, 10, 7, None, None); // AR
+        m.ranks[1].skew_us = 400.0;
+        let b = cycle_budgets();
+        let mut sources = HashSet::new();
+        for seq in 0..6u64 {
+            script_matching(&m, 1, seq, 8);
+            let (_, v) = m.root.lane_position(epoch(2)).unwrap();
+            script_cycle(&m, 2, seq, v);
+            m.script_window(3, seq, &[], &[500 + seq as u32]);
+            let (start, out) = m.step(&[req(1, 99), req(2, 99), req(3, 99)], &b);
+            for l in &out.lanes {
+                sources.insert(l.source.source as usize);
+            }
+            assert_eq!(start.lanes[2].source, ProposalSource::None);
+        }
+        assert_eq!(
+            sources,
+            HashSet::from([
+                ProposalSource::None as usize,
+                ProposalSource::Native as usize,
+                ProposalSource::Copy as usize
+            ]),
+            "copy windows ran beside native and AR windows"
+        );
+        assert_eq!(
+            m.ranks[0].calls, m.ranks[1].calls,
+            "every rank saw the identical ordered calls"
+        );
+    }
+
+    #[test]
+    fn mesh_lane_protocol_inherited_head_lag_is_validated_and_dropped_without_copy() {
+        let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+        let admit = |m: &mut Mesh, tag: u64, copy: bool, head: HeadState, lag: Vec<u32>| {
+            m.root.admit_lane(LaneAdmission {
+                epoch: epoch(tag),
+                position: 30,
+                seed: 5,
+                eos: None,
+                rng_seed: tag,
+                prompt: (1..=30).collect(),
+                spec_k: Some(3),
+                head,
+                copy,
+                head_lag: lag,
+            })
+        };
+        let err = admit(&mut m, 1, true, HeadState::Lag { from: 28 }, vec![1]);
+        assert!(matches!(err, Err(ProtocolError::Config(_))), "{err:?}");
+        assert!(
+            m.root.head_state(epoch(1)).is_none(),
+            "nothing was admitted"
+        );
+        let err = admit(&mut m, 1, true, HeadState::Aligned, vec![1]);
+        assert!(matches!(err, Err(ProtocolError::Config(_))), "{err:?}");
+        admit(&mut m, 2, true, HeadState::Lag { from: 28 }, vec![27, 28]).unwrap();
+        assert_eq!(
+            m.root.head_state(epoch(2)).unwrap(),
+            (HeadState::Lag { from: 28 }, &[27u32, 28][..])
+        );
+        admit(&mut m, 3, false, HeadState::Lag { from: 28 }, vec![27, 28]).unwrap();
+        assert_eq!(
+            m.root.head_state(epoch(3)).unwrap(),
+            (HeadState::Free, &[][..]),
+            "no copy future: truly head-free"
         );
     }
 

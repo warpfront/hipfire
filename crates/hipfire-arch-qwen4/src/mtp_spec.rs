@@ -4133,8 +4133,7 @@ pub(crate) fn copy_take_decision(
         let retired_cold = input.retired && !input.last_first_accepted;
         if best.1 >= native_rate && !retired_cold {
             decision.take = best.0;
-            decision.confirm =
-                copy_take_confirms(best.0, a1, a1_weight, input.last_first_accepted);
+            decision.confirm = copy_take_confirms(best.0, a1, a1_weight, input.last_first_accepted);
         }
     }
     decision
@@ -6989,8 +6988,7 @@ impl Qwen4MtpDrafter {
                 return false;
             }
             decision.take = d;
-            decision.confirm =
-                copy_take_confirms(d, a1, a1_weight, self.ngram_last_first_accepted);
+            decision.confirm = copy_take_confirms(d, a1, a1_weight, self.ngram_last_first_accepted);
             self.ngram_candidates.clear();
             self.ngram_candidates
                 .extend_from_slice(&self.ngram_proposal[..d]);
