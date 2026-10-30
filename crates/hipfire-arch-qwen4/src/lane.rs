@@ -1006,11 +1006,7 @@ impl LaneSpec {
     /// `parts`: its pending hidden copied in, no window, fresh counters. The
     /// head and draft request state are the singleton's own and swap in at
     /// commit; its agreement and retirement seed the root's lane policy.
-    fn promote(
-        &mut self,
-        gpu: &mut Gpu,
-        parts: &Qwen4PromotionParts<'_>,
-    ) -> Result<(), String> {
+    fn promote(&mut self, gpu: &mut Gpu, parts: &Qwen4PromotionParts<'_>) -> Result<(), String> {
         let bytes = self.pending_hidden.byte_size();
         if parts.pending_hidden.byte_size() != bytes {
             return Err(format!(
@@ -1905,49 +1901,45 @@ impl Qwen4LaneStore {
             _ => {}
         }
         let root_prompt = prompt.clone();
-        let slot = self
-            .table
-            .admit_decoding(
-                epoch,
-                prompt,
-                generated,
-                pending_seed,
-                |slot, existing| match existing {
-                    Some(cell) => {
-                        match (spec_cfg, cell.spec.as_mut(), parts.as_ref()) {
-                            (Some(_), Some(spec), Some(parts)) => spec
-                                .promote(gpu, parts)
-                                .map_err(|e| format!("admit_promoted: lane {slot}: {e}"))?,
-                            (None, None, None) => {}
-                            _ => {
-                                return Err(format!(
+        let slot = self.table.admit_decoding(
+            epoch,
+            prompt,
+            generated,
+            pending_seed,
+            |slot, existing| match existing {
+                Some(cell) => {
+                    match (spec_cfg, cell.spec.as_mut(), parts.as_ref()) {
+                        (Some(_), Some(spec), Some(parts)) => spec
+                            .promote(gpu, parts)
+                            .map_err(|e| format!("admit_promoted: lane {slot}: {e}"))?,
+                        (None, None, None) => {}
+                        _ => {
+                            return Err(format!(
                                 "admit_promoted: lane {slot} spec state does not match the store"
                             ));
-                            }
                         }
-                        cell.state.row_capture_armed = false;
-                        Ok(None)
                     }
-                    None => {
-                        let (state, mut spec) = new_payload(gpu, bundle, slot, spec_cfg)?;
-                        let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
-                            (Some(_), Some(spec), Some(parts)) => {
-                                spec.promote(gpu, parts)
-                            }
-                            _ => Ok(()),
-                        };
-                        if let Err(error) = seeded {
-                            let _ = state.free_gpu(gpu);
-                            if let Some(spec) = spec {
-                                let _ = spec.head.free_gpu(gpu);
-                                let _ = gpu.free_tensor(spec.pending_hidden);
-                            }
-                            return Err(format!("admit_promoted: lane {slot}: {error}"));
+                    cell.state.row_capture_armed = false;
+                    Ok(None)
+                }
+                None => {
+                    let (state, mut spec) = new_payload(gpu, bundle, slot, spec_cfg)?;
+                    let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
+                        (Some(_), Some(spec), Some(parts)) => spec.promote(gpu, parts),
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = seeded {
+                        let _ = state.free_gpu(gpu);
+                        if let Some(spec) = spec {
+                            let _ = spec.head.free_gpu(gpu);
+                            let _ = gpu.free_tensor(spec.pending_hidden);
                         }
-                        Ok(Some((state, spec)))
+                        return Err(format!("admit_promoted: lane {slot}: {error}"));
                     }
-                },
-            )?;
+                    Ok(Some((state, spec)))
+                }
+            },
+        )?;
         // The root learns the promoted request: the singleton's agreement
         // seeds the lane policy and its retirement is kept (the floor is
         // never reset by a promotion).

@@ -2831,11 +2831,7 @@ impl MeshRoot {
         }
         let spill_per_window = p.spill as f64 / p.verify_windows.max(1) as f64;
         for o in &p.lanes {
-            let Some(policy) = self
-                .lanes
-                .get_mut(&o.epoch)
-                .and_then(|l| l.policy.as_mut())
-            else {
+            let Some(policy) = self.lanes.get_mut(&o.epoch).and_then(|l| l.policy.as_mut()) else {
                 continue; // released since: nothing to teach
             };
             observe_lane(&self.cost, policy, &p, o, m, spill_per_window);

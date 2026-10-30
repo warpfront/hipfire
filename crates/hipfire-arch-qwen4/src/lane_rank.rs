@@ -61,7 +61,7 @@ use crate::mtp_lanes::{
 };
 use crate::mtp_spec::{draft_accept_estimate, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH};
 use hipfire_runtime::slot_batch::RequestEpoch;
-use hipfire_runtime::spec::MtpWindow;
+use hipfire_runtime::spec::GreedyAccept;
 use rdna_compute::{Gpu, GpuTensor};
 
 /// What the protocol holds of a store between the driver's entries: the
@@ -86,7 +86,7 @@ pub(crate) struct LaneFlight {
     /// lane's own draws on a sampled lane).
     picks: Vec<Vec<u32>>,
     /// Per lane: the naive window a sampled Verify lane drew.
-    naive: Vec<Option<MtpWindow>>,
+    naive: Vec<Option<GreedyAccept>>,
     /// Row groups the forward executed.
     row_groups: usize,
     pub(crate) decision: Option<CommitDecision>,
@@ -263,7 +263,6 @@ impl LocalLaneRank<'_> {
                 seed: l.seed,
                 drafts: Vec::new(),
                 steps: 0,
-                budget: l.budget,
                 head_ticket: None,
                 target_ticket: None,
                 prepared: None,
@@ -311,12 +310,12 @@ impl LocalLaneRank<'_> {
 
     /// Download the argmax picks and run the sampled lanes' draws of a
     /// sealed verify; the step's decode forward.
-    fn verify_device(&mut self, plan: &VerifyPlan) -> Result<(Vec<Vec<u32>>, Vec<Option<MtpWindow>>, usize), String> {
+    fn verify_device(
+        &mut self,
+        plan: &VerifyPlan,
+    ) -> Result<(Vec<Vec<u32>>, Vec<Option<GreedyAccept>>, usize), String> {
         let Self {
-            bundle,
-            gpu,
-            store,
-            ..
+            bundle, gpu, store, ..
         } = self;
         let vocab = bundle.lane_vocab();
         let epochs: Vec<RequestEpoch> = plan.lanes.iter().map(|l| l.key.request_epoch).collect();
@@ -432,11 +431,12 @@ impl LocalLaneRank<'_> {
         // (`lane_sample_step`: one D2H of the request's logits rows); a
         // greedy lane takes the unchanged argmax path.
         let mut picks: Vec<Vec<u32>> = Vec::with_capacity(plan.lanes.len());
-        let mut naive: Vec<Option<MtpWindow>> = Vec::with_capacity(plan.lanes.len());
+        let mut naive: Vec<Option<GreedyAccept>> = Vec::with_capacity(plan.lanes.len());
         let mut first = 0usize;
         for (vl, lane) in plan.lanes.iter().zip(lanes.iter_mut()) {
             let rows = vl.rows.len();
-            let mut lane_picks: Vec<u32> = (0..rows).map(|j| pick_at(top1_host, first + j)).collect();
+            let mut lane_picks: Vec<u32> =
+                (0..rows).map(|j| pick_at(top1_host, first + j)).collect();
             let mut window = None;
             if lane.host.sampling.is_some() {
                 let drafts = (rows > 1).then(|| &vl.rows[1..]);
@@ -469,7 +469,10 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         self.session.ownership()
     }
 
-    fn admit_lane(&mut self, admit: &crate::mesh_lane_protocol::LaneAdmit) -> Result<(), RankError> {
+    fn admit_lane(
+        &mut self,
+        admit: &crate::mesh_lane_protocol::LaneAdmit,
+    ) -> Result<(), RankError> {
         self.session.admit(admit)
     }
 
@@ -598,6 +601,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                     token,
                     keep_going: false,
                     drop_last: true,
+                    read: None,
                 });
                 continue;
             }
@@ -607,6 +611,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                 token,
                 keep_going: !done,
                 drop_last: false,
+                read: None,
             });
         }
         flight.head_calls += round.ops.len();
@@ -630,6 +635,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                 .zip(&picks)
                 .map(|(l, p)| (l.key, p.clone()))
                 .collect(),
+            rows: None,
         });
         let flight = self.flight_mut()?;
         flight.picks = picks;
@@ -672,8 +678,8 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                 if rows > 1 {
                     let config = spec_config
                         .ok_or_else(|| rank_error("Verify row in a store without MTP lanes"))?;
-                    let hidden = hidden
-                        .ok_or_else(|| rank_error("Verify row without a hidden capture"))?;
+                    let hidden =
+                        hidden.ok_or_else(|| rank_error("Verify row without a hidden capture"))?;
                     let prepared = prepare_lane_window(
                         bundle,
                         gpu,
@@ -927,9 +933,7 @@ fn plan_and_draft_with(
         root.collect_draft(&round, &[result])
             .map_err(|e| format!("draft_step: {e}"))?;
     }
-    let sealed = root
-        .seal_verify()
-        .map_err(|e| format!("draft_step: {e}"))?;
+    let sealed = root.seal_verify().map_err(|e| format!("draft_step: {e}"))?;
     let mut out = Vec::with_capacity(requests.len());
     for (epoch, _) in requests {
         let i = start
@@ -963,3 +967,621 @@ fn plan_and_draft_with(
     Ok(out)
 }
 
+#[cfg(test)]
+mod tests {
+    //! The single rank over the scripted executor: the SAME reducer the
+    //! multicard topologies run must reproduce, window for window, what the
+    //! singleton lane route (per-lane policy + pooled cost model observed at
+    //! the end of each forward) decided.
+    use super::*;
+    use crate::gpu_forward_lanes::row_group_count;
+    use crate::lane::LabRoutes;
+    use crate::mesh_lane_protocol::scripted::{FailAt, Script, ScriptedExecutor, WindowScript};
+    use crate::mesh_lane_protocol::{
+        run_mesh_step, GreedyRule, HeadState, MergedCostEvidence, ProposalSource, StepOutput,
+    };
+    use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy};
+    use hipfire_runtime::spec::{accept_greedy_prefix, MtpWindow};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    const K: usize = 7;
+
+    fn epoch(tag: u64) -> RequestEpoch {
+        RequestEpoch {
+            request_tag: tag,
+            owner_generation: 1,
+        }
+    }
+
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn config(floor: bool) -> RootConfig {
+        RootConfig {
+            topology_generation: 1,
+            stage: StagePolicy {
+                moe_layers: 0,
+                moe_once: false,
+                stream_bf16: false,
+            },
+            floor_enabled: floor,
+        }
+    }
+
+    fn budgets(lab: LabRoutes) -> WindowBudgets {
+        WindowBudgets {
+            max_lanes: 8,
+            verify_rows_per_lane: LANE_MAX_ROWS,
+            max_rows: 8 * LANE_MAX_ROWS,
+            copy_take_cap: 0,
+            lab,
+            pp_microbatch_lanes: None,
+        }
+    }
+
+    /// The single-card protocol: a root and the scripted rank, as the store
+    /// builds them (driver-owned termination).
+    struct Single {
+        root: MeshRoot,
+        rank: ScriptedExecutor,
+        script: Rc<RefCell<Script>>,
+    }
+
+    impl Single {
+        fn new(floor: bool) -> Self {
+            let own = RankOwnership::single();
+            let mut root = MeshRoot::new(own, &[own], config(floor)).unwrap();
+            root.set_driver_terminates(true);
+            let script = Rc::new(RefCell::new(Script::default()));
+            Self {
+                root,
+                rank: ScriptedExecutor::new(own, script.clone()),
+                script,
+            }
+        }
+
+        fn admit(&mut self, tag: u64, eos: Option<u32>, spec_k: Option<usize>) {
+            let admit = self
+                .root
+                .admit_lane(LaneAdmission {
+                    epoch: epoch(tag),
+                    position: 10,
+                    seed: 7,
+                    eos,
+                    rng_seed: 0,
+                    prompt: vec![1, 2, 3],
+                    spec_k,
+                    head: HeadState::Aligned,
+                })
+                .unwrap();
+            self.rank.admit_lane(&admit).unwrap();
+        }
+
+        fn request(tag: u64, budget: usize) -> LaneRequest {
+            LaneRequest {
+                epoch: epoch(tag),
+                remaining: budget + 1,
+                context_left: budget + 1,
+                copy_candidates: Vec::new(),
+                forced: None,
+                sampling: SamplingMode::Greedy,
+            }
+        }
+
+        /// One whole step; returns the plan, the output and the evidence
+        /// merged with `interval`, settled eagerly like the store does.
+        fn step(
+            &mut self,
+            requests: &[LaneRequest],
+            lab: LabRoutes,
+            interval: ControllerInterval,
+        ) -> (WindowStart, StepOutput, MergedCostEvidence) {
+            let b = budgets(lab);
+            let start = self.root.plan_window(None, requests, &b).unwrap();
+            let ready = self.rank.begin_window(&start);
+            self.root.collect_ready(&[ready]).unwrap();
+            while let Some(round) = self.root.next_draft_round().unwrap() {
+                let r = self.rank.run_draft_round(&round).unwrap();
+                self.root.collect_draft(&round, &[r]).unwrap();
+            }
+            let plan = self.root.seal_verify().unwrap();
+            let v = self.rank.run_verify(&plan).unwrap();
+            self.root.collect_verify(&[v]).unwrap();
+            let decision = self.root.decide_commit(&mut GreedyRule).unwrap();
+            let receipt = self.rank.prepare_commit(&decision).unwrap();
+            self.root.collect_prepared(&[receipt]).unwrap();
+            let out = self.root.publish_commit().unwrap();
+            self.rank.publish_commit(&decision);
+            let ev = self.rank.evidence(&out.key).unwrap();
+            let merged = self.root.merge_evidence(&[ev], interval).unwrap();
+            self.root.settle_evidence(Some(&merged)).unwrap();
+            (start, out, merged)
+        }
+    }
+
+    fn wall(us: f64) -> ControllerInterval {
+        ControllerInterval {
+            wall_us: us,
+            prefill_ran: false,
+        }
+    }
+
+    /// The old route, statement for statement (`lane_exec::forward_inner`'s
+    /// pricing block, `draft_lanes`' router call).
+    struct OldRoute {
+        cost: LaneCostModel,
+        policies: HashMap<u64, LaneSpecPolicy>,
+        lab: LabRoutes,
+    }
+
+    struct OldWindow {
+        route: LaneRoute,
+        drafts: Vec<u32>,
+        window: MtpWindow,
+    }
+
+    impl OldRoute {
+        fn new(lab: LabRoutes) -> Self {
+            Self {
+                cost: LaneCostModel::new(),
+                policies: HashMap::new(),
+                lab,
+            }
+        }
+
+        fn step(
+            &mut self,
+            lanes: &[(u64, usize)],
+            script: &Script,
+            seq: &HashMap<u64, u64>,
+            prefill_ran: bool,
+            wall_us: f32,
+        ) -> Vec<OldWindow> {
+            let mut windows: Vec<(u64, usize, OldWindow)> = Vec::new();
+            for &(tag, budget) in lanes {
+                let policy = self
+                    .policies
+                    .entry(tag)
+                    .or_insert_with(|| LaneSpecPolicy::with_floor(K, true));
+                let route = policy.route(budget, self.lab);
+                let s = &script.windows[&(tag, seq[&tag])];
+                let drafts: Vec<u32> = match route {
+                    LaneRoute::Batched { k_max } => s.drafts[..k_max].to_vec(),
+                    _ => Vec::new(),
+                };
+                let rows = 1 + drafts.len();
+                let window = if matches!(route, LaneRoute::Batched { .. }) {
+                    let acc = accept_greedy_prefix(&drafts, &s.picks[..rows], None);
+                    MtpWindow {
+                        committed: acc.committed,
+                        accepted: acc.accepted,
+                        drafts_generated: drafts.len(),
+                    }
+                } else {
+                    MtpWindow {
+                        committed: vec![s.picks[0]],
+                        accepted: 0,
+                        drafts_generated: 0,
+                    }
+                };
+                windows.push((
+                    tag,
+                    budget.min(policy.max_k()),
+                    OldWindow {
+                        route,
+                        drafts,
+                        window,
+                    },
+                ));
+            }
+            let dec_rows: Vec<usize> = windows.iter().map(|w| 1 + w.2.drafts.len()).collect();
+            let verify_windows = windows.iter().filter(|w| !w.2.drafts.is_empty()).count();
+            let verified: usize = windows.iter().map(|w| w.2.drafts.len()).sum();
+            let decode_lanes = windows.len();
+            let spill = row_group_count(&dec_rows).saturating_sub(1);
+            let spill_per_window = spill as f64 / verify_windows.max(1) as f64;
+            if !prefill_ran {
+                self.cost.observe(decode_lanes, spill, verified, wall_us);
+            }
+            for (tag, budget, w) in &windows {
+                let policy = self.policies.get_mut(tag).unwrap();
+                match w.route {
+                    LaneRoute::Batched { k_max } => {
+                        let units = self.cost.window_units(
+                            decode_lanes,
+                            w.window.drafts_generated,
+                            spill_per_window,
+                        );
+                        policy.observe_batched(&w.window, units, k_max, *budget);
+                    }
+                    LaneRoute::ArSynced => policy.observe_ar_synced(&w.window, *budget),
+                    LaneRoute::ArRetired | LaneRoute::Ar => {}
+                }
+            }
+            windows.into_iter().map(|(_, _, w)| w).collect()
+        }
+    }
+
+    fn script_window(rng: &mut Xs, tag: u64, seq: u64, accept_pct: u64, script: &mut Script) {
+        let drafts: Vec<u32> = (0..K as u32).map(|j| 100 + j + tag as u32 * 10).collect();
+        // Accept a prefix: each draft survives with `accept_pct` percent.
+        let mut a = 0;
+        while a < K && rng.below(100) < accept_pct {
+            a += 1;
+        }
+        let picks: Vec<u32> = (0..=K)
+            .map(|j| if j < a { drafts[j] } else { 5000 + j as u32 })
+            .collect();
+        script.windows.insert(
+            (tag, seq),
+            WindowScript {
+                drafts,
+                picks,
+                keep_going: Vec::new(),
+                drop_last: Vec::new(),
+            },
+        );
+    }
+
+    /// Plan equality with the old route: the per-window route and drafts, the
+    /// committed IDs, the pooled cost fit and every lane's retirement are the
+    /// old route's, over lanes that skip steps, steps that ran a prefill tile
+    /// and the three route modes.
+    #[test]
+    fn single_rank_reducer_reproduces_the_old_lane_route() {
+        let mut retired_seen = false;
+        let mut batched_seen = false;
+        let mut ar_seen = false;
+        for (lab, seed) in [
+            (LabRoutes::Floor, 0x9E37_79B9_7F4A_7C15u64),
+            (LabRoutes::Floor, 0xDEAD_BEEF_CAFE_F00D),
+            (LabRoutes::Cycle, 0x1234_5678_9ABC_DEF1),
+            (LabRoutes::Batched, 0x0F0F_0F0F_1111_2222),
+        ] {
+            let mut rng = Xs(seed);
+            let mut single = Single::new(true);
+            let mut old = OldRoute::new(lab);
+            let lanes: u64 = 1 + rng.below(8);
+            // Per-lane acceptance: from near-zero (retires under the floor)
+            // to near-perfect.
+            let accept: Vec<u64> = (0..lanes)
+                .map(|_| [5, 20, 55, 85, 97][rng.below(5) as usize])
+                .collect();
+            for tag in 1..=lanes {
+                single.admit(tag, None, Some(K));
+            }
+            let mut seq: HashMap<u64, u64> = (1..=lanes).map(|t| (t, 0)).collect();
+            for step in 0..260 {
+                // A lane sits out about one step in five.
+                let mut chosen: Vec<(u64, usize)> = Vec::new();
+                for tag in 1..=lanes {
+                    if lanes == 1 || rng.below(5) != 0 {
+                        chosen.push((tag, [0, 1, 2, 3, 5, 7, 7][rng.below(7) as usize]));
+                    }
+                }
+                if chosen.is_empty() {
+                    continue;
+                }
+                {
+                    let mut script = single.script.borrow_mut();
+                    for &(tag, _) in &chosen {
+                        script_window(
+                            &mut rng,
+                            tag,
+                            seq[&tag],
+                            accept[tag as usize - 1],
+                            &mut script,
+                        );
+                    }
+                }
+                let prefill_ran = rng.below(7) == 0;
+                let wall_us = 9_000.0 + rng.below(90_000) as f64;
+                let interval = ControllerInterval {
+                    wall_us: if prefill_ran { f64::NAN } else { wall_us },
+                    prefill_ran,
+                };
+                let requests: Vec<LaneRequest> =
+                    chosen.iter().map(|&(t, b)| Single::request(t, b)).collect();
+                let (start, out, merged) = single.step(&requests, lab, interval);
+                assert_eq!(merged.priced, !prefill_ran, "step {step}");
+                assert!(merged.units_valid, "step {step}");
+                let want = old.step(
+                    &chosen,
+                    &single.script.borrow(),
+                    &seq,
+                    prefill_ran,
+                    wall_us as f32,
+                );
+                for (i, ((l, o), w)) in start.lanes.iter().zip(&out.lanes).zip(&want).enumerate() {
+                    assert_eq!(l.route, w.route, "{lab:?} step {step} lane {i} route");
+                    let drafts = single.script.borrow().windows
+                        [&(l.key.request_epoch.request_tag, l.key.window_seq)]
+                        .drafts
+                        .clone();
+                    assert_eq!(
+                        o.source.offered,
+                        w.drafts.len(),
+                        "step {step} lane {i} depth"
+                    );
+                    assert_eq!(o.emitted, w.window.committed, "step {step} lane {i} ids");
+                    assert_eq!(o.source.accepted, w.window.accepted, "step {step} lane {i}");
+                    if let LaneRoute::Batched { k_max } = l.route {
+                        assert_eq!(w.drafts, drafts[..k_max], "step {step} lane {i} drafts");
+                        batched_seen = true;
+                        assert_eq!(l.source, ProposalSource::Native);
+                    } else {
+                        ar_seen = true;
+                        assert_eq!(l.source, ProposalSource::None);
+                    }
+                    if l.route == LaneRoute::ArRetired {
+                        retired_seen = true;
+                        assert_eq!(
+                            l.head,
+                            HeadState::Free,
+                            "a retired window never touches the head"
+                        );
+                    }
+                }
+                for &(tag, _) in &chosen {
+                    *seq.get_mut(&tag).unwrap() += 1;
+                }
+                let (f, a, r, g) = single.root.cost_fit();
+                let (of, oa, or, og) = old.cost.fit();
+                assert_eq!(
+                    (f, a, r, g),
+                    (of, oa, or, og),
+                    "{lab:?} step {step} cost fit"
+                );
+                for tag in 1..=lanes {
+                    assert_eq!(
+                        single.root.lane_retired(epoch(tag)),
+                        Some(old.policies.get(&tag).is_some_and(LaneSpecPolicy::retired)),
+                        "{lab:?} step {step} lane {tag} retirement"
+                    );
+                }
+            }
+        }
+        assert!(batched_seen && ar_seen && retired_seen);
+    }
+
+    /// The singleton lane route drafts through an EOS draft and keeps a lane
+    /// whose pending seed is EOS stepping (the driver ends it); the protocol's
+    /// default stops drafting at EOS and closes the lane.
+    #[test]
+    fn driver_owned_termination_drafts_through_eos_and_keeps_the_lane() {
+        for driver in [true, false] {
+            let mut single = Single::new(false);
+            single.root.set_driver_terminates(driver);
+            single.admit(1, Some(77), Some(3));
+            single.script.borrow_mut().windows.insert(
+                (1, 0),
+                WindowScript {
+                    drafts: vec![5, 77, 9],
+                    picks: vec![5, 77, 9, 1],
+                    keep_going: Vec::new(),
+                    drop_last: Vec::new(),
+                },
+            );
+            let (start, out, _) =
+                single.step(&[Single::request(1, 3)], LabRoutes::Batched, wall(30_000.0));
+            assert_eq!(start.lanes[0].route, LaneRoute::Batched { k_max: 3 });
+            let l = &out.lanes[0];
+            // Accepted EOS draft: committed [5, 77], the bonus is not emitted.
+            assert_eq!(l.emitted, vec![5, 77]);
+            assert_eq!(l.consumed_rows, 2);
+            if driver {
+                assert_eq!(l.source.offered, 3, "the chain ran through the EOS draft");
+                // The EOS pending seed is still stepped once, as before.
+                single.script.borrow_mut().windows.insert(
+                    (1, 1),
+                    WindowScript {
+                        drafts: vec![1, 2, 3],
+                        picks: vec![4, 4, 4, 4],
+                        keep_going: Vec::new(),
+                        drop_last: Vec::new(),
+                    },
+                );
+                let (_, again, _) =
+                    single.step(&[Single::request(1, 3)], LabRoutes::Batched, wall(30_000.0));
+                assert_eq!(again.lanes[0].emitted, vec![4]);
+            } else {
+                assert_eq!(l.source.offered, 2, "the default stops drafting at EOS");
+                assert!(l.terminal);
+                assert!(single
+                    .root
+                    .plan_window(None, &[Single::request(1, 3)], &budgets(LabRoutes::Batched))
+                    .is_err());
+            }
+        }
+    }
+
+    /// A prefill tile or an unusable wall keeps the wall out of the fit while
+    /// the floor still prices at the model's units; an incomplete rank or a
+    /// warm bind spends the probe unpriced.
+    #[test]
+    fn units_stay_valid_when_only_the_wall_is_unusable() {
+        let mut single = Single::new(true);
+        single.admit(1, None, Some(K));
+        for (case, interval, priced, units_valid) in [
+            (
+                "prefill",
+                ControllerInterval {
+                    wall_us: f64::NAN,
+                    prefill_ran: true,
+                },
+                false,
+                true,
+            ),
+            ("wall", wall(f64::NAN), false, true),
+            ("ok", wall(40_000.0), true, true),
+        ] {
+            // The lane's window sequence is the number of windows it published.
+            let win = single.script.borrow().windows.len() as u64;
+            single.script.borrow_mut().windows.insert(
+                (1, win),
+                WindowScript {
+                    drafts: vec![1, 2, 3],
+                    picks: vec![1, 2, 3, 4],
+                    keep_going: Vec::new(),
+                    drop_last: Vec::new(),
+                },
+            );
+            let (_, _, merged) =
+                single.step(&[Single::request(1, 3)], LabRoutes::Batched, interval);
+            assert_eq!(
+                (merged.priced, merged.units_valid),
+                (priced, units_valid),
+                "{case}"
+            );
+        }
+        // An incomplete rank is unusable for the floor too.
+        single.script.borrow_mut().windows.insert(
+            (1, 3),
+            WindowScript {
+                drafts: vec![1, 2, 3],
+                picks: vec![1, 2, 3, 4],
+                keep_going: Vec::new(),
+                drop_last: Vec::new(),
+            },
+        );
+        single.rank.evidence_unpriced = true;
+        let (_, _, merged) = single.step(&[Single::request(1, 3)], LabRoutes::Batched, wall(1.0e4));
+        assert!(!merged.priced && !merged.units_valid);
+    }
+
+    /// A failed step on one card poisons only its participants: the root
+    /// and rank return to Idle with every other lane's state intact.
+    #[test]
+    fn discard_step_recovers_the_single_rank_without_quarantine() {
+        let mut single = Single::new(true);
+        single.admit(1, None, Some(K));
+        single.admit(2, None, Some(K));
+        for tag in [1, 2] {
+            single.script.borrow_mut().windows.insert(
+                (tag, 0),
+                WindowScript {
+                    drafts: vec![1, 2, 3],
+                    picks: vec![1, 2, 3, 4],
+                    keep_going: Vec::new(),
+                    drop_last: Vec::new(),
+                },
+            );
+        }
+        single.rank.fail_at = Some(FailAt::Verify);
+        let own = RankOwnership::single();
+        let err = run_mesh_step(
+            &mut single.root,
+            &mut [&mut single.rank],
+            None,
+            &[Single::request(1, 3)],
+            &budgets(LabRoutes::Batched),
+            &mut GreedyRule,
+        );
+        assert!(err.is_err());
+        assert!(single.root.quarantined().is_some());
+        single.root.discard_step(&[epoch(1)]).unwrap();
+        single.rank.session.discard_step().unwrap();
+        single.rank.session.forget_lane(&epoch(1));
+        single.rank.fail_at = None;
+        assert_eq!(own, single.root.ownership());
+        assert!(single.root.quarantined().is_none());
+        assert!(!single.root.has_lane(epoch(1)));
+        assert_eq!(single.root.lane_position(epoch(2)), Some((10, 7)));
+        let (_, out, _) = single.step(&[Single::request(2, 3)], LabRoutes::Batched, wall(3.0e4));
+        assert_eq!(out.lanes[0].emitted, vec![1, 2, 3, 4]);
+        // A mesh refuses the single-rank recovery.
+        let ep = [RankOwnership::ep(0), RankOwnership::ep(1)];
+        let mut mesh = MeshRoot::new(ep[0], &ep, config(true)).unwrap();
+        assert!(mesh.discard_step(&[]).is_err());
+        let mut session = RankSession::new(ep[1]);
+        assert!(session.discard_step().is_err());
+    }
+
+    /// A forced close token replaces the pending seed only: no position
+    /// move, no generated ID, no RNG draw.
+    #[test]
+    fn force_seed_replaces_the_seed_only() {
+        let mut single = Single::new(false);
+        single.admit(1, None, None);
+        let rng = single.root.rng_probe(epoch(1));
+        single.root.force_seed(epoch(1), 4242).unwrap();
+        assert_eq!(single.root.lane_position(epoch(1)), Some((10, 4242)));
+        assert_eq!(single.root.generated(epoch(1)), Some(&[][..]));
+        assert_eq!(single.root.rng_probe(epoch(1)), rng);
+        single.script.borrow_mut().windows.insert(
+            (1, 0),
+            WindowScript {
+                drafts: Vec::new(),
+                picks: vec![9],
+                keep_going: Vec::new(),
+                drop_last: Vec::new(),
+            },
+        );
+        let (start, out, _) = single.step(&[Single::request(1, 0)], LabRoutes::Floor, wall(1.0e4));
+        assert_eq!(start.lanes[0].seed, 4242);
+        assert_eq!(start.lanes[0].route, LaneRoute::Ar);
+        assert_eq!(out.lanes[0].emitted, vec![9]);
+        assert_eq!(single.root.lane_position(epoch(1)), Some((11, 9)));
+        assert!(single.root.force_seed(epoch(2), 1).is_err());
+    }
+
+    /// A promotion keeps the singleton's retirement for good (the lane is
+    /// head-free) and starts every other lane's floor fresh.
+    #[test]
+    fn promoted_retirement_stays_and_the_head_is_free() {
+        let mut single = Single::new(true);
+        let own_admit = single
+            .root
+            .admit_promoted(
+                LaneAdmission {
+                    epoch: epoch(1),
+                    position: 40,
+                    seed: 3,
+                    eos: None,
+                    rng_seed: 0,
+                    prompt: vec![1, 2],
+                    spec_k: Some(K),
+                    head: HeadState::Free,
+                },
+                &[(0.5, 4.0); K],
+                true,
+            )
+            .unwrap();
+        single.rank.admit_lane(&own_admit).unwrap();
+        assert_eq!(single.root.lane_retired(epoch(1)), Some(true));
+        single.script.borrow_mut().windows.insert(
+            (1, 0),
+            WindowScript {
+                drafts: Vec::new(),
+                picks: vec![8],
+                keep_going: Vec::new(),
+                drop_last: Vec::new(),
+            },
+        );
+        let (start, _, _) = single.step(&[Single::request(1, 7)], LabRoutes::Floor, wall(2.0e4));
+        assert_eq!(start.lanes[0].route, LaneRoute::ArRetired);
+        assert_eq!(start.lanes[0].head, HeadState::Free);
+    }
+
+    #[test]
+    fn single_world_validation() {
+        let one = RankOwnership::single();
+        assert!(MeshRoot::new(one, &[one], config(true)).is_ok());
+        assert!(MeshRoot::new(one, &[one, one], config(true)).is_err());
+        assert!(one.root && one.sampler && one.head && one.target);
+    }
+}

@@ -31,21 +31,18 @@
 //! [`LaneCostModel`] instead of wall clocks (see its docs).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
-use crate::lane::Qwen4LaneStore;
 use crate::lane::{
     download_lane_rows, lane_sample_step, LabRoutes, LaneSpec, LaneSpecConfig, Qwen4LaneState,
 };
-use crate::lane_exec::{LaneDraft, LaneRoute};
+use crate::lane_exec::LaneRoute;
 use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
-    accept_native_greedy, draft_accept_estimate, floor_with_call_log, mtp_prefill_chunk,
-    mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
-    mtp_skip_intermediate_pick_enabled, prepare_native_window, publish_native_window, HeadTicket,
-    NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket, DRAFT_ACCEPT_MAX,
-    MTP_ROW_WORTH, MTP_WINDOW_COST,
+    accept_native_greedy, floor_with_call_log, mtp_prefill_chunk, mtp_prefill_chunk_needs_pick,
+    mtp_reuse_prefill_ids_enabled, mtp_skip_intermediate_pick_enabled, prepare_native_window,
+    publish_native_window, HeadTicket, NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops,
+    TargetTicket, MTP_WINDOW_COST,
 };
 
-use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::{GreedyAccept, MtpWindow};
 use hipfire_runtime::spec_economics::{
     observe_agreement, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
@@ -225,11 +222,6 @@ pub(crate) struct LaneSpecPolicy {
 }
 
 impl LaneSpecPolicy {
-    /// A request's fresh policy for drafts of at most `k`.
-    pub(crate) fn new(k: usize) -> Self {
-        Self::with_floor(k, floor_env_enabled())
-    }
-
     pub(crate) fn with_floor(k: usize, floor_enabled: bool) -> Self {
         let max_k = k.min(LANE_MAX_DRAFTS);
         Self::with_agreement(max_k, vec![AGREEMENT_PRIOR; max_k], false, floor_enabled)
@@ -384,8 +376,6 @@ pub(crate) struct PendingWindow {
     /// Draft steps the head ran (one more than `drafts` when the last step
     /// drafted a dropped token).
     pub steps: usize,
-    /// The drafts budget (clamped to the lane's `K`) the floor observes.
-    pub budget: usize,
     /// The head ticket taken before the draft steps (`Batched`).
     pub head_ticket: Option<HeadTicket>,
     /// The target ticket taken before the verify forward (`Batched`). Lanes
@@ -793,12 +783,25 @@ mod tests {
         );
         assert!(p < q, "prepare before publish");
         assert!(native.contains("prepare_native_window(picks, ops, f, timers)?"));
-        let lane = fn_body(LANES_SRC, "finish_lane_window");
-        let (p, q) = (
-            lane.find("prepare_lane_window(").expect("prepare"),
-            lane.find("publish_lane_window(").expect("publish"),
+        // The lane route calls prepare in the rank's `prepare_commit` and
+        // consumes the tickets in its `publish_commit` (the protocol phases).
+        let rank_src = include_str!("lane_rank.rs");
+        let method = |name: &str| {
+            let head = format!("    fn {name}(");
+            let start = rank_src
+                .find(&head)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            let rest = &rank_src[start..];
+            &rest[..rest.find("\n    }\n").expect("method end")]
+        };
+        let prepare = method("prepare_commit");
+        assert!(
+            prepare.contains("prepare_lane_window(") && !prepare.contains("publish_lane_window(")
         );
-        assert!(p < q, "prepare before publish");
+        let publish = method("publish_commit");
+        assert!(
+            publish.contains("publish_lane_window(") && !publish.contains("prepare_lane_window(")
+        );
         let prepare = fn_body(LANES_SRC, "prepare_lane_window");
         assert!(prepare.contains("prepare_native_window("));
         assert!(!prepare.contains("publish_native_window("));

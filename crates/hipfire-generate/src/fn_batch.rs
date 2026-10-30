@@ -45,6 +45,15 @@
 //! install a `LaneSampling` right after admission: the lane draws on the host
 //! with the AR singleton's sampler and the request seed, and MTP lanes verify
 //! sampled windows naively. Promoted lanes are greedy-only.
+//! Single and expert-parallel stores run every decode lane through the mesh
+//! lane protocol's one-rank reducer (`hipfire_arch_qwen4::lane_rank`): the
+//! driver's four entries are the protocol's phases (`draft_step`: plan, begin,
+//! draft rounds, seal; `forward_step`: verify, decide, prepare; `commit_step`:
+//! publish and settle the step's price), and the lane table's committed IDs
+//! and pending seed are the mirror of the root's published step (the driver
+//! plans rows from it and emits `forwarded_tokens` from the advance the
+//! root's output produced). The driver keeps request termination (EOS, stop,
+//! length, think budget, cancel): the root never closes a lane.
 
 use crate::ar::*;
 use crate::batch::{
@@ -742,9 +751,12 @@ fn plan_step(
                 .ok_or("qwen4 prefill tile exceeds prompt")?;
             plan.batch.tokens.extend_from_slice(slice);
         } else {
+            // The root's pending seed (a PP band's lane never reaches the
+            // single-card root; its host mirror is its whole state).
             plan.batch.tokens.push(
-                lane.host
-                    .pending_seed
+                store
+                    .root_seed(&epoch)
+                    .or(lane.host.pending_seed)
                     .ok_or("decoding lane has no pending seed")?,
             );
             plan.batch.tokens.extend_from_slice(&drafted);

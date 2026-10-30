@@ -104,9 +104,7 @@ use crate::lane::{
     download_lane_rows, lane_sample_step, LaneHost, LaneStatus, Qwen4LaneState, Qwen4LaneStore,
     StepParts,
 };
-use crate::lane_rank::{
-    plan_and_draft, DecodeAdmission, LaneProto, LocalLaneRank,
-};
+use crate::lane_rank::{plan_and_draft, DecodeAdmission, LaneProto, LocalLaneRank};
 use crate::mesh_lane_protocol::{ControllerInterval, GreedyRule, LaneMeshExecutor};
 use crate::mtp_lanes::prefill_tile;
 use hipfire_runtime::slot_batch::{
@@ -863,9 +861,9 @@ fn provision_inner(
         let lane = store
             .lane_mut(&r.epoch)
             .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
-        lane.state.ensure_mapped_capacity(gpu, end).map_err(|e| {
-            format!("provision_step: map {end} positions for {:?}: {e}", r.epoch)
-        })?;
+        lane.state
+            .ensure_mapped_capacity(gpu, end)
+            .map_err(|e| format!("provision_step: map {end} positions for {:?}: {e}", r.epoch))?;
         if let Some(spec) = lane.spec.as_mut() {
             // A retired lane's head lags the trunk and is never touched.
             let retired = spec
@@ -974,10 +972,14 @@ fn forward_with_proto(
             flight,
         };
         let verified = exec.run_verify(&verify).map_err(|e| e.reason)?;
-        root.collect_verify(&[verified]).map_err(|e| e.to_string())?;
-        let decision = root.decide_commit(&mut GreedyRule).map_err(|e| e.to_string())?;
+        root.collect_verify(&[verified])
+            .map_err(|e| e.to_string())?;
+        let decision = root
+            .decide_commit(&mut GreedyRule)
+            .map_err(|e| e.to_string())?;
         let receipt = exec.prepare_commit(&decision).map_err(|e| e.reason)?;
-        root.collect_prepared(&[receipt]).map_err(|e| e.to_string())?;
+        root.collect_prepared(&[receipt])
+            .map_err(|e| e.to_string())?;
         let fl = exec
             .flight
             .as_ref()
@@ -1323,9 +1325,7 @@ fn commit_with_proto(
                 let out = published
                     .as_ref()
                     .and_then(|p| p.lanes.iter().find(|o| o.key.request_epoch == r.epoch))
-                    .ok_or_else(|| {
-                        format!("commit_step: {:?} has no published window", r.epoch)
-                    })?;
+                    .ok_or_else(|| format!("commit_step: {:?} has no published window", r.epoch))?;
                 // The host table mirrors the root's published state.
                 lane.host.generated.extend_from_slice(&out.emitted);
                 lane.host.pending_seed = Some(out.next_seed);
@@ -1882,21 +1882,14 @@ mod tests {
     }
 
     #[test]
-    fn a_committed_verify_window_extends_the_lane_and_seeds_the_last_token() {
+    fn a_verify_request_ends_in_a_pick() {
+        // The window's committed IDs and next seed come from the root's
+        // published step (`lane_rank` tests); the table only needs the
+        // verify row's pick to exist.
         let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10)]);
         assert!(wants_pick(
             &host(1, 0, LaneStatus::Decoding, 10, 10),
             &plan.requests[0]
         ));
-        let mut h = host(1, 0, LaneStatus::Decoding, 10, 10);
-        h.generated = vec![77];
-        assert_eq!(commit_verify(&mut h, &[5, 6, 8]), Some(8));
-        assert_eq!(
-            (h.pending_seed, h.generated.clone()),
-            (Some(8), vec![77, 5, 6, 8])
-        );
-        // A window that committed nothing changes nothing.
-        assert_eq!(commit_verify(&mut h, &[]), None);
-        assert_eq!(h.generated, vec![77, 5, 6, 8]);
     }
 }

@@ -1667,6 +1667,7 @@ mod tests {
         fn with_floor(kind: MeshKind, tags: &[u64], floor: bool) -> Self {
             let world = match kind {
                 MeshKind::Ep => vec![RankOwnership::ep(0), RankOwnership::ep(1)],
+                MeshKind::Single => vec![RankOwnership::single()],
                 MeshKind::Pp => vec![RankOwnership::pp(0, false), RankOwnership::pp(1, true)],
             };
             let own = *world.iter().find(|r| r.root).unwrap();
