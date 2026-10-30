@@ -44,8 +44,12 @@
 use crate::gpu_forward_lanes::LANE_MAX_ROWS;
 use crate::lane::LabRoutes;
 use crate::lane_exec::LaneRoute;
+use crate::mesh_lane_copy::{
+    head_outcome, CopyLane, CopyPool, CopyProposal, CopyShadow, HeadWindow,
+};
 use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy};
-use crate::mtp_spec::target_commit_accept_len;
+use crate::mtp_spec::{target_commit_accept_len, HeadLag, NGRAM_DEPTHS};
+use hipfire_runtime::ngram_mod::NgramModConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::{accept_greedy_prefix, GreedyAccept, MtpWindow};
 use hipfire_runtime::spec_sampling::SpecRng;
@@ -370,6 +374,52 @@ pub enum HeadEnd {
     Free,
 }
 
+/// The owed head rows head owners append before a window's head work (the
+/// plan's catch-up): token `from + i` is `tokens[i]`, paired with the target
+/// hidden of `from + i - 1` (the head's pending hidden for the first).
+/// Teacher-forced: no FFN, no head gather.
+///
+/// Rank contract: the catch-up is committed head work, run as the first head
+/// operation of round 0 and **before** the lane's head ticket is taken: the
+/// ticket (and so `prepare_commit`'s head restore) is the head right after
+/// the catch-up, which leaves it `Aligned` at `from + tokens.len()`, the
+/// lane's window position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatchUp {
+    pub from: usize,
+    pub tokens: Vec<u32>,
+}
+
+/// The teacher-forced head rows of `prepare_commit`, after the repair to the
+/// head's ticket: `owed` lag rows first (a flush at capacity, or before a
+/// copy takeover / forced realignment that has no plan catch-up), then the
+/// window's `retained` consumed rows (token `p` with the target hidden of
+/// `p - 1`). Both zero: the head is not touched (a retired AR token that
+/// only owes its row, or a head-free lane).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeadAppend {
+    pub owed: usize,
+    pub retained: usize,
+}
+
+impl HeadAppend {
+    pub fn total(&self) -> usize {
+        self.owed + self.retained
+    }
+}
+
+/// What the first-candidate confirmation of a copy window decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// Not a confirmed-copy plan (native, AR, forced, or an established
+    /// copy source that omits the head's row-0 draft).
+    NotAsked,
+    /// The head's row-0 argmax equalled the first candidate: copy window.
+    Confirmed,
+    /// It did not: the window fell back to the native route (or AR).
+    Missed,
+}
+
 /// A request's admission at the root (mirrored to ranks as [`LaneAdmit`]).
 #[derive(Clone, Debug)]
 pub struct LaneAdmission {
@@ -384,6 +434,15 @@ pub struct LaneAdmission {
     /// Draft capacity of the lane (`None`: a non-spec AR lane).
     pub spec_k: Option<usize>,
     pub head: HeadState,
+    /// Arm the root copy lane for this request (a request-local context
+    /// seeded from the full `prompt`). Inactive unless the root has a copy
+    /// lane ([`MeshRoot::with_copy_lane`]) and the lane is a spec lane.
+    pub copy: bool,
+    /// The owed head tokens of an inherited `HeadState::Lag { from }`:
+    /// `position - from` tokens at positions `from..position`; empty for every
+    /// other head state. A lag without an armed copy lane is dropped (the
+    /// lane is head-free).
+    pub head_lag: Vec<u32>,
 }
 
 /// What a rank learns of an admission: identity only. No RNG, no policy.
@@ -395,7 +454,8 @@ pub struct LaneAdmit {
     pub spec: bool,
 }
 
-/// One lane's per-step request from the driver.
+/// One lane's per-step request from the driver. The copy candidates are the
+/// root's own (its request-local copy context), not the driver's.
 #[derive(Clone, Debug)]
 pub struct LaneRequest {
     pub epoch: RequestEpoch,
@@ -403,9 +463,6 @@ pub struct LaneRequest {
     pub remaining: usize,
     /// Positions left before `max_seq_len` (rows this window may consume).
     pub context_left: usize,
-    /// Copy candidates the root's copy chooser offers this window (empty:
-    /// none). Point-mass proposals; truncated at the first EOS.
-    pub copy_candidates: Vec<u32>,
     /// Forced control tokens (not proposals).
     pub forced: Option<Vec<u32>>,
     pub sampling: SamplingMode,
@@ -426,6 +483,10 @@ pub struct WindowBudgets {
     pub lab: LabRoutes,
     /// PP: lanes per pipeline microbatch (`None`: one whole-step batch).
     pub pp_microbatch_lanes: Option<usize>,
+    /// Fixed capacity of a retired lane's owed head rows
+    /// (`LaneSpecBudget.head_lag_rows`, at least 1 is used): a full record is
+    /// flushed.
+    pub head_lag_rows: usize,
 }
 
 /// The stage policy every rank must agree on.
@@ -456,17 +517,37 @@ pub struct LanePlan {
     /// The native chooser's route (floor accounting); `Ar` on non-spec and
     /// forced lanes. A copy window keeps the native route it overrides.
     pub route: LaneRoute,
+    /// The planned source. A `Copy` plan with `copy_confirm` is only
+    /// *planned* copy: the window stays a copy window unless the head's
+    /// row-0 confirmation misses (then the native route, or AR); see
+    /// [`SourceAccounting`] for the final source.
     pub source: ProposalSource,
-    /// Proposals this window verifies at most (native `k_max`, or the copy
-    /// candidates kept; 0 for AR/forced).
+    /// Most proposals this window verifies: the native depth, or the copy
+    /// candidates kept (the larger of the two for a confirmed-copy plan,
+    /// whose fallback is the native route); 0 for AR/forced.
     pub max_depth: usize,
-    /// Copy candidates (only `ProposalSource::Copy`).
+    /// Copy candidates (only `ProposalSource::Copy`), chosen by the root's
+    /// copy chooser (cut after the first EOS).
     pub copy_drafts: Vec<u32>,
+    /// The copy source is not yet established: round 0 runs one head Draft
+    /// for such a lane and the window stays a copy window only if its argmax
+    /// equals `copy_drafts[0]`. An established source omits it: a copy window
+    /// then runs no head round.
+    pub copy_confirm: bool,
+    /// The native route's depth (`Batched { k_max }`, clamped), else 0: the
+    /// fallback of a missed confirmation.
+    pub native_depth: usize,
+    /// Owed head rows head owners append before any head work of this window
+    /// (a lagging head the window must draft from).
+    pub catch_up: Option<CatchUp>,
     pub sampling: SamplingMode,
     pub eos: Option<u32>,
     pub remaining: usize,
     /// The drafts budget the floor observes.
     pub budget: usize,
+    /// The head's state at the window's start. A retired lane without a copy
+    /// future is `Free`; `Lag` exists only while a copy future keeps the owed
+    /// rows.
     pub head: HeadState,
 }
 
@@ -502,9 +583,20 @@ fn lane_plan_digest(d: &mut Digest, l: &LanePlan) {
     d.usize(l.source as usize)
         .usize(l.max_depth)
         .slice(&l.copy_drafts)
+        .bool(l.copy_confirm)
+        .usize(l.native_depth)
         .usize(l.sampling as usize)
         .usize(l.remaining)
         .usize(l.budget);
+    match &l.catch_up {
+        None => d.usize(0),
+        Some(c) => d.usize(1).usize(c.from).slice(&c.tokens),
+    };
+    match l.head {
+        HeadState::Aligned => d.usize(0),
+        HeadState::Lag { from } => d.usize(1).usize(from),
+        HeadState::Free => d.usize(2),
+    };
     match &l.kind {
         LaneKind::Decode => d.usize(0),
         LaneKind::Forced(t) => d.usize(1).slice(t),
@@ -520,6 +612,7 @@ fn start_digest(key: &MeshStepKey, lanes: &[LanePlan], b: &WindowBudgets, s: &St
         .usize(b.max_lanes)
         .usize(b.verify_rows_per_lane)
         .usize(b.max_rows)
+        .usize(b.head_lag_rows)
         .usize(s.moe_layers);
     for l in lanes {
         lane_plan_digest(&mut d, l);
@@ -585,6 +678,10 @@ pub struct DraftRound {
     pub key: MeshStepKey,
     pub round: u32,
     pub ops: Vec<DraftOp>,
+    /// Round 0 only: the owed head rows each lagging lane's head owners
+    /// append first (the plan's [`CatchUp`]s, in plan lane order), before any
+    /// op of the round and before the lane's head ticket is taken.
+    pub catch_up: Vec<(LaneWindowKey, CatchUp)>,
 }
 
 /// What the sampler owner read for one op. The head's q/candidate
@@ -601,6 +698,11 @@ pub struct DraftProposal {
     /// the ledger) but is NOT kept; drafting ends. Never set on the first
     /// draft of a lane.
     pub drop_last: bool,
+    /// The head's row-0 argmax before any sampled draw, when it differs from
+    /// `token` (a sampled lane). The first-candidate confirmation of a copy
+    /// window compares it (`None`: `token` is the argmax). Read only for a
+    /// lane's confirmation op.
+    pub argmax: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -611,6 +713,8 @@ pub struct RankDraftResult {
     pub ops_executed: usize,
     /// Head gathers this rank crossed in the round.
     pub head_gathers: usize,
+    /// Owed head rows this rank appended (the round's catch-ups; no gather).
+    pub catch_up_rows: usize,
     /// `Some` only from the sampler owner.
     pub proposals: Option<Vec<DraftProposal>>,
 }
@@ -723,6 +827,9 @@ pub struct SourceAccounting {
     pub source: ProposalSource,
     pub offered: usize,
     pub accepted: usize,
+    /// The first-candidate confirmation's outcome (the final `source` is
+    /// `Native`/`None` after a miss).
+    pub confirm: ConfirmOutcome,
 }
 
 /// The root's decision for one lane.
@@ -747,6 +854,9 @@ pub struct LaneDecision {
     /// The row whose target hidden is the new pending hidden.
     pub pending_hidden_row: usize,
     pub head_end: HeadEnd,
+    /// The teacher-forced head rows of `prepare_commit` (the lag the head
+    /// owners flush ahead of the retained rows, and the retained rows).
+    pub head_append: HeadAppend,
     pub source: SourceAccounting,
 }
 
@@ -770,7 +880,11 @@ fn decision_digest(key: &MeshStepKey, lanes: &[LaneDecision]) -> u64 {
             .u32(l.next_seed)
             .bool(l.terminal)
             .usize(l.target_end)
-            .usize(l.pending_hidden_row);
+            .usize(l.pending_hidden_row)
+            .usize(l.head_append.owed)
+            .usize(l.head_append.retained)
+            .usize(l.source.source as usize)
+            .usize(l.source.confirm as usize);
         match l.head_end {
             HeadEnd::Aligned { end } => d.usize(0).usize(end),
             HeadEnd::Lag { from, to } => d.usize(1).usize(from).usize(to),
@@ -818,6 +932,9 @@ pub struct PreparedLane {
     pub target_end: Option<usize>,
     /// `Some` on head owners.
     pub head_end: Option<HeadEnd>,
+    /// `Some` on head owners with a head ticket: the teacher-forced rows the
+    /// rank appended (must equal the decision's schedule).
+    pub head_append: Option<HeadAppend>,
     pub tickets: LaneTickets,
 }
 
@@ -1148,20 +1265,22 @@ pub fn merge_evidence(
 // Root
 // ---------------------------------------------------------------------------
 
-/// Epoch-scoped authoritative token history the copy chooser reads
-/// (`prompt ++ retained output`; candidates and rejected tails never enter).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CopyHistory {
+/// Epoch-scoped authoritative token history the copy chooser reads, as a
+/// view of the request's copy context: `prompt ++ [admission seed] ++
+/// retained output` (the singleton emitter's stream holds the first token
+/// exactly once). Candidates and rejected tails never enter it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyHistory<'a> {
     epoch: RequestEpoch,
-    tokens: Vec<u32>,
+    tokens: &'a [u32],
 }
 
-impl CopyHistory {
+impl CopyHistory<'_> {
     pub fn epoch(&self) -> RequestEpoch {
         self.epoch
     }
     pub fn tokens(&self) -> &[u32] {
-        &self.tokens
+        self.tokens
     }
 }
 
@@ -1171,7 +1290,6 @@ enum LaneStatus {
     Terminal,
 }
 
-#[derive(Clone)]
 struct RootLane {
     epoch: RequestEpoch,
     lane_generation: u64,
@@ -1182,8 +1300,12 @@ struct RootLane {
     rng: SpecRng,
     policy: Option<LaneSpecPolicy>,
     generated: Vec<u32>,
-    copy: CopyHistory,
+    /// The request's copy lane (`None`: copy not armed on this lane).
+    copy: Option<CopyLane>,
     head: HeadState,
+    /// The owed head rows while `head` is `Lag` (mirror of the singleton's
+    /// `HeadLag`; the head owners hold the matching hidden rows).
+    lag: HeadLag,
     status: LaneStatus,
 }
 
@@ -1192,6 +1314,7 @@ struct RootLane {
 struct PendingLaneObs {
     epoch: RequestEpoch,
     route: LaneRoute,
+    /// The window's final source.
     source: ProposalSource,
     window: MtpWindow,
     budget: usize,
@@ -1214,6 +1337,10 @@ struct StagedLane {
     rng: SpecRng,
     policy: Option<LaneSpecPolicy>,
     window: Option<WindowUpdate>,
+    /// The copy lane's mutable state, staged (`None`: copy not armed).
+    copy: Option<CopyShadow>,
+    /// This window's pool proposal and the chooser's decision.
+    copy_prop: Option<CopyProposal>,
 }
 
 #[derive(Clone)]
@@ -1222,6 +1349,8 @@ struct WindowUpdate {
     position: usize,
     seed: u32,
     terminal: bool,
+    head: HeadState,
+    lag: HeadLag,
 }
 
 /// Mutable per-draft state of one lane inside a step.
@@ -1229,6 +1358,9 @@ struct WindowUpdate {
 struct DraftLane {
     drafts: Vec<u32>,
     active: bool,
+    /// The first-candidate confirmation's outcome (`None` until round 0
+    /// answered it, or when the plan asks for none).
+    confirm: Option<bool>,
 }
 
 struct StepState {
@@ -1247,6 +1379,8 @@ struct StepState {
     decision: Option<CommitDecision>,
     cancelled: HashSet<RequestEpoch>,
     pending_obs: Option<PendingObservation>,
+    /// The copy windows' warm-depth mask after this step's evidence.
+    staged_copy_warm: u64,
 }
 
 /// Root counters (diagnostic).
@@ -1272,6 +1406,12 @@ pub struct MeshRoot {
     phase: StepPhase,
     aborted: Option<AbortRecord>,
     counters: RootCounters,
+    /// The root's copy lane (`None`: copy off on every lane).
+    copy_pool: Option<CopyPool>,
+    /// Bit `d`: this root already priced a copy takeover of `d` candidates
+    /// (the first of a row count binds its specialised verify symbols and is
+    /// observed unpriced, as the singleton's `ngram_warm_depths`).
+    copy_warm: u64,
 }
 
 impl MeshRoot {
@@ -1302,7 +1442,27 @@ impl MeshRoot {
             phase: StepPhase::Idle,
             aborted: None,
             counters: RootCounters::default(),
+            copy_pool: None,
+            copy_warm: 0,
         })
+    }
+
+    /// Give the root a copy lane: requests that arm it (`LaneAdmission.copy`)
+    /// get a request-local [`MtpCopyContext`](hipfire_runtime::ngram_mod::MtpCopyContext)
+    /// seeded from the full prompt, and the root proposes copy candidates for
+    /// their windows. Without it copy is off on every lane (the default).
+    /// Call before the first admission.
+    pub fn with_copy_lane(mut self, config: NgramModConfig) -> Result<Self, ProtocolError> {
+        if !self.lanes.is_empty() {
+            return Err(ProtocolError::Config(
+                "the copy lane must be configured before the first admission".to_string(),
+            ));
+        }
+        self.copy_pool = Some(
+            CopyPool::new(config)
+                .map_err(|e| ProtocolError::Config(format!("copy lane config: {e}")))?,
+        );
+        Ok(self)
     }
 
     /// The root rank's ownership (the only rank that chooses, draws, accepts).
@@ -1331,6 +1491,12 @@ impl MeshRoot {
     #[cfg(test)]
     pub(crate) fn cost_fit(&self) -> (f64, f64, f64, f64) {
         self.cost.fit()
+    }
+
+    /// Replace a lane's policy (tests: a promoted, floor-retired lane).
+    #[cfg(test)]
+    pub(crate) fn test_set_policy(&mut self, epoch: RequestEpoch, policy: LaneSpecPolicy) {
+        self.lanes.get_mut(&epoch).expect("lane").policy = Some(policy);
     }
 
     fn check_live(&self) -> Result<(), ProtocolError> {
@@ -1441,6 +1607,59 @@ impl MeshRoot {
                 a.epoch.request_tag
             )));
         }
+        // Validate everything before any state changes.
+        let armed = a.copy && a.spec_k.is_some() && self.copy_pool.is_some();
+        let (head, lag) = if a.spec_k.is_none() {
+            if !a.head_lag.is_empty() {
+                return Err(ProtocolError::Config(
+                    "a non-spec lane carries no owed head rows".to_string(),
+                ));
+            }
+            (HeadState::Free, HeadLag::default())
+        } else {
+            match a.head {
+                HeadState::Lag { from } => {
+                    if from > a.position || a.head_lag.len() != a.position - from {
+                        return Err(ProtocolError::Config(format!(
+                            "inherited head lag from {from} needs {} owed tokens, got {}",
+                            a.position.saturating_sub(from),
+                            a.head_lag.len()
+                        )));
+                    }
+                    if !armed {
+                        // No copy future: the lane is truly head-free.
+                        (HeadState::Free, HeadLag::default())
+                    } else if from == a.position {
+                        (HeadState::Aligned, HeadLag::default())
+                    } else {
+                        (
+                            HeadState::Lag { from },
+                            HeadLag {
+                                start: from,
+                                tokens: a.head_lag.clone(),
+                            },
+                        )
+                    }
+                }
+                other => {
+                    if !a.head_lag.is_empty() {
+                        return Err(ProtocolError::Config(
+                            "owed head tokens without a lagging head".to_string(),
+                        ));
+                    }
+                    (other, HeadLag::default())
+                }
+            }
+        };
+        let copy = if armed {
+            let pool = self.copy_pool.as_mut().expect("armed implies a pool");
+            Some(
+                pool.checkout(&a.prompt, a.seed)
+                    .map_err(|e| ProtocolError::Config(format!("copy lane: {e}")))?,
+            )
+        } else {
+            None
+        };
         let generation = self.next_lane_generation;
         self.next_lane_generation += 1;
         let policy = a
@@ -1458,15 +1677,9 @@ impl MeshRoot {
                 rng: SpecRng::new(a.rng_seed),
                 policy,
                 generated: Vec::new(),
-                copy: CopyHistory {
-                    epoch: a.epoch,
-                    tokens: a.prompt,
-                },
-                head: if a.spec_k.is_some() {
-                    a.head
-                } else {
-                    HeadState::Free
-                },
+                copy,
+                head,
+                lag,
                 status: LaneStatus::Live,
             },
         );
@@ -1476,6 +1689,19 @@ impl MeshRoot {
             position: a.position,
             spec: a.spec_k.is_some(),
         })
+    }
+
+    /// Remove a lane and return its copy context to the pool.
+    fn drop_lane(&mut self, epoch: RequestEpoch) -> bool {
+        match self.lanes.remove(&epoch) {
+            Some(mut lane) => {
+                if let (Some(copy), Some(pool)) = (lane.copy.take(), self.copy_pool.as_mut()) {
+                    pool.recycle(copy);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Drop a lane (terminal, or cancelled while idle). Refused while a
@@ -1488,10 +1714,11 @@ impl MeshRoot {
                 actual: self.phase,
             });
         }
-        self.lanes
-            .remove(&epoch)
-            .map(|_| ())
-            .ok_or(ProtocolError::UnknownLane(epoch))
+        if self.drop_lane(epoch) {
+            Ok(())
+        } else {
+            Err(ProtocolError::UnknownLane(epoch))
+        }
     }
 
     fn in_flight(&self, epoch: RequestEpoch) -> bool {
@@ -1515,7 +1742,7 @@ impl MeshRoot {
             }
             Ok(CancelOutcome::Deferred { phase })
         } else {
-            self.lanes.remove(&epoch);
+            self.drop_lane(epoch);
             Ok(CancelOutcome::Released)
         }
     }
@@ -1534,8 +1761,32 @@ impl MeshRoot {
         self.lanes.get(&epoch).map(|l| l.generated.as_slice())
     }
 
-    pub fn copy_history(&self, epoch: RequestEpoch) -> Option<&CopyHistory> {
-        self.lanes.get(&epoch).map(|l| &l.copy)
+    /// The request's copy history (`None`: copy not armed on the lane).
+    pub fn copy_history(&self, epoch: RequestEpoch) -> Option<CopyHistory<'_>> {
+        let lane = self.lanes.get(&epoch)?;
+        lane.copy.as_ref().map(|c| CopyHistory {
+            epoch,
+            tokens: c.history(),
+        })
+    }
+
+    /// The lane's committed copy shadow `(active, per-depth agreement,
+    /// last first-candidate accepted)` (diagnostic).
+    pub fn copy_shadow(&self, epoch: RequestEpoch) -> Option<(bool, Vec<(f32, f32)>, bool)> {
+        let c = self.lanes.get(&epoch)?.copy.as_ref()?;
+        Some((
+            c.shadow.active,
+            c.shadow.agreement.clone(),
+            c.shadow.last_first_accepted,
+        ))
+    }
+
+    /// The lane's head state and owed tokens (diagnostic): `Lag { from }`
+    /// carries `position - from` owed tokens.
+    pub fn head_state(&self, epoch: RequestEpoch) -> Option<(HeadState, &[u32])> {
+        self.lanes
+            .get(&epoch)
+            .map(|l| (l.head, l.lag.tokens.as_slice()))
     }
 
     pub fn lane_position(&self, epoch: RequestEpoch) -> Option<(usize, u32)> {
@@ -1602,7 +1853,6 @@ impl MeshRoot {
 
         // Resolve lanes in request order; duplicates and stale epochs fail.
         let mut seen = HashSet::new();
-        let mut resolved: Vec<&RootLane> = Vec::with_capacity(requests.len());
         for r in requests {
             if !seen.insert(r.epoch) {
                 return Err(ProtocolError::Config(format!(
@@ -1630,13 +1880,14 @@ impl MeshRoot {
                     r.epoch
                 )));
             }
-            resolved.push(lane);
         }
 
         // Stage: evidence first, then routes (all on clones).
         let mut staged_cost = self.cost.clone();
+        let mut staged_warm = self.copy_warm;
         let mut staged: HashMap<RequestEpoch, StagedLane> = HashMap::new();
-        for l in &resolved {
+        for r in requests {
+            let l = &self.lanes[&r.epoch];
             staged.insert(
                 l.epoch,
                 StagedLane {
@@ -1644,6 +1895,8 @@ impl MeshRoot {
                     rng: l.rng,
                     policy: l.policy.clone(),
                     window: None,
+                    copy: l.copy.as_ref().map(|c| c.shadow.clone()),
+                    copy_prop: None,
                 },
             );
         }
@@ -1653,7 +1906,7 @@ impl MeshRoot {
             match prior_evidence {
                 Some(m) => {
                     applied = true;
-                    apply_evidence(&mut staged_cost, &mut staged, &self.lanes, p, m);
+                    apply_evidence(&mut staged_cost, &mut staged, &mut staged_warm, p, m);
                 }
                 None => dropped = true,
             }
@@ -1661,7 +1914,10 @@ impl MeshRoot {
 
         let mut plans: Vec<LanePlan> = Vec::with_capacity(requests.len());
         let mut total_rows = 0usize;
-        for (r, lane) in requests.iter().zip(&resolved) {
+        for r in requests {
+            // The copy context proposes from committed history only: asking
+            // it touches scratch, never the state a window publishes.
+            let lane = self.lanes.get_mut(&r.epoch).expect("validated above");
             let key = LaneWindowKey {
                 request_epoch: lane.epoch,
                 lane_generation: lane.lane_generation,
@@ -1679,12 +1935,17 @@ impl MeshRoot {
                 source: ProposalSource::None,
                 max_depth: 0,
                 copy_drafts: Vec::new(),
+                copy_confirm: false,
+                native_depth: 0,
+                catch_up: None,
                 sampling: r.sampling,
                 eos: lane.eos,
                 remaining: r.remaining,
                 budget: 0,
                 head: lane.head,
             };
+            let sl = staged.get_mut(&lane.epoch).expect("staged lane");
+            let copy_active = sl.copy.as_ref().is_some_and(|c| c.active);
             if let Some(forced) = &r.forced {
                 if forced.is_empty() || forced.len() > budgets.verify_rows_per_lane {
                     return Err(ProtocolError::Budget(format!(
@@ -1701,39 +1962,73 @@ impl MeshRoot {
                     )));
                 }
                 plan.kind = LaneKind::Forced(forced.clone());
-            } else if let Some(sl) = staged.get_mut(&lane.epoch) {
-                if let Some(policy) = sl.policy.as_mut() {
-                    let budget = max_drafts.min(policy.max_k());
-                    plan.budget = budget;
-                    let route = policy.route(max_drafts, budgets.lab);
-                    plan.route = route;
-                    match route {
-                        LaneRoute::Batched { k_max } => {
-                            plan.source = ProposalSource::Native;
-                            plan.max_depth = k_max.min(max_drafts);
-                        }
-                        _ => {
-                            if budget > 0 && !r.copy_candidates.is_empty() {
-                                let cap = r
-                                    .copy_candidates
-                                    .len()
-                                    .min(budgets.copy_take_cap)
-                                    .min(max_drafts);
-                                let mut take = cap;
-                                if let Some(eos) = lane.eos {
-                                    if let Some(i) =
-                                        r.copy_candidates[..cap].iter().position(|&t| t == eos)
-                                    {
-                                        take = i + 1;
-                                    }
-                                }
-                                if take > 0 {
-                                    plan.source = ProposalSource::Copy;
-                                    plan.max_depth = take;
-                                    plan.copy_drafts = r.copy_candidates[..take].to_vec();
-                                }
-                            }
-                        }
+                // A forced advance realigns a lagging head (the owed rows
+                // first); without a copy future there is nothing to realign.
+                plan.head = match lane.head {
+                    HeadState::Lag { .. } if !copy_active => HeadState::Free,
+                    h => h,
+                };
+            } else if let Some(policy) = sl.policy.as_mut() {
+                let budget = max_drafts.min(policy.max_k());
+                plan.budget = budget;
+                let route = policy.route(max_drafts, budgets.lab);
+                plan.route = route;
+                if let LaneRoute::Batched { k_max } = route {
+                    plan.source = ProposalSource::Native;
+                    plan.native_depth = k_max.min(max_drafts);
+                    plan.max_depth = plan.native_depth;
+                }
+                // The head at the window's start. A retired lane keeps head
+                // work only for a copy future (owed rows, no per-token head
+                // work); without one it is truly head-free.
+                plan.head = match lane.head {
+                    HeadState::Free => HeadState::Free,
+                    HeadState::Aligned
+                        if matches!(route, LaneRoute::ArRetired) && !copy_active =>
+                    {
+                        HeadState::Free
+                    }
+                    HeadState::Aligned => HeadState::Aligned,
+                    HeadState::Lag { from } if copy_active => HeadState::Lag { from },
+                    HeadState::Lag { .. } => HeadState::Free,
+                };
+                // The copy source (its own chooser, apart from the native
+                // one; the retired lane keeps it).
+                let prop = match (copy_active, lane.copy.as_mut(), sl.copy.as_ref()) {
+                    (true, Some(copy), Some(shadow)) => copy.offer(
+                        shadow,
+                        policy,
+                        budgets.lab,
+                        budgets.copy_take_cap,
+                        max_drafts,
+                        lane.eos,
+                    ),
+                    _ => None,
+                };
+                if let Some(p) = &prop {
+                    // A head-free lane has no head to confirm an unestablished
+                    // source: only an established one may take the window.
+                    let confirmable = p.decision.confirm && plan.head != HeadState::Free;
+                    if !p.drafts.is_empty() && (!p.decision.confirm || confirmable) {
+                        plan.source = ProposalSource::Copy;
+                        plan.copy_drafts = p.drafts.clone();
+                        plan.copy_confirm = p.decision.confirm;
+                        plan.max_depth = if plan.copy_confirm {
+                            p.drafts.len().max(plan.native_depth)
+                        } else {
+                            p.drafts.len()
+                        };
+                    }
+                }
+                sl.copy_prop = prop;
+                // Head work before the window's own head rows: a lagging
+                // head must be caught up before it drafts or confirms.
+                if let HeadState::Lag { from } = plan.head {
+                    if plan.source == ProposalSource::Native || plan.copy_confirm {
+                        plan.catch_up = Some(CatchUp {
+                            from,
+                            tokens: lane.lag.tokens.clone(),
+                        });
                     }
                 }
             }
@@ -1761,6 +2056,7 @@ impl MeshRoot {
                 .usize(budgets.copy_take_cap)
                 .usize(budgets.lab as usize)
                 .usize(budgets.pp_microbatch_lanes.unwrap_or(0))
+                .usize(budgets.head_lag_rows)
                 .usize(self.world.len());
             d.finish()
         };
@@ -1784,7 +2080,9 @@ impl MeshRoot {
             .iter()
             .map(|l| DraftLane {
                 drafts: Vec::new(),
-                active: l.source == ProposalSource::Native && l.max_depth > 0,
+                active: (l.source == ProposalSource::Native && l.max_depth > 0)
+                    || (l.source == ProposalSource::Copy && l.copy_confirm),
+                confirm: None,
             })
             .collect();
         let staged_vec: Vec<StagedLane> = start
@@ -1808,6 +2106,7 @@ impl MeshRoot {
             decision: None,
             cancelled: HashSet::new(),
             pending_obs: None,
+            staged_copy_warm: staged_warm,
         });
         self.phase = StepPhase::Planned;
         Ok(start)
@@ -1942,7 +2241,17 @@ impl MeshRoot {
                 kind: DraftOpKind::Draft,
             });
         }
-        if ops.is_empty() {
+        // Round 0 carries the owed-row catch-ups of lagging lanes first.
+        let catch_up: Vec<(LaneWindowKey, CatchUp)> = if s.round == 0 {
+            s.start
+                .lanes
+                .iter()
+                .filter_map(|l| l.catch_up.clone().map(|c| (l.key, c)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if ops.is_empty() && catch_up.is_empty() {
             let s = self.step_mut();
             s.phase = StepPhase::Drafted;
             self.phase = StepPhase::Drafted;
@@ -1952,6 +2261,7 @@ impl MeshRoot {
             key: s.start.key.clone(),
             round: s.round,
             ops,
+            catch_up,
         };
         Ok(Some(round))
     }
@@ -1994,6 +2304,16 @@ impl MeshRoot {
                         r.ops_executed,
                         r.head_gathers,
                         round.ops.len()
+                    ),
+                ));
+            }
+            let want_catch_up: usize = round.catch_up.iter().map(|(_, c)| c.tokens.len()).sum();
+            if r.catch_up_rows != want_catch_up {
+                return Err(self.fail(
+                    Some(r.rank),
+                    format!(
+                        "appended {} owed head rows, scheduled {want_catch_up}",
+                        r.catch_up_rows
                     ),
                 ));
             }
@@ -2057,15 +2377,33 @@ impl MeshRoot {
                 .iter()
                 .position(|l| l.key == p.key)
                 .expect("keys checked against the round");
-            let max_depth = s.start.lanes[i].max_depth;
-            let eos = s.start.lanes[i].eos;
+            let l = &s.start.lanes[i];
+            let (source, copy_confirm, native_depth, max_depth, eos) =
+                (l.source, l.copy_confirm, l.native_depth, l.max_depth, l.eos);
+            let first_candidate = l.copy_drafts.first().copied();
             let d = &mut s.draft[i];
+            if source == ProposalSource::Copy && copy_confirm && d.confirm.is_none() {
+                // The first-candidate confirmation: the head's own row-0
+                // argmax. A hit abandons the head's draft (the window is a
+                // copy window); a miss falls back to the native route.
+                let hit = first_candidate == Some(p.argmax.unwrap_or(p.token));
+                d.confirm = Some(hit);
+                if hit || native_depth == 0 {
+                    d.active = false;
+                    continue;
+                }
+            }
+            let cap = if source == ProposalSource::Copy {
+                native_depth
+            } else {
+                max_depth
+            };
             if p.drop_last {
                 // A dropped token never enters the window.
                 d.active = false;
             } else {
                 d.drafts.push(p.token);
-                d.active = p.keep_going && d.drafts.len() < max_depth && eos != Some(p.token);
+                d.active = p.keep_going && d.drafts.len() < cap && eos != Some(p.token);
             }
         }
         s.round += 1;
@@ -2087,7 +2425,7 @@ impl MeshRoot {
                     .chain(t[..t.len() - 1].iter().copied())
                     .collect(),
                 LaneKind::Decode => {
-                    let drafts: &[u32] = match l.source {
+                    let drafts: &[u32] = match final_source(l, s.draft[i].confirm) {
                         ProposalSource::Native => &s.draft[i].drafts,
                         ProposalSource::Copy => &l.copy_drafts,
                         ProposalSource::None => &[],
@@ -2275,15 +2613,29 @@ impl MeshRoot {
         let mut decisions = Vec::with_capacity(start.lanes.len());
         let mut updates: Vec<(usize, WindowUpdate, Option<MtpWindow>)> = Vec::new();
         let mut rng_out: Vec<SpecRng> = Vec::new();
+        let mut shadows: Vec<Option<CopyShadow>> = Vec::new();
+        let mut final_sources: Vec<ProposalSource> = Vec::new();
         for (i, l) in start.lanes.iter().enumerate() {
             let vl = &plan.lanes[i];
             let lane_picks = &picks.picks[i].1;
             let mut rng = self.step_ref().staged[i].rng;
+            let confirm = self.step_ref().draft[i].confirm;
+            let forced_lane = matches!(l.kind, LaneKind::Forced(_));
+            // The window's final source (a missed confirmation fell back).
+            let fsrc = if forced_lane {
+                ProposalSource::None
+            } else {
+                final_source(l, confirm)
+            };
             let (emitted, accepted, hit_eos, forced, consumed, offered) = match &l.kind {
                 LaneKind::Forced(t) => (t.clone(), t.len() - 1, false, true, vl.rows.len(), 0),
                 LaneKind::Decode => {
                     let drafts = &vl.rows[1..];
-                    let acc = rule.accept(l, drafts, lane_picks, &mut rng);
+                    // The rule sees the window's final source (point-mass q
+                    // only for a window that stayed a copy window).
+                    let mut eff = l.clone();
+                    eff.source = fsrc;
+                    let acc = rule.accept(&eff, drafts, lane_picks, &mut rng);
                     let accepted_eos = acc.hit_eos && acc.committed.len() == acc.accepted;
                     let shape_ok = acc.accepted <= drafts.len()
                         && !acc.committed.is_empty()
@@ -2313,14 +2665,26 @@ impl MeshRoot {
             let target_end = l.position + consumed;
             let next_seed = *emitted.last().expect("non-empty emission");
             let terminal = hit_eos || emitted.len() >= l.remaining;
-            let head_end = match l.head {
-                HeadState::Aligned => HeadEnd::Aligned { end: target_end },
-                HeadState::Lag { from } => HeadEnd::Lag {
-                    from,
-                    to: target_end,
-                },
-                HeadState::Free => HeadEnd::Free,
+            // The head: a plan catch-up flushed the owed rows before the
+            // window (the head starts it aligned); otherwise the lane's own
+            // record decides what the head owners append and where it ends.
+            let (win_head, win_lag) = if l.catch_up.is_some() {
+                (HeadState::Aligned, HeadLag::default())
+            } else {
+                (l.head, self.lanes[&l.key.request_epoch].lag.clone())
             };
+            let live = forced_lane
+                || fsrc != ProposalSource::None
+                || !matches!(l.route, LaneRoute::ArRetired);
+            let ho = head_outcome(&HeadWindow {
+                head: win_head,
+                lag: &win_lag,
+                position: l.position,
+                seed: l.seed,
+                consumed,
+                live,
+                capacity: start.budgets.head_lag_rows,
+            });
             decisions.push(LaneDecision {
                 key: l.key,
                 emitted: emitted.clone(),
@@ -2332,11 +2696,13 @@ impl MeshRoot {
                 terminal,
                 target_end,
                 pending_hidden_row: consumed - 1,
-                head_end,
+                head_end: ho.end,
+                head_append: ho.append,
                 source: SourceAccounting {
-                    source: l.source,
+                    source: fsrc,
                     offered,
                     accepted: if forced { 0 } else { accepted },
+                    confirm: confirm_outcome(l, confirm, forced_lane),
                 },
             });
             let window = (!forced).then(|| MtpWindow {
@@ -2344,6 +2710,17 @@ impl MeshRoot {
                 accepted,
                 drafts_generated: offered,
             });
+            // The copy shadow observes the window's proposal against the
+            // committed tokens, whichever source ran the window.
+            let st = &self.step_ref().staged[i];
+            let shadow = st.copy.clone().map(|mut sh| {
+                if let Some(p) = &st.copy_prop {
+                    sh.observe(&p.proposal, &emitted);
+                }
+                sh
+            });
+            shadows.push(shadow);
+            final_sources.push(fsrc);
             updates.push((
                 i,
                 WindowUpdate {
@@ -2351,6 +2728,8 @@ impl MeshRoot {
                     position: target_end,
                     seed: next_seed,
                     terminal,
+                    head: ho.head,
+                    lag: ho.lag,
                 },
                 window,
             ));
@@ -2376,19 +2755,21 @@ impl MeshRoot {
             .lanes
             .iter()
             .zip(&updates)
-            .filter_map(|(l, (_, _, w))| {
+            .zip(&final_sources)
+            .filter_map(|((l, (_, _, w)), &fsrc)| {
                 let w = w.clone()?;
-                // Only native windows (and the synced AR row of a spec lane)
-                // price the floor; copy windows are root copy accounting.
-                (l.source != ProposalSource::Copy
-                    && matches!(
+                // Native windows and the synced/retired AR rows price the
+                // native floor; a copy window prices the external (copy)
+                // side of it.
+                (fsrc == ProposalSource::Copy
+                    || matches!(
                         l.route,
                         LaneRoute::Batched { .. } | LaneRoute::ArSynced | LaneRoute::ArRetired
                     ))
                 .then_some(PendingLaneObs {
                     epoch: l.key.request_epoch,
                     route: l.route,
-                    source: l.source,
+                    source: fsrc,
                     window: w,
                     budget: l.budget,
                 })
@@ -2403,7 +2784,9 @@ impl MeshRoot {
                 .iter()
                 .zip(&start.lanes)
                 .filter(|(_, l)| l.head != HeadState::Free)
-                .map(|(d, _)| d.consumed_rows)
+                .map(|(d, l)| {
+                    l.catch_up.as_ref().map_or(0, |c| c.tokens.len()) + d.head_append.total()
+                })
                 .sum(),
             drafts_generated: verified,
             accepted: decision.lanes.iter().map(|d| d.source.accepted).sum(),
@@ -2412,9 +2795,10 @@ impl MeshRoot {
             decode_lanes,
         };
         let s = self.step_mut();
-        for ((i, up, _), rng) in updates.into_iter().zip(rng_out) {
+        for (((i, up, _), rng), shadow) in updates.into_iter().zip(rng_out).zip(shadows) {
             s.staged[i].rng = rng;
             s.staged[i].window = Some(up);
+            s.staged[i].copy = shadow;
         }
         s.pending_obs = Some(PendingObservation {
             key: start.key.clone(),
@@ -2473,12 +2857,21 @@ impl MeshRoot {
                 }
                 let want_target = w.target.then_some(d.target_end);
                 let want_head = (w.head && lane_needs_head(plan)).then_some(d.head_end);
-                if pl.target_end != want_target || pl.head_end != want_head {
+                let want_append = (w.head && lane_needs_head(plan)).then_some(d.head_append);
+                if pl.target_end != want_target
+                    || pl.head_end != want_head
+                    || pl.head_append != want_append
+                {
                     return Err(self.fail(
                         Some(r.rank),
                         format!(
-                            "positions {:?}/{:?} differ from the decision {:?}/{:?}",
-                            pl.target_end, pl.head_end, want_target, want_head
+                            "positions {:?}/{:?} or head append {:?} differ from the decision {:?}/{:?}/{:?}",
+                            pl.target_end,
+                            pl.head_end,
+                            pl.head_append,
+                            want_target,
+                            want_head,
+                            want_append
                         ),
                     ));
                 }
@@ -2505,6 +2898,7 @@ impl MeshRoot {
         let decision = s.decision.expect("prepared");
         let mut out = Vec::with_capacity(decision.lanes.len());
         self.cost = s.staged_cost;
+        self.copy_warm = s.staged_copy_warm;
         if s.obs_applied {
             self.counters.observations_applied += 1;
         }
@@ -2514,7 +2908,7 @@ impl MeshRoot {
         for (st, d) in s.staged.into_iter().zip(&decision.lanes) {
             let cancelled = s.cancelled.contains(&st.epoch);
             if cancelled {
-                self.lanes.remove(&st.epoch);
+                self.drop_lane(st.epoch);
             } else {
                 let lane = self
                     .lanes
@@ -2527,7 +2921,12 @@ impl MeshRoot {
                 lane.position = up.position;
                 lane.seed = up.seed;
                 lane.generated.extend_from_slice(&up.emitted);
-                lane.copy.tokens.extend_from_slice(&up.emitted);
+                lane.head = up.head;
+                lane.lag = up.lag;
+                if let (Some(copy), Some(shadow)) = (lane.copy.as_mut(), st.copy) {
+                    copy.shadow = shadow;
+                    copy.append(&up.emitted);
+                }
                 if up.terminal {
                     lane.status = LaneStatus::Terminal;
                 }
@@ -2581,6 +2980,33 @@ fn lane_needs_head(l: &LanePlan) -> bool {
     l.head != HeadState::Free
 }
 
+/// A window's final source: a confirmed-copy plan whose first-candidate
+/// confirmation missed falls back to the native route (`Native`, with the
+/// head's own drafts) or, without a native route, to AR.
+fn final_source(l: &LanePlan, confirm: Option<bool>) -> ProposalSource {
+    match (&l.kind, l.source) {
+        (LaneKind::Forced(_), _) => ProposalSource::None,
+        (_, ProposalSource::Copy) if l.copy_confirm && confirm != Some(true) => {
+            if l.native_depth > 0 {
+                ProposalSource::Native
+            } else {
+                ProposalSource::None
+            }
+        }
+        (_, source) => source,
+    }
+}
+
+fn confirm_outcome(l: &LanePlan, confirm: Option<bool>, forced: bool) -> ConfirmOutcome {
+    if forced || l.source != ProposalSource::Copy || !l.copy_confirm {
+        ConfirmOutcome::NotAsked
+    } else if confirm == Some(true) {
+        ConfirmOutcome::Confirmed
+    } else {
+        ConfirmOutcome::Missed
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelOutcome {
     /// Released at once (no step in flight over the lane).
@@ -2591,10 +3017,18 @@ pub enum CancelOutcome {
 
 /// Fold merged evidence into the staged cost model and the lanes' policies.
 /// An unpriced price spends probe budget without recording a cost.
+///
+/// A copy window prices the lane floor's external side
+/// ([`LaneSpecPolicy::observe_external_copy`]): the first takeover of a
+/// candidate count binds that row count's specialised verify symbols and is
+/// observed unpriced (`warm`), exactly as the singleton's
+/// `ngram_warm_depths`. A floor verdict that takeovers cost no less per
+/// token than AR deactivates the lane's copy source; a retired lane stays
+/// retired.
 fn apply_evidence(
     cost: &mut LaneCostModel,
     staged: &mut HashMap<RequestEpoch, StagedLane>,
-    _lanes: &HashMap<RequestEpoch, RootLane>,
+    warm: &mut u64,
     p: &PendingObservation,
     m: &MergedCostEvidence,
 ) {
@@ -2609,6 +3043,23 @@ fn apply_evidence(
         let Some(policy) = sl.policy.as_mut() else {
             continue;
         };
+        if o.source == ProposalSource::Copy {
+            let drafts = o.window.drafts_generated;
+            let bit = 1u64 << drafts.min(NGRAM_DEPTHS);
+            let first_use = *warm & bit == 0;
+            *warm |= bit;
+            let units = if m.priced && !first_use {
+                cost.window_units(p.decode_lanes, drafts, spill_per_window)
+            } else {
+                f32::NAN
+            };
+            if policy.observe_external_copy(o.window.committed.len(), units, drafts) {
+                if let Some(copy) = sl.copy.as_mut() {
+                    copy.active = false;
+                }
+            }
+            continue;
+        }
         match o.route {
             LaneRoute::Batched { k_max } if o.source == ProposalSource::Native => {
                 let units = if m.priced {
@@ -2868,12 +3319,30 @@ impl RankSession {
         if round.round != s.round {
             return Err(RankError::new(rank, "draft round out of order"));
         }
+        // The owed-row catch-ups are exactly the plan's, in round 0 only.
+        let want_catch_up: Vec<(LaneWindowKey, CatchUp)> = if round.round == 0 {
+            s.start
+                .lanes
+                .iter()
+                .filter_map(|l| l.catch_up.clone().map(|c| (l.key, c)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if round.catch_up != want_catch_up {
+            return Err(RankError::new(
+                rank,
+                "owed head rows differ from the planned catch-up",
+            ));
+        }
         for op in &round.ops {
             let Some(i) = s.start.lanes.iter().position(|l| l.key == op.key) else {
                 return Err(RankError::new(rank, "draft op for a lane outside the plan"));
             };
             let l = &s.start.lanes[i];
-            if l.source != ProposalSource::Native || op.position != s.next_pos[i] {
+            let drafts_head = l.source == ProposalSource::Native
+                || (l.source == ProposalSource::Copy && l.copy_confirm);
+            if !drafts_head || op.position != s.next_pos[i] {
                 return Err(RankError::new(
                     rank,
                     "draft op position/source disagrees with the plan",
@@ -2887,6 +3356,7 @@ impl RankSession {
             }
             s.next_pos[i] += 1;
         }
+        let catch_up_rows: usize = round.catch_up.iter().map(|(_, c)| c.tokens.len()).sum();
         s.round += 1;
         s.head_calls += round.ops.len();
         Ok(RankDraftResult {
@@ -2895,6 +3365,7 @@ impl RankSession {
             rank,
             ops_executed: round.ops.len(),
             head_gathers: round.ops.len(),
+            catch_up_rows,
             proposals: None,
         })
     }
@@ -2988,10 +3459,30 @@ impl RankSession {
                     "decision departs from the sealed rows",
                 ));
             }
+            // The head schedule must be one the plan allows: nothing on a
+            // head-free lane, no owed flush without a lagging head (or after
+            // the plan's own catch-up), retained rows are all or none.
+            let append = d.head_append;
+            let lag_possible =
+                matches!(l.head, HeadState::Lag { .. }) && l.catch_up.is_none();
+            let schedule_ok = if l.head == HeadState::Free {
+                append == HeadAppend::default() && d.head_end == HeadEnd::Free
+            } else {
+                (append.retained == 0 || append.retained == d.consumed_rows)
+                    && (lag_possible || append.owed == 0)
+            };
+            if !schedule_ok {
+                return Err(RankError::new(
+                    rank,
+                    "decision head schedule departs from the plan",
+                ));
+            }
+            let heads = own.head && lane_needs_head(l);
             lanes.push(PreparedLane {
                 key: d.key,
                 target_end: own.target.then_some(d.target_end),
-                head_end: (own.head && lane_needs_head(l)).then_some(d.head_end),
+                head_end: heads.then_some(d.head_end),
+                head_append: heads.then_some(append),
                 tickets: *t,
             });
         }
@@ -3001,7 +3492,9 @@ impl RankSession {
                 .iter()
                 .zip(&s.start.lanes)
                 .filter(|(_, l)| l.head != HeadState::Free)
-                .map(|(d, _)| d.consumed_rows)
+                .map(|(d, l)| {
+                    l.catch_up.as_ref().map_or(0, |c| c.tokens.len()) + d.head_append.total()
+                })
                 .sum()
         } else {
             0
@@ -3203,6 +3696,9 @@ pub(crate) mod scripted {
         /// Head step `j` drafted a token that the singleton rule drops
         /// (default `false`).
         pub drop_last: Vec<bool>,
+        /// The head's row-0 argmax when it differs from the drafted token
+        /// (a sampled lane); read by a copy window's confirmation.
+        pub argmax: Option<u32>,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -3223,9 +3719,13 @@ pub(crate) mod scripted {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Call {
         Begin(u64),
+        /// Owed head rows appended before the round's ops: `(lane, from, rows)`.
+        CatchUp(Vec<(LaneWindowKey, usize, usize)>),
         Draft(u32, Vec<(LaneWindowKey, usize, u32)>),
         Verify(u64, Vec<Vec<u32>>, Vec<RowGroup>),
         Prepare(u64),
+        /// A head owner's repair schedule: `(lane, head end, appended rows)`.
+        HeadRepair(Vec<(LaneWindowKey, HeadEnd, HeadAppend)>),
         Publish(u64),
         Abort(String),
     }
@@ -3308,6 +3808,15 @@ pub(crate) mod scripted {
         }
 
         fn run_draft_round(&mut self, round: &DraftRound) -> Result<RankDraftResult, RankError> {
+            if !round.catch_up.is_empty() {
+                self.calls.push(Call::CatchUp(
+                    round
+                        .catch_up
+                        .iter()
+                        .map(|(k, c)| (*k, c.from, c.tokens.len()))
+                        .collect(),
+                ));
+            }
             self.calls.push(Call::Draft(
                 round.round,
                 round
@@ -3339,6 +3848,7 @@ pub(crate) mod scripted {
                         token,
                         keep_going: w.keep_going.get(j).copied().unwrap_or(true),
                         drop_last: w.drop_last.get(j).copied().unwrap_or(false),
+                        argmax: if j == 0 { w.argmax } else { None },
                     });
                 }
                 res.proposals = Some(props);
@@ -3400,6 +3910,14 @@ pub(crate) mod scripted {
             c.drafts_generated = decision.lanes.iter().map(|l| l.source.offered).sum();
             c.accepted = decision.lanes.iter().map(|l| l.source.accepted).sum();
             c.consumed_rows = decision.lanes.iter().map(|l| l.consumed_rows).sum();
+            if self.ownership().head {
+                self.calls.push(Call::HeadRepair(
+                    r.lanes
+                        .iter()
+                        .filter_map(|l| Some((l.key, l.head_end?, l.head_append?)))
+                        .collect(),
+                ));
+            }
             Ok(r)
         }
 
@@ -3473,6 +3991,7 @@ mod tests {
             copy_take_cap: 7,
             lab,
             pp_microbatch_lanes: None,
+            head_lag_rows: 4,
         }
     }
 
@@ -3481,7 +4000,6 @@ mod tests {
             epoch: epoch(tag),
             remaining,
             context_left: 10_000,
-            copy_candidates: Vec::new(),
             forced: None,
             sampling: SamplingMode::Greedy,
         }
@@ -3508,10 +4026,14 @@ mod tests {
 
     impl Mesh {
         fn new(kind: MeshKind, floor: bool) -> Self {
+            Self::new_with(kind, floor, None)
+        }
+
+        fn new_with(kind: MeshKind, floor: bool, copy: Option<NgramModConfig>) -> Self {
             let w = world(kind);
             let script = Rc::new(RefCell::new(Script::default()));
             let own = *w.iter().find(|r| r.root).unwrap();
-            let root = MeshRoot::new(
+            let mut root = MeshRoot::new(
                 own,
                 &w,
                 RootConfig {
@@ -3525,6 +4047,9 @@ mod tests {
                 },
             )
             .unwrap();
+            if let Some(c) = copy {
+                root = root.with_copy_lane(c).unwrap();
+            }
             let ranks = w
                 .iter()
                 .map(|&o| ScriptedExecutor::new(o, script.clone()))
@@ -3550,6 +4075,28 @@ mod tests {
             eos: Option<u32>,
             spec_k: Option<usize>,
         ) -> RequestEpoch {
+            self.admit_with(
+                tag,
+                position,
+                seed,
+                eos,
+                spec_k,
+                vec![1, 2, 3, tag as u32],
+                false,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn admit_with(
+            &mut self,
+            tag: u64,
+            position: usize,
+            seed: u32,
+            eos: Option<u32>,
+            spec_k: Option<usize>,
+            prompt: Vec<u32>,
+            copy: bool,
+        ) -> RequestEpoch {
             let e = epoch(tag);
             let a = self
                 .root
@@ -3559,9 +4106,11 @@ mod tests {
                     seed,
                     eos,
                     rng_seed: 1000 + tag,
-                    prompt: vec![1, 2, 3, tag as u32],
+                    prompt,
                     spec_k,
                     head: HeadState::Aligned,
+                    copy,
+                    head_lag: Vec::new(),
                 })
                 .unwrap();
             for r in &mut self.ranks {
@@ -3578,6 +4127,7 @@ mod tests {
                     picks: picks.to_vec(),
                     keep_going: Vec::new(),
                     drop_last: Vec::new(),
+                    argmax: None,
                 },
             );
         }
@@ -4443,6 +4993,8 @@ mod tests {
                     prompt: vec![],
                     spec_k: None,
                     head: HeadState::Free,
+                    copy: false,
+                    head_lag: Vec::new(),
                 }),
                 Err(ProtocolError::Config(_))
             ),
@@ -4474,6 +5026,8 @@ mod tests {
                 prompt: vec![8, 8],
                 spec_k: Some(3),
                 head: HeadState::Aligned,
+                copy: false,
+                head_lag: Vec::new(),
             })
             .unwrap();
         for r in &mut m.ranks {
@@ -4510,6 +5064,8 @@ mod tests {
                 prompt: vec![],
                 spec_k: Some(3),
                 head: HeadState::Aligned,
+                copy: false,
+                head_lag: Vec::new(),
             })
             .unwrap();
         m2.ranks[0].admit_lane(&a).unwrap();

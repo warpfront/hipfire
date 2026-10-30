@@ -1982,7 +1982,7 @@ const NGRAM_YIELD_RECOVERY: f32 = 0.95;
 /// Draft depths of the request-local n-gram acceptance table: one per verify
 /// row of the spec capacity below the seed, the longest proposal the pool
 /// can make (`qwen4_ngram_mod_config` caps `n_max` there).
-const NGRAM_DEPTHS: usize = QWEN4_SPEC_VERIFY_ROWS - 1;
+pub(crate) const NGRAM_DEPTHS: usize = QWEN4_SPEC_VERIFY_ROWS - 1;
 /// Fewest candidates of a takeover that may skip the head's row-0
 /// confirmation, once the copy source is established (see
 /// [`NGRAM_UNCONFIRMED_MIN_ACCEPT`]). Checked against teacher-forced replays
@@ -3485,21 +3485,21 @@ fn window_key(window: Result<MtpWindow, String>) -> Result<(Vec<u32>, usize, usi
 /// `start - 1` (the head's position - 1), which owed token 0 pairs with
 /// (token `i` pairs with spec hidden row `i - 1`); the catch-up ends it on
 /// row `owed - 1`. Host only.
-#[derive(Debug, Default)]
-struct HeadLag {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeadLag {
     /// The head position: where the first owed row goes.
-    start: usize,
+    pub(crate) start: usize,
     /// The owed tokens, at positions `start..start + tokens.len()`; token
     /// `i`'s own target hidden is spec hidden row `i` (the pair of token
     /// `i + 1`).
-    tokens: Vec<u32>,
+    pub(crate) tokens: Vec<u32>,
 }
 
 impl HeadLag {
     /// The spec hidden row the AR token at `position` captures into: the
     /// next row. Refused unless `position` continues the owed rows and a row
     /// below `capacity` is free.
-    fn next_row(&self, position: usize, capacity: usize) -> Result<usize, String> {
+    pub(crate) fn next_row(&self, position: usize, capacity: usize) -> Result<usize, String> {
         let row = self.tokens.len();
         if row != 0 && self.start + row != position {
             return Err(format!(
@@ -3517,7 +3517,7 @@ impl HeadLag {
     }
 
     /// Owe the token at `position`, whose hidden went to [`Self::next_row`].
-    fn push(&mut self, position: usize, token: u32) {
+    pub(crate) fn push(&mut self, position: usize, token: u32) {
         debug_assert!(self.tokens.is_empty() || self.start + self.tokens.len() == position);
         if self.tokens.is_empty() {
             self.start = position;
@@ -3525,7 +3525,7 @@ impl HeadLag {
         self.tokens.push(token);
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.tokens.clear();
     }
 }
@@ -4035,19 +4035,121 @@ struct FloorPending {
 /// of it (`rate` and `native_rate` stay 0 when the proposal was shorter than
 /// `n_min` or the budget and was never priced).
 #[derive(Clone, Copy, Debug)]
-struct NgramDecision {
+pub(crate) struct NgramDecision {
     /// The proposal's length.
-    available: usize,
+    pub(crate) available: usize,
     /// Candidates taken; 0 when the proposal was declined.
-    take: usize,
+    pub(crate) take: usize,
     /// The head's row-0 draft must confirm the first candidate.
-    confirm: bool,
+    pub(crate) confirm: bool,
     /// Best takeover rate (expected emitted tokens per AR step of cost).
-    rate: f32,
+    pub(crate) rate: f32,
     /// The native window's rate it was compared with.
-    native_rate: f32,
+    pub(crate) native_rate: f32,
     /// Depth-1 n-gram acceptance.
+    pub(crate) a1: f32,
+}
+
+/// Whether a copy take of `take` candidates still needs the head's own row-0
+/// draft to confirm its first candidate: only an established source
+/// (acceptance and evidence of the depth-1 shadow table, and the last shadow
+/// observation accepting its first candidate) skips it.
+pub(crate) fn copy_take_confirms(
+    take: usize,
     a1: f32,
+    a1_weight: f32,
+    last_first_accepted: bool,
+) -> bool {
+    !(take >= NGRAM_UNCONFIRMED_MIN_TAKE
+        && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
+        && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
+        && last_first_accepted)
+}
+
+/// The inputs of the copy lane's take-length chooser, shared by the
+/// singleton drafter and the mesh lane root.
+pub(crate) struct CopyTakeInput<'a> {
+    /// The pool proposal's length.
+    pub(crate) available: usize,
+    /// Most candidates a take may carry (`min(take cap, caller budget,
+    /// table depths)`).
+    pub(crate) cap: usize,
+    pub(crate) n_min: usize,
+    /// The request's own per-depth copy acceptance (non-empty).
+    pub(crate) agreement: &'a [(f32, f32)],
+    /// The native floor retired the request.
+    pub(crate) retired: bool,
+    /// The last shadow observation accepted its first candidate.
+    pub(crate) last_first_accepted: bool,
+}
+
+/// The copy lane's take-length chooser: the `d` in `n_min..=min(proposal,
+/// cap)` maximizing the expected emitted tokens `1 + Σ_i Π_{j<=i} a_j` per
+/// unit `takeover_cost(d)` (shorter on ties), taken when that rate is at
+/// least the native window's (`native_rate`, evaluated only when a take is
+/// priced) or, on a retired request, AR's 1.0, and then only while the last
+/// shadow observation accepted its first candidate.
+pub(crate) fn copy_take_decision(
+    input: &CopyTakeInput<'_>,
+    native_rate: impl FnOnce() -> f32,
+    takeover_cost: impl Fn(usize) -> f32,
+) -> NgramDecision {
+    let (a1_sum, a1_weight) = input.agreement[0];
+    let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
+    let mut decision = NgramDecision {
+        available: input.available,
+        take: 0,
+        confirm: true,
+        rate: 0.0,
+        native_rate: 0.0,
+        a1,
+    };
+    let hi = input.available.min(input.cap);
+    let lo = input.n_min.max(1);
+    if hi >= lo {
+        let native_rate = if input.retired { 1.0 } else { native_rate() };
+        let (mut prefix, mut expected) = (1.0f32, 1.0f32);
+        let mut best = (0usize, 0.0f32);
+        for d in 1..=hi {
+            let (accepted, weight) = input.agreement[d - 1];
+            prefix *= accepted / weight.max(f32::MIN_POSITIVE);
+            expected += prefix;
+            if d < lo {
+                continue;
+            }
+            let rate = expected / takeover_cost(d);
+            if best.0 == 0 || rate > best.1 {
+                best = (d, rate);
+            }
+        }
+        decision.rate = best.1;
+        decision.native_rate = native_rate;
+        // A retired request's alternative is one AR row, so a takeover
+        // rejected at its first candidate wastes the whole verify (a
+        // native window that agreed with the same wrong candidate would
+        // have failed with it): once retired, take only while the last
+        // shadow observation accepted its first candidate. A copy span
+        // that resumes re-arms after one AR token.
+        let retired_cold = input.retired && !input.last_first_accepted;
+        if best.1 >= native_rate && !retired_cold {
+            decision.take = best.0;
+            decision.confirm =
+                copy_take_confirms(best.0, a1, a1_weight, input.last_first_accepted);
+        }
+    }
+    decision
+}
+
+/// `(matched, horizon)` of one shadow observation: the common prefix of the
+/// window's pool proposal and the tokens committed after it, censored at the
+/// committed length.
+pub(crate) fn copy_shadow_counts(proposal: &[u32], truth: &[u32]) -> (usize, usize) {
+    let matched = proposal
+        .iter()
+        .zip(truth)
+        .take_while(|(proposed, committed)| proposed == committed)
+        .count();
+    (matched, proposal.len().min(truth.len()))
 }
 
 // ---------------------------------------------------------------------------
@@ -5907,13 +6009,7 @@ impl Qwen4MtpDrafter {
             return;
         }
         let truth = &emitted[start..];
-        let matched = self
-            .ngram_proposal
-            .iter()
-            .zip(truth)
-            .take_while(|(proposed, committed)| proposed == committed)
-            .count();
-        let horizon = self.ngram_proposal.len().min(truth.len());
+        let (matched, horizon) = copy_shadow_counts(&self.ngram_proposal, truth);
         observe_agreement_counts(
             &mut self.ngram_agreement,
             matched,
@@ -6874,76 +6970,49 @@ impl Qwen4MtpDrafter {
         // `k` already includes the remaining emit budget: a takeover commits
         // seed + candidates to both device owners before the host sees them.
         let cap = self.ngram_take_cap().min(k).min(self.ngram_agreement.len());
-        let (a1_sum, a1_weight) = self.ngram_agreement[0];
-        let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
-        let mut decision = NgramDecision {
-            available,
-            take: 0,
-            confirm: true,
-            rate: 0.0,
-            native_rate: 0.0,
-            a1,
-        };
         #[cfg(feature = "reference-parity")]
         if let Some(d) = self.lab_ngram_width() {
             // Bypass the take-length chooser only. These are the exact
             // source's real tokens, never fabricated longer offers.
+            let (a1_sum, a1_weight) = self.ngram_agreement[0];
+            let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
+            let mut decision = NgramDecision {
+                available,
+                take: 0,
+                confirm: true,
+                rate: 0.0,
+                native_rate: 0.0,
+                a1,
+            };
             if d > available || d > k {
                 self.ngram_decision = Some(decision);
                 return false;
             }
             decision.take = d;
-            decision.confirm = !(d >= NGRAM_UNCONFIRMED_MIN_TAKE
-                && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
-                && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
-                && self.ngram_last_first_accepted);
+            decision.confirm =
+                copy_take_confirms(d, a1, a1_weight, self.ngram_last_first_accepted);
             self.ngram_candidates.clear();
             self.ngram_candidates
                 .extend_from_slice(&self.ngram_proposal[..d]);
             self.ngram_decision = Some(decision);
             return d > 0;
         }
-        let hi = available.min(cap);
-        let lo = config.n_min.max(1);
-        if hi >= lo {
-            let native_rate = if self.floor.retired() {
-                1.0
-            } else {
-                self.native_rate(k.min(self.incumbent_max_k()))
-            };
-            let (mut prefix, mut expected) = (1.0f32, 1.0f32);
-            let mut best = (0usize, 0.0f32);
-            for d in 1..=hi {
-                let (accepted, weight) = self.ngram_agreement[d - 1];
-                prefix *= accepted / weight.max(f32::MIN_POSITIVE);
-                expected += prefix;
-                if d < lo {
-                    continue;
-                }
-                let rate = expected / self.takeover_cost(d);
-                if best.0 == 0 || rate > best.1 {
-                    best = (d, rate);
-                }
-            }
-            decision.rate = best.1;
-            decision.native_rate = native_rate;
-            // A retired request's alternative is one AR row, so a takeover
-            // rejected at its first candidate wastes the whole verify (a
-            // native window that agreed with the same wrong candidate would
-            // have failed with it): once retired, take only while the last
-            // shadow observation accepted its first candidate. A copy span
-            // that resumes re-arms after one AR token.
-            let retired_cold = self.floor.retired() && !self.ngram_last_first_accepted;
-            if best.1 >= native_rate && !retired_cold {
-                decision.take = best.0;
-                decision.confirm = !(best.0 >= NGRAM_UNCONFIRMED_MIN_TAKE
-                    && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
-                    && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
-                    && self.ngram_last_first_accepted);
-                self.ngram_candidates.clear();
-                self.ngram_candidates
-                    .extend_from_slice(&self.ngram_proposal[..best.0]);
-            }
+        let decision = copy_take_decision(
+            &CopyTakeInput {
+                available,
+                cap,
+                n_min: config.n_min,
+                agreement: &self.ngram_agreement,
+                retired: self.floor.retired(),
+                last_first_accepted: self.ngram_last_first_accepted,
+            },
+            || self.native_rate(k.min(self.incumbent_max_k())),
+            |d| self.takeover_cost(d),
+        );
+        if decision.take > 0 {
+            self.ngram_candidates.clear();
+            self.ngram_candidates
+                .extend_from_slice(&self.ngram_proposal[..decision.take]);
         }
         self.ngram_decision = Some(decision);
         decision.take > 0
