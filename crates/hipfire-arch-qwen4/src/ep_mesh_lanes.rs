@@ -1684,6 +1684,8 @@ impl EpMeshLanes {
                 prompt: admission.prompt,
                 spec_k: admission.spec_k,
                 head,
+                copy: false,
+                head_lag: Vec::new(),
             })
             .map_err(|e| e.to_string())?;
         let (mut fan, _) = self.fan(bundle, gpu);

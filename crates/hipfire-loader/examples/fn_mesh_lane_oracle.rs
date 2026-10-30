@@ -1892,6 +1892,7 @@ fn drive_mtp_inner(
         verify_rows_per_lane: depth + 1,
         max_rows: cfg.max_lanes * (depth + 1),
         copy_take_cap: 0,
+        head_lag_rows: 0,
         lab: lab_routes(routes),
         pp_microbatch_lanes: None,
     };
@@ -2006,7 +2007,6 @@ fn drive_mtp_inner(
                 epoch: lane.epoch,
                 remaining: cfg.tokens - lane.committed.len(),
                 context_left: max_seq.saturating_sub(position),
-                copy_candidates: Vec::new(),
                 forced: None,
                 sampling: SamplingMode::Greedy,
             });

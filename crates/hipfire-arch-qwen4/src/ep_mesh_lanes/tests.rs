@@ -36,6 +36,7 @@ fn budgets(lab: LabRoutes, k: usize) -> WindowBudgets {
         verify_rows_per_lane: k + 1,
         max_rows: 8 * (k + 1),
         copy_take_cap: 7,
+        head_lag_rows: 0,
         lab,
         pp_microbatch_lanes: None,
     }
@@ -46,7 +47,6 @@ fn req(tag: u64, remaining: usize) -> LaneRequest {
         epoch: epoch(tag),
         remaining,
         context_left: 10_000,
-        copy_candidates: Vec::new(),
         forced: None,
         sampling: SamplingMode::Greedy,
     }
@@ -445,6 +445,8 @@ fn admit(
             prompt: vec![1, 2, 3],
             spec_k,
             head: HeadState::Aligned,
+            copy: false,
+            head_lag: Vec::new(),
         })
         .unwrap();
     fan.admit(&a).unwrap();
@@ -542,6 +544,8 @@ fn mesh_lane_ep_serial_dispatch_of_a_collective_phase_cannot_rendezvous() {
             prompt: vec![1],
             spec_k: Some(1),
             head: HeadState::Aligned,
+            copy: false,
+            head_lag: Vec::new(),
         })
         .unwrap();
     for r in &mut ranks {
