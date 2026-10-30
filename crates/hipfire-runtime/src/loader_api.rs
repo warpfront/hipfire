@@ -129,6 +129,10 @@ pub struct BatchLoadRequest {
     /// Requested step row budget (`serve.max_batch_tokens`); the staged
     /// budget is `max(row_budget, continuous_batch_size)`.
     pub row_budget: usize,
+    /// Native-MTP lanes of draft depth `k` are staged (`serve.batch_spec`):
+    /// the EP lane reservation charges the spec lane store (target ring,
+    /// head state, wide hidden) instead of the AR store. `None`: AR lanes.
+    pub spec_k: Option<usize>,
 }
 
 impl BatchLoadRequest {
@@ -432,24 +436,28 @@ mod ep_lane_reservation_request_tests {
             vmm_batch: true,
             continuous_batch_size: 1,
             row_budget: 4096,
+            spec_k: None,
         };
         assert_eq!(one.lanes(), None);
         let no_vmm = BatchLoadRequest {
             vmm_batch: false,
             continuous_batch_size: 8,
             row_budget: 4096,
+            spec_k: None,
         };
         assert_eq!(no_vmm.lanes(), None);
         let zero = BatchLoadRequest {
             vmm_batch: true,
             continuous_batch_size: 0,
             row_budget: 0,
+            spec_k: None,
         };
         assert_eq!(zero.lanes(), None);
         let on = BatchLoadRequest {
             vmm_batch: true,
             continuous_batch_size: 4,
             row_budget: 0,
+            spec_k: None,
         };
         assert_eq!(on.lanes(), Some(4));
     }

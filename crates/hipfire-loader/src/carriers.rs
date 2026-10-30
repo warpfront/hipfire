@@ -2881,7 +2881,7 @@ pub fn qwen4_ep_vram_layers(
             shared.vmm_granularity,
             lanes,
             row_budget,
-            None,
+            batch.spec_k,
         )
     });
     Ok(hipfire_arch_qwen4::expert_residency::ep_vram_plan(
@@ -12921,6 +12921,7 @@ mod ep_lane_reservation_tests {
             vmm_batch,
             continuous_batch_size: lanes,
             row_budget,
+            spec_k: None,
         }
     }
 

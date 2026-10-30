@@ -2384,6 +2384,9 @@ fn main() {
                     vmm_batch: parsed_vmm_batch.is_some_and(|params| !params.nonexact),
                     continuous_batch_size: parsed_continuous_batch_size,
                     row_budget: parsed_vmm_batch.map_or(0, |params| params.max_batch_tokens),
+                    // EP stages AR lanes under serve (the topology override);
+                    // mesh spec lanes are staged by the oracle/driver.
+                    spec_k: None,
                 };
                 // Only tp>1 EP loads defer prior retirement. Every single-device
                 // or pp load (Qwen4/Flash-Next included) is unload-first: after

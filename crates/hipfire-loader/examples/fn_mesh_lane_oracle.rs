@@ -2607,6 +2607,8 @@ fn load_with_lane_reservation(
         row_budget: args
             .row_budget
             .unwrap_or_else(|| *args.ks.last().expect("ks is non-empty")),
+        // `--spec mtp` stages spec lanes: the EP plan charges that store.
+        spec_k: (args.spec == SpecMode::Mtp).then(|| args.k.unwrap_or(DEFAULT_K)),
     };
     let warning = legacy_warning(admission.kv_backend, admission.kv_backend_reason.as_deref());
     let loaded = hipfire_loader::load_admitted_with_gemma4_drafter(
