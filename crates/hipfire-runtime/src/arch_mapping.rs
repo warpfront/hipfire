@@ -121,6 +121,10 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     // key winning, so `Flux2Transformer2DModel` resolves to 45 via "flux2" and
     // `FluxTransformer2DModel` to 40 via "flux".
     ("flux2", 45),
+    // arch 19 — Raon-1-mini. The class name `Raon1MiniForCausalLM` does not
+    // contain `raon1_mini`, so the class alias is its own key.
+    ("raon1_mini", 19),
+    ("raon1miniforcausallm", 19),
 ];
 /// Reserved source classifications with no executable carrier or reset owner.
 /// These strings remain accepted by [`lookup_model_type`] so packers and
@@ -226,6 +230,17 @@ mod tests {
             RESERVED_MODEL_TYPE_TO_ARCH_ID,
             &[("qwen4_exp", 16), ("qwen4_exp_text", 16)]
         );
+    }
+
+    #[test]
+    fn raon1_mini_is_executable_arch_19() {
+        use super::lookup_architecture;
+        assert_eq!(lookup_model_type("raon1_mini"), Some(19));
+        assert_eq!(lookup_architecture("Raon1MiniForCausalLM"), Some(19));
+        assert!(MODEL_TYPE_TO_ARCH_ID.contains(&("raon1_mini", 19)));
+        assert!(RESERVED_MODEL_TYPE_TO_ARCH_ID
+            .iter()
+            .all(|(_, id)| *id != 19));
     }
 
     #[test]

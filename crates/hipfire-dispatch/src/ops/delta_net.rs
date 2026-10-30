@@ -301,3 +301,143 @@ pub fn sigmoid_alpha_gate_batched(
 ) -> hip_bridge::HipResult<()> {
     gpu.fused_sigmoid_alpha_gate_f32_batched(beta, alpha, dt_bias, a_log, n, batch_size)
 }
+
+// ── Generic gated delta rule (per-head or per-key-channel decay) ─────────
+//
+// Independent of `DeltaNetStepParams`/`DeltaNetBatchParams`: those carry one
+// scalar gate per (token, head) and FP32/Q8/Q4 state selection. This op carries
+// explicit decay geometry, head mapping and state strides, and runs N>=1 tokens
+// in ONE launch (state tile resident in registers across tokens).
+
+/// Axis of the log-decay operand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum DecayAxis {
+    /// `log_decay[t, h]`: one scalar per (token, head).
+    PerHead,
+    /// `log_decay[t, h, k]`: one value per key channel.
+    PerKeyChannel,
+}
+
+/// Element strides (f32 elements) of every operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatedDeltaStrides {
+    pub q_row: usize,
+    pub k_row: usize,
+    pub v_row: usize,
+    pub decay_row: usize,
+    pub beta_row: usize,
+    pub out_row: usize,
+    pub state_slot: usize,
+    pub state_head: usize,
+    /// Elements between consecutive value rows of one head's `[V,K]` state.
+    pub state_row: usize,
+}
+
+impl GatedDeltaStrides {
+    /// Dense `[N,Hqk,K]` / `[N,H,V]` / `[N,H]` rows with a dense `[H,V,K]`
+    /// state per slot.
+    pub fn contiguous(
+        n_heads: usize,
+        qk_group: usize,
+        key_dim: usize,
+        value_dim: usize,
+        decay_axis: DecayAxis,
+    ) -> Self {
+        let hq = n_heads / qk_group.max(1);
+        Self {
+            q_row: hq * key_dim,
+            k_row: hq * key_dim,
+            v_row: n_heads * value_dim,
+            decay_row: match decay_axis {
+                DecayAxis::PerHead => n_heads,
+                DecayAxis::PerKeyChannel => n_heads * key_dim,
+            },
+            beta_row: n_heads,
+            out_row: n_heads * value_dim,
+            state_slot: n_heads * value_dim * key_dim,
+            state_head: value_dim * key_dim,
+            state_row: key_dim,
+        }
+    }
+}
+
+/// One gated-delta-rule layer step over `n_tokens` rows.
+///
+/// Per token: `S *= exp(log_decay)` (per key column), `pred = S·k`,
+/// `S += beta * (v - pred) ⊗ k`, `y = S·q` (read after write). State is FP32
+/// `[H,V,K]` (value-major, key contiguous), updated in place. Operands are FP32
+/// planes; BF16 boundaries are applied by the producer, except the optional
+/// `round_output_bf16` rounding of `y`.
+pub struct GatedDeltaOp<'a> {
+    pub query: &'a GpuTensor,
+    pub key: &'a GpuTensor,
+    /// Value operand (already write-ratio scaled by the caller when needed).
+    pub value: &'a GpuTensor,
+    pub log_decay: &'a GpuTensor,
+    pub beta: &'a GpuTensor,
+    pub state: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    /// Optional device `i32` slot selector (graph-capture safe); overrides `slot`.
+    pub slot_idx: Option<&'a GpuTensor>,
+    /// Optional device `i32` token count (<= `n_tokens`).
+    pub n_dev: Option<&'a GpuTensor>,
+    pub n_tokens: usize,
+    pub n_heads: usize,
+    /// Value heads per q/k head (1 = no repetition).
+    pub qk_group: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub decay_axis: DecayAxis,
+    pub round_output_bf16: bool,
+    pub slot: usize,
+    pub strides: GatedDeltaStrides,
+}
+
+/// Execute `op` with the generic serial vector-decay kernel. Unsupported
+/// geometry is a named refusal, never a per-token loop.
+pub fn execute_gated_delta(
+    gpu: &mut Gpu,
+    op: &GatedDeltaOp<'_>,
+) -> Result<(), crate::types::DispatchError> {
+    use crate::types::DispatchError;
+    if op.key_dim != rdna_compute::gated_delta_vector::GATED_DELTA_VECTOR_HEAD_DIM
+        || op.value_dim != rdna_compute::gated_delta_vector::GATED_DELTA_VECTOR_HEAD_DIM
+    {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "gated_delta",
+            variant: "vector_serial_head_dim",
+            arch: "any",
+            quant: "fp32",
+        });
+    }
+    let s = &op.strides;
+    let launch = rdna_compute::gated_delta_vector::GatedDeltaVectorLaunch {
+        query: op.query,
+        key: op.key,
+        value: op.value,
+        log_decay: op.log_decay,
+        beta: op.beta,
+        state: op.state,
+        output: op.output,
+        slot_idx: op.slot_idx,
+        n_dev: op.n_dev,
+        n_tokens: op.n_tokens,
+        n_heads: op.n_heads,
+        qk_group: op.qk_group,
+        head_dim: op.key_dim,
+        decay_per_key: op.decay_axis == DecayAxis::PerKeyChannel,
+        round_out_bf16: op.round_output_bf16,
+        slot: op.slot,
+        q_row_stride: s.q_row,
+        k_row_stride: s.k_row,
+        v_row_stride: s.v_row,
+        decay_row_stride: s.decay_row,
+        beta_row_stride: s.beta_row,
+        out_row_stride: s.out_row,
+        state_head_stride: s.state_head,
+        state_row_stride: s.state_row,
+        state_slot_stride: s.state_slot,
+    };
+    gpu.gated_delta_net_vector_serial_f32(&launch)
+        .map_err(|e| DispatchError::Hip(e.to_string()))
+}

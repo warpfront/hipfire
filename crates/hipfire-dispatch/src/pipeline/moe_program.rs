@@ -6521,3 +6521,1068 @@ mod tests {
         ));
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Generic GroupedMoeOp
+//
+// A sealed, borrowed description of one routed-expert FFN layer (router kind,
+// activation, shared-expert policy, cast policy, combine order, logical versus
+// physical widths) executed over the tuned qt44 cores: the indexed GEMVs for
+// decode rows and the grouped WMMA core plus stable scatter for prefill rows.
+// The program carries no model identity: admission is geometry/format/kernel
+// limits only (`GroupedMoeGeometry::validate`, named refusals), and the
+// existing recipe-driven sealed calls above keep their arithmetic untouched.
+// ════════════════════════════════════════════════════════════════════════════
+
+use crate::families::gemm::{GemmFamily, GemmParams};
+use crate::families::gemv::WeightRef;
+use crate::families::moe::{grouped_moe_m_total_bound, GroupedMoeGeometry, MOE_GROUPED_BLOCK_M};
+pub use rdna_compute::ffn_activation::{CombineOrder, FfnActivation, RouterKind};
+use rdna_compute::ffn_activation::{
+    FfnActivationGrouped, FfnActivationRows, FfnAwq, MoeCombine, MoeRouterTopK,
+};
+use rdna_compute::DType;
+
+/// Rounding boundaries of a grouped MoE / gated FFN program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastPolicy {
+    /// Every boundary stays FP32 (the separately labelled FP32 oracle mode).
+    Exact32,
+    /// Model-dtype (BF16, round-to-nearest-even) boundaries: projection
+    /// outputs before the activation, the activation result, each expert's
+    /// down output, the routed sum (cast once) and the final sum.
+    Bf16Boundaries,
+}
+
+impl CastPolicy {
+    #[inline]
+    fn bf16(self) -> bool {
+        self == Self::Bf16Boundaries
+    }
+}
+
+/// How the shared expert joins the routed sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedExpertPolicy {
+    /// No shared expert.
+    Absent,
+    /// Ungated shared expert (no scalar selector) added AFTER the routed sum
+    /// has been cast; the shared output is cast on its own first.
+    UngatedAfterRoutedCast,
+}
+
+/// Every load-time policy of a grouped MoE layer. Shared kernels receive these
+/// as launch arguments; nothing in a kernel inspects a model name.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupedMoePolicy {
+    pub router: RouterKind,
+    pub activation: FfnActivation,
+    pub shared: SharedExpertPolicy,
+    pub cast: CastPolicy,
+    pub combine: CombineOrder,
+}
+
+/// Which routed-expert core runs the layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupedMoeProtocol {
+    /// `rows <= GROUPED_MOE_INDEXED_MAX_ROWS` takes the indexed GEMVs, wider
+    /// batches the grouped WMMA core.
+    Auto,
+    /// Per-(row, rank) indexed qt44 gate/up and down GEMVs (decode core).
+    Indexed,
+    /// Stable scatter + grouped WMMA gate/up and down (prefill core).
+    Grouped,
+}
+
+/// Row count up to which [`GroupedMoeProtocol::Auto`] runs the indexed core.
+pub const GROUPED_MOE_INDEXED_MAX_ROWS: usize = 1;
+
+impl GroupedMoeProtocol {
+    /// The concrete core for a call of `rows` rows.
+    pub fn resolve(self, rows: usize) -> Self {
+        match self {
+            Self::Auto if rows <= GROUPED_MOE_INDEXED_MAX_ROWS => Self::Indexed,
+            Self::Auto => Self::Grouped,
+            other => other,
+        }
+    }
+}
+
+/// Element counts (F32 or i32 words) of every scratch tensor one call needs.
+/// Zero means the tensor is not used by that core. Allocate with
+/// [`GroupedMoeScratchPlan::for_rows`] (union of both cores) to run any
+/// protocol at up to `rows` rows without reallocating.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupedMoeScratchPlan {
+    pub router_logits: usize,
+    pub topk_indices: usize,
+    pub topk_weights: usize,
+    pub x_rot: usize,
+    pub act: usize,
+    pub rot: usize,
+    pub down_rows: usize,
+    pub indexed_gate: usize,
+    pub indexed_up: usize,
+    pub gate_up_rows: usize,
+    pub m_total: usize,
+    pub expert_token_counts: usize,
+    pub expert_offsets: usize,
+    pub sorted_slot_index: usize,
+    pub expert_tile_ids: usize,
+    pub inverse_perm: usize,
+    pub shared_gate: usize,
+    pub shared_up: usize,
+    pub shared_act: usize,
+    pub shared_rot: usize,
+    pub shared_out: usize,
+    /// Single-expert grouping tables of the shared expert projections.
+    pub shared_tables: usize,
+}
+
+fn plan_overflow() -> DispatchError {
+    DispatchError::Hip("grouped moe: scratch extent overflows usize".into())
+}
+
+fn mul(a: usize, b: usize) -> Result<usize, DispatchError> {
+    a.checked_mul(b).ok_or_else(plan_overflow)
+}
+
+impl GroupedMoeScratchPlan {
+    /// Extents of one core (`protocol` is resolved against `rows`).
+    pub fn for_protocol(
+        g: &GroupedMoeGeometry,
+        rows: usize,
+        protocol: GroupedMoeProtocol,
+    ) -> Result<Self, DispatchError> {
+        g.validate()?;
+        let slots = mul(rows, g.top_k)?;
+        let mut p = Self {
+            router_logits: mul(rows, g.n_experts)?,
+            topk_indices: slots,
+            topk_weights: slots,
+            x_rot: mul(rows, g.hidden)?,
+            act: mul(slots, g.down_k)?,
+            rot: mul(slots, g.down_k)?,
+            shared_gate: mul(rows, g.shared_mi)?,
+            shared_up: mul(rows, g.shared_mi)?,
+            shared_act: mul(rows, g.shared_down_k)?,
+            shared_rot: mul(rows, g.shared_down_k)?,
+            shared_tables: if g.shared_mi == 0 {
+                0
+            } else {
+                rdna_compute::ffn_activation::single_expert_table_words(rows)
+            },
+            shared_out: if g.shared_mi == 0 {
+                0
+            } else {
+                mul(rows, g.hidden)?
+            },
+            ..Self::default()
+        };
+        match protocol.resolve(rows) {
+            GroupedMoeProtocol::Indexed => {
+                p.down_rows = mul(slots, g.hidden)?;
+                p.indexed_gate = mul(slots, g.logical_mi)?;
+                p.indexed_up = p.indexed_gate;
+            }
+            GroupedMoeProtocol::Grouped => {
+                let m_total = grouped_moe_m_total_bound(slots, g.n_experts);
+                p.m_total = m_total;
+                p.down_rows = mul(m_total, g.hidden)?;
+                p.gate_up_rows = mul(m_total, 2 * g.logical_mi)?;
+                p.expert_token_counts = g.n_experts;
+                p.expert_offsets = g.n_experts + 1;
+                p.sorted_slot_index = m_total;
+                p.expert_tile_ids = m_total / MOE_GROUPED_BLOCK_M;
+                p.inverse_perm = slots;
+            }
+            GroupedMoeProtocol::Auto => unreachable!("resolve never returns Auto"),
+        }
+        Ok(p)
+    }
+
+    /// Element-wise maximum.
+    pub fn max_with(self, o: Self) -> Self {
+        Self {
+            router_logits: self.router_logits.max(o.router_logits),
+            topk_indices: self.topk_indices.max(o.topk_indices),
+            topk_weights: self.topk_weights.max(o.topk_weights),
+            x_rot: self.x_rot.max(o.x_rot),
+            act: self.act.max(o.act),
+            rot: self.rot.max(o.rot),
+            down_rows: self.down_rows.max(o.down_rows),
+            indexed_gate: self.indexed_gate.max(o.indexed_gate),
+            indexed_up: self.indexed_up.max(o.indexed_up),
+            gate_up_rows: self.gate_up_rows.max(o.gate_up_rows),
+            m_total: self.m_total.max(o.m_total),
+            expert_token_counts: self.expert_token_counts.max(o.expert_token_counts),
+            expert_offsets: self.expert_offsets.max(o.expert_offsets),
+            sorted_slot_index: self.sorted_slot_index.max(o.sorted_slot_index),
+            expert_tile_ids: self.expert_tile_ids.max(o.expert_tile_ids),
+            inverse_perm: self.inverse_perm.max(o.inverse_perm),
+            shared_gate: self.shared_gate.max(o.shared_gate),
+            shared_up: self.shared_up.max(o.shared_up),
+            shared_act: self.shared_act.max(o.shared_act),
+            shared_rot: self.shared_rot.max(o.shared_rot),
+            shared_out: self.shared_out.max(o.shared_out),
+            shared_tables: self.shared_tables.max(o.shared_tables),
+        }
+    }
+
+    /// Extents covering both cores at `rows` rows (allocate once for the
+    /// widest call: the indexed core at `rows` and the grouped core at `rows`).
+    pub fn for_rows(g: &GroupedMoeGeometry, rows: usize) -> Result<Self, DispatchError> {
+        Ok(
+            Self::for_protocol(g, rows, GroupedMoeProtocol::Indexed)?.max_with(Self::for_protocol(
+                g,
+                rows,
+                GroupedMoeProtocol::Grouped,
+            )?),
+        )
+    }
+}
+
+/// Router linear weights and selection bias.
+#[derive(Clone, Copy)]
+pub struct GroupedMoeRouter<'a> {
+    /// F32 `[n_experts, hidden]` (the router projection runs in FP32).
+    pub weight: &'a GpuTensor,
+    /// F32 `[n_experts]` selection-only correction bias; `None` is zero. Must
+    /// be `None` for [`RouterKind::SoftmaxRenorm`].
+    pub correction_bias: Option<&'a GpuTensor>,
+}
+
+/// Routed expert tables.
+#[derive(Clone, Copy)]
+pub struct GroupedMoeRouted<'a> {
+    /// Wire format of every routed projection. Only `MQ4G256V2` (qt44) has the
+    /// indexed and grouped cores wired here; anything else is a named refusal.
+    pub dtype: DType,
+    /// `[n_experts]` u64 device pointers to fused `[2*logical_mi, hidden]`
+    /// gate-then-up tensors.
+    pub gate_up_ptrs: &'a GpuTensor,
+    /// `[n_experts]` u64 device pointers to `[hidden, down_k]` down tensors.
+    pub down_ptrs: &'a GpuTensor,
+    /// F32 `[hidden]` AWQ divide of the gate/up input basis (before the FWHT);
+    /// shared with the shared expert's gate/up when present.
+    pub input_awq: Option<&'a GpuTensor>,
+    /// `[n_experts]` u64 pointers to per-expert F32 `[down_k]` AWQ divides of
+    /// the down input (applied after the pad, before the FWHT).
+    pub down_awq_ptrs: Option<&'a GpuTensor>,
+}
+
+/// Gate/up/down projections of one gated FFN (shared expert or dense layer).
+#[derive(Clone, Copy)]
+pub struct GroupedMoeShared<'a> {
+    pub gate: WeightRef<'a>,
+    pub up: WeightRef<'a>,
+    pub down: WeightRef<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub struct GroupedMoeIndexedScratch<'a> {
+    /// F32 `[rows * top_k * logical_mi]` each.
+    pub gate: &'a GpuTensor,
+    pub up: &'a GpuTensor,
+}
+
+#[derive(Clone, Copy)]
+pub struct GroupedMoeGroupedScratch<'a> {
+    /// F32 `[m_total * 2 * logical_mi]`.
+    pub gate_up_rows: &'a GpuTensor,
+    /// i32 tables, see [`GroupedMoeScratchPlan`].
+    pub expert_token_counts: &'a GpuTensor,
+    pub expert_offsets: &'a GpuTensor,
+    pub sorted_slot_index: &'a GpuTensor,
+    pub expert_tile_ids: &'a GpuTensor,
+    pub inverse_perm: &'a GpuTensor,
+}
+
+#[derive(Clone, Copy)]
+pub struct GroupedMoeSharedScratch<'a> {
+    pub gate_out: &'a GpuTensor,
+    pub up_out: &'a GpuTensor,
+    pub act: &'a GpuTensor,
+    pub rot: &'a GpuTensor,
+    /// Cast shared expert output `[rows, hidden]` (diagnostic: the shared-only
+    /// result of the layer).
+    pub out: &'a GpuTensor,
+    /// F32 words, at least `single_expert_table_words(rows)`: grouping tables
+    /// that run the qt44 gate/up/down weights as one-entry expert tables.
+    pub tables: &'a GpuTensor,
+}
+
+#[derive(Clone, Copy)]
+pub struct GroupedMoeScratch<'a> {
+    pub router_logits: &'a GpuTensor,
+    /// i32 `[rows, top_k]` (selected experts) and F32 weights; both are
+    /// device-resident outputs of the router, never downloaded.
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    pub x_rot: &'a GpuTensor,
+    pub act: &'a GpuTensor,
+    pub rot: &'a GpuTensor,
+    pub down_rows: &'a GpuTensor,
+    pub indexed: Option<GroupedMoeIndexedScratch<'a>>,
+    pub grouped: Option<GroupedMoeGroupedScratch<'a>>,
+    pub shared: Option<GroupedMoeSharedScratch<'a>>,
+}
+
+/// Complete borrowed description of one grouped MoE layer call.
+#[derive(Clone, Copy)]
+pub struct GroupedMoeOp<'a> {
+    pub ctx: &'a DispatchCtx,
+    pub policy: GroupedMoePolicy,
+    pub geometry: GroupedMoeGeometry,
+    pub protocol: GroupedMoeProtocol,
+    pub rows: usize,
+    /// F32 `[rows, hidden]` normalized layer input (BF16-valued under
+    /// [`CastPolicy::Bf16Boundaries`]).
+    pub x: &'a GpuTensor,
+    pub router: GroupedMoeRouter<'a>,
+    pub routed: GroupedMoeRouted<'a>,
+    pub shared: Option<GroupedMoeShared<'a>>,
+    pub scratch: GroupedMoeScratch<'a>,
+    /// F32 `[rows, hidden]` layer output (routed sum + shared).
+    pub out: &'a GpuTensor,
+    /// Optional F32 `[rows, hidden]` diagnostic: the routed sum after its cast.
+    pub routed_out: Option<&'a GpuTensor>,
+}
+
+fn grouped_refusal(variant: &'static str, quant: &'static str) -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "moe",
+        variant,
+        arch: "",
+        quant,
+    }
+}
+
+fn scratch_need(t: &GpuTensor, elems: usize, what: &str) -> Result<(), DispatchError> {
+    let need = elems.checked_mul(4).ok_or_else(plan_overflow)?;
+    if t.buf.size() < need {
+        return Err(DispatchError::Hip(format!(
+            "grouped moe: scratch `{what}` holds {} bytes, needs {need}",
+            t.buf.size()
+        )));
+    }
+    Ok(())
+}
+
+fn f32_like(t: &GpuTensor, what: &str) -> Result<(), DispatchError> {
+    if matches!(t.dtype, DType::F32 | DType::Raw) {
+        Ok(())
+    } else {
+        Err(DispatchError::Hip(format!(
+            "grouped moe: `{what}` must be an F32 tensor, got {:?}",
+            t.dtype
+        )))
+    }
+}
+
+/// The projection formats the shared expert / dense FFN accepts and whether the
+/// format consumes the FWHT-rotated (AWQ-divided) basis of its input.
+fn projection_kind(
+    dtype: DType,
+    variant: &'static str,
+) -> Result<(crate::types::KernelKey, bool), DispatchError> {
+    use crate::types::KernelKey;
+    match dtype {
+        DType::MQ4G256V2 => Ok((KernelKey::GemmMq4G256V2, true)),
+        DType::Q8_0 => Ok((KernelKey::GemmQ8_0BatchedChunked, false)),
+        DType::F32 => Ok((KernelKey::GemmF32Batched, false)),
+        _ => Err(grouped_refusal(variant, "projection-dtype")),
+    }
+}
+
+fn check_projection(
+    w: &WeightRef<'_>,
+    m: usize,
+    k: usize,
+    variant: &'static str,
+) -> Result<(), DispatchError> {
+    let (_, rotated) = projection_kind(w.dtype, variant)?;
+    if w.m != m || w.k != k {
+        return Err(DispatchError::Hip(format!(
+            "grouped moe: projection geometry [{}x{}] != expected [{m}x{k}] ({variant})",
+            w.m, w.k
+        )));
+    }
+    if rotated && k % 256 != 0 {
+        return Err(grouped_refusal(variant, "qt44-k-not-256-multiple"));
+    }
+    if !rotated && w.awq_scale.is_some() {
+        return Err(grouped_refusal(variant, "awq-on-unrotated-projection"));
+    }
+    Ok(())
+}
+
+/// Both projections share one rotated input basis: their AWQ sidecars must be
+/// both absent or both present (value identity is the loader's verified
+/// contract; the divide actually applied is `input_awq`).
+fn awq_presence_matches(a: Option<&GpuTensor>, b: Option<&GpuTensor>) -> bool {
+    a.is_some() == b.is_some()
+}
+
+impl<'a> GroupedMoeOp<'a> {
+    /// Admission and operand validation; no launch happens before it passes.
+    /// Every refusal is named; nothing falls back to a token loop.
+    pub fn validate(&self) -> Result<GroupedMoeScratchPlan, DispatchError> {
+        let g = &self.geometry;
+        g.validate()?;
+        let protocol = self.protocol.resolve(self.rows);
+        let plan = GroupedMoeScratchPlan::for_protocol(g, self.rows, protocol)?;
+        if self.routed.dtype != DType::MQ4G256V2 {
+            return Err(grouped_refusal("grouped-op-routed-dtype", "non-qt44"));
+        }
+        if protocol == GroupedMoeProtocol::Grouped
+            && !(self.ctx.arch.has_wmma_w32() || self.ctx.arch.is_rdna4())
+        {
+            return Err(grouped_refusal("grouped-op-grouped-core-needs-wmma", ""));
+        }
+        match (self.policy.router, self.router.correction_bias) {
+            (RouterKind::SoftmaxRenorm, Some(_)) => {
+                return Err(grouped_refusal("grouped-op-softmax-router-with-bias", ""));
+            }
+            _ => {}
+        }
+        if self.policy.shared == SharedExpertPolicy::Absent {
+            if self.shared.is_some() || g.shared_mi != 0 || self.scratch.shared.is_some() {
+                return Err(grouped_refusal("grouped-op-shared-policy-mismatch", ""));
+            }
+        } else if self.shared.is_none() || g.shared_mi == 0 || self.scratch.shared.is_none() {
+            return Err(grouped_refusal("grouped-op-shared-policy-mismatch", ""));
+        }
+        f32_like(self.x, "x")?;
+        f32_like(self.out, "out")?;
+        f32_like(self.router.weight, "router.weight")?;
+        scratch_need(self.x, plan.x_rot, "x")?;
+        scratch_need(self.out, plan.x_rot, "out")?;
+        scratch_need(
+            self.router.weight,
+            mul(g.n_experts, g.hidden)?,
+            "router.weight",
+        )?;
+        if let Some(b) = self.router.correction_bias {
+            f32_like(b, "router.correction_bias")?;
+            scratch_need(b, g.n_experts, "router.correction_bias")?;
+        }
+        if let Some(r) = self.routed_out {
+            scratch_need(r, plan.x_rot, "routed_out")?;
+        }
+        scratch_need(
+            self.routed.gate_up_ptrs,
+            2 * g.n_experts,
+            "routed.gate_up_ptrs",
+        )?;
+        scratch_need(self.routed.down_ptrs, 2 * g.n_experts, "routed.down_ptrs")?;
+        if let Some(t) = self.routed.down_awq_ptrs {
+            scratch_need(t, 2 * g.n_experts, "routed.down_awq_ptrs")?;
+        }
+        let s = &self.scratch;
+        scratch_need(s.router_logits, plan.router_logits, "router_logits")?;
+        scratch_need(s.topk_indices, plan.topk_indices, "topk_indices")?;
+        scratch_need(s.topk_weights, plan.topk_weights, "topk_weights")?;
+        scratch_need(s.x_rot, plan.x_rot, "x_rot")?;
+        scratch_need(s.act, plan.act, "act")?;
+        scratch_need(s.rot, plan.rot, "rot")?;
+        scratch_need(s.down_rows, plan.down_rows, "down_rows")?;
+        match protocol {
+            GroupedMoeProtocol::Indexed => {
+                let i = s
+                    .indexed
+                    .as_ref()
+                    .ok_or_else(|| grouped_refusal("grouped-op-indexed-scratch-missing", ""))?;
+                scratch_need(i.gate, plan.indexed_gate, "indexed.gate")?;
+                scratch_need(i.up, plan.indexed_up, "indexed.up")?;
+            }
+            GroupedMoeProtocol::Grouped => {
+                let t = s
+                    .grouped
+                    .as_ref()
+                    .ok_or_else(|| grouped_refusal("grouped-op-grouped-scratch-missing", ""))?;
+                scratch_need(t.gate_up_rows, plan.gate_up_rows, "grouped.gate_up_rows")?;
+                scratch_need(
+                    t.expert_token_counts,
+                    plan.expert_token_counts,
+                    "grouped.expert_token_counts",
+                )?;
+                scratch_need(
+                    t.expert_offsets,
+                    plan.expert_offsets,
+                    "grouped.expert_offsets",
+                )?;
+                scratch_need(
+                    t.sorted_slot_index,
+                    plan.sorted_slot_index,
+                    "grouped.sorted_slot_index",
+                )?;
+                scratch_need(
+                    t.expert_tile_ids,
+                    plan.expert_tile_ids,
+                    "grouped.expert_tile_ids",
+                )?;
+                scratch_need(t.inverse_perm, plan.inverse_perm, "grouped.inverse_perm")?;
+            }
+            GroupedMoeProtocol::Auto => unreachable!("resolve never returns Auto"),
+        }
+        if let (Some(shared), Some(ss)) = (self.shared.as_ref(), s.shared.as_ref()) {
+            check_projection(
+                &shared.gate,
+                g.shared_mi,
+                g.hidden,
+                "grouped-op-shared-gate",
+            )?;
+            check_projection(&shared.up, g.shared_mi, g.hidden, "grouped-op-shared-up")?;
+            check_projection(
+                &shared.down,
+                g.hidden,
+                g.shared_down_k,
+                "grouped-op-shared-down",
+            )?;
+            // One rotated input basis feeds the routed gate/up and every
+            // rotated shared gate/up: their AWQ presence must agree.
+            let rotated_gate = projection_kind(shared.gate.dtype, "grouped-op-shared-gate")?.1;
+            let rotated_up = projection_kind(shared.up.dtype, "grouped-op-shared-up")?.1;
+            if (rotated_gate && !awq_presence_matches(shared.gate.awq_scale, self.routed.input_awq))
+                || (rotated_up && !awq_presence_matches(shared.up.awq_scale, self.routed.input_awq))
+            {
+                return Err(grouped_refusal("grouped-op-input-awq-mismatch", ""));
+            }
+            scratch_need(ss.gate_out, plan.shared_gate, "shared.gate_out")?;
+            scratch_need(ss.up_out, plan.shared_up, "shared.up_out")?;
+            scratch_need(ss.act, plan.shared_act, "shared.act")?;
+            scratch_need(ss.rot, plan.shared_rot, "shared.rot")?;
+            scratch_need(ss.out, plan.shared_out, "shared.out")?;
+            scratch_need(ss.tables, plan.shared_tables, "shared.tables")?;
+        }
+        Ok(plan)
+    }
+}
+
+/// Rotated (FWHT-256, optional AWQ-divided) basis of an F32 activation block.
+fn rotate_input_basis(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    awq: Option<&GpuTensor>,
+    k: usize,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    match awq {
+        Some(awq) => hip!(gpu.rotate_x_mq_awq_batched(x, awq, x_rot, k, rows)),
+        None => hip!(gpu.rotate_x_mq_batched(x, x_rot, k, rows)),
+    }
+}
+
+/// Gated FFN from the already prepared input bases: `down(act(gate(x), up(x)))`.
+/// `x` is the plain F32 input (consumed by unrotated projection formats) and
+/// `x_rot` its rotated (AWQ-divided) basis, consumed by qt44 projections. The
+/// activation result is padded from `mi` to the down projection's physical K
+/// with exact zeros, AWQ-divided by the down weight's own sidecar when it
+/// carries one, rotated for qt44 down weights, then projected; the down output
+/// is cast per policy.
+#[allow(clippy::too_many_arguments)]
+fn gated_ffn_from_basis(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    activation: FfnActivation,
+    cast: CastPolicy,
+    rows: usize,
+    hidden: usize,
+    mi: usize,
+    down_k: usize,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    w: &GroupedMoeShared<'_>,
+    s: &GroupedMoeSharedScratch<'_>,
+    out: &GpuTensor,
+) -> Result<(), DispatchError> {
+    static GEMM: std::sync::LazyLock<GemmFamily> = std::sync::LazyLock::new(GemmFamily::new);
+    let gemm = &*GEMM;
+    let (down_key, down_rotated) = projection_kind(w.down.dtype, "gated-ffn-down")?;
+    // One-entry grouping tables drive qt44 weights through the grouped F16 WMMA
+    // core (BF16 policy, rows >= 2) or the F32 indexed GEMV (exact policy), so a
+    // shared/dense projection never takes the quantized-activation prefill GEMMs
+    // (A8 / IU4 / FP8) that the dense GEMM entry selects at wide batches.
+    let any_qt44 = [&w.gate, &w.up, &w.down]
+        .iter()
+        .any(|p| p.dtype == DType::MQ4G256V2);
+    let views = if any_qt44 && !(cast.bf16() && rows == 1) {
+        hip!(gpu.ffn_single_expert_tables(s.tables, rows, [w.gate.buf, w.up.buf, w.down.buf]))?;
+        Some(Gpu::single_expert_views(s.tables, rows))
+    } else {
+        None
+    };
+    let project = |gpu: &mut Gpu,
+                   weight: &WeightRef<'_>,
+                   which: usize,
+                   xin: &GpuTensor,
+                   y: &GpuTensor,
+                   key: crate::types::KernelKey,
+                   m: usize,
+                   k: usize|
+     -> Result<(), DispatchError> {
+        if let (Some(v), DType::MQ4G256V2) = (views.as_ref(), weight.dtype) {
+            let ptr = [&v.gate_ptr, &v.up_ptr, &v.down_ptr][which];
+            if !cast.bf16() {
+                // FP32 activations and accumulation: the indexed GEMV with
+                // one rank per row (`top_k = 1`, expert 0).
+                return hip!(gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+                    ptr, &v.index, xin, y, m, k, 1, rows,
+                ));
+            }
+            if ctx.arch.has_wmma_w32() || ctx.arch.is_rdna4() {
+                return hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                    ptr, &v.tiles, &v.sorted, xin, y, m, k, 1, rows, rows,
+                ));
+            }
+        }
+        gemm.run_key(
+            key,
+            ctx,
+            gpu,
+            &GemmParams {
+                w: weight,
+                x: xin,
+                y,
+                batch_size: rows,
+            },
+        )
+    };
+    for (which, (weight, y)) in [(&w.gate, s.gate_out), (&w.up, s.up_out)]
+        .into_iter()
+        .enumerate()
+    {
+        let (key, rotated) = projection_kind(weight.dtype, "gated-ffn-gate-up")?;
+        project(
+            gpu,
+            weight,
+            which,
+            if rotated { x_rot } else { x },
+            y,
+            key,
+            mi,
+            hidden,
+        )?;
+    }
+    let awq = match w.down.awq_scale {
+        Some(t) if down_rotated => FfnAwq::Vector(t),
+        _ => FfnAwq::None,
+    };
+    hip!(gpu.ffn_activation_rows_f32(&FfnActivationRows {
+        activation,
+        gate: s.gate_out,
+        gate_offset: 0,
+        gate_ld: mi,
+        up: s.up_out,
+        up_offset: 0,
+        up_ld: mi,
+        out: s.act,
+        rows,
+        logical_n: mi,
+        phys_n: down_k,
+        round_inputs: cast.bf16(),
+        round_output: cast.bf16(),
+        awq,
+    }))?;
+    let down_x = if down_rotated {
+        hip!(gpu.rotate_x_mq_batched(s.act, s.rot, down_k, rows))?;
+        s.rot
+    } else {
+        s.act
+    };
+    project(gpu, &w.down, 2, down_x, out, down_key, hidden, down_k)?;
+    if cast.bf16() {
+        hip!(gpu.ffn_round_bf16_f32(out, rows * hidden))?;
+    }
+    Ok(())
+}
+
+/// Dense gated FFN (the first-layer dense MLP, or any non-routed gated FFN) as
+/// a standalone program: one slot, no router.
+#[derive(Clone, Copy)]
+pub struct GatedFfnOp<'a> {
+    pub ctx: &'a DispatchCtx,
+    pub activation: FfnActivation,
+    pub cast: CastPolicy,
+    pub rows: usize,
+    pub hidden: usize,
+    /// Logical intermediate width of gate/up (`weights.gate.m`).
+    pub mi: usize,
+    /// Physical K of the down projection (`>= mi`, `% 256 == 0`).
+    pub down_k: usize,
+    /// F32 `[rows, hidden]` normalized input.
+    pub x: &'a GpuTensor,
+    /// AWQ divide of the gate/up input basis (before the FWHT).
+    pub input_awq: Option<&'a GpuTensor>,
+    pub weights: GroupedMoeShared<'a>,
+    /// F32 `[rows, hidden]` rotated basis scratch.
+    pub x_rot: &'a GpuTensor,
+    pub scratch: GroupedMoeSharedScratch<'a>,
+    /// F32 `[rows, hidden]` result (aliasing `scratch.out` is allowed).
+    pub out: &'a GpuTensor,
+}
+
+/// Execute a [`GatedFfnOp`].
+pub fn execute_gated_ffn(gpu: &mut Gpu, op: &GatedFfnOp<'_>) -> Result<(), DispatchError> {
+    if op.rows == 0 {
+        return Ok(());
+    }
+    if op.hidden == 0 || op.mi == 0 || op.down_k < op.mi {
+        return Err(grouped_refusal("gated-ffn-geometry", ""));
+    }
+    let r = op.rows;
+    check_projection(&op.weights.gate, op.mi, op.hidden, "gated-ffn-gate")?;
+    check_projection(&op.weights.up, op.mi, op.hidden, "gated-ffn-up")?;
+    check_projection(&op.weights.down, op.hidden, op.down_k, "gated-ffn-down")?;
+    let rotated_gate = projection_kind(op.weights.gate.dtype, "gated-ffn-gate")?.1;
+    let rotated_up = projection_kind(op.weights.up.dtype, "gated-ffn-up")?.1;
+    if (rotated_gate && !awq_presence_matches(op.weights.gate.awq_scale, op.input_awq))
+        || (rotated_up && !awq_presence_matches(op.weights.up.awq_scale, op.input_awq))
+    {
+        return Err(grouped_refusal("gated-ffn-input-awq-mismatch", ""));
+    }
+    f32_like(op.x, "x")?;
+    scratch_need(op.x, mul(r, op.hidden)?, "x")?;
+    scratch_need(op.x_rot, mul(r, op.hidden)?, "x_rot")?;
+    scratch_need(op.out, mul(r, op.hidden)?, "out")?;
+    scratch_need(op.scratch.gate_out, mul(r, op.mi)?, "gate_out")?;
+    scratch_need(op.scratch.up_out, mul(r, op.mi)?, "up_out")?;
+    scratch_need(op.scratch.act, mul(r, op.down_k)?, "act")?;
+    scratch_need(op.scratch.rot, mul(r, op.down_k)?, "rot")?;
+    scratch_need(
+        op.scratch.tables,
+        rdna_compute::ffn_activation::single_expert_table_words(r),
+        "tables",
+    )?;
+    if rotated_gate || rotated_up {
+        if op.hidden % 256 != 0 {
+            return Err(grouped_refusal("gated-ffn-geometry", ""));
+        }
+        rotate_input_basis(gpu, op.x, op.x_rot, op.input_awq, op.hidden, r)?;
+    }
+    gated_ffn_from_basis(
+        gpu,
+        op.ctx,
+        op.activation,
+        op.cast,
+        r,
+        op.hidden,
+        op.mi,
+        op.down_k,
+        op.x,
+        op.x_rot,
+        &op.weights,
+        &op.scratch,
+        op.out,
+    )
+}
+
+/// Execute one grouped MoE layer: FP32 router linear and device-resident
+/// top-k, shared rotated input basis, routed experts on the indexed or the
+/// grouped core, the optional ungated shared expert, and the policy combine.
+/// Never downloads routing and allocates nothing: every launch is graph-capture
+/// safe (`launch_maybe_blob`).
+pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), DispatchError> {
+    if op.rows == 0 {
+        return Ok(());
+    }
+    let _plan = op.validate()?;
+    let g = op.geometry;
+    let s = &op.scratch;
+    let rows = op.rows;
+    let k = g.top_k;
+    let slots = rows * k;
+    let bf16 = op.policy.cast.bf16();
+    let protocol = op.protocol.resolve(rows);
+
+    // Router: FP32 linear of the (BF16-valued) F32 input, then device top-k.
+    hip!(gpu.gemm_f32_batched(
+        op.router.weight,
+        op.x,
+        s.router_logits,
+        g.n_experts,
+        g.hidden,
+        rows,
+    ))?;
+    hip!(gpu.ffn_moe_router_topk_f32(&MoeRouterTopK {
+        kind: op.policy.router,
+        logits: s.router_logits,
+        correction_bias: op.router.correction_bias,
+        topk_indices: s.topk_indices,
+        topk_weights: s.topk_weights,
+        rows,
+        n_experts: g.n_experts,
+        top_k: k,
+    }))?;
+
+    // One rotated input basis for the routed gate/up and the shared gate/up.
+    rotate_input_basis(gpu, op.x, s.x_rot, op.routed.input_awq, g.hidden, rows)?;
+
+    let down_awq_table = op.routed.down_awq_ptrs;
+    let row_of_slot = match protocol {
+        GroupedMoeProtocol::Indexed => {
+            let i = s.indexed.as_ref().expect("validated");
+            hip!(gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
+                op.routed.gate_up_ptrs,
+                s.topk_indices,
+                s.x_rot,
+                i.gate,
+                i.up,
+                2 * g.logical_mi,
+                g.hidden,
+                k,
+                rows,
+            ))?;
+            let awq = match down_awq_table {
+                Some(table) => FfnAwq::PerExpert {
+                    table,
+                    row_expert: s.topk_indices,
+                    n_experts: g.n_experts,
+                },
+                None => FfnAwq::None,
+            };
+            hip!(gpu.ffn_activation_rows_f32(&FfnActivationRows {
+                activation: op.policy.activation,
+                gate: i.gate,
+                gate_offset: 0,
+                gate_ld: g.logical_mi,
+                up: i.up,
+                up_offset: 0,
+                up_ld: g.logical_mi,
+                out: s.act,
+                rows: slots,
+                logical_n: g.logical_mi,
+                phys_n: g.down_k,
+                round_inputs: bf16,
+                round_output: bf16,
+                awq,
+            }))?;
+            hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
+            hip!(gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+                op.routed.down_ptrs,
+                s.topk_indices,
+                s.rot,
+                s.down_rows,
+                g.hidden,
+                g.down_k,
+                k,
+                rows,
+            ))?;
+            None
+        }
+        GroupedMoeProtocol::Grouped => {
+            let t = s.grouped.as_ref().expect("validated");
+            let m_total = grouped_moe_m_total_bound(slots, g.n_experts);
+            hip!(gpu.moe_scatter_fused_k8(
+                s.topk_indices,
+                t.expert_token_counts,
+                t.expert_offsets,
+                t.sorted_slot_index,
+                t.expert_tile_ids,
+                t.inverse_perm,
+                slots,
+                g.n_experts,
+                m_total,
+                MOE_GROUPED_BLOCK_M,
+            ))?;
+            hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                op.routed.gate_up_ptrs,
+                t.expert_tile_ids,
+                t.sorted_slot_index,
+                s.x_rot,
+                t.gate_up_rows,
+                2 * g.logical_mi,
+                g.hidden,
+                k,
+                m_total,
+                rows,
+            ))?;
+            hip!(gpu.ffn_activation_grouped_f32(&FfnActivationGrouped {
+                activation: op.policy.activation,
+                y_grouped: t.gate_up_rows,
+                sorted_slot_index: t.sorted_slot_index,
+                expert_tile_ids: t.expert_tile_ids,
+                out: s.act,
+                m_total,
+                block_m: MOE_GROUPED_BLOCK_M,
+                logical_n: g.logical_mi,
+                phys_n: g.down_k,
+                round_inputs: bf16,
+                round_output: bf16,
+                awq_table: down_awq_table,
+                n_experts: g.n_experts,
+            }))?;
+            hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
+            hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                op.routed.down_ptrs,
+                t.expert_tile_ids,
+                t.sorted_slot_index,
+                s.rot,
+                s.down_rows,
+                g.hidden,
+                g.down_k,
+                1,
+                m_total,
+                slots,
+            ))?;
+            Some(t.inverse_perm)
+        }
+        GroupedMoeProtocol::Auto => unreachable!("resolve never returns Auto"),
+    };
+
+    // Ungated shared expert from the same rotated basis; cast on its own, then
+    // added after the routed sum is cast.
+    let shared_sum = match (op.shared.as_ref(), s.shared.as_ref()) {
+        (Some(w), Some(ss)) => {
+            gated_ffn_from_basis(
+                gpu,
+                op.ctx,
+                op.policy.activation,
+                op.policy.cast,
+                rows,
+                g.hidden,
+                g.shared_mi,
+                g.shared_down_k,
+                op.x,
+                s.x_rot,
+                w,
+                ss,
+                ss.out,
+            )?;
+            Some(ss.out)
+        }
+        _ => None,
+    };
+
+    hip!(gpu.ffn_moe_combine_f32(&MoeCombine {
+        order: op.policy.combine,
+        round_expert_outputs: bf16,
+        round_routed_sum: bf16,
+        round_final: bf16,
+        down_rows: s.down_rows,
+        row_of_slot,
+        topk_indices: s.topk_indices,
+        topk_weights: s.topk_weights,
+        shared: shared_sum,
+        routed_out: op.routed_out,
+        out: op.out,
+        rows,
+        hidden: g.hidden,
+        top_k: k,
+        n_experts: g.n_experts,
+    }))
+}
+
+#[cfg(test)]
+mod grouped_moe_tests {
+    use super::*;
+
+    fn raon_geometry() -> GroupedMoeGeometry {
+        GroupedMoeGeometry {
+            n_experts: 128,
+            top_k: 6,
+            hidden: 2560,
+            logical_mi: 1088,
+            down_k: 1280,
+            shared_mi: 1088,
+            shared_down_k: 1280,
+        }
+    }
+
+    #[test]
+    fn protocol_auto_resolves_by_rows() {
+        assert_eq!(
+            GroupedMoeProtocol::Auto.resolve(1),
+            GroupedMoeProtocol::Indexed
+        );
+        assert_eq!(
+            GroupedMoeProtocol::Auto.resolve(2),
+            GroupedMoeProtocol::Grouped
+        );
+        assert_eq!(
+            GroupedMoeProtocol::Grouped.resolve(1),
+            GroupedMoeProtocol::Grouped
+        );
+        assert_eq!(
+            GroupedMoeProtocol::Indexed.resolve(512),
+            GroupedMoeProtocol::Indexed
+        );
+    }
+
+    #[test]
+    fn scratch_plan_matches_grouped_row_bound() {
+        let g = raon_geometry();
+        let p = GroupedMoeScratchPlan::for_protocol(&g, 512, GroupedMoeProtocol::Auto).unwrap();
+        // 3072 slots + 128 touched experts * 15 pad rows.
+        assert_eq!(p.m_total, 4992);
+        assert_eq!(p.m_total % MOE_GROUPED_BLOCK_M, 0);
+        assert_eq!(p.gate_up_rows, 4992 * 2176);
+        assert_eq!(p.down_rows, 4992 * 2560);
+        assert_eq!(p.act, 3072 * 1280);
+        assert_eq!(p.expert_tile_ids, 4992 / 16);
+        assert_eq!(p.inverse_perm, 3072);
+        assert_eq!(p.indexed_gate, 0);
+        assert_eq!(p.shared_act, 512 * 1280);
+        assert_eq!(p.shared_out, 512 * 2560);
+        // 3 u64 pointers + index/sorted (512 each) + 32 tile ids.
+        assert_eq!(p.shared_tables, 6 + 2 * 512 + 32);
+    }
+
+    #[test]
+    fn scratch_plan_decode_uses_expanded_rows() {
+        let g = raon_geometry();
+        let p = GroupedMoeScratchPlan::for_protocol(&g, 1, GroupedMoeProtocol::Auto).unwrap();
+        assert_eq!(p.down_rows, 6 * 2560);
+        assert_eq!(p.indexed_gate, 6 * 1088);
+        assert_eq!(p.indexed_up, 6 * 1088);
+        assert_eq!(p.m_total, 0);
+        let u = GroupedMoeScratchPlan::for_rows(&g, 1).unwrap();
+        assert_eq!(u.indexed_gate, 6 * 1088);
+        // One grouped row tile per touched expert at N = 1: 6 slots + 6*15.
+        assert_eq!(u.m_total, 96);
+    }
+
+    #[test]
+    fn geometry_admits_raon_and_other_shapes_and_refuses_with_names() {
+        assert!(raon_geometry().validate().is_ok());
+        let small = GroupedMoeGeometry {
+            n_experts: 16,
+            top_k: 3,
+            hidden: 256,
+            logical_mi: 192,
+            down_k: 256,
+            shared_mi: 0,
+            shared_down_k: 0,
+        };
+        assert!(small.validate().is_ok());
+        for k in 1..=8 {
+            let mut g = raon_geometry();
+            g.top_k = k;
+            assert!(g.validate().is_ok(), "top_k {k}");
+        }
+        let refuse = |g: GroupedMoeGeometry| match g.validate() {
+            Err(DispatchError::UnsupportedVariant { variant, .. }) => variant,
+            other => panic!("expected refusal, got {other:?}"),
+        };
+        let mut g = raon_geometry();
+        g.top_k = 9;
+        assert_eq!(refuse(g), "grouped-op-top-k-outside-1..=8-or-experts");
+        g = raon_geometry();
+        g.top_k = 0;
+        assert_eq!(refuse(g), "grouped-op-top-k-outside-1..=8-or-experts");
+        g = raon_geometry();
+        g.n_experts = 1025;
+        assert_eq!(refuse(g), "grouped-op-top-k-outside-1..=8-or-experts");
+        g = raon_geometry();
+        g.down_k = 1088;
+        assert_eq!(refuse(g), "grouped-op-down-k-geometry");
+        g = raon_geometry();
+        g.hidden = 2500;
+        assert_eq!(refuse(g), "grouped-op-hidden-not-256-multiple");
+        g = raon_geometry();
+        g.shared_down_k = 1000;
+        assert_eq!(refuse(g), "grouped-op-shared-geometry");
+    }
+}

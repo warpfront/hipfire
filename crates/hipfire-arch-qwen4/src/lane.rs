@@ -59,7 +59,7 @@ use crate::mtp_spec::{
     mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture,
     Qwen4PromotionParts,
 };
-use crate::state::{scope_layer_counts, Qwen4State, Qwen4StateFormat};
+use crate::state::{Qwen4State, Qwen4StateFormat};
 use crate::weights::{
     HyperConnectionWeights, MoeWeights, Qwen4BandScope, Qwen4FfnWeights, Qwen4LayerWeights,
     Qwen4TierRecipe, Qwen4Weights, TensorRef,
@@ -70,6 +70,7 @@ use rdna_compute::expert_capabilities::{self, ExpertQt, Route};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
+pub mod census;
 pub(crate) mod groups;
 use groups::GroupPlanner;
 
@@ -950,21 +951,17 @@ pub struct LaneSpec {
 }
 
 impl LaneSpec {
-    /// A fresh spec state: the trunk `state` gets its `k + 1`-row verify
-    /// ring, the head is built on the resident head's backend and context
-    /// bound.
+    /// A fresh spec state: the head is built on the resident head's backend
+    /// and context bound. The trunk state's verify ring is the payload's
+    /// ([`new_payload`]), owned by every band that owns target layers.
     fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         spec: LaneSpecConfig,
         head_max_seq: usize,
         backend: Qwen4KvBackend,
-        state: &mut Qwen4State,
     ) -> Result<Self, String> {
         let config = &bundle.config;
-        state
-            .ensure_row_capture(gpu, spec.k + 1, config.linear_conv_kernel_dim - 1)
-            .map_err(|e| format!("lane ring: {e}"))?;
         let head = MtpGpuState::new_with_backend(gpu, config, head_max_seq, backend)
             .map_err(|e| format!("lane head state: {e}"))?;
         let width = config
@@ -1023,21 +1020,32 @@ impl LaneSpec {
     }
 }
 
-/// A fresh slot's payload: a lane trunk state and, with `spec_cfg`, its MTP
-/// state (a failure frees what was allocated).
+/// A fresh slot's payload: a lane trunk state with its `ring_rows`-row GDN
+/// capture ring (every band that owns target layers; `0`: AR lanes arm no
+/// ring) and, with `spec_cfg`, its MTP head state (a failure frees what was
+/// allocated).
 fn new_payload(
     gpu: &mut Gpu,
     bundle: &Qwen4Bundle,
     slot: usize,
+    ring_rows: usize,
     spec_cfg: Option<(LaneSpecConfig, usize, Qwen4KvBackend)>,
 ) -> Result<(Qwen4State, Option<LaneSpec>), String> {
     let mut state = bundle
         .new_lane_state(gpu)
         .map_err(|e| format!("admit: allocate lane {slot}: {e}"))?;
+    if ring_rows > 0 {
+        if let Err(error) =
+            state.ensure_row_capture(gpu, ring_rows, bundle.config.linear_conv_kernel_dim - 1)
+        {
+            let _ = state.free_gpu(gpu);
+            return Err(format!("admit: allocate lane {slot}: lane ring: {error}"));
+        }
+    }
     let spec = match spec_cfg {
         None => None,
         Some((config, head_max_seq, backend)) => {
-            match LaneSpec::new(gpu, bundle, config, head_max_seq, backend, &mut state) {
+            match LaneSpec::new(gpu, bundle, config, head_max_seq, backend) {
                 Ok(spec) => Some(spec),
                 Err(error) => {
                     let _ = state.free_gpu(gpu);
@@ -1644,9 +1652,9 @@ impl Qwen4LaneStore {
         // This band's ownership: the single scope allocates the historical
         // whole-model store.
         let scope = bundle.weights.band_scope().clone();
-        if spec.is_some() && !scope.output {
-            return Err("lane store: MTP lanes need the output band".to_string());
-        }
+        // A head owner (the single scope, every EP rank, the PP output band)
+        // holds the MTP head; any other band that owns target layers holds
+        // only its lanes' verify rings (target-only ownership).
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -1660,7 +1668,7 @@ impl Qwen4LaneStore {
                     verify_rows - 1
                 ));
             }
-            if bundle.mtp.is_none() {
+            if scope.output && bundle.mtp.is_none() {
                 return Err("lane store: MTP lanes need the attached MTP head".to_string());
             }
             if !native_mtp_row_capture(gpu, &bundle.config) {
@@ -1696,16 +1704,18 @@ impl Qwen4LaneStore {
             (None, None)
         };
         let spec_store = match spec {
-            Some(config) => match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap) {
-                Ok(store) => Some(store),
-                Err(error) => {
-                    for tensor in [logits, top1].into_iter().flatten() {
-                        let _ = gpu.free_tensor(tensor);
+            Some(config) if scope.output => {
+                match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap) {
+                    Ok(store) => Some(store),
+                    Err(error) => {
+                        for tensor in [logits, top1].into_iter().flatten() {
+                            let _ = gpu.free_tensor(tensor);
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
-            },
-            None => None,
+            }
+            _ => None,
         };
         Ok(Self {
             table: LaneTable::new(max_lanes),
@@ -1766,12 +1776,14 @@ impl Qwen4LaneStore {
     }
 
     /// [`Self::device_bytes`] of the store one pipeline band holds: the
-    /// lane states cover only the band's layers
-    /// ([`Qwen4State::device_bytes_scoped`]; the verify ring only its GDN
-    /// layers), and the step logits/top-1 buffers and every MTP charge only
-    /// exist on the output band (`scope.output`, the band that holds the
-    /// head). `None` on overflow, or for MTP lanes off the output band,
-    /// which [`Self::new`] refuses.
+    /// census of [`census::ar_lane_census`] / [`census::lane_spec_census`]
+    /// under the legacy budget ([`census::LaneSpecBudget::legacy`]: copy not
+    /// armed, a `k + 1`-row ring). The lane states and rings cover only the
+    /// band's layers; the step logits/top-1 buffers exist only on a band
+    /// that runs the LM head (`scope.output`) and every MTP head charge only
+    /// on the head owner (the output band). A non-output band with `spec_k`
+    /// holds its lanes' target rings alone. `None` on overflow or a `spec_k`
+    /// outside the lane budget, which [`Self::new`] refuses.
     pub fn device_bytes_scoped(
         config: &Qwen4Config,
         format: Qwen4StateFormat,
@@ -1781,47 +1793,28 @@ impl Qwen4LaneStore {
         spec_k: Option<usize>,
         scope: &Qwen4BandScope,
     ) -> Option<u64> {
-        let f32_bytes = std::mem::size_of::<f32>();
-        let mut per_lane = Qwen4State::device_bytes_scoped(config, format, context, scope)?;
-        let rows_cap = match spec_k {
-            Some(k) => max_lanes.checked_mul(k.checked_add(1)?)?,
-            None => max_lanes,
+        // The legacy wrapper has no rank: rank 0 owns the head iff its band
+        // runs the LM head (the single scope and the output band do).
+        let (rank, owner_mask) = if scope.output { (0, 1) } else { (0, 2) };
+        let append_scratch = (mtp_fill_scratch_requested()
+            && MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).is_some())
+        .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
+        let inputs = census::CensusInputs {
+            config,
+            format,
+            scope,
+            rank,
+            append_scratch,
         };
-        let rows = rows_cap.checked_add(max_lanes)?;
-        let mut shared = if scope.output {
-            rows.checked_mul(config.vocab_size)?
-                .checked_mul(f32_bytes)?
-                .checked_add(rows.checked_mul(std::mem::size_of::<i32>())?)?
-        } else {
-            0
-        };
-        if let Some(k) = spec_k {
-            if !scope.output {
-                return None;
+        let census = match spec_k {
+            None => census::ar_lane_census(max_lanes, context, &inputs).ok()?,
+            Some(k) => {
+                let budget =
+                    census::LaneSpecBudget::new(max_lanes, k, 0, 0, *context, owner_mask).ok()?;
+                census::lane_spec_census(&budget, &inputs).ok()?
             }
-            let wide = config.hc_count.checked_mul(config.hidden_size)?;
-            let (gdn_layers, _) = scope_layer_counts(config, scope);
-            let ring = Qwen4State::row_capture_bytes_scoped(
-                config,
-                format.gdn,
-                k.checked_add(1)?,
-                gdn_layers,
-            )?;
-            per_lane = per_lane
-                .checked_add(MtpGpuState::device_bytes(config, context)?)?
-                .checked_add(ring)?
-                .checked_add(wide.checked_mul(f32_bytes)?)?;
-            let append = if mtp_fill_scratch_requested() {
-                MtpAppendScratch::device_bytes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).unwrap_or(0)
-            } else {
-                0
-            };
-            shared = shared
-                .checked_add(rows_cap.checked_mul(wide)?.checked_mul(f32_bytes)?)?
-                .checked_add(max_lanes.checked_mul(Gpu::TOPK8_OUT_BYTES)?)?
-                .checked_add(append)?;
-        }
-        u64::try_from(max_lanes.checked_mul(per_lane)?.checked_add(shared)?).ok()
+        };
+        census.total()
     }
 
     /// Admit `epoch` with its canonical `prompt` into the lowest free lane
@@ -1835,6 +1828,7 @@ impl Qwen4LaneStore {
         epoch: RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, String> {
+        let ring_rows = self.ring_rows;
         let spec_cfg = self
             .spec
             .as_ref()
@@ -1859,7 +1853,7 @@ impl Qwen4LaneStore {
                     }
                     Ok(None)
                 }
-                None => new_payload(gpu, bundle, slot, spec_cfg).map(Some),
+                None => new_payload(gpu, bundle, slot, ring_rows, spec_cfg).map(Some),
             })
     }
 
@@ -1885,6 +1879,7 @@ impl Qwen4LaneStore {
         if self.phase != LanePhase::Idle {
             return Err("admit_promoted: a step is in flight".to_string());
         }
+        let ring_rows = self.ring_rows;
         let spec_cfg = self
             .spec
             .as_ref()
@@ -1923,7 +1918,7 @@ impl Qwen4LaneStore {
                     Ok(None)
                 }
                 None => {
-                    let (state, mut spec) = new_payload(gpu, bundle, slot, spec_cfg)?;
+                    let (state, mut spec) = new_payload(gpu, bundle, slot, ring_rows, spec_cfg)?;
                     let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
                         (Some(_), Some(spec), Some(parts)) => spec.promote(gpu, parts),
                         _ => Ok(()),
@@ -3375,6 +3370,7 @@ mod tests {
 mod band_accounting_tests {
     use super::*;
     use crate::config::compact_test_config;
+    use crate::state::scope_layer_counts;
 
     fn partition(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
         assert_eq!(counts.iter().sum::<usize>(), config.num_hidden_layers);
@@ -3451,7 +3447,7 @@ mod band_accounting_tests {
     }
 
     #[test]
-    fn non_output_band_refuses_mtp_lane_bytes() {
+    fn non_output_band_spec_bytes_are_target_only() {
         let config = compact_test_config();
         let context = Qwen4ContextCommit::legacy(1024);
         let format = Qwen4StateFormat::F32;
@@ -3467,31 +3463,21 @@ mod band_accounting_tests {
         )
         .is_some());
         let scopes = partition(&config, &[24, 24]);
-        assert!(Qwen4LaneStore::device_bytes_scoped(
-            &config,
-            format,
-            &context,
-            2,
-            2,
-            Some(3),
-            &scopes[0]
-        )
-        .is_none());
-        let output = Qwen4LaneStore::device_bytes_scoped(
-            &config,
-            format,
-            &context,
-            2,
-            2,
-            Some(3),
-            &scopes[1],
-        )
-        .unwrap();
-        let ar_output =
-            Qwen4LaneStore::device_bytes_scoped(&config, format, &context, 2, 2, None, &scopes[1])
-                .unwrap();
-        // The MTP head, ring and wide buffers add bytes on the output band only.
-        assert!(output > ar_output);
+        let bytes = |spec_k, scope: &Qwen4BandScope| {
+            Qwen4LaneStore::device_bytes_scoped(&config, format, &context, 2, 2, spec_k, scope)
+                .unwrap()
+        };
+        // The non-output band holds its lanes' capture rings and no head,
+        // logits or wide hidden: exactly the AR store plus the rings.
+        let (gdn_layers, _) = scope_layer_counts(&config, &scopes[0]);
+        let ring =
+            Qwen4State::row_capture_bytes_scoped(&config, format.gdn, 4, gdn_layers).unwrap();
+        assert_eq!(
+            bytes(Some(3), &scopes[0]),
+            bytes(None, &scopes[0]) + 2 * ring as u64
+        );
+        // The MTP head, ring and wide buffers add more on the output band.
+        assert!(bytes(Some(3), &scopes[1]) > bytes(None, &scopes[1]));
     }
 }
 

@@ -41,6 +41,21 @@ const DIGIT_GROUPS_RIGHT_PATTERN: &str = r"\d{1,3}(?=(?:\d{3})*\b)";
 /// a maximal run whose end boundary holds.
 const DIGIT_RUN_PATTERN: &str = r"\d+\b";
 
+/// Raon-1-mini's Isolated Split regex, matched as the exact literal (no
+/// general lookaround engine). Branches, leftmost-first: CJK run; non-CJK
+/// letter(+marks) word optionally space-joined to further words; `\p{N}`
+/// run cut into right-aligned groups of 3; punctuation; newline runs; the
+/// `\s+(?!\S)` whitespace tail; `\s+`.
+const RAON_PRETOK_PATTERN: &str = r" ?[一-龥぀-ゟ゠-ヿ]+| ?(?:(?:(?![一-龥぀-ゟ゠-ヿ])\p{L})\p{M}*)+(?: (?:(?:(?![一-龥぀-ゟ゠-ヿ])\p{L})\p{M}*)+)*|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Lookahead-free equivalent of [`RAON_PRETOK_PATTERN`] for the `regex`
+/// crate: `(?!CJK)\p{L}` is the class difference, `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`
+/// is a maximal `\p{N}+` run that the splitter cuts right-aligned, and the
+/// whitespace tail alternatives are folded into the `hf_ws_tail` group.
+const RAON_PRETOK_RUST_REGEX: &str = r" ?[一-龥぀-ゟ゠-ヿ]+| ?(?:[\p{L}--[一-龥぀-ゟ゠-ヿ]]\p{M}*)+(?: (?:[\p{L}--[一-龥぀-ゟ゠-ヿ]]\p{M}*)+)*|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|(?P<hf_ws_tail>\s+)";
+/// Marker of the Raon CJK class: any pattern containing it that is not the
+/// exact literal above is refused at load (never canonical-GPT-2 fallback).
+const RAON_PRETOK_MARKER: &str = "[一-龥";
+
 /// Bookkeeping for the emulated `\s+(?!\S)` alternative.
 struct WsTail {
     /// Capture index of the plain `\s+` alternative.
@@ -72,6 +87,9 @@ struct PretokSplitter {
     /// `re` is [`DIGIT_RUN_PATTERN`]; each match is emitted as right-aligned
     /// chunks of up to 3 chars instead of as one piece.
     digit_groups: bool,
+    /// [`RAON_PRETOK_PATTERN`]: a match whose first char is `\p{N}` is a
+    /// maximal number run, emitted as right-aligned groups of up to 3.
+    number_groups: Option<Regex>,
     /// The pattern text as given (pre-rewrite); part of the config digest.
     source: String,
     /// HF `Split{behavior: Removed, invert: true}`: `invert` flips the
@@ -93,9 +111,33 @@ impl PretokSplitter {
                 re: Regex::new(DIGIT_RUN_PATTERN).map_err(|e| e.to_string())?,
                 ws_tail: None,
                 digit_groups: true,
+                number_groups: None,
                 source: pattern.to_owned(),
                 drop_gaps,
             });
+        }
+        if pattern == RAON_PRETOK_PATTERN {
+            let re = Regex::new(RAON_PRETOK_RUST_REGEX).map_err(|e| e.to_string())?;
+            let group = re
+                .capture_names()
+                .position(|n| n == Some(WS_TAIL_GROUP))
+                .ok_or_else(|| "whitespace tail group missing".to_string())?;
+            return Ok(Self {
+                re,
+                ws_tail: Some(WsTail {
+                    group,
+                    ws_only: Regex::new(r"\A\s+\z").map_err(|e| e.to_string())?,
+                }),
+                digit_groups: false,
+                number_groups: Some(Regex::new(r"\A\p{N}").map_err(|e| e.to_string())?),
+                source: pattern.to_owned(),
+                drop_gaps,
+            });
+        }
+        if pattern.contains(RAON_PRETOK_MARKER) {
+            return Err(
+                "CJK-class pre-tokenizer regex is not the exact supported Raon pattern".into(),
+            );
         }
         let (src, has_tail) = match pattern.find(WS_LOOKAHEAD_ALT) {
             None => (pattern.to_owned(), false),
@@ -127,6 +169,7 @@ impl PretokSplitter {
             re,
             ws_tail,
             digit_groups: false,
+            number_groups: None,
             source: pattern.to_owned(),
             drop_gaps,
         })
@@ -186,7 +229,12 @@ impl PretokSplitter {
             if !self.drop_gaps && start > gap {
                 out.push(&text[gap..start]);
             }
-            if self.digit_groups {
+            let chunk_digits = self.digit_groups
+                || self
+                    .number_groups
+                    .as_ref()
+                    .is_some_and(|n| n.is_match(&text[start..end]));
+            if chunk_digits {
                 // Right-aligned groups: first chunk is n%3 chars (3 if n%3==0).
                 let run = &text[start..end];
                 let n = run.chars().count();
@@ -252,8 +300,17 @@ fn default_pretokenizer() -> &'static Gpt2Pretokenizer {
 /// combination, or a pattern the `regex` crate cannot compile). A chain is
 /// honored whole or not at all. Other stage types (`ByteLevel`,
 /// string-pattern `Split`, …) are ignored, as before.
-fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer> {
-    fn collect(p: &serde_json::Value, patterns: &mut Vec<(String, bool)>) -> bool {
+///
+/// A chain containing the Raon CJK-class regex is exact-or-error: any other
+/// behavior/invert or an inexact pattern text is `Err`, never the fallback.
+fn pretokenizer_from_hf_json(
+    pre: &serde_json::Value,
+) -> Result<Option<Gpt2Pretokenizer>, TokenizerError> {
+    fn collect(
+        p: &serde_json::Value,
+        patterns: &mut Vec<(String, bool)>,
+        fatal: &mut Option<String>,
+    ) -> bool {
         match p.get("type").and_then(|v| v.as_str()) {
             Some("Split") => {
                 let Some(re) = p
@@ -265,6 +322,20 @@ fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer
                 };
                 let behavior = p.get("behavior").and_then(|v| v.as_str());
                 let invert = p.get("invert").and_then(|v| v.as_bool()).unwrap_or(false);
+                if re.contains(RAON_PRETOK_MARKER) {
+                    if re != RAON_PRETOK_PATTERN || (behavior, invert) != (Some("Isolated"), false)
+                    {
+                        *fatal = Some(format!(
+                            "CJK-class Split is only supported as the exact Raon pattern with \
+                             behavior=Isolated invert=false (got behavior={behavior:?}, \
+                             invert={invert}, exact_pattern={})",
+                            re == RAON_PRETOK_PATTERN
+                        ));
+                        return false;
+                    }
+                    patterns.push((re.to_owned(), false));
+                    return true;
+                }
                 let drop_gaps = match (behavior, invert) {
                     (Some("Isolated"), false) => false,
                     (Some("Removed"), true) => true,
@@ -285,7 +356,7 @@ fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer
                 .map(|arr| {
                     let mut ok = true;
                     for child in arr {
-                        ok &= collect(child, patterns);
+                        ok &= collect(child, patterns, fatal);
                     }
                     ok
                 })
@@ -294,23 +365,31 @@ fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer
         }
     }
     let mut patterns = Vec::new();
-    if !collect(pre, &mut patterns) || patterns.is_empty() {
-        return None;
+    let mut fatal = None;
+    let ok = collect(pre, &mut patterns, &mut fatal);
+    if let Some(reason) = fatal {
+        return Err(TokenizerError::UnsupportedPreTokenizer { reason });
+    }
+    if !ok || patterns.is_empty() {
+        return Ok(None);
     }
     let mut splitters = Vec::with_capacity(patterns.len());
     for (pattern, drop_gaps) in &patterns {
         match PretokSplitter::compile_with_mode(pattern, *drop_gaps) {
             Ok(s) => splitters.push(s),
+            Err(e) if pattern.contains(RAON_PRETOK_MARKER) => {
+                return Err(TokenizerError::UnsupportedPreTokenizer { reason: e });
+            }
             Err(e) => {
                 eprintln!(
                     "[tokenizer] unsupported pre_tokenizer regex ({e}); \
                      using canonical GPT-2 pre-tokenizer"
                 );
-                return None;
+                return Ok(None);
             }
         }
     }
-    Some(Gpt2Pretokenizer { splitters })
+    Ok(Some(Gpt2Pretokenizer { splitters }))
 }
 
 /// NFC-normalize `text` exactly as HF `tokenizers` does; borrowed (no
@@ -465,6 +544,10 @@ pub enum TokenizerError {
     /// A merge rule's resolved result (`left + right`) has no entry in `token_to_id`.
     /// The encoder cannot represent the post-merge state without this.
     MissingMergeResult { rank: usize, expected: String },
+    /// The `pre_tokenizer` carries a pattern/mode this loader recognizes as
+    /// requiring an exact emulation but cannot honor; loading would silently
+    /// mis-tokenize, so it is refused.
+    UnsupportedPreTokenizer { reason: String },
 }
 
 impl fmt::Display for TokenizerError {
@@ -486,6 +569,9 @@ impl fmt::Display for TokenizerError {
                 f,
                 "merge rule rank {rank}: merged result {expected:?} not in vocab"
             ),
+            Self::UnsupportedPreTokenizer { reason } => {
+                write!(f, "unsupported pre_tokenizer: {reason}")
+            }
         }
     }
 }
@@ -1016,9 +1102,10 @@ impl Tokenizer {
         // GPT-2 pre-tokenizer: honor the tokenizer.json `Split` regex(es)
         // (compiled once, here); `None` → canonical fallback.
         let hf_pretok = if is_gpt2_bpe {
-            tok.get("pre_tokenizer")
-                .filter(|v| !v.is_null())
-                .and_then(pretokenizer_from_hf_json)
+            match tok.get("pre_tokenizer").filter(|v| !v.is_null()) {
+                Some(v) => pretokenizer_from_hf_json(v)?,
+                None => None,
+            }
         } else {
             None
         };
@@ -4749,5 +4836,231 @@ mod nfc_exactness_tests {
                 assert!(is_nfc(&s), "no-alloc check accepted non-NFC {s:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod raon_pretok_tests {
+    use super::*;
+    use serde_json::json;
+
+    const PARITY: &str = include_str!("../tests/fixtures/raon_tokenizer/parity.json");
+
+    fn splitter() -> PretokSplitter {
+        PretokSplitter::compile(RAON_PRETOK_PATTERN).expect("exact Raon pattern compiles")
+    }
+
+    fn pieces(s: &PretokSplitter, text: &str) -> Vec<String> {
+        // HF runs the Split stage on the NFC-normalized text.
+        let text = nfc_normalize(text);
+        let mut out = Vec::new();
+        s.split(&text, &mut out);
+        out.into_iter().map(str::to_owned).collect()
+    }
+
+    fn v(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Piece-level expectations hardcoded from HF `Split.pre_tokenize_str`
+    /// (tokenizers 0.23.3) on the official pattern.
+    #[test]
+    fn raon_pretok_hardcoded_pieces() {
+        let s = splitter();
+        assert_eq!(
+            pieces(&s, "Hello World foo bar  baz"),
+            v(&["Hello World foo bar", " ", " baz"])
+        );
+        assert_eq!(
+            pieces(&s, "1 12 123 1234 12345 123456 1234567"),
+            v(&[
+                "1", " ", "12", " ", "123", " ", "1", "234", " ", "12", "345", " ", "123", "456",
+                " ", "1", "234", "567"
+            ])
+        );
+        assert_eq!(
+            pieces(&s, "x_1234 1234_5678 a1b22c333"),
+            v(&[
+                "x", "_", "1", "234", " ", "1", "234", "_", "5", "678", " a", "1", "b", "22", "c",
+                "333"
+            ])
+        );
+        assert_eq!(
+            pieces(
+                &s,
+                "\u{4e00}\u{9fa5}\u{9fa6}\u{9fff}\u{3400} \u{6f22}\u{5b57}"
+            ),
+            v(&[
+                "\u{4e00}\u{9fa5}",
+                "\u{9fa6}\u{9fff}\u{3400}",
+                " \u{6f22}\u{5b57}"
+            ])
+        );
+        assert_eq!(
+            pieces(&s, "hello世界안녕こんにちはworld123세계"),
+            v(&[
+                "hello",
+                "世界",
+                "안녕",
+                "こんにちは",
+                "world",
+                "123",
+                "세계"
+            ])
+        );
+        assert_eq!(
+            pieces(&s, "line with trailing   \nnext line  \n\n  indent\n   "),
+            v(&[
+                "line with trailing",
+                "   \n",
+                "next line",
+                "  \n\n",
+                " ",
+                " indent",
+                "\n",
+                "   "
+            ])
+        );
+        assert_eq!(
+            pieces(&s, "a\r\nb\r\n\r\nc\r\n  d\r"),
+            v(&["a", "\r\n", "b", "\r\n\r\n", "c", "\r\n", " ", " d", "\r"])
+        );
+        assert_eq!(
+            pieces(&s, "a\tb\t\tc\u{a0}d\u{a0}\u{a0}e \u{a0}f\t \tg"),
+            v(&[
+                "a", "\t", "b", "\t", "\t", "c", "\u{a0}", "d", "\u{a0}", "\u{a0}", "e", " ",
+                "\u{a0}", "f", "\t ", "\t", "g"
+            ])
+        );
+        // Combining mark after a space is not a letter-word start.
+        assert_eq!(
+            pieces(&s, "caf\u{e9} \u{301}x"),
+            v(&["caf\u{e9}", " \u{301}", "x"])
+        );
+        // Superscripts / Arabic-Indic / fullwidth are \p{N}, grouped right-aligned.
+        assert_eq!(
+            pieces(&s, "\u{661}\u{662}\u{663}\u{664}\u{665} \u{ff11}\u{ff12}\u{ff13}\u{ff14} x\u{b2}\u{b3}\u{b9}"),
+            v(&["\u{661}\u{662}", "\u{663}\u{664}\u{665}", " ", "\u{ff11}", "\u{ff12}\u{ff13}\u{ff14}", " x", "\u{b2}\u{b3}\u{b9}"])
+        );
+        assert_eq!(pieces(&s, ""), Vec::<String>::new());
+    }
+
+    /// Every fixture case's HF Split pieces are reproduced by the splitter
+    /// alone (no tokenizer.json needed).
+    #[test]
+    fn raon_pretok_fixture_pieces_match_hf() {
+        let s = splitter();
+        let fx: serde_json::Value = serde_json::from_str(PARITY).unwrap();
+        let cases = fx["cases"].as_array().unwrap();
+        assert!(cases.len() >= 25);
+        for c in cases {
+            let text = c["text"].as_str().unwrap();
+            let want: Vec<String> = c["pieces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(pieces(&s, text), want, "case {}", c["name"]);
+        }
+    }
+
+    fn split_node(pattern: &str, behavior: &str, invert: bool) -> serde_json::Value {
+        json!({"type":"Split","pattern":{"Regex":pattern},"behavior":behavior,"invert":invert})
+    }
+
+    #[test]
+    fn raon_pretok_selected_and_refused() {
+        let ok = pretokenizer_from_hf_json(&json!({"type":"Sequence","pretokenizers":[
+            split_node(RAON_PRETOK_PATTERN, "Isolated", false),
+            {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}
+        ]}))
+        .unwrap()
+        .expect("raon splitter selected");
+        assert!(ok.splitters[0].number_groups.is_some());
+        // Wrong behavior/invert with the Raon pattern: load error, not fallback.
+        for (b, inv) in [("Removed", true), ("Isolated", true), ("Removed", false)] {
+            let e = pretokenizer_from_hf_json(&split_node(RAON_PRETOK_PATTERN, b, inv));
+            assert!(
+                matches!(e, Err(TokenizerError::UnsupportedPreTokenizer { .. })),
+                "{b} {inv}"
+            );
+        }
+        // Modified CJK-class pattern (not the exact literal): error.
+        let altered = RAON_PRETOK_PATTERN.replace(
+            "[^\\s\\p{L}\\p{N}]+[\\r\\n/]*",
+            "[^\\s\\p{L}\\p{N}]+[\\r\\n]*",
+        );
+        assert_ne!(altered, RAON_PRETOK_PATTERN);
+        let e = pretokenizer_from_hf_json(&split_node(&altered, "Isolated", false));
+        assert!(matches!(
+            e,
+            Err(TokenizerError::UnsupportedPreTokenizer { .. })
+        ));
+    }
+
+    fn hf_path() -> Option<std::path::PathBuf> {
+        match std::env::var_os("HIPFIRE_RAON_TOKENIZER") {
+            Some(p) => {
+                let p = std::path::PathBuf::from(p);
+                let p = if p.is_dir() {
+                    p.join("tokenizer.json")
+                } else {
+                    p
+                };
+                assert!(
+                    p.is_file(),
+                    "HIPFIRE_RAON_TOKENIZER={} is not a file",
+                    p.display()
+                );
+                Some(p)
+            }
+            None => {
+                eprintln!("SKIP raon tokenizer HF parity: HIPFIRE_RAON_TOKENIZER not set");
+                None
+            }
+        }
+    }
+
+    /// Full encode parity against HF ids (tokenizer.json via env path).
+    #[test]
+    fn raon_pretok_hf_id_parity() {
+        let Some(path) = hf_path() else { return };
+        let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(path).unwrap())
+            .expect("official Raon tokenizer.json loads");
+        assert!(
+            tok.hf_pretok.is_some(),
+            "Raon splitter variant must be selected"
+        );
+        let fx: serde_json::Value = serde_json::from_str(PARITY).unwrap();
+        for c in fx["cases"].as_array().unwrap() {
+            let text = c["text"].as_str().unwrap();
+            let want: Vec<u32> = c["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(tok.encode(text), want, "case {}", c["name"]);
+        }
+    }
+
+    /// No BOS/EOS on encode; added tokens resolve through the added-token table.
+    #[test]
+    fn raon_pretok_added_tokens_no_bos() {
+        let Some(path) = hf_path() else { return };
+        let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for (id, s) in [
+            (259200u32, "<|endoftext|>"),
+            (259201, "<|im_start|>"),
+            (259202, "<|im_end|>"),
+            (259213, "<think>"),
+            (259214, "</think>"),
+        ] {
+            assert_eq!(tok.encode(s), vec![id], "{s}");
+        }
+        let ids = tok.encode("hi");
+        assert!(!ids.contains(&259200) && !ids.contains(&259202));
+        assert_eq!(tok.encode("<|im_start|>a<|im_end|>").first(), Some(&259201));
     }
 }

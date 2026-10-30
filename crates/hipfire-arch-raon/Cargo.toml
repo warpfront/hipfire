@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-raon"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[features]
+lab = []
+default = ["deltanet"]
+deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet"]
+
+# Raon module/state/logits/bench oracle (PLAN §6.2). Exercises production
+# launchers; built with --features lab.
+[[example]]
+name = "raon_oracle"
+required-features = ["lab"]
+
+[dev-dependencies]
+md5 = "0.8"

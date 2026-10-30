@@ -1527,6 +1527,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-raon"
+version = "0.1.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "md5 0.8.1",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-toy"
 version = "0.4.4"
 dependencies = [
@@ -1714,6 +1728,7 @@ dependencies = [
  "hipfire-arch-qwen35-embed",
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-qwen4",
+ "hipfire-arch-raon",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-engine",
@@ -1758,6 +1773,7 @@ dependencies = [
  "hipfire-arch-qwen35-embed",
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-qwen4",
+ "hipfire-arch-raon",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-runtime",

@@ -347,6 +347,9 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
     # Maple-Preview: natively-ternary 256-expert MoE, its own arch crate.
     if family == "maple-preview":
         return 15
+    # KRAFTON Raon-1-mini-preview: RDA + MLA + mHC MoE (arch 19, RaonCarrier).
+    if family == "raon-1-mini-preview":
+        return 19
     if family == "vibethinker":
         return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
     # FLUX.1 MMDiT trunk packs (per-component HFQ, arch 40; sidecar ids

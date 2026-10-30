@@ -311,6 +311,13 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             },
         ),
         (
+            GenerationRoute::RaonAr,
+            GenerationRouteInputs {
+                arch_id: 19,
+                ..base()
+            },
+        ),
+        (
             GenerationRoute::Unknown,
             GenerationRouteInputs {
                 arch_id: 99,
@@ -345,6 +352,10 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // `<|tool_call>call:NAME{ARGS}<tool_call|>` blocks from content and stages
     // the parsed calls on a `finish_reason=tool_calls` commit_ready terminal.
     GenerationRoute::Gemma4Ar,
+    // Arch 19 (Raon-1-mini). Shares Qwen4 AR's `generate_ar_with_forward`
+    // producer: XML `<tool_call><function=..>` through the strict
+    // `ToolOutputRouter`, semantic contract v2 via the carrier caps.
+    GenerationRoute::RaonAr,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -1171,7 +1182,7 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 11);
+    assert_eq!(from_all.len(), 12);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
@@ -1228,7 +1239,13 @@ fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
     with_stop.sort_unstable();
     assert_eq!(
         with_stop,
-        ["qwen4_ar", "qwen4_spec", "qwen_ar", "qwen_dflash"]
+        [
+            "qwen4_ar",
+            "qwen4_spec",
+            "qwen_ar",
+            "qwen_dflash",
+            "raon_ar"
+        ]
     );
     // Both Qwen4 routes a Flash-Next load can select carry tools AND stop, so
     // attaching MTP never changes which request shapes are accepted.

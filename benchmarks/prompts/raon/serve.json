@@ -1,0 +1,1359 @@
+[
+  {
+    "id": "think-on-capital",
+    "genre": "thinking-on-factual",
+    "description": "Thinking on. message.content (after the close tag) must contain Paris; reasoning_content must be non-empty; no raw tags leak into content.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France? Answer in one short sentence."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "Paris"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "present",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "think-on-capital-stream",
+    "genre": "thinking-on-factual-stream",
+    "description": "Same as think-on-capital but stream=true; concatenated reasoning deltas non-empty, content deltas contain Paris.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France? Answer in one short sentence."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "stream": true,
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "Paris"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "present",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "think-off-capital",
+    "genre": "thinking-off-factual",
+    "description": "Thinking off. Answer is visible; reasoning absent/empty; no stray <think> in content.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France? Answer in one short sentence."
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "Paris"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "think-off-planet",
+    "genre": "thinking-off-factual",
+    "description": "Thinking off, different fact; content has no think tags.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Which planet is known as the Red Planet? Reply with the planet name only."
+        }
+      ],
+      "max_tokens": 128,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "Mars"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "think-on-max-tokens-length",
+    "genre": "thinking-on-truncation",
+    "description": "Thinking on with tiny max_tokens: generation stops inside the reasoning block; finish_reason must be length, reasoning present, content empty or without raw tags.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain in detail, step by step, why the sky is blue and why sunsets are red."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "expect": {
+      "contains_any": [],
+      "not_contains": [
+        "<think>",
+        "</think>"
+      ],
+      "reasoning": "present",
+      "finish_reason": "length"
+    }
+  },
+  {
+    "id": "think-off-max-tokens-length",
+    "genre": "thinking-off-truncation",
+    "description": "Thinking off with tiny max_tokens: finish_reason length, content non-empty prefix, reasoning absent.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a long essay about the history of the printing press."
+        }
+      ],
+      "max_tokens": 12,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "length"
+    }
+  },
+  {
+    "id": "tool-roundtrip-call-off",
+    "genre": "tool-call-thinking-off",
+    "description": "The model must answer with an XML tool call for get_weather with Seoul in the arguments; server parses it into tool_calls, finish_reason tool_calls.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "What's the weather in Seoul right now? Use celsius."
+        }
+      ],
+      "max_tokens": 512,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [],
+      "not_contains": [
+        "<tool_call>",
+        "<function="
+      ],
+      "tool_call": {
+        "name": "get_weather",
+        "argument_substrings": [
+          "Seoul"
+        ]
+      },
+      "reasoning": "absent",
+      "finish_reason": "tool_calls"
+    }
+  },
+  {
+    "id": "tool-roundtrip-result-off",
+    "genre": "tool-result-thinking-off",
+    "description": "Follow-up request carrying the assistant tool call and the tool result; the final answer must mention the returned temperature 18.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "What's the weather in Seoul right now? Use celsius."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_0001",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\": \"Seoul\", \"unit\": \"celsius\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_0001",
+          "content": "{\"location\": \"Seoul\", \"temperature\": 18, \"unit\": \"celsius\", \"condition\": \"partly cloudy\"}"
+        }
+      ],
+      "max_tokens": 512,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "18"
+      ],
+      "not_contains": [
+        "<tool_call>",
+        "<function=",
+        "<tool_response>",
+        "<think>",
+        "</think>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "tool-roundtrip-call-on",
+    "genre": "tool-call-thinking-on",
+    "description": "The model must answer with an XML tool call for get_weather with Seoul in the arguments; server parses it into tool_calls, finish_reason tool_calls.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "What's the weather in Seoul right now? Use celsius."
+        }
+      ],
+      "max_tokens": 1536,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "expect": {
+      "contains_any": [],
+      "not_contains": [
+        "<tool_call>",
+        "<function="
+      ],
+      "tool_call": {
+        "name": "get_weather",
+        "argument_substrings": [
+          "Seoul"
+        ]
+      },
+      "reasoning": "present",
+      "finish_reason": "tool_calls"
+    }
+  },
+  {
+    "id": "tool-roundtrip-result-on",
+    "genre": "tool-result-thinking-on",
+    "description": "Follow-up request carrying the assistant tool call and the tool result; the final answer must mention the returned temperature 18.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "What's the weather in Seoul right now? Use celsius."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_0001",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\": \"Seoul\", \"unit\": \"celsius\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_0001",
+          "content": "{\"location\": \"Seoul\", \"temperature\": 18, \"unit\": \"celsius\", \"condition\": \"partly cloudy\"}"
+        }
+      ],
+      "max_tokens": 1536,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "18"
+      ],
+      "not_contains": [
+        "<tool_call>",
+        "<function=",
+        "<tool_response>",
+        "<think>",
+        "</think>"
+      ],
+      "reasoning": "present",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "tool-parallel-call",
+    "genre": "tool-call-parallel",
+    "description": "Two independent cities asked: the model should emit at least two tool calls (parallel), one for each city (substrings are matched across all calls' arguments).",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "Tell me the current weather in both Tokyo and Paris. Call the tool for each city."
+        }
+      ],
+      "max_tokens": 512,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [],
+      "not_contains": [
+        "<tool_call>",
+        "<function="
+      ],
+      "tool_call": {
+        "name": "get_weather",
+        "argument_substrings": [
+          "Tokyo",
+          "Paris"
+        ],
+        "min_calls": 2
+      },
+      "reasoning": "absent",
+      "finish_reason": "tool_calls"
+    }
+  },
+  {
+    "id": "tool-parallel-result",
+    "genre": "tool-result-parallel",
+    "description": "Follow-up with two parallel tool results; final answer must mention both temperatures (21 and 64).",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "Tell me the current weather in both Tokyo and Paris. Call the tool for each city."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\": \"Tokyo\"}"
+              }
+            },
+            {
+              "id": "call_b",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\": \"Paris\", \"unit\": \"fahrenheit\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_a",
+          "content": "{\"location\": \"Tokyo\", \"temperature\": 21, \"unit\": \"celsius\"}"
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_b",
+          "content": "{\"location\": \"Paris\", \"temperature\": 64, \"unit\": \"fahrenheit\"}"
+        }
+      ],
+      "max_tokens": 512,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "21"
+      ],
+      "not_contains": [
+        "<tool_call>",
+        "<function=",
+        "<tool_response>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "tool-nested-args",
+    "genre": "tool-call-nested",
+    "description": "Nested object/array/enum/boolean arguments; call create_event with title containing Review and start date 2025-03-14.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "Create an event titled 'Quarterly Review' on 2025-03-14 at 15:00 with high priority, attendees ana@example.com and bo@example.com, not an all-day event."
+        }
+      ],
+      "max_tokens": 512,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "create_event",
+            "description": "Create a calendar event.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "start": {
+                  "type": "object",
+                  "properties": {
+                    "date": {
+                      "type": "string"
+                    },
+                    "time": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "date"
+                  ]
+                },
+                "priority": {
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ]
+                },
+                "attendees": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "all_day": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "title",
+                "start"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [],
+      "not_contains": [
+        "<tool_call>",
+        "<function="
+      ],
+      "tool_call": {
+        "name": "create_event",
+        "argument_substrings": [
+          "Quarterly Review",
+          "2025-03-14",
+          "high",
+          "ana@example.com"
+        ]
+      },
+      "reasoning": "absent",
+      "finish_reason": "tool_calls"
+    }
+  },
+  {
+    "id": "tool-not-needed",
+    "genre": "tool-restraint",
+    "description": "Tools provided but the question is general knowledge: answer directly without a tool call.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "What is the capital of Japan? One word."
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "calculate",
+            "description": "Evaluate an arithmetic expression and return the result.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "expression": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "expression"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "Tokyo"
+      ],
+      "not_contains": [
+        "<tool_call>",
+        "<function="
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "tool-calc-choice",
+    "genre": "tool-selection",
+    "description": "Two tools provided; pick the calculator for an arithmetic request.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Use the provided tools whenever they are needed to answer."
+        },
+        {
+          "role": "user",
+          "content": "Use a tool to compute 123456 * 789."
+        }
+      ],
+      "max_tokens": 512,
+      "temperature": 0,
+      "stream": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "calculate",
+            "description": "Evaluate an arithmetic expression and return the result.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "expression": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "expression"
+              ]
+            }
+          }
+        }
+      ],
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [],
+      "not_contains": [
+        "<tool_call>",
+        "<function="
+      ],
+      "tool_call": {
+        "name": "calculate",
+        "argument_substrings": [
+          "123456",
+          "789"
+        ]
+      },
+      "reasoning": "absent",
+      "finish_reason": "tool_calls"
+    }
+  },
+  {
+    "id": "ko-factual",
+    "genre": "korean-factual",
+    "description": "Korean question; the answer must contain Seoul in Hangul.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "대한민국의 수도는 어디입니까? 한 단어로 답하세요."
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "서울"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "ko-factual-stream",
+    "genre": "korean-factual-stream",
+    "description": "Korean question with stream=true; the concatenated content deltas must contain the answer.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "대한민국의 수도는 어디입니까? 한 단어로 답하세요."
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "stream": true,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "서울"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "ja-factual",
+    "genre": "japanese-factual",
+    "description": "Japanese question; the answer must contain Tokyo in kanji.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "日本の首都はどこですか？一言で答えてください。"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "東京",
+        "东京"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "ko-think-on",
+    "genre": "korean-thinking-on",
+    "description": "Korean question with thinking on; content has the answer after the reasoning block.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "물은 섭씨 몇 도에서 끓나요? (해수면 기준) 숫자로 답하세요."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "100"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "present",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "code-python",
+    "genre": "code-generation",
+    "description": "Generate a python function; must contain def is_prime and a return statement.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a Python function is_prime(n) that returns True if n is prime and False otherwise. Output only the code."
+        }
+      ],
+      "max_tokens": 512,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "def is_prime"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent"
+    }
+  },
+  {
+    "id": "json-output",
+    "genre": "json-output",
+    "description": "Ask for a raw JSON object; content must contain the name and the age value.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Extract the data and reply with ONLY a JSON object with keys \"name\" (string) and \"age\" (integer): 'Alice is a 30 year old engineer.'"
+        }
+      ],
+      "max_tokens": 128,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "\"age\": 30",
+        "\"age\":30"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "arith-mul",
+    "genre": "arithmetic",
+    "description": "17*23=391 exact.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 17 * 23? Answer with just the number."
+        }
+      ],
+      "max_tokens": 128,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "391"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "arith-add-think-on",
+    "genre": "arithmetic-thinking-on",
+    "description": "12345+67890=80235 exact, with reasoning.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 12345 + 67890? Answer with just the number."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "80235",
+        "80,235"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "present",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "multiturn-memory",
+    "genre": "multi-turn-memory",
+    "description": "Name given in turn 1 must be recalled in turn 3 via history (assistant turns carry no reasoning).",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi! My name is Priya Raghunathan and I live in Lisbon."
+        },
+        {
+          "role": "assistant",
+          "content": "Nice to meet you, Priya! How can I help you today?"
+        },
+        {
+          "role": "user",
+          "content": "What is 6 times 7?"
+        },
+        {
+          "role": "assistant",
+          "content": "6 times 7 is 42."
+        },
+        {
+          "role": "user",
+          "content": "Great. By the way, what is my name and where do I live?"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "Priya"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "multiturn-memory-think-on",
+    "genre": "multi-turn-memory-thinking-on",
+    "description": "Same history with thinking on; reasoning present, answer mentions Lisbon.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi! My name is Priya Raghunathan and I live in Lisbon."
+        },
+        {
+          "role": "assistant",
+          "content": "Nice to meet you, Priya! How can I help you today?"
+        },
+        {
+          "role": "user",
+          "content": "Which city do I live in? One word."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "Lisbon",
+        "Lisboa"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "present",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "empty-system",
+    "genre": "empty-system-message",
+    "description": "Empty system message must be accepted and rendered as an empty system turn; model still answers.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": ""
+        },
+        {
+          "role": "user",
+          "content": "Say hello in one short sentence."
+        }
+      ],
+      "max_tokens": 128,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "hello",
+        "Hello",
+        "Hi",
+        "hi"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>"
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  },
+  {
+    "id": "system-instruction",
+    "genre": "system-prompt-following",
+    "description": "System prompt demands a specific format.",
+    "request": {
+      "model": "raon-1-mini-preview",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You always answer with exactly one lowercase word and nothing else."
+        },
+        {
+          "role": "user",
+          "content": "What color is a ripe banana?"
+        }
+      ],
+      "max_tokens": 64,
+      "temperature": 0,
+      "stream": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "expect": {
+      "contains_any": [
+        "yellow"
+      ],
+      "not_contains": [
+        "<think>",
+        "</think>",
+        "<|im_end|>",
+        "<|im_start|>",
+        "Yellow."
+      ],
+      "reasoning": "absent",
+      "finish_reason": "stop"
+    }
+  }
+]

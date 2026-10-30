@@ -284,6 +284,98 @@ pub enum MoeScores {
 /// Widest selection the biased sigmoid router and the k8 routed kernels take.
 pub const MOE_BIASED_SIGMOID_MAX_K: usize = 8;
 
+// ── Generic grouped MoE (sealed policies, kernel-limit admission) ──────────
+
+pub use rdna_compute::ffn_activation::{
+    CombineOrder, FfnActivation, RouterKind, FFN_ROUTER_MAX_EXPERTS, FFN_ROUTER_MAX_TOP_K,
+};
+
+/// Widest top-k the generic grouped-MoE program runs: the router selection and
+/// the combine kernels carry up to [`FFN_ROUTER_MAX_TOP_K`] ranks, and the
+/// indexed gate/up + down qt44 kernels and the grouped WMMA core take the rank
+/// count as a runtime argument (`K_TOP` grid axis / `x_row_div`).
+pub const MOE_GROUPED_MAX_TOP_K: usize = FFN_ROUTER_MAX_TOP_K;
+
+/// Whether the generic grouped-MoE program (`pipeline::moe_program::GroupedMoeOp`)
+/// can run `top_k` ranks over `n_experts` experts: `1 <= top_k <= 8`,
+/// `top_k <= n_experts <= 1024`. Never pads the rank count with dummy experts.
+#[inline]
+pub fn moe_grouped_top_k_supported(top_k: usize, n_experts: usize) -> bool {
+    (1..=MOE_GROUPED_MAX_TOP_K).contains(&top_k)
+        && top_k <= n_experts
+        && n_experts <= FFN_ROUTER_MAX_EXPERTS
+}
+
+/// The sealed Qwen softmax router (`moe_softmax_topk_renorm_k8*`,
+/// `moe_router_softmax_topk_k8_*`) selects exactly eight experts: this is the
+/// kernel contract of that router, not a model property. The generic
+/// grouped-MoE program uses [`moe_grouped_top_k_supported`] instead.
+#[inline]
+pub fn moe_softmax_k8_router_top_k_supported(top_k: usize) -> bool {
+    top_k == 8
+}
+
+/// Padded grouped-row bound of the WMMA grouped route: every touched expert
+/// rounds its slot count up to [`MOE_GROUPED_BLOCK_M`]. Only experts that
+/// receive at least one slot contribute padding.
+pub fn grouped_moe_m_total_bound(total_slots: usize, n_experts: usize) -> usize {
+    let live_expert_bound = total_slots.min(n_experts);
+    let raw = total_slots + live_expert_bound * (MOE_GROUPED_BLOCK_M - 1);
+    raw.div_ceil(MOE_GROUPED_BLOCK_M) * MOE_GROUPED_BLOCK_M
+}
+
+/// Logical versus physical widths of one generic grouped-MoE layer. Logical
+/// `logical_mi` is the activation width; `down_k` is the physical (padded)
+/// down-projection input width; the pad columns are exact zeros appended after
+/// the activation and its cast, before the AWQ divide and the rotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupedMoeGeometry {
+    pub n_experts: usize,
+    pub top_k: usize,
+    pub hidden: usize,
+    /// Routed expert intermediate width (gate and up rows each).
+    pub logical_mi: usize,
+    /// Physical K of the routed down projection (`>= logical_mi`, `% 256 == 0`).
+    pub down_k: usize,
+    /// Shared expert intermediate width, `0` when the layer has no shared expert.
+    pub shared_mi: usize,
+    /// Physical K of the shared down projection (`0` without a shared expert).
+    pub shared_down_k: usize,
+}
+
+impl GroupedMoeGeometry {
+    fn refuse(variant: &'static str) -> DispatchError {
+        DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant,
+            arch: "",
+            quant: "",
+        }
+    }
+
+    /// Capability check against the actual limits of the grouped kernels. Named
+    /// refusal for every violated limit; never a silent reinterpretation.
+    pub fn validate(&self) -> Result<(), DispatchError> {
+        if !moe_grouped_top_k_supported(self.top_k, self.n_experts) {
+            return Err(Self::refuse("grouped-op-top-k-outside-1..=8-or-experts"));
+        }
+        if self.hidden == 0 || self.hidden % 256 != 0 {
+            return Err(Self::refuse("grouped-op-hidden-not-256-multiple"));
+        }
+        if self.logical_mi == 0 || self.down_k < self.logical_mi || self.down_k % 256 != 0 {
+            return Err(Self::refuse("grouped-op-down-k-geometry"));
+        }
+        if self.shared_mi == 0 {
+            if self.shared_down_k != 0 {
+                return Err(Self::refuse("grouped-op-shared-geometry"));
+            }
+        } else if self.shared_down_k < self.shared_mi {
+            return Err(Self::refuse("grouped-op-shared-geometry"));
+        }
+        Ok(())
+    }
+}
+
 /// Architecture declaration, checked against both live operands and the
 /// immutable specialized-kernel contract before any route is selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1145,7 +1237,7 @@ impl MoeResolution {
             || routed_indexable_e8
             || routed_indexable_qt53_f32;
 
-        let use_gpu_topk = k == 8 && routed_dtype_indexable;
+        let use_gpu_topk = moe_softmax_k8_router_top_k_supported(k) && routed_dtype_indexable;
         let qt53_fallback_refused = routed_indexable_qt53_f32 && !use_gpu_topk;
         let needs_x_rot_local = gate_side_mq4
             || gate_fusable_mq4v2
@@ -2016,7 +2108,7 @@ pub fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
 
 #[inline]
 pub fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
-    k_top == 8 && num_experts <= 1024
+    moe_softmax_k8_router_top_k_supported(k_top) && num_experts <= FFN_ROUTER_MAX_EXPERTS
 }
 
 /// Quantized routed-expert formats with an implemented Cohere sigmoid

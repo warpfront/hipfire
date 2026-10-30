@@ -36,6 +36,7 @@ mod quant_mq;
 mod quant_mq4v2_lloyd;
 mod quant_q4;
 mod qwen4;
+mod raon;
 mod reap_overlay;
 mod trunk_overlay;
 

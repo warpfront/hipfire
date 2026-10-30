@@ -656,6 +656,7 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-arch-qwen35-embed`
 - `hipfire-arch-qwen35-vl`
 - `hipfire-arch-qwen4`
+- `hipfire-arch-raon`
 - `hipfire-cli`
 - `hipfire-client`
 - `hipfire-daemon`

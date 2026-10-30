@@ -9827,6 +9827,116 @@ impl Carrier for Lfm2MoeCarrier {
     }
 }
 
+// ─── RaonCarrier ─────────────────────────────────────────────────────
+
+pub struct RaonCarrier;
+impl Carrier for RaonCarrier {
+    fn name(&self) -> &'static str {
+        "raon1_mini"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 19
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: Some(2),
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        // generation_config.json: temperature 1.0, top_p 0.95 (top_k 20 and the
+        // 1.5 presence penalty are applied by the Raon generation route; this
+        // struct carries only temp/top_p/repeat_penalty).
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.raon_mut()?;
+        match bundle.bench_prefill_rows(gpu, synthetic.len()) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                *prefill_err = Some(format!("raon1_mini bench prefill: {e}"));
+                Some(false)
+            }
+        }
+    }
+    /// Prime the decode probe: the same bounded batched prefill `bench_prefill`
+    /// runs (`context` synthetic rows from a cold slot).
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let mut error = None;
+        match self.bench_prefill(m, gpu, synthetic, synthetic.len(), &mut error) {
+            Some(true) => Some(None),
+            Some(false) => {
+                Some(Some(error.unwrap_or_else(|| {
+                    "raon1_mini bench decode prime failed".into()
+                })))
+            }
+            None => None,
+        }
+    }
+    /// `iterations` production decode steps (`RaonBundle::decode_step`, the
+    /// route `serve` runs) on deterministic ids; no logits readback.
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        _context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let Some(bundle) = m.raon_mut() else {
+            *decode_err = Some("raon1_mini bench decode missing state".into());
+            return Some(false);
+        };
+        let vocab = bundle.config.vocab as u64;
+        let lo = 1024u64.min(vocab.saturating_sub(1));
+        let span = vocab - lo;
+        for i in 0..iterations as u64 {
+            let token = (lo + i.wrapping_mul(2654435761).wrapping_add(17) % span) as u32;
+            if let Err(e) = bundle.decode_step(gpu, token) {
+                *decode_err = Some(format!("raon1_mini bench decode step {i}: {e}"));
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_raon::load_raon_bundle(src, ctx)?;
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+                meta.chat_template_source,
+            )
+        })
+    }
+}
+
 // ─── Cohere2MoeCarrier ───────────────────────────────────────────────
 // cohere2moe (arch_id 12, HFQ-only) landed upstream via the generic
 // `HfqCarrier` fn-pointer registry entry. Our dedicated-carrier refactor

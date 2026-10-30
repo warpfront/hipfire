@@ -1222,3 +1222,19 @@ required-features = ["lab"]
 [[example]]
 name = "tp_peer_pushn_probe"
 required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_absorb_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_absorb_check"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_decode_check"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_flash_check"
+required-features = ["lab"]
