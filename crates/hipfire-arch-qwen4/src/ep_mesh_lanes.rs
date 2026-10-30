@@ -327,6 +327,11 @@ impl RankLane<'_> {
                     "{epoch:?}: copy proposals are not supported by the EP lane executor"
                 ));
             }
+            if plan.catch_up.is_some() || plan.copy_confirm {
+                return Err(format!(
+                    "{epoch:?}: head catch-up and copy confirmation are not supported by the EP lane executor"
+                ));
+            }
             if matches!(plan.head, HeadState::Lag { .. }) {
                 return Err(format!(
                     "{epoch:?}: head-lag lanes are not supported by the EP lane executor"
