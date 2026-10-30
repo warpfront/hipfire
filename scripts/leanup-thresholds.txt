@@ -103,7 +103,10 @@ daemon_lines                <= 5850
 # route-043 sub-4 oracles; Kaden-approved raise 2026-10-15
 # RATCHET-RAISE 67 -> 68: `rdna-compute/gdn_wy_repeat_check`, the synthetic GPU oracle for the Qwen GDN WY
 # T-inverse fix (repeated-token NaN); its gate runs it without `--features lab`.
-ungated_examples            <= 68
+# RATCHET-RAISE 68 -> 69: Lloyd prefill PR evidence pair. `tmp_lloyd_i8_twin_t0`
+# (this branch) is gated behind `lab`; `tmp_lloyd_gfx11_t0` stays ungated while
+# the branch's measurement runs invoke it bare. Revisit at merge: gate or drop.
+ungated_examples            <= 69
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is
