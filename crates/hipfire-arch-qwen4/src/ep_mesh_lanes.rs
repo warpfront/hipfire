@@ -929,6 +929,9 @@ impl LaneMeshExecutor for RankLane<'_> {
                 token,
                 keep_going,
                 drop_last,
+                // Greedy lanes propose the head's argmax; a sampled lane's
+                // distribution read (S4) is the sampler owner's alone.
+                read: None,
             });
         }
         if sampler {
@@ -985,14 +988,13 @@ impl LaneMeshExecutor for RankLane<'_> {
             head_draft_calls: plan.ledger.head_draft_calls,
         };
         if sampler {
-            result.sampler = Some(SamplerOutput {
-                picks: plan
-                    .lanes
+            result.sampler = Some(SamplerOutput::picks_only(
+                plan.lanes
                     .iter()
                     .zip(picks)
                     .map(|(l, p)| (l.key, p))
                     .collect(),
-            });
+            ));
         }
         Ok(result)
     }
