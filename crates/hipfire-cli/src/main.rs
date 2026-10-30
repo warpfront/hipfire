@@ -17154,6 +17154,7 @@ effort = "high"
                         allow_pull: false,
                         allow_paths: false,
                         operator_model: None,
+                        operator_path: None,
                     },
                     max_batch_tokens: 4096,
                 }),
