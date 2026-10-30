@@ -226,6 +226,9 @@ pub struct Qwen4Bundle {
     /// loop, not host emission work) makes that step's interval unusable as a
     /// price.
     pub(crate) mesh_last_end: Option<std::time::Instant>,
+    /// The mesh step-level concurrency switch ([`crate::ep_mesh_serve`]):
+    /// native windows while the step carries few lanes, AR windows above.
+    pub(crate) mesh_native_on: bool,
     /// Expert-parallel mesh (`attach_ep_mesh`): this bundle is rank 0 and every
     /// daemon-facing call is replicated on the peer ranks. `None` = single
     /// device (the default; no behaviour change).
@@ -924,6 +927,7 @@ impl Qwen4Bundle {
             lanes: None,
             mesh_lanes: None,
             mesh_last_end: None,
+            mesh_native_on: true,
             ep: None,
             pp: None,
             pp_band: None,

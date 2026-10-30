@@ -186,6 +186,34 @@ impl Qwen4Bundle {
             .mesh_lanes
             .take()
             .ok_or_else(|| "EP mesh lanes are not armed".to_string())?;
+        // Step-level concurrency switch with hysteresis: native windows while
+        // the step carries at most `max_active` lanes (the measured win is at
+        // low concurrency), AR windows from `max_active + 2` lanes up; in
+        // between the previous decision stands. An AR window is a one-token
+        // window the root plans as `ArSynced` (the head stays aligned), so a
+        // lane crossing back loses no state.
+        let max_active = hipfire_config::developer_var("HIPFIRE_EP_MTP_LANE_MAX_ACTIVE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4);
+        if requests.len() <= max_active {
+            self.mesh_native_on = true;
+        } else if requests.len() >= max_active + 2 {
+            self.mesh_native_on = false;
+        }
+        let switched: Vec<MeshDecodeRequest>;
+        let requests = if self.mesh_native_on {
+            requests
+        } else {
+            switched = requests
+                .iter()
+                .map(|r| MeshDecodeRequest {
+                    epoch: r.epoch,
+                    tokens_left: 1,
+                })
+                .collect();
+            &switched[..]
+        };
         // The previous step's price is the wall from its start to this
         // step's plan. A serve loop that idled between the two (no decoding
         // lane, a long admission) would train the cost model on that stall:

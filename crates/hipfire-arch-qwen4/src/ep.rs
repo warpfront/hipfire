@@ -1745,6 +1745,20 @@ pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
     requested_row_budget.max(lanes)
 }
 
+/// Draft depth of EP native-MTP lanes: the load's resolved K capped at
+/// `HIPFIRE_EP_MTP_LANE_K` (default 3: the measured sweet spot of the mesh
+/// step, whose window cost grows with every extra draft round).
+pub fn ep_lane_spec_k(resolved_k: usize) -> usize {
+    let cap = hipfire_config::developer_var("HIPFIRE_EP_MTP_LANE_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3);
+    resolved_k
+        .min(cap)
+        .min(crate::gpu_forward_lanes::LANE_MAX_ROWS - 1)
+        .max(1)
+}
+
 /// The copy lane EP native-MTP lanes stage under the default policy: armed
 /// exactly where the singleton's native Qwen4 n-gram copy lane is
 /// (`speculation.mtp_ngram_copy`, `auto` on gfx1151/gfx1201, `off` is the kill
@@ -1753,7 +1767,12 @@ pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
 /// reservation, the daemon's request and the batch staging share, so the
 /// reserved and the staged store cannot differ.
 pub fn ep_default_copy_config(gpu_arch: &str) -> Option<crate::lane::LaneCopyConfig> {
-    if !hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, gpu_arch) {
+    // Copy widens every lane's ring to 8 rows (about 3.7 GiB per rank at 8
+    // lanes) and so costs resident experts: armed only on request
+    // (`HIPFIRE_EP_MTP_LANE_COPY=1`) and where the singleton policy arms it.
+    if !hipfire_config::developer_bool("HIPFIRE_EP_MTP_LANE_COPY", false)
+        || !hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, gpu_arch)
+    {
         return None;
     }
     let ngram =

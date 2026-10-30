@@ -577,9 +577,8 @@ pub fn ep_spec_lane_reservation(
     if !admitted {
         return (None, false);
     }
-    let k = crate::carriers::qwen4_native_mtp_k(spec, gpu_arch)
-        .min(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1)
-        .max(1);
+    let k =
+        hipfire_arch_qwen4::ep::ep_lane_spec_k(crate::carriers::qwen4_native_mtp_k(spec, gpu_arch));
     (
         Some(k),
         hipfire_arch_qwen4::ep::ep_default_copy_config(gpu_arch).is_some(),
@@ -684,6 +683,11 @@ fn stage_qwen4_lanes(
             reason.to_string()
         }),
         (reason, _) => reason.map(str::to_string),
+    };
+    let spec_k = if topology == "ep" {
+        hipfire_arch_qwen4::ep::ep_lane_spec_k(spec_k)
+    } else {
+        spec_k
     };
     let spec = spec_off_reason
         .is_none()
@@ -1136,16 +1140,13 @@ mod tests {
         };
         let (k, _) = ep_spec_lane_reservation(true, false, on, "gfx1201");
         assert_eq!(k, Some(3));
-        // K is clamped to the lane ring (`LANE_MAX_ROWS - 1` drafts).
+        // K is capped at the EP lane depth (`HIPFIRE_EP_MTP_LANE_K`, default 3).
         let wide = SpecLoadCfg {
             mtp_k: Some(63),
             ..on
         };
         let (k, _) = ep_spec_lane_reservation(true, false, wide, "gfx1201");
-        assert_eq!(
-            k,
-            Some(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1)
-        );
+        assert_eq!(k, Some(3));
         // `serve.batch_spec` off, MTP not explicit, sampled lanes: AR store.
         assert_eq!(
             ep_spec_lane_reservation(false, false, on, "gfx1201"),
