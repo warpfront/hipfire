@@ -84,7 +84,24 @@ _tx_fail() {
     # Preserve original failure status after rollback.
     local status="${1:-1}"
     _tx_rollback
+    _tx_report_unchanged_install
     exit "$status"
+}
+
+# A failed install leaves the prior install's binaries in place; say which
+# version is still installed so nobody tests against a version they did not
+# install (the reporting host benched a release that was never actually
+# installed this way).
+_tx_report_unchanged_install() {
+    local home="${HIPFIRE_HOME:-$HOME/.hipfire}"
+    local identity="$home/install.json"
+    [ -f "$identity" ] || return 0
+    local ref commit
+    ref=$(sed -n 's/.*"ref"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity" | head -1)
+    commit=$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity" | head -1)
+    if [ -n "${ref:-}" ] || [ -n "${commit:-}" ]; then
+        echo "installation unchanged: still at ref=${ref:-?} commit=${commit:-?} ($identity)" >&2
+    fi
 }
 
 # Retain original argv for forwarding to `hipfire setup`.

@@ -64,6 +64,7 @@ fi
 python3 -m unittest tools.redline.tests.test_product_bench tools.redline.tests.test_golden tools.redline.tests.test_serve_diff tools.redline.tests.test_lower tools.redline.tests.test_dispatch_profile
 python3 -m unittest discover -s scripts/jev_eval -p 'test_*.py'
 python3 scripts/test_install_revision.py
+python3 scripts/test_client_build_stamp.py
 python3 scripts/test_uninstall.py
 bash scripts/test-gpu-lock.sh
 bash scripts/test-fmt-sweep-rebase.sh
