@@ -2292,6 +2292,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_Q8_0_WMMA_GFX1151_XLDS_SRC,
             ["gemm_q8_0_wmma_gfx1151_xlds"]
         );
+        // Exact-gfx1151 1..=16-row F16-weight WMMA (DSpark drafter head; same switch).
+        add!(
+            "gemm_f16_wmma_gfx1151_xlds",
+            kernels::GEMM_F16_WMMA_GFX1151_XLDS_SRC,
+            ["gemm_f16_wmma_gfx1151_xlds"]
+        );
         add!(
             "gemm_mqv2_wmma_gfx1151_mw_lds",
             kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC,

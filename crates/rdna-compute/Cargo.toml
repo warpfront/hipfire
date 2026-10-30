@@ -1192,6 +1192,10 @@ name = "bench_q8_lmhead_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "test_gate_up_f16_xlds_gfx1151"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_rows_pm_gfx1201_h0"
 required-features = ["lab"]
 

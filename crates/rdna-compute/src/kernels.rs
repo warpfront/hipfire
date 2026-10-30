@@ -4361,6 +4361,11 @@ pub const GEMM_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_q8_
 /// outputs): 4 waves x 16 rows per block, X slab staged in LDS, b128 weight loads.
 pub const GEMM_Q8_0_WMMA_GFX1151_XLDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_wmma_gfx1151_xlds.hip");
+/// Exact-gfx1151 1..=16-row sibling of `gemm_mw16_residual_wmma` for
+/// `gemm_mw16_residual_wmma_f16x` (byte-identical outputs): 4 waves x 16 rows per
+/// block, X slab staged in LDS, b128 weight loads.
+pub const GEMM_F16_WMMA_GFX1151_XLDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_wmma_gfx1151_xlds.hip");
 
 /// Path 2 unscatter combine for gate_up: fans Y_grouped[m_total × 2*mi]
 /// back into per-token gate_batch[N × K_TOP × mi] + up_batch[N × K_TOP
