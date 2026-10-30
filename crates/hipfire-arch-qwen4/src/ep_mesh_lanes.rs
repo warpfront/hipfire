@@ -559,6 +559,11 @@ impl RankLane<'_> {
             }
             for (vl, lane) in plan.lanes.iter().zip(lanes.iter_mut()) {
                 if vl.rows.len() > 1 && lane.spec.is_some() {
+                    // The sealed rows are the window's proposals (the root's
+                    // seal, after any draft truncation / probe outcome).
+                    if let Some(w) = lane.spec.as_mut().and_then(|s| s.window.as_mut()) {
+                        w.drafts = vl.rows[1..].to_vec();
+                    }
                     arm_lane_verify(bundle, gpu, &mut **lane, vl)?;
                 }
             }
