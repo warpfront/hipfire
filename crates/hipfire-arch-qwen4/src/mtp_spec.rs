@@ -7869,6 +7869,11 @@ pub(crate) struct NativeFinish<'a> {
     /// singleton drafter's windows, which a terminal stop may cut short. The
     /// caller records the tickets and releases them.
     pub retain: bool,
+    /// The head never advanced this window (a copy/forced window: `k > 0`
+    /// rows verified but no head Draft ran), so it is still at the window's
+    /// start and the seed's row is appended instead of truncated to. A native
+    /// window passes `false`.
+    pub head_at_start: bool,
 }
 
 /// A native window whose every fallible target/head operation succeeded and
@@ -7949,6 +7954,7 @@ pub(crate) fn prepare_native_window(
         verify_hidden,
         ple_normed,
         retain,
+        head_at_start: head_already_at_start,
     } = f;
     let drafts = block
         .get(1..)
@@ -7962,7 +7968,7 @@ pub(crate) fn prepare_native_window(
     // both owners if either side's GPU work fails.
     // Under a mesh a full target restore also restores the head to the
     // window's start (one aggregate restore): the head then replays below.
-    let mut head_at_start = false;
+    let mut head_at_start = head_already_at_start;
     if !full_accept && picks.ops_ring_eligible(target_snapshot, block.len()) {
         mark_phase(&mut timers, ops.gpu()?, "target_rollback");
         picks.ops_rollback_rows(
@@ -8971,6 +8977,7 @@ impl Qwen4MtpDrafter {
                     verify_hidden: &verify_hidden,
                     ple_normed: ple_normed.as_ref(),
                     retain: true,
+                    head_at_start: false,
                 },
                 Some(&mut timers),
             )?;
