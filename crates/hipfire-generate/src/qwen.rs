@@ -11124,8 +11124,7 @@ mod qwen4_pp_spec_refusal_tests {
         // Penalties are refused greedy or sampled.
         for temp in [0.0, 0.7] {
             assert!(
-                qwen4_pp_spec_refusal("mtp", true, temp, false, true, true, false, false)
-                    .is_some()
+                qwen4_pp_spec_refusal("mtp", true, temp, false, true, true, false, false).is_some()
             );
         }
     }
@@ -11135,12 +11134,8 @@ mod qwen4_pp_spec_refusal_tests {
         assert!(
             qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false, false, false).is_some()
         );
-        assert!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, true, false).is_some()
-        );
-        assert!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, true).is_some()
-        );
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, true, false).is_some());
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, true).is_some());
     }
 }
 

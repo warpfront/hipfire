@@ -9015,12 +9015,10 @@ impl Qwen4MtpDrafter {
         }
         match self.sampled.as_ref() {
             Some(sampled) if !sampled.draws_drafts() => {
-                return Err(
-                    "Qwen4 native MTP under qwen4 topology.pp does not support \
+                return Err("Qwen4 native MTP under qwen4 topology.pp does not support \
                      HIPFIRE_MTP_SAMPLED_MODE=naive (its draws come from the process-wide AR \
                      sampler); use the default leviathan mode"
-                        .to_string(),
-                );
+                    .to_string());
             }
             Some(_) if self.request.penalties_active() => {
                 return Err(
