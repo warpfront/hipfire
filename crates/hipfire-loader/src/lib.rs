@@ -18,6 +18,7 @@ use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_lfm3 as lfm3;
 use hipfire_arch_lfm3_audio::lfm3_audio;
+use hipfire_arch_lfm3_omni as lfm3_omni;
 use hipfire_arch_lfm3_vl::lfm3_vl;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
@@ -349,6 +350,12 @@ pub struct LoadedModel {
     // projector; audio is detected by `encoder.downsample.*` tensor presence.
     pub lfm3_audio_config: Option<lfm3_audio::AudioConfig>,
     pub lfm3_audio_weights: Option<lfm3_audio::AudioWeights>,
+    // LFM3-Omni depth decoder state (arch_id 13 + depth decoder). The depth
+    // decoder predicts the 12 codebooks of one speech frame from the LM hidden
+    // state via MaskGIT. Detected by `model.depth_decoder.depth_linear.weight`
+    // tensor presence. Phase 4a of the LFM3 port.
+    pub lfm3_depth_config: Option<lfm3_omni::DepthConfig>,
+    pub lfm3_depth_weights: Option<lfm3_omni::DepthWeights>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
     pub seq_pos: usize,
@@ -421,6 +428,8 @@ impl LoadedModel {
             lfm3_vision_weights: None,
             lfm3_audio_config: None,
             lfm3_audio_weights: None,
+            lfm3_depth_config: None,
+            lfm3_depth_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -1996,6 +2005,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         w.free_gpu(gpu);
     }
     if let Some(w) = m.lfm3_audio_weights {
+        w.free_gpu(gpu);
+    }
+    if let Some(w) = m.lfm3_depth_weights {
         w.free_gpu(gpu);
     }
     // lfm2moe / minimax teardown is now compiler-enforced via the exhaustive

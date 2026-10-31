@@ -1432,6 +1432,7 @@ impl Carrier for Lfm3Carrier {
 
         use hipfire_arch_lfm3 as lfm3;
         use hipfire_arch_lfm3_audio::lfm3_audio;
+        use hipfire_arch_lfm3_omni as lfm3_omni;
         use hipfire_arch_lfm3_vl::lfm3_vl;
         // LFM3-VL vision tower + projector (loaded when the HFQ carries vision
         // tensors). Text-only LFM3-1.7B leaves these None.
@@ -1441,6 +1442,10 @@ impl Carrier for Lfm3Carrier {
         // audio tensors). Phase 3 of the LFM3 port.
         let mut lfm3_audio_config: Option<lfm3_audio::AudioConfig> = None;
         let mut lfm3_audio_weights: Option<lfm3_audio::AudioWeights> = None;
+        // LFM3-Omni depth decoder + shared codebook embedding (loaded when the
+        // HFQ carries the depth decoder). Phase 4a of the LFM3 port.
+        let mut lfm3_depth_config: Option<lfm3_omni::DepthConfig> = None;
+        let mut lfm3_depth_weights: Option<lfm3_omni::DepthWeights> = None;
         // ── source-varying seam: (config, weights) only ──
         let (config, weights) = match src {
             ModelSource::Hfq(mut hfq) => {
@@ -1469,6 +1474,22 @@ impl Carrier for Lfm3Carrier {
                         .map_err(|e| format!("lfm3-audio: load_audio_weights: {e:?}"))?;
                     lfm3_audio_config = Some(ac);
                     lfm3_audio_weights = Some(aw);
+                }
+                // Detect the LFM3-Omni depth decoder by tensor presence
+                // (model.depth_decoder.depth_linear.weight). arch_id stays 13;
+                // the depth decoder is opt-in by tensor presence, mirroring the
+                // VL/audio precedent. Phase 4a.
+                if hfq
+                    .tensor_data("model.depth_decoder.depth_linear.weight")
+                    .is_some()
+                {
+                    eprintln!("lfm3: LFM3-Omni depth decoder detected — loading depth decoder + codebook embedding weights");
+                    let dc = lfm3_omni::depth_config_from_hfq(&hfq)
+                        .ok_or_else(|| "lfm3-omni: depth_config not found in HFQ metadata".to_string())?;
+                    let dw = lfm3_omni::load_depth_weights(&hfq, &dc, ctx.gpu)
+                        .map_err(|e| format!("lfm3-omni: load_depth_weights: {e:?}"))?;
+                    lfm3_depth_config = Some(dc);
+                    lfm3_depth_weights = Some(dw);
                 }
                 (config, weights)
             }
@@ -1528,6 +1549,8 @@ impl Carrier for Lfm3Carrier {
             lfm3_vision_weights,
             lfm3_audio_config,
             lfm3_audio_weights,
+            lfm3_depth_config,
+            lfm3_depth_weights,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

@@ -831,6 +831,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-lfm3-omni"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-lfm3-vl"
 version = "0.3.0"
 dependencies = [
@@ -1001,6 +1012,7 @@ dependencies = [
  "hipfire-arch-lfm2moe",
  "hipfire-arch-lfm3",
  "hipfire-arch-lfm3-audio",
+ "hipfire-arch-lfm3-omni",
  "hipfire-arch-lfm3-vl",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
@@ -1067,6 +1079,7 @@ dependencies = [
  "hipfire-arch-lfm2moe",
  "hipfire-arch-lfm3",
  "hipfire-arch-lfm3-audio",
+ "hipfire-arch-lfm3-omni",
  "hipfire-arch-lfm3-vl",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",

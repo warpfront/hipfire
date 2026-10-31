@@ -4804,6 +4804,10 @@ fn should_quantize(name: &str) -> bool {
         || name.starts_with("model.multi_modal_projector.")
         || name.starts_with("encoder.downsample.")
         || name.starts_with("mlp.model.")
+        // LFM3-Omni (Phase 4): depth decoder + shared codebook embedding stay
+        // F16 (small, not decode-hot-path; match the vision/audio towers).
+        || name.starts_with("model.depth_decoder.")
+        || name.starts_with("model.codebook_embedding.")
     {
         return false;
     }
@@ -7343,8 +7347,12 @@ fn main() {
         // downsampler (`encoder.downsample.*`) + projector (`mlp.model.*`)
         // are kept F16; the encoder backbone (`encoder.lfm.*`) quantizes Q8
         // like the text backbone; the text tensors sit at `lfm.model.*` and
-        // are resolved by the Lfm3Weights loader's prefix fallback.
-        "lfm3" | "lfm3_vl" | "lfm3_audio" => 13,
+        // are resolved by the Lfm3Weights loader's prefix fallback. The omni
+        // variant (model_type "lfm3_omni") reuses arch_id 13 too — its depth
+        // decoder (`model.depth_decoder.*`) + shared `codebook_embedding` are
+        // kept F16 (Phase 4a); the text backbone sits at `model.language_model.*`
+        // and is stripped to `model.*` like lfm3_vl.
+        "lfm3" | "lfm3_vl" | "lfm3_audio" | "lfm3_omni" => 13,
         // Cohere2-MoE (CohereLabs/North-Mini-Code-1.0): parallel-block
         // transformer, interleaved sliding(RoPE)/global(NoPE) GQA, mean-centered
         // Cohere2LayerNorm, sigmoid 128-expert MoE (norm_topk_prob=false, no bias,

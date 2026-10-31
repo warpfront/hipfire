@@ -16,6 +16,7 @@ members = [
     "crates/hipfire-arch-lfm3",
     "crates/hipfire-arch-lfm3-vl",
     "crates/hipfire-arch-lfm3-audio",
+    "crates/hipfire-arch-lfm3-omni",
     "crates/hipfire-arch-minimax",
     "crates/hipfire-arch-cohere2moe",
     "crates/hipfire-arch-dots-ocr",
