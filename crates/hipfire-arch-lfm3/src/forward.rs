@@ -43,7 +43,25 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    decode_step_inner(cfg, weights, state, gpu, token_id, position, None)?;
+    decode_step_inner(cfg, weights, state, gpu, token_id, position, None, None)?;
+    gpu.download_f32(&state.logits)
+        .map_err(|e| format!("lfm3: download logits: {e:?}"))
+}
+
+/// Decode one position using a PRECOMPUTED embedding instead of a token-id
+/// lookup. Used by the LFM3-VL prefill to splice projected visual tokens into
+/// the residual stream at `image_token_id` positions: the daemon calls this
+/// with the visual embedding slice (width == hidden_size) in place of
+/// `decode_step(token_id)`. `embed` is host-side F32, length `hidden_size`.
+pub fn decode_step_with_embed(
+    cfg: &Lfm3Config,
+    weights: &Lfm3Weights,
+    state: &mut Lfm3State,
+    gpu: &mut Gpu,
+    embed: &[f32],
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    decode_step_inner(cfg, weights, state, gpu, 0, position, Some(embed), None)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("lfm3: download logits: {e:?}"))
 }
@@ -59,7 +77,7 @@ pub fn decode_step_capture(
     position: u32,
     capture: &mut [Vec<f32>],
 ) -> Result<(), String> {
-    decode_step_inner(cfg, weights, state, gpu, token_id, position, Some(capture))
+    decode_step_inner(cfg, weights, state, gpu, token_id, position, None, Some(capture))
 }
 
 fn decode_step_inner(
@@ -69,6 +87,7 @@ fn decode_step_inner(
     gpu: &mut Gpu,
     token_id: u32,
     position: u32,
+    embed: Option<&[f32]>,
     mut capture: Option<&mut [Vec<f32>]>,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
@@ -84,9 +103,17 @@ fn decode_step_inner(
         .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|e| format!("lfm3: htod pos: {e:?}"))?;
 
-    // Embedding lookup → residual stream h (Q8 table).
-    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
-        .map_err(|e| format!("lfm3: embed lookup: {e:?}"))?;
+    // Embedding → residual stream h. Normally a Q8 table lookup; the VL prefill
+    // overrides this with a projected visual embedding at image-token positions.
+    if let Some(e) = embed {
+        let bytes: Vec<u8> = e.iter().flat_map(|&f| f.to_le_bytes()).collect();
+        gpu.hip
+            .memcpy_htod(&state.h.buf, &bytes)
+            .map_err(|e| format!("lfm3: htod embed: {e:?}"))?;
+    } else {
+        gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
+            .map_err(|e| format!("lfm3: embed lookup: {e:?}"))?;
+    }
 
     for (l, layer) in weights.layers.iter().enumerate() {
         // ── Mixer block (pre-norm) ──────────────────────────────────────────

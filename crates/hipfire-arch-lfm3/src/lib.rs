@@ -40,7 +40,7 @@ pub mod spec_impl;
 
 pub use arch::Lfm3;
 pub use config::{config_from_source, Lfm3Config, MixerKind};
-pub use forward::{decode_step, decode_step_capture};
+pub use forward::{decode_step, decode_step_capture, decode_step_with_embed};
 pub use lfm3::{load_weights_from_source, Lfm3State, Lfm3Weights};
 pub use spec_impl::Lfm3Bundle;
 

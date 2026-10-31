@@ -147,7 +147,10 @@ impl Lfm3Config {
         let inner = wrapper
             .get("config")
             .ok_or_else(|| "lfm3: metadata_json missing `config` wrapper".to_string())?;
-        Self::from_config_value(inner)
+        // LFM3-VL nests the text backbone config under `text_config`; the
+        // text-only LFM3-1.7B has the fields at the top level of `config`.
+        let text = inner.get("text_config").unwrap_or(inner);
+        Self::from_config_value(text)
     }
 
     /// Parse from a raw `config.json` Value (the inner `config` blob, or a
@@ -278,7 +281,9 @@ pub fn config_from_source(source: &dyn ModelSource) -> Option<Lfm3Config> {
     let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
     // Envelope form: { "config": { ... } }.
     if let Some(inner) = meta.get("config") {
-        return Lfm3Config::from_config_value(inner).ok();
+        // LFM3-VL nests the text backbone config under `text_config`.
+        let text = inner.get("text_config").unwrap_or(inner);
+        return Lfm3Config::from_config_value(text).ok();
     }
     // Bare config.json form (no wrapper): the metadata_json IS the config.
     Lfm3Config::from_config_value(&meta).ok()

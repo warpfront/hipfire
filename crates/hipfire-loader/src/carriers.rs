@@ -1431,11 +1431,28 @@ impl Carrier for Lfm3Carrier {
         let meta = resolve_source_meta(&src, ctx.path)?;
 
         use hipfire_arch_lfm3 as lfm3;
+        use hipfire_arch_lfm3_vl::lfm3_vl;
+        // LFM3-VL vision tower + projector (loaded when the HFQ carries vision
+        // tensors). Text-only LFM3-1.7B leaves these None.
+        let mut lfm3_vision_config: Option<lfm3_vl::VisionConfig> = None;
+        let mut lfm3_vision_weights: Option<lfm3_vl::VisionWeights> = None;
         // ── source-varying seam: (config, weights) only ──
         let (config, weights) = match src {
             ModelSource::Hfq(mut hfq) => {
                 let config = lfm3::config::Lfm3Config::from_hfq(&hfq)?;
                 let weights = lfm3::lfm3::Lfm3Weights::load(&mut hfq, &config, ctx.gpu)?;
+                // Detect the LFM3-VL vision tower by tensor presence (the
+                // qwen35-vl precedent: arch_id stays 13, vision is opt-in by
+                // tensor presence, not a separate arch id).
+                if hfq.tensor_data("model.vision_tower.patchifier.weight").is_some() {
+                    eprintln!("lfm3: LFM3-VL vision tower detected — loading vision + projector weights");
+                    let vc = lfm3_vl::vision_config_from_hfq(&hfq)
+                        .ok_or_else(|| "lfm3-vl: vision_config not found in HFQ metadata".to_string())?;
+                    let vw = lfm3_vl::load_vision_weights(&hfq, &vc, ctx.gpu)
+                        .map_err(|e| format!("lfm3-vl: load_vision_weights: {e:?}"))?;
+                    lfm3_vision_config = Some(vc);
+                    lfm3_vision_weights = Some(vw);
+                }
                 (config, weights)
             }
             ModelSource::Dir(source) => {
@@ -1490,6 +1507,8 @@ impl Carrier for Lfm3Carrier {
                 eos_tok,
             })),
             speculator,
+            lfm3_vision_config,
+            lfm3_vision_weights,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

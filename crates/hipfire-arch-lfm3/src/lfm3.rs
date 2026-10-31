@@ -35,10 +35,20 @@ const FLASH_PREFILL_SUBBATCH: usize = 64;
 // ───────────────────────── HFQ load helpers ─────────────────────────
 
 fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .ok_or_else(|| format!("lfm3: tensor not found in HFQ: {name}"))?;
-    Ok((info.quant_type, data))
+    if let Some((info, data)) = hfq.tensor_data_vec(name) {
+        return Ok((info.quant_type, data));
+    }
+    // LFM3-VL nests the text backbone under `model.language_model.*` (the VL
+    // checkpoint's `Lfm3VlModel.language_model`). Text-only LFM3-1.7B uses
+    // `model.*` directly, so this fallback is a no-op there; for VL it resolves
+    // `model.embed_tokens.weight` → `model.language_model.embed_tokens.weight`.
+    if let Some(stripped) = name.strip_prefix("model.") {
+        let prefixed = format!("model.language_model.{stripped}");
+        if let Some((info, data)) = hfq.tensor_data_vec(&prefixed) {
+            return Ok((info.quant_type, data));
+        }
+    }
+    Err(format!("lfm3: tensor not found in HFQ: {name}"))
 }
 
 /// Load a 1D/raw F16/F32/Q8 vector → F32 GpuTensor with the given shape.
@@ -438,10 +448,17 @@ fn read_tensor_from_source<'a>(
     source: &'a dyn ModelSource,
     name: &str,
 ) -> Result<(u8, &'a str, &'a [u8]), String> {
-    let (info, data) = source
-        .tensor_data(name)
-        .ok_or_else(|| format!("lfm3: tensor not found in source: {name}"))?;
-    Ok((effective_quant_type(info, data), info.dtype.as_str(), data))
+    if let Some((info, data)) = source.tensor_data(name) {
+        return Ok((effective_quant_type(info, data), info.dtype.as_str(), data));
+    }
+    // LFM3-VL nests the text backbone under `model.language_model.*`.
+    if let Some(stripped) = name.strip_prefix("model.") {
+        let prefixed = format!("model.language_model.{stripped}");
+        if let Some((info, data)) = source.tensor_data(&prefixed) {
+            return Ok((effective_quant_type(info, data), info.dtype.as_str(), data));
+        }
+    }
+    Err(format!("lfm3: tensor not found in source: {name}"))
 }
 
 fn load_f32_from_source(

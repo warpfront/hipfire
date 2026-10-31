@@ -4790,14 +4790,17 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 fn should_quantize(name: &str) -> bool {
     // Vision encoder weights stay FP16 (only ~500M params, run once per image).
     // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
-    // `vision_tower.*`. Both arches keep vision F16 during bring-up so the
-    // per-stage diff against the HF reference activations
+    // `vision_tower.*`; LFM3-VL uses `model.vision_tower.*` /
+    // `model.multi_modal_projector.*`. All arches keep vision F16 during
+    // bring-up so the per-stage diff against the HF reference activations
     // (`benchmarks/references/<image>_activations/`) doesn't have to absorb
     // both forward-pass implementation noise AND quant noise — clean
     // attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
     if name.starts_with("model.visual.")
         || name.starts_with("visual.")
         || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_tower.")
+        || name.starts_with("model.multi_modal_projector.")
     {
         return false;
     }
@@ -7328,8 +7331,12 @@ fn main() {
         // sigmoid output gate, conv_L_cache 7. Dense SwiGLU FFN only (no MoE in
         // the text backbone). Crate hipfire-arch-lfm3 (arch_id 13). The ingest
         // Q8s all tensors (the loader dequants norms / conv-filter / gate to
-        // F32); tensor names ship verbatim.
-        "lfm3" => 13,
+        // F32); tensor names ship verbatim. The VL variant (model_type "lfm3_vl")
+        // reuses arch_id 13 — its vision/projector tensors (`model.vision_tower.*`
+        // / `model.multi_modal_projector.*`) are kept F16 via should_quantize,
+        // and the text tensors' `model.language_model.` prefix is stripped to
+        // `model.` so the existing Lfm3Weights loader finds them.
+        "lfm3" | "lfm3_vl" => 13,
         // Cohere2-MoE (CohereLabs/North-Mini-Code-1.0): parallel-block
         // transformer, interleaved sliding(RoPE)/global(NoPE) GQA, mean-centered
         // Cohere2LayerNorm, sigmoid 128-expert MoE (norm_topk_prob=false, no bias,
@@ -7884,12 +7891,15 @@ fn main() {
         }
         // Skip MTP head; optionally include vision encoder for VL inference.
         // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
-        // dots.ocr names them `vision_tower.*`. Both fall through to the
-        // F16 fallback path (see should_quantize: vision_tower.* is
-        // skipped from quantization) when --include-vision is set.
+        // dots.ocr names them `vision_tower.*`; LFM3-VL names them
+        // `model.vision_tower.*` / `model.multi_modal_projector.*`. All fall
+        // through to the F16 fallback path (see should_quantize) when
+        // --include-vision is set.
         let is_vision = name.starts_with("model.visual.")
             || name.starts_with("visual.")
-            || name.starts_with("vision_tower.");
+            || name.starts_with("vision_tower.")
+            || name.starts_with("model.vision_tower.")
+            || name.starts_with("model.multi_modal_projector.");
         if is_vision && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();

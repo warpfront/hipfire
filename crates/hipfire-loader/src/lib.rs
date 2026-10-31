@@ -17,6 +17,7 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_lfm3 as lfm3;
+use hipfire_arch_lfm3_vl::lfm3_vl;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
@@ -337,6 +338,11 @@ pub struct LoadedModel {
     // Vision state
     pub vision_config: Option<qwen35_vl::VisionConfig>,
     pub vision_weights: Option<qwen35_vl::VisionWeights>,
+    // LFM3-VL vision state (arch_id 13 + vision tower). Separate from the
+    // qwen35-vl fields above because the vision tower + projector types differ
+    // (LFM3-VL hybrid conv/attention encoder vs SigLIP-2 ViT).
+    pub lfm3_vision_config: Option<lfm3_vl::VisionConfig>,
+    pub lfm3_vision_weights: Option<lfm3_vl::VisionWeights>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
     pub seq_pos: usize,
@@ -405,6 +411,8 @@ impl LoadedModel {
             dots_ocr_weights: None,
             vision_config: None,
             vision_weights: None,
+            lfm3_vision_config: None,
+            lfm3_vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -1974,6 +1982,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         pbs.free_gpu(gpu);
     }
     if let Some(w) = m.vision_weights {
+        w.free_gpu(gpu);
+    }
+    if let Some(w) = m.lfm3_vision_weights {
         w.free_gpu(gpu);
     }
     // lfm2moe / minimax teardown is now compiler-enforced via the exhaustive
