@@ -1538,7 +1538,11 @@ impl Qwen4Bundle {
         // The largest rung whose chunk-sized resources fit the free device
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
-        let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
+        // Planned capacity (total - own - reserve), not the instantaneous free
+        // figure: a transient foreign allocation must not shrink the chunk.
+        let planned = gpu.planned_capacity().map_err(BundleError::Hip)?;
+        let free = planned.bytes;
+        eprintln!("  qwen4 admission decision: prefill chunk rung search from {planned}");
         // A load that placed its experts for decode-share (`fixed` / `on`, a
         // donor tail in the lease) sized the placement for exactly this chunk and
         // this scratch plan: the chunk is final (no rung downshift) and a
@@ -1607,7 +1611,7 @@ impl Qwen4Bundle {
             Err(Qwen4GpuForwardError::CompactUnverified { verified, total })
                 if s1_tile.is_none() && mode == Qwen4ForwardScratchMode::FnSymGfx1201 =>
             {
-                let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
+                let free = gpu.planned_capacity().map_err(BundleError::Hip)?.bytes;
                 let rows = full_fallback_rows(&self.config, requested, free as u64);
                 eprintln!(
                     "  qwen4 forward scratch: compact plan refused by the GPU symmetry check ({verified}/{total} layers verified); re-planned Full at {rows} rows"
@@ -1901,8 +1905,8 @@ impl Qwen4Bundle {
     }
 
     /// Whether this load shares the EP reserve (this rank's forward carries a
-    /// plan receipt, or the attached mesh agreed one). Dynamic lane staging
-    /// and any consumer needing the resident scratch bank refuse on it.
+    /// plan receipt, or the attached mesh agreed one). Consumers that need the
+    /// 4096-row scratch bank resident at every call refuse on it.
     pub(crate) fn ep_reserve_active(&self) -> bool {
         self.execution
             .as_ref()
@@ -4568,12 +4572,20 @@ impl Qwen4Bundle {
         copy: Option<crate::lane::LaneCopyConfig>,
     ) -> Result<(), BundleError> {
         self.pp_refuse("continuous-batch lanes")?;
-        if self.ep_reserve_active() {
-            return Err(BundleError::Forward(
-                "Qwen4 lanes cannot be staged on an EP reserve-sharing load: lane steps and \
-                 lane prefill waves need the resident scratch bank (not supported)"
-                    .to_string(),
-            ));
+        // An EP reserve-sharing load runs lane decode steps on the 512-row
+        // resident bank (prefill tiles borrow like a singleton prompt), so a
+        // store with more lanes than resident rows cannot step.
+        if let Some(rows) = self
+            .execution
+            .as_ref()
+            .and_then(|forward| forward.ep_reserve_resident_rows())
+        {
+            if max_lanes > rows {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 lanes on an EP reserve-sharing load step on the {rows}-row resident \
+                     scratch bank; {max_lanes} lanes do not fit"
+                )));
+            }
         }
         if self.ep.is_some() {
             return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec, copy);

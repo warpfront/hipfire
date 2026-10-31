@@ -688,11 +688,30 @@ What the switch does when it is admitted:
   drained and reloaded, because a locally successful restore is not a successful request.
 
 Scope. The admitted configuration is discrete gfx1201 EP2, the pinned Flash-Next QT44/QT53 recipe, prompt chunk 4096,
-whole-layer placement and ordinary routing, for both AR and native MTP. Every other configuration takes today's
-**ordinary** path with the switch ignored (the load logs the opt-in refusal): other arches (gfx1100, gfx1151,
-gfx942), EP counts other than two, a single card, PP, tier / slab placements, the NPU trunk, DFlash, the
-single-device slow-link prefill, continuous batching or dynamic lane staging, an explicit different chunk, and a
-lower `max_seq`. They are not broken by the switch, and an EP2 result implies nothing about them.
+whole-layer placement and ordinary routing, for both AR and native MTP, with or without continuous-batching AR lanes.
+Every other configuration takes today's **ordinary** path with the switch ignored (the load logs the opt-in refusal):
+other arches (gfx1100, gfx1151, gfx942), EP counts other than two, a single card, PP, tier / slab placements, the NPU
+trunk, DFlash, the single-device slow-link prefill, an explicit different chunk, and a lower `max_seq`. They are not
+broken by the switch, and an EP2 result implies nothing about them.
+
+**AR lanes (`serve.vmm_batch`, `continuous_batch_size` >= 2).** The load charges the lane store's per-rank bytes
+(`ep_lane_store_device_bytes`, the same helper the staging uses) to the decoupled census, so the stage after the load
+finds them free, and takes the plan only when it holds more resident layers than the ordinary lane placement (a plan
+without lanes keeps the 33-layer qualification minimum). Lane **decode** steps run on the 512-row resident bank: they
+restore a dirty borrow epoch first (a clean epoch passes with no barrier) and refuse more lanes than resident rows.
+Lane **prefill** tiles are the singleton chunk program on a lane state, so a tile of more than 512 rows borrows exactly
+as a singleton prompt tile does; a step's tiles are one whole-prompt entry, so the donors are restored once per step,
+not once per tile. A load without lanes is unchanged.
+
+**EP prefill-chunk auto-fit (opt-in, `HIPFIRE_EP_CHUNK_AUTOFIT=1`).** The PP lever steps the chunk down because a band
+must fit; an EP load always fits (host-mapped layers), so the question is only decode against prefill. EP2 mq4-xts, 2x
+R9700, no lanes, one binary, `hipfire bench --matrix` (`mgmtp/epfit/runs/pr1-*`): pp16384 / pp65536 tok/s at 4096 rows
+with the decoupled reserve 5133 / 4911 (34 resident layers), then at 2048 / 1024 / 512 rows with the ordinary reserve
+4191 / 4056 (32 layers, -18% / -17%), 3010 / 2763 (33, -41% / -44%), 2173 / 1994 (34, -58% / -59%). With lanes the
+decoupled plan holds 32 layers (ordinary 27), which one halving of the chunk cannot match, so the auto-fit is off by
+default; with it on, the load re-plans the ordinary placement (each rung with its own forward reserve and lane store) at
+2048 / 1024 / 512 and takes the rung with the most resident layers if it beats the placement it replaces by at least two.
+An explicit `HIPFIRE_PREFILL_CHUNK_ROWS` is never moved.
 
 Qualification is `scripts/fn-ep-gate.sh --mode reserve` plus the card campaign's timing documents. Every threshold
 below is a **kill rule**, evaluated by `scripts/fn_ep_compare.py reserve ...`; passing one is not a performance claim.

@@ -879,6 +879,49 @@ impl Qwen4GpuForward {
         Some(reserve.plan.mesh_receipt(reserve.source_generation, s1, s2))
     }
 
+    /// Rows of the resident scratch bank of an EP reserve-sharing load; `None`
+    /// on an ordinary load. Lane decode steps run on it.
+    pub(crate) fn ep_reserve_resident_rows(&self) -> Option<usize> {
+        self.ep_reserve
+            .as_ref()
+            .map(|reserve| reserve.banks.resident_rows())
+    }
+
+    /// Entry of a lane decode step (`forward_lanes`, `rows` decode rows) on an
+    /// EP reserve-sharing load; a no-op on an ordinary load. A lane step reads
+    /// the Full peer tables and the donor layers' experts, so a dirty borrow
+    /// epoch (a lane prefill tile on the borrowed bank ran since the last
+    /// restore) is globally restored first, exactly as a resident-bank call of
+    /// [`Self::ep_reserve_forward_chunk`] restores; a clean epoch passes with no
+    /// barrier. The step then runs on the resident bank, which is checked to be
+    /// the one in `scratch` (never swapped here).
+    pub(crate) fn ep_reserve_lane_step_enter(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: usize,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let Some(reserve) = self.ep_reserve.as_ref() else {
+            return Ok(());
+        };
+        reserve.check()?;
+        if rows == 0 || rows > reserve.banks.resident_rows() {
+            return Err(invalid(format!(
+                "a {rows}-row lane step does not fit the {}-row resident bank of an EP reserve load",
+                reserve.banks.resident_rows()
+            )));
+        }
+        self.ep_reserve_require_resident(gpu, "a lane step")?;
+        let reserve = self.ep_reserve.as_mut().expect("checked above");
+        if let Err(error) = reserve
+            .banks
+            .select(&mut self.scratch, rows, EpBankRoute::TileExchange)
+        {
+            reserve.poison(error.to_string());
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Print this rank's header and rank receipt records (once, when the mesh
     /// is serviceable). A reserve load prints the plan's receipt; an ordinary
     /// EP load under `HIPFIRE_EP_RESERVE_RECEIPT=1` prints the real loaded
@@ -1091,11 +1134,16 @@ impl Qwen4GpuForward {
             .epoch
             .plan_call(n, resident_rows, prompt_rows, route)
             .map_err(invalid)?;
+        // A lane PREFILL tile is the singleton chunk program on a lane state
+        // (`with_lane`, `lane_scope`), so it borrows exactly as a singleton
+        // prompt tile does; only a device-argmax decode or a mesh segment is
+        // refused. Lane DECODE steps never reach here (`forward_lanes` enters
+        // through [`Self::ep_reserve_lane_step_enter`]).
         if plan.bank == EpBankKind::Borrowed
-            && (argmax_of.is_some() || self.lane_scope || self.mesh_route_rows.is_some())
+            && (argmax_of.is_some() || self.mesh_route_rows.is_some())
         {
             return Err(invalid(
-                "an argmax, lane or mesh forward cannot run on the borrowed EP reserve bank",
+                "an argmax or mesh forward cannot run on the borrowed EP reserve bank",
             ));
         }
         self.ep_reserve_hash_before(gpu, plan.bank == EpBankKind::Borrowed)?;

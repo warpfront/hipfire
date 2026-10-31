@@ -2267,6 +2267,22 @@ impl Gpu {
         Ok(self.emu_cap_mem_info(free.min(usize::MAX as u64) as usize, total))
     }
 
+    /// Capacity an auto admission may plan against: device total minus this
+    /// process's own live device allocations ([`hip_bridge::HipRuntime::own_device_bytes`])
+    /// minus the fixed [`PLANNED_CAPACITY_RESERVE_BYTES`]. Unlike
+    /// [`Self::device_mem_info`]'s free figure it does not move when a foreign
+    /// process transiently allocates, so a route chosen from it is stable
+    /// across loads. Callers MUST still verify the real allocation and fall to
+    /// a smaller rung only when it truly fails. UMA parts and `HIPFIRE_EMU`
+    /// profiles share host memory / a capped ledger, so there the capped free
+    /// figure stays authoritative.
+    pub fn planned_capacity(&self) -> HipResult<PlannedCapacity> {
+        let (free, total) = self.device_mem_info()?;
+        let own = self.hip.own_device_bytes();
+        let stable = !self.is_uma() && self.emu.is_none();
+        Ok(PlannedCapacity::new(free, total, own, stable))
+    }
+
     /// Install a real stream if launches are still going to the null stream.
     ///
     /// HIP refuses to capture the legacy default stream, so anything that
@@ -12580,5 +12596,81 @@ mod tests {
         drop(fd);
         assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (0, 0));
         gpu.ensure_vmm_cleaned().expect("exporter clean");
+    }
+}
+
+/// Fixed device reserve a planned admission leaves for driver/runtime state
+/// that is not in the allocation ledger (code objects, queues, context).
+pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 512 << 20;
+
+/// Result of [`Gpu::planned_capacity`]; `Display` is the load-log input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedCapacity {
+    /// Bytes the admission plans against.
+    pub bytes: usize,
+    pub total: usize,
+    pub own: usize,
+    pub reserve: usize,
+    /// Instantaneous free at query time (observation only when `planned`).
+    pub free_now: usize,
+    /// `bytes` is `total - own - reserve`; false = free figure used (UMA/emu).
+    pub planned: bool,
+}
+
+impl PlannedCapacity {
+    pub fn new(free_now: usize, total: usize, own: usize, planned: bool) -> Self {
+        let reserve = PLANNED_CAPACITY_RESERVE_BYTES;
+        let bytes = if planned {
+            total.saturating_sub(own).saturating_sub(reserve)
+        } else {
+            free_now
+        };
+        Self {
+            bytes,
+            total,
+            own,
+            reserve,
+            free_now,
+            planned,
+        }
+    }
+}
+
+impl std::fmt::Display for PlannedCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let m = |b: usize| b as f64 / (1024.0 * 1024.0);
+        if self.planned {
+            write!(
+                f,
+                "planned={:.0} MiB (total {:.0} - own {:.0} - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
+                m(self.bytes), m(self.total), m(self.own), m(self.reserve), m(self.free_now)
+            )
+        } else {
+            write!(
+                f,
+                "capacity={:.0} MiB (free figure: UMA/emu)",
+                m(self.bytes)
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod planned_capacity_tests {
+    use super::*;
+    const G: usize = 1 << 30;
+    #[test]
+    fn foreign_allocation_does_not_change_planned_capacity() {
+        let a = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);
+        let b = PlannedCapacity::new(6 * G, 32 * G, 8 * G, true); // 14 GiB foreign
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.bytes, 24 * G - PLANNED_CAPACITY_RESERVE_BYTES);
+    }
+    #[test]
+    fn uma_uses_free() {
+        assert_eq!(
+            PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).bytes,
+            5 * G
+        );
     }
 }

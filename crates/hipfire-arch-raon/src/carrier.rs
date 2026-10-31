@@ -179,7 +179,7 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
             return Err(e);
         }
     };
-    let scratch = match RaonPrefillScratch::new(ctx.gpu, &dims, rows) {
+    let (scratch, rows) = match alloc_scratch_descending(ctx.gpu, &dims, rows, state.max_seq()) {
         Ok(s) => s,
         Err(e) => {
             if let Err(fe) = state.free_gpu(ctx.gpu) {
@@ -189,7 +189,47 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
             return Err(format!("raon1_mini: RaonPrefillScratch::new failed: {e}"));
         }
     };
+    let _ = rows;
     RaonBundle::new(ctx.gpu, config, weights, state, scratch)
+}
+
+/// Verify the admitted rung by really allocating it; step down the ladder
+/// only when the allocation itself fails (a foreign allocation that leaves
+/// room never changes the route).
+fn alloc_scratch_descending(
+    gpu: &mut Gpu,
+    dims: &RaonStateDims,
+    rows: usize,
+    max_seq: usize,
+) -> Result<(RaonPrefillScratch, usize), String> {
+    let base_rows = PREFILL_SCRATCH_ROWS.min(max_seq);
+    let mut rungs: Vec<usize> = vec![rows];
+    for r in PREFILL_CHUNK_LADDER {
+        let r = r.min(max_seq);
+        if r < rows && rungs.last() != Some(&r) {
+            rungs.push(r);
+        }
+    }
+    let mut last_err = String::new();
+    for r in rungs {
+        match RaonPrefillScratch::new(gpu, dims, r) {
+            Ok(s) => {
+                if r != rows {
+                    eprintln!(
+                        "raon1_mini: prefill scratch allocation for {rows} rows failed ({last_err}); fell back to {r} rows"
+                    );
+                }
+                return Ok((s, r));
+            }
+            Err(e) => {
+                last_err = e;
+                if r <= base_rows {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Prefill chunk widths the loader may admit, widest first. The last rung is
@@ -314,7 +354,7 @@ fn admit_prefill_rows(
     state: &RaonState,
     forced: Option<usize>,
 ) -> Result<usize, String> {
-    let available = state.mirror_available_bytes(gpu)?;
+    let (available, cap) = state.mirror_available_with_input(gpu)?;
     let mut extra = |rows: usize| -> Result<usize, String> {
         Ok(RaonPrefillScratch::required_bytes(dims, rows)?
             + RaonWork::required_bytes(config, rows)?)
@@ -323,7 +363,7 @@ fn admit_prefill_rows(
         state.projected_mirror_budget_rows(usable)
     })?;
     eprintln!(
-        "raon1_mini: prefill chunk rows requested={} admitted={} (scratch+work {:.0} MiB; \
+        "raon1_mini: admission decision: prefill chunk rows from {cap}; requested={} admitted={} (scratch+work {:.0} MiB; \
          projected expanded K/V mirror budget {} rows of {} reserved context, 512-row policy {} rows)",
         forced.map_or("auto".to_string(), |f| f.to_string()),
         adm.rows,
@@ -354,6 +394,21 @@ mod tests {
             &mut |rows| Ok(rows * MIB),
             &|usable| (usable / MIB).min(max_seq),
         )
+    }
+
+    #[test]
+    fn foreign_allocation_does_not_flip_the_route() {
+        // Planned capacity ignores the instantaneous free figure: a 14 GiB foreign
+        // allocation (free 20 GiB -> 6 GiB) used to flip 4096 -> 512.
+        const G: usize = 1 << 30;
+        let avail = |free_now: usize| {
+            rdna_compute::PlannedCapacity::new(free_now, 32 * G, 8 * G, true).bytes / MIB
+        };
+        let before = pick(8192, None, avail(20 * G)).unwrap();
+        let during = pick(8192, None, avail(6 * G)).unwrap();
+        assert_eq!(before.rows, 4096);
+        assert_eq!(during.rows, before.rows);
+        assert_eq!(during.mirror_rows, before.mirror_rows);
     }
 
     #[test]

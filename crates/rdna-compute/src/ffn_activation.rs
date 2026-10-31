@@ -34,6 +34,8 @@ const COMBINE_SRC: &str = include_str!("../../../kernels/src/ffn_moe_combine_pol
 
 const SITU_MODULE: &str = "ffn_situ";
 const GROUPED_MODULE: &str = "ffn_grouped_activation_pad";
+const GROUPED_ROTATE_I8_SRC: &str = crate::kernels::FFN_GROUPED_ACTIVATION_ROTATE_I8_SRC;
+const GROUPED_ROTATE_I8_MODULE: &str = "ffn_grouped_activation_rotate_i8_gfx1201";
 const ROUTER_MODULE: &str = "ffn_router_renorm";
 const COMBINE_MODULE: &str = "ffn_moe_combine_policy";
 
@@ -146,6 +148,57 @@ pub struct FfnActivationGrouped<'a> {
     /// `[n_experts]` u64 ptr table -> `F32[phys_n]`
     pub awq_table: Option<&'a GpuTensor>,
     pub n_experts: usize,
+}
+
+/// Operands of [`Gpu::ffn_activation_grouped_rotate_i8_f32`]: [`FfnActivationGrouped`] with the F32
+/// activation rows replaced by the A8 sidecar of their rotation (and an optional F32 copy of the
+/// rotated rows).
+pub struct FfnActivationGroupedI8<'a> {
+    pub activation: FfnActivation,
+    /// F32 `[m_total, 2*logical_n]`, as [`FfnActivationGrouped::y_grouped`].
+    pub y_grouped: &'a GpuTensor,
+    /// i32 `[m_total]`; flat slot of grouped row g, or -1 for padding rows (skipped).
+    pub sorted_slot_index: &'a GpuTensor,
+    /// i32 `[m_total / block_m]`; read only when `awq_table` is Some.
+    pub expert_tile_ids: &'a GpuTensor,
+    /// Optional F32 `[total_slots, phys_n]` receiving the rotated rows (what
+    /// `rotate_x_mq_batched` would store); `None` when no F32 consumer remains.
+    pub x_out: Option<&'a GpuTensor>,
+    pub m_total: usize,
+    pub block_m: usize,
+    pub logical_n: usize,
+    pub phys_n: usize,
+    /// Flat slots (`rows * top_k`): the sidecar's batch extent; a flat slot outside it is skipped.
+    pub total_slots: usize,
+    pub round_inputs: bool,
+    pub round_output: bool,
+    /// `[n_experts]` u64 ptr table -> `F32[phys_n]`, as [`FfnActivationGrouped::awq_table`].
+    pub awq_table: Option<&'a GpuTensor>,
+    pub n_experts: usize,
+}
+
+/// Operands of [`Gpu::ffn_activation_rows_rotate_i8_f32`]: [`FfnActivationRows`] (no per-expert
+/// AWQ) with the F32 activation rows replaced by the A8 sidecar of their rotation (and an optional
+/// F32 copy of the rotated rows).
+pub struct FfnActivationRowsI8<'a> {
+    pub activation: FfnActivation,
+    /// F32; element offset of row 0 col 0 and elements per row, as [`FfnActivationRows`].
+    pub gate: &'a GpuTensor,
+    pub gate_offset: usize,
+    pub gate_ld: usize,
+    pub up: &'a GpuTensor,
+    pub up_offset: usize,
+    pub up_ld: usize,
+    /// Optional F32 `[rows, phys_n]` receiving the rotated rows; `None` when no F32 consumer
+    /// remains.
+    pub x_out: Option<&'a GpuTensor>,
+    pub rows: usize,
+    pub logical_n: usize,
+    pub phys_n: usize,
+    pub round_inputs: bool,
+    pub round_output: bool,
+    /// One F32 `[phys_n]` AWQ divide shared by every row ([`FfnAwq::Vector`]); `None` = no divide.
+    pub awq: Option<&'a GpuTensor>,
 }
 
 pub struct MoeRouterTopK<'a> {
@@ -312,6 +365,22 @@ fn grouped_entry(act: FfnActivation) -> &'static str {
         FfnActivation::SwiGlu => "ffn_swiglu_grouped_f32",
         FfnActivation::SwiGluClamp { .. } => "ffn_swiglu_clamp_grouped_f32",
         FfnActivation::Situ { .. } => "ffn_situ_grouped_f32",
+    }
+}
+
+fn grouped_rotate_i8_entry(act: FfnActivation) -> &'static str {
+    match act {
+        FfnActivation::SwiGlu => "ffn_swiglu_grouped_rotate_i8_gfx1201",
+        FfnActivation::SwiGluClamp { .. } => "ffn_swiglu_clamp_grouped_rotate_i8_gfx1201",
+        FfnActivation::Situ { .. } => "ffn_situ_grouped_rotate_i8_gfx1201",
+    }
+}
+
+fn rows_rotate_i8_entry(act: FfnActivation) -> &'static str {
+    match act {
+        FfnActivation::SwiGlu => "ffn_swiglu_rows_rotate_i8_gfx1201",
+        FfnActivation::SwiGluClamp { .. } => "ffn_swiglu_clamp_rows_rotate_i8_gfx1201",
+        FfnActivation::Situ { .. } => "ffn_situ_rows_rotate_i8_gfx1201",
     }
 }
 
@@ -574,6 +643,341 @@ impl Gpu {
                 b
             },
         )
+    }
+
+    /// Grouped gate/up activation + FWHT rotation + A8 `block_i8_128` quantization in one launch
+    /// (`ffn_grouped_activation_rotate_i8.gfx1201.hip`), exact gfx1201 only.
+    ///
+    /// The blocks written into `reservation` are byte-identical to
+    /// [`Self::ffn_activation_grouped_f32`] into an F32 `[total_slots, phys_n]` tensor, then
+    /// [`Self::rotate_x_mq_batched`], then [`Self::ensure_int8_mmq_x`] (`k = phys_n`,
+    /// `n = total_slots`); `x_out = Some` additionally stores the rotated F32 rows the middle step
+    /// leaves. Seals `reservation` after a successful launch; allocates nothing and never calls
+    /// `ensure_int8_mmq_x`. Every `total_slots` row must be named by exactly one
+    /// `sorted_slot_index` entry (the MoE scatter's permutation); an unnamed row's blocks are not
+    /// written. Refusals (named, nothing launched): another arch, `logical_n % 8 != 0`,
+    /// `phys_n % 256 != 0`, `logical_n > phys_n`, a reservation not `(phys_n, total_slots)`.
+    pub fn ffn_activation_grouped_rotate_i8_f32(
+        &mut self,
+        a: &FfnActivationGroupedI8<'_>,
+        reservation: crate::scratch::Int8MmqReservation,
+    ) -> HipResult<crate::scratch::Int8MmqPrepared> {
+        self.bind_thread()?;
+        const WHAT: &str = "ffn_activation_grouped_rotate_i8_f32";
+        if self.arch != "gfx1201" {
+            return Err(refuse(
+                "ffn_activation_grouped_rotate_i8_f32: exact gfx1201 only",
+            ));
+        }
+        let (p0, p1) = activation_params(a.activation)?;
+        if a.block_m == 0 {
+            return Err(refuse(
+                "ffn_activation_grouped_rotate_i8_f32: block_m must be > 0",
+            ));
+        }
+        if a.logical_n == 0 || a.logical_n % 8 != 0 || a.logical_n > a.phys_n || a.phys_n % 256 != 0
+        {
+            return Err(refuse(
+                "ffn_activation_grouped_rotate_i8_f32: needs 0 < logical_n <= phys_n, \
+                 logical_n % 8 == 0 and phys_n % 256 == 0",
+            ));
+        }
+        if reservation.k() != a.phys_n || reservation.n() != a.total_slots {
+            return Err(refuse(
+                "ffn_activation_grouped_rotate_i8_f32: reservation (k,n) mismatch",
+            ));
+        }
+        if a.m_total == 0 || a.total_slots == 0 {
+            return Err(refuse(
+                "ffn_activation_grouped_rotate_i8_f32: m_total and total_slots must be > 0",
+            ));
+        }
+        let groups = a.phys_n / 256;
+        let blocks = mul(a.m_total, groups, WHAT)?;
+        if blocks > u32::MAX as usize {
+            return Err(refuse(
+                "ffn_activation_grouped_rotate_i8_f32: grid exceeds u32::MAX blocks",
+            ));
+        }
+        let m_total_i = as_i32(a.m_total, "ffn_activation_grouped_rotate_i8_f32 m_total")?;
+        let block_m_i = as_i32(a.block_m, "ffn_activation_grouped_rotate_i8_f32 block_m")?;
+        let logical_i = as_i32(
+            a.logical_n,
+            "ffn_activation_grouped_rotate_i8_f32 logical_n",
+        )?;
+        let phys_i = as_i32(a.phys_n, "ffn_activation_grouped_rotate_i8_f32 phys_n")?;
+        let total_slots_i = as_i32(
+            a.total_slots,
+            "ffn_activation_grouped_rotate_i8_f32 total_slots",
+        )?;
+        require_f32(
+            a.y_grouped,
+            "ffn_activation_grouped_rotate_i8_f32 y_grouped",
+        )?;
+        require_words(
+            a.y_grouped,
+            mul(a.m_total, mul(a.logical_n, 2, WHAT)?, WHAT)?,
+            "ffn_activation_grouped_rotate_i8_f32 y_grouped extent",
+        )?;
+        require_words(
+            a.sorted_slot_index,
+            a.m_total,
+            "ffn_activation_grouped_rotate_i8_f32 sorted_slot_index extent",
+        )?;
+        if let Some(x) = a.x_out {
+            require_f32(x, "ffn_activation_grouped_rotate_i8_f32 x_out")?;
+            require_words(
+                x,
+                mul(a.total_slots, a.phys_n, WHAT)?,
+                "ffn_activation_grouped_rotate_i8_f32 x_out extent",
+            )?;
+        }
+        let (table_ptr, n_experts_i) = match a.awq_table {
+            None => (std::ptr::null_mut::<c_void>(), 0i32),
+            Some(t) => {
+                if a.n_experts == 0 {
+                    return Err(refuse(
+                        "ffn_activation_grouped_rotate_i8_f32: awq_table needs n_experts > 0",
+                    ));
+                }
+                let ne = as_i32(
+                    a.n_experts,
+                    "ffn_activation_grouped_rotate_i8_f32 n_experts",
+                )?;
+                require_words(
+                    t,
+                    mul(a.n_experts, 2, WHAT)?,
+                    "ffn_activation_grouped_rotate_i8_f32 awq pointer table extent",
+                )?;
+                require_words(
+                    a.expert_tile_ids,
+                    a.m_total.div_ceil(a.block_m),
+                    "ffn_activation_grouped_rotate_i8_f32 expert_tile_ids extent",
+                )?;
+                (t.buf.as_ptr(), ne)
+            }
+        };
+
+        self.ensure_mq_signs()?;
+        let entry = grouped_rotate_i8_entry(a.activation);
+        self.ensure_kernel(GROUPED_ROTATE_I8_MODULE, GROUPED_ROTATE_I8_SRC, entry)?;
+        let yp = a.y_grouped.buf.as_ptr();
+        let sp = a.sorted_slot_index.buf.as_ptr();
+        let tp = a.expert_tile_ids.buf.as_ptr();
+        let xo = a
+            .x_out
+            .map_or(std::ptr::null_mut::<c_void>(), |t| t.buf.as_ptr());
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let i8p = reservation.ptr();
+        let ri = a.round_inputs as i32;
+        let ro = a.round_output as i32;
+        let mut params = [
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &table_ptr as *const _ as *mut c_void,
+            &xo as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &i8p as *const _ as *mut c_void,
+            &m_total_i as *const _ as *mut c_void,
+            &block_m_i as *const _ as *mut c_void,
+            &logical_i as *const _ as *mut c_void,
+            &phys_i as *const _ as *mut c_void,
+            &n_experts_i as *const _ as *mut c_void,
+            &total_slots_i as *const _ as *mut c_void,
+            &ri as *const _ as *mut c_void,
+            &ro as *const _ as *mut c_void,
+            &p0 as *const _ as *mut c_void,
+            &p1 as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            entry,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(table_ptr);
+                b.push_ptr(xo);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(i8p);
+                b.push_i32(m_total_i);
+                b.push_i32(block_m_i);
+                b.push_i32(logical_i);
+                b.push_i32(phys_i);
+                b.push_i32(n_experts_i);
+                b.push_i32(total_slots_i);
+                b.push_i32(ri);
+                b.push_i32(ro);
+                b.push_f32(p0);
+                b.push_f32(p1);
+                b
+            },
+        );
+        if !xo.is_null() {
+            self.invalidate_x_caches_for(xo);
+        }
+        result?;
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
+    }
+
+    /// Dense-rows gate/up activation + FWHT rotation + A8 `block_i8_128` quantization in one launch
+    /// (the rows entries of `ffn_grouped_activation_rotate_i8.gfx1201.hip`), exact gfx1201 only.
+    ///
+    /// Byte-identical to [`Self::ffn_activation_rows_f32`] (`FfnAwq::None` / `FfnAwq::Vector`) into
+    /// an F32 `[rows, phys_n]` tensor, then [`Self::rotate_x_mq_batched`], then
+    /// [`Self::ensure_int8_mmq_x`] (`k = phys_n`, `n = rows`); `x_out = Some` additionally stores
+    /// the rotated F32 rows. Seals `reservation`; allocates nothing. Refusals (named, nothing
+    /// launched): another arch, `logical_n % 8 != 0`, `phys_n % 256 != 0`, `logical_n > phys_n`,
+    /// `gate_ld` / `up_ld` / offsets not multiples of 4, a reservation not `(phys_n, rows)`.
+    pub fn ffn_activation_rows_rotate_i8_f32(
+        &mut self,
+        a: &FfnActivationRowsI8<'_>,
+        reservation: crate::scratch::Int8MmqReservation,
+    ) -> HipResult<crate::scratch::Int8MmqPrepared> {
+        self.bind_thread()?;
+        const WHAT: &str = "ffn_activation_rows_rotate_i8_f32";
+        if self.arch != "gfx1201" {
+            return Err(refuse(
+                "ffn_activation_rows_rotate_i8_f32: exact gfx1201 only",
+            ));
+        }
+        let (p0, p1) = activation_params(a.activation)?;
+        if a.logical_n == 0 || a.logical_n % 8 != 0 || a.logical_n > a.phys_n || a.phys_n % 256 != 0
+        {
+            return Err(refuse(
+                "ffn_activation_rows_rotate_i8_f32: needs 0 < logical_n <= phys_n, \
+                 logical_n % 8 == 0 and phys_n % 256 == 0",
+            ));
+        }
+        if a.gate_ld % 4 != 0 || a.up_ld % 4 != 0 || a.gate_offset % 4 != 0 || a.up_offset % 4 != 0
+        {
+            return Err(refuse(
+                "ffn_activation_rows_rotate_i8_f32: gate/up ld and offset must be multiples of 4",
+            ));
+        }
+        if a.rows == 0 {
+            return Err(refuse(
+                "ffn_activation_rows_rotate_i8_f32: rows must be > 0",
+            ));
+        }
+        if reservation.k() != a.phys_n || reservation.n() != a.rows {
+            return Err(refuse(
+                "ffn_activation_rows_rotate_i8_f32: reservation (k,n) mismatch",
+            ));
+        }
+        let blocks = mul(a.rows, a.phys_n / 256, WHAT)?;
+        if blocks > u32::MAX as usize {
+            return Err(refuse(
+                "ffn_activation_rows_rotate_i8_f32: grid exceeds u32::MAX blocks",
+            ));
+        }
+        let rows_i = as_i32(a.rows, "ffn_activation_rows_rotate_i8_f32 rows")?;
+        let logical_i = as_i32(a.logical_n, "ffn_activation_rows_rotate_i8_f32 logical_n")?;
+        let phys_i = as_i32(a.phys_n, "ffn_activation_rows_rotate_i8_f32 phys_n")?;
+        let gate_ld_i = as_i32(a.gate_ld, "ffn_activation_rows_rotate_i8_f32 gate_ld")?;
+        let up_ld_i = as_i32(a.up_ld, "ffn_activation_rows_rotate_i8_f32 up_ld")?;
+        require_f32(a.gate, "ffn_activation_rows_rotate_i8_f32 gate")?;
+        require_f32(a.up, "ffn_activation_rows_rotate_i8_f32 up")?;
+        let g = strided_extent(a.gate_offset, a.gate_ld, a.rows, a.logical_n, WHAT)?;
+        require_words(a.gate, g, "ffn_activation_rows_rotate_i8_f32 gate extent")?;
+        let u = strided_extent(a.up_offset, a.up_ld, a.rows, a.logical_n, WHAT)?;
+        require_words(a.up, u, "ffn_activation_rows_rotate_i8_f32 up extent")?;
+        if let Some(x) = a.x_out {
+            require_f32(x, "ffn_activation_rows_rotate_i8_f32 x_out")?;
+            require_words(
+                x,
+                mul(a.rows, a.phys_n, WHAT)?,
+                "ffn_activation_rows_rotate_i8_f32 x_out extent",
+            )?;
+        }
+        let awq_ptr = match a.awq {
+            None => std::ptr::null_mut::<c_void>(),
+            Some(v) => {
+                require_f32(v, "ffn_activation_rows_rotate_i8_f32 awq vector")?;
+                require_words(
+                    v,
+                    a.phys_n,
+                    "ffn_activation_rows_rotate_i8_f32 awq vector extent",
+                )?;
+                v.buf.as_ptr()
+            }
+        };
+
+        self.ensure_mq_signs()?;
+        let entry = rows_rotate_i8_entry(a.activation);
+        self.ensure_kernel(GROUPED_ROTATE_I8_MODULE, GROUPED_ROTATE_I8_SRC, entry)?;
+        let gp = offset_ptr(a.gate, a.gate_offset);
+        let up = offset_ptr(a.up, a.up_offset);
+        let xo = a
+            .x_out
+            .map_or(std::ptr::null_mut::<c_void>(), |t| t.buf.as_ptr());
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let i8p = reservation.ptr();
+        let ri = a.round_inputs as i32;
+        let ro = a.round_output as i32;
+        let mut params = [
+            &gp as *const _ as *mut c_void,
+            &up as *const _ as *mut c_void,
+            &xo as *const _ as *mut c_void,
+            &awq_ptr as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &i8p as *const _ as *mut c_void,
+            &rows_i as *const _ as *mut c_void,
+            &logical_i as *const _ as *mut c_void,
+            &phys_i as *const _ as *mut c_void,
+            &gate_ld_i as *const _ as *mut c_void,
+            &up_ld_i as *const _ as *mut c_void,
+            &ri as *const _ as *mut c_void,
+            &ro as *const _ as *mut c_void,
+            &p0 as *const _ as *mut c_void,
+            &p1 as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            entry,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_ptr(xo);
+                b.push_ptr(awq_ptr);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(i8p);
+                b.push_i32(rows_i);
+                b.push_i32(logical_i);
+                b.push_i32(phys_i);
+                b.push_i32(gate_ld_i);
+                b.push_i32(up_ld_i);
+                b.push_i32(ri);
+                b.push_i32(ro);
+                b.push_f32(p0);
+                b.push_f32(p1);
+                b
+            },
+        );
+        if !xo.is_null() {
+            self.invalidate_x_caches_for(xo);
+        }
+        result?;
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// Router top-k with renormalised weights (`ffn_router_renorm.hip`): one

@@ -5776,6 +5776,23 @@ pub const MQ_ROTATE_X_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i8_gfx11\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+/// gfx1201 MoE / gated-FFN down producer of the A8 route (`Gpu::ffn_activation_grouped_rotate_i8_f32`,
+/// entries `ffn_{swiglu,swiglu_clamp,situ}_grouped_rotate_i8_gfx1201`; `Gpu::ffn_activation_rows_rotate_i8_f32`,
+/// entries `ffn_{swiglu,swiglu_clamp,situ}_rows_rotate_i8_gfx1201`): the gate/up activation
+/// (`ffn_grouped_activation_pad.hip`, concatenated whole so the element expression is
+/// the standalone kernel's own), the FWHT rotation (`mq_fwht256.h`) and the `block_i8_128`
+/// register emit in one launch. Blocks are byte-identical to the activation +
+/// `mq_rotate_x_batched` + `ensure_int8_mmq_x` chain. Grid `[m_total * (phys_n / 256), 1, 1]`
+/// (`[rows * (phys_n / 256), 1, 1]` for the rows entries), block 32.
+pub const FFN_GROUPED_ACTIVATION_ROTATE_I8_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/ffn_grouped_activation_pad.hip"),
+    include_str!("../../../kernels/src/ffn_grouped_activation_rotate_i8.gfx1201.hip")
+);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =
@@ -7847,6 +7864,16 @@ pub const GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_batched_wide_exact.hip");
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
+/// Row-exact multi-row twins of the rows == 1 decode Q8_0 GEMV singletons
+/// (module names `gemv_q8_0_rows_exact` / `gemv_q8_0_wide_rows_exact`; one
+/// kernel per row count, `..._r1` .. `..._r16`). Row r of the output is
+/// bit-identical to the singleton's output for x row r:
+/// [`GEMV_Q8_0_ROWS_EXACT_SRC`] mirrors `gemv_q8_0` (K > 1536),
+/// [`GEMV_Q8_0_WIDE_ROWS_EXACT_SRC`] mirrors `gemv_q8_0_wide` (K <= 1536).
+pub const GEMV_Q8_0_ROWS_EXACT_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_rows_exact.hip");
+pub const GEMV_Q8_0_WIDE_ROWS_EXACT_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_wide_rows_exact.hip");
 /// Qwen4 siblings of `gemv_q8_0` (module `qwen4_gemv_q8_0`): the staged
 /// K=320/2560 and eight-wave split kernels with their few-row variants,
 /// BF16 -> Q8_0 requantization and the Q8_0 draft-head re-score.

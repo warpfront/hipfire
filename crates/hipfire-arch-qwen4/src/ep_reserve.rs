@@ -134,8 +134,6 @@ pub struct EpReserveFacts<'a> {
     /// Stage (S2) minimum rows; `None` when S2 is off. Must exceed the
     /// resident bank so every call that can stage uses the borrowed bank.
     pub s2_min_rows: Option<usize>,
-    /// Dynamic AR-lane staging requested.
-    pub lane_request: bool,
     /// Retained-body / capture replay requested.
     pub capture: bool,
     /// Invariant-prefill or routing overrides that can produce a wide Full-table call.
@@ -146,7 +144,6 @@ pub struct EpReserveFacts<'a> {
     pub npu: bool,
     pub dflash: bool,
     pub single_device_slowlink: bool,
-    pub continuous_batch: bool,
 }
 
 /// Pure phase-one admission. `Ok` only for discrete gfx1201 EP2, pinned
@@ -195,12 +192,6 @@ pub fn admit_ep_reserve(facts: &EpReserveFacts<'_>) -> Result<(), Refusal> {
     }
     if facts.single_device_slowlink {
         return no("a single-device slow-link prefill profile");
-    }
-    if facts.continuous_batch {
-        return no("continuous batching stages lanes");
-    }
-    if facts.lane_request {
-        return no("dynamic AR-lane staging is requested");
     }
     if facts.capture {
         return no("retained-body capture replay is requested");
@@ -1003,7 +994,6 @@ mod tests {
             whole_layer_placement: true,
             owner_routed_s1: true,
             s2_min_rows: Some(2048),
-            lane_request: false,
             capture: false,
             routing_override: false,
             pipeline_parallel: false,
@@ -1012,7 +1002,6 @@ mod tests {
             npu: false,
             dflash: false,
             single_device_slowlink: false,
-            continuous_batch: false,
         }
     }
 
@@ -1067,8 +1056,6 @@ mod tests {
             ("npu", Box::new(|f| f.npu = true)),
             ("dflash", Box::new(|f| f.dflash = true)),
             ("slowlink", Box::new(|f| f.single_device_slowlink = true)),
-            ("cb", Box::new(|f| f.continuous_batch = true)),
-            ("lanes", Box::new(|f| f.lane_request = true)),
             ("capture", Box::new(|f| f.capture = true)),
             ("routing", Box::new(|f| f.routing_override = true)),
             ("s2 rows", Box::new(|f| f.s2_min_rows = Some(512))),
@@ -1379,6 +1366,27 @@ mod tests {
         // Too few layers for the donors plus two S2 donors.
         let mut cap = capacity_for(8, 0);
         cap.min_resident_layers = 1;
+        assert!(plan_ep_reserve(&fwd, &g, &cap).is_err());
+    }
+
+    #[test]
+    fn a_lane_store_trades_whole_layers_and_the_lane_minimum_is_the_callers() {
+        let fwd = forward();
+        let g = geometry();
+        let layer = g.layer_bytes().unwrap();
+        // Two layers' worth of lane store leaves 31 where 33 fit, and 31 is
+        // refused only because the default minimum is 33: a lane load passes
+        // its own (strictly better than the ordinary lane placement).
+        let mut cap = capacity_for(33, 0);
+        cap.lane_bytes = 2 * layer;
+        assert!(plan_ep_reserve(&fwd, &g, &cap).is_err());
+        cap.min_resident_layers = 31;
+        let plan = plan_ep_reserve(&fwd, &g, &cap).unwrap();
+        assert_eq!(plan.resident_layers, 31);
+        // The plan's reserve is the census reserve alone: the lane store is
+        // a separate term every rank's own recompute never sees.
+        assert_eq!(plan.reserve_bytes, cap.reserve_bytes);
+        cap.min_resident_layers = 32;
         assert!(plan_ep_reserve(&fwd, &g, &cap).is_err());
     }
 

@@ -507,6 +507,27 @@ fn widened_route(wide_candidate: bool, limit: usize) -> bool {
     wide_candidate && limit > WIDENED_COMMIT_ROWS
 }
 
+/// Window during which a widened-PBS rung that really failed to allocate is
+/// not retried.
+const WIDENED_ALLOC_FAIL_MEMO: std::time::Duration = std::time::Duration::from_secs(60);
+
+static WIDENED_ALLOC_FAILED: std::sync::Mutex<Option<(usize, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Rows to try first: `rows`, narrowed below a rung that failed within the memo window.
+fn widened_alloc_clamp(rows: usize) -> usize {
+    match *WIDENED_ALLOC_FAILED.lock().unwrap() {
+        Some((failed, at)) if at.elapsed() < WIDENED_ALLOC_FAIL_MEMO && rows >= failed => {
+            (failed / 2).max(WIDENED_COMMIT_ROWS)
+        }
+        _ => rows,
+    }
+}
+
+fn widened_alloc_failed(rows: usize) {
+    *WIDENED_ALLOC_FAILED.lock().unwrap() = Some((rows, std::time::Instant::now()));
+}
+
 /// Rows of the owned widened PBS for an `n`-token call under `limit`.
 fn widened_owned_rows(limit: usize, n: usize) -> usize {
     limit.min(n).max(MIN_BATCH)
@@ -1485,8 +1506,23 @@ fn ordinary_wrapper_pbs_prepare(
     }
     if plan.alloc_virtual {
         if let WrapperOwner::Virtual { rows, tape } = plan.owner {
-            let owner = PrefillBatchScratch::new_opt(gpu, config, rows, tape)?;
-            *scratch.reuse_virtual_pbs.borrow_mut() = Some(owner);
+            // The admission planned this owner from device capacity; the
+            // allocation is the real check. Only a real failure keeps the
+            // incumbent implicit cache and ceiling.
+            match PrefillBatchScratch::new_opt(gpu, config, rows, tape) {
+                Ok(owner) => *scratch.reuse_virtual_pbs.borrow_mut() = Some(owner),
+                Err(e) => {
+                    eprintln!(
+                        "prefill_chunk: allocating the {rows}-row virtual prefill owner failed ({e:?}); keeping the implicit cache and its ceiling"
+                    );
+                    return Ok(WrapperPbsPlan {
+                        owner: WrapperOwner::Physical,
+                        max_batch_override: None,
+                        free_virtual: false,
+                        alloc_virtual: false,
+                    });
+                }
+            }
         }
     }
     Ok(plan)
@@ -1788,7 +1824,7 @@ struct ResidentMoeMemoryFacts {
 
 fn resident_moe_memory_facts(gpu: &Gpu) -> ResidentMoeMemoryFacts {
     ResidentMoeMemoryFacts {
-        free_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
+        free_bytes: gpu.planned_capacity().ok().map(|cap| cap.bytes),
         live: live_projection_scratch(gpu),
         live_q16_bytes: gpu.scratch.fa2_q16_scratch_bytes,
     }
@@ -2336,8 +2372,8 @@ fn can_retain_widened_pbs(
             }
         }
     }
-    gpu.device_mem_info()
-        .is_ok_and(|(free, _)| free >= unmapped.saturating_add(minimum).saturating_add(128 << 20))
+    gpu.planned_capacity()
+        .is_ok_and(|cap| cap.bytes >= unmapped.saturating_add(minimum).saturating_add(128 << 20))
 }
 
 /// gfx1100 stays off the grow-only route on purpose: there, later pp8192
@@ -2378,7 +2414,7 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
                 .and_then(|minimum| growth.checked_add(minimum))
         })
         .and_then(|needed| needed.checked_add(128 << 20))
-        .is_some_and(|needed| gpu.device_mem_info().is_ok_and(|(free, _)| free >= needed));
+        .is_some_and(|needed| gpu.planned_capacity().is_ok_and(|cap| cap.bytes >= needed));
     if !keep {
         if let Some(old) = scratch.widened_prefill_batch.borrow_mut().take() {
             old.free_gpu(gpu)?;
@@ -2394,8 +2430,44 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
 /// owner needs no allocation, and a smaller owner is freed before replacement.
 /// The query follows model+KV mapping and request-state allocation.
 /// Falls back to 512 when no enlarged rung fits.
+/// Logs the planned-capacity chunk decision whenever it changes.
 #[allow(clippy::too_many_arguments)]
 fn memory_admitted_rung(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    kv_cache: &llama::KvCache,
+    perf_rows: usize,
+    lean: bool,
+    native_mq4: bool,
+    mq3: Mq3WideProjection,
+    cached: Option<&PrefillBatchScratch>,
+    free_deduction: usize,
+) -> HipResult<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LAST_LOGGED: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let rung = memory_admitted_rung_planned(
+        gpu,
+        config,
+        kv_cache,
+        perf_rows,
+        lean,
+        native_mq4,
+        mq3,
+        cached,
+        free_deduction,
+    )?;
+    if perf_rows > WIDENED_COMMIT_ROWS && LAST_LOGGED.swap(rung, Ordering::Relaxed) != rung {
+        if let Ok(cap) = gpu.planned_capacity() {
+            eprintln!(
+                "qwen35: admission decision: prefill chunk rows {rung} (perf ceiling {perf_rows}) from {cap}"
+            );
+        }
+    }
+    Ok(rung)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memory_admitted_rung_planned(
     gpu: &Gpu,
     config: &Qwen35Config,
     kv_cache: &llama::KvCache,
@@ -2423,7 +2495,10 @@ fn memory_admitted_rung(
     {
         return Ok(WIDENED_COMMIT_ROWS);
     }
-    let free_bytes = gpu.device_mem_info()?.0.saturating_sub(free_deduction);
+    // Planned capacity (total - own - reserve), not instantaneous free: a
+    // transient foreign allocation must not flip the chunk route.
+    let capacity = gpu.planned_capacity()?;
+    let free_bytes = capacity.bytes.saturating_sub(free_deduction);
     let q_dim = config.n_heads.checked_mul(config.head_dim).unwrap_or(0);
     // Only a selectable gfx11 whole-chunk FA2 route needs more than the
     // incumbent 512-row Q16 scratch. Charge each candidate rung separately.
@@ -2632,6 +2707,19 @@ fn ordinary_prefill_chunk_limit_with_cache(
     )
 }
 
+/// Logs the resident-MoE chunk decision and its planned-capacity input when it changes.
+fn log_resident_moe_decision(gpu: &Gpu, rows: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LAST: AtomicUsize = AtomicUsize::new(usize::MAX);
+    if LAST.swap(rows, Ordering::Relaxed) != rows {
+        if let Ok(cap) = gpu.planned_capacity() {
+            eprintln!(
+                "qwen35: admission decision: resident-MoE prefill chunk rows {rows} from {cap}"
+            );
+        }
+    }
+}
+
 /// [`ordinary_prefill_chunk_limit_with_cache`] over already gathered resident
 /// MoE static facts (the inner entry gathers them once for the whole call).
 #[allow(clippy::too_many_arguments)]
@@ -2651,7 +2739,7 @@ fn ordinary_prefill_chunk_limit_with_facts(
 ) -> HipResult<usize> {
     let legacy = prefill_max_batch_for_model(gpu, weights);
     let Some(perf) = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state) else {
-        return Ok(resident_moe_chunk_limit_from_facts(
+        let rows = resident_moe_chunk_limit_from_facts(
             moe,
             pbs.map(|p| p.max_batch),
             config,
@@ -2661,7 +2749,9 @@ fn ordinary_prefill_chunk_limit_with_facts(
             reuse_rows,
             free_deduction,
             legacy,
-        ));
+        );
+        log_resident_moe_decision(gpu, rows);
+        return Ok(rows);
     };
     if perf <= WIDENED_COMMIT_ROWS {
         return Ok(perf.min(legacy));
@@ -2741,9 +2831,65 @@ pub fn ordinary_serve_prefill_chunk_len(remaining: usize, ceiling: usize) -> Opt
 /// log. Emitted on the first chunked (multi-token) prefill of the process and
 /// again whenever the admitted ceiling changes, so a later memory-admission
 /// fallback is visible in the log.
-fn emit_prefill_chunk_receipt(requested: usize, admitted: usize, commit_stride: Option<usize>) {
+fn emit_prefill_chunk_receipt(
+    requested: usize,
+    admitted: usize,
+    commit_stride: Option<usize>,
+    downgrade: Option<&str>,
+) {
     static LAST_ADMITTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    emit_prefill_chunk_receipt_guarded(&LAST_ADMITTED, requested, admitted, commit_stride);
+    if emit_prefill_chunk_receipt_guarded(&LAST_ADMITTED, requested, admitted, commit_stride) {
+        if let Some(reason) = downgrade {
+            // An explicit knob that cannot be honored is a WARNING; a default
+            // ceiling narrowed by a smaller caller scratch is a plain note.
+            let level = if explicit_prefill_max_batch().is_some() {
+                "WARNING"
+            } else {
+                "note"
+            };
+            eprintln!("prefill_chunk: {level} {reason}");
+        }
+    }
+}
+
+/// The receipt of the chunk the ordinary loop really executes, plus a named
+/// reason when that is below the planned ceiling. `chunk_batch` is the value
+/// the loop chunks with ([`prefill_effective_chunk_batch`]); the planned
+/// ceiling can exceed it when the PBS staging owner (e.g. the exact-gfx1201
+/// implicit `HIPFIRE_PREFILL_REUSE_PBS=1` cache, capped at 512 rows) or the
+/// hidden ring is smaller, so an explicit `HIPFIRE_PREFILL_MAX_BATCH` it cannot
+/// honor is reported as downgraded rather than silently ignored.
+fn executed_chunk_receipt(
+    planned: PrefillChunkReceipt,
+    chunk_batch: usize,
+    n: usize,
+    pbs_max_batch: usize,
+    ring_cap: Option<usize>,
+) -> (PrefillChunkReceipt, Option<String>) {
+    // A call shorter than the ceiling executes `n`-row chunks by construction;
+    // that is the planned ceiling being honored, not a downgrade.
+    if chunk_batch >= planned.admitted.min(n) {
+        return (planned, None);
+    }
+    let executed = PrefillChunkReceipt {
+        admitted: chunk_batch,
+        ..planned
+    };
+    let cause = if pbs_max_batch < planned.admitted {
+        format!("the prefill batch scratch (PBS) holds only {pbs_max_batch} rows")
+    } else {
+        format!(
+            "the hidden-state ring stages only {} rows",
+            ring_cap.unwrap_or(chunk_batch)
+        )
+    };
+    (
+        executed,
+        Some(format!(
+            "requested {} rows (admitted ceiling {}) cannot be honored: {cause}; executing {chunk_batch}-row chunks",
+            planned.requested, planned.admitted
+        )),
+    )
 }
 
 /// [`emit_prefill_chunk_receipt`] with the changed-admission guard injected,
@@ -3737,11 +3883,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         },
     )?;
     let limit = plan.limit;
-    emit_prefill_chunk_receipt(
-        plan.receipt.requested,
-        plan.receipt.admitted,
-        plan.receipt.commit_stride,
-    );
     // Allocate the batch scratch once per call (or reuse a caller-owned one).
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains
     // ownership across DFlash cycles to avoid ~25 per-cycle tensor alloc/free
@@ -3784,11 +3925,35 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     if let Some(old) = cached.take() {
                         let _ = old.free_gpu(gpu);
                     }
-                    *cached = Some(if lean {
-                        PrefillBatchScratch::new_opt_lean(gpu, config, owned_rows)?
-                    } else {
-                        PrefillBatchScratch::new_opt(gpu, config, owned_rows, false)?
-                    });
+                    // Admission plans from device capacity; the allocation is
+                    // the real check. Step down a rung only when it really
+                    // fails (a foreign allocation that leaves room never
+                    // narrows the route); the receipt below reports the rows
+                    // actually allocated.
+                    // A rung that really failed is not retried for a short
+                    // window (no alloc/free thrash per request while memory is
+                    // genuinely short); the next window re-tries the planned rung.
+                    let mut rows = widened_alloc_clamp(owned_rows);
+                    let built = loop {
+                        let attempt = if lean {
+                            PrefillBatchScratch::new_opt_lean(gpu, config, rows)
+                        } else {
+                            PrefillBatchScratch::new_opt(gpu, config, rows, false)
+                        };
+                        match attempt {
+                            Ok(p) => break p,
+                            Err(e) if rows > WIDENED_COMMIT_ROWS => {
+                                let next = (rows / 2).max(WIDENED_COMMIT_ROWS);
+                                eprintln!(
+                                    "prefill_chunk: allocating the {rows}-row prefill scratch failed ({e:?}); retrying with {next} rows"
+                                );
+                                widened_alloc_failed(rows);
+                                rows = next;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    *cached = Some(built);
                 }
                 own_pbs = cached.take();
                 widened_from_cache = true;
@@ -3811,16 +3976,23 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         // A ring seed chunks exactly as AR does; chunks wider than staging
         // land straight in the ring, so the ring (not its staging) bounds
         // them. Every other ring caller stays capped at staging.
-        let chunk_batch = prefill_effective_chunk_batch(
-            limit,
-            pbs.max_batch,
-            hidden_rb.as_ref().map(|rb| {
-                if ring_seed {
-                    rb.max_positions.max(rb.max_batch)
-                } else {
-                    rb.max_batch
-                }
-            }),
+        let ring_cap = hidden_rb.as_ref().map(|rb| {
+            if ring_seed {
+                rb.max_positions.max(rb.max_batch)
+            } else {
+                rb.max_batch
+            }
+        });
+        let chunk_batch = prefill_effective_chunk_batch(limit, pbs.max_batch, ring_cap);
+        // The receipt names the chunk the loop below actually executes
+        // (`chunk_batch`), never the planned ceiling or the request.
+        let (executed, downgrade) =
+            executed_chunk_receipt(plan.receipt, chunk_batch, n, pbs.max_batch, ring_cap);
+        emit_prefill_chunk_receipt(
+            executed.requested,
+            executed.admitted,
+            executed.commit_stride,
+            downgrade.as_deref(),
         );
         // F2 pair envelope, loop-invariant half: ordinary sequential prefill
         // with FA layers batch-admissible, no tree/tape/max_layer machinery,
@@ -7619,6 +7791,51 @@ pub(crate) fn forward_batch_chunk_impl(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_override_receipt_is_the_physical_chunk() {
+        // gfx1201 + HIPFIRE_PREFILL_MAX_BATCH=8192 + HIPFIRE_PREFILL_REUSE_PBS=1: the implicit
+        // cache is 512 rows, so the loop executes 512-row chunks. The receipt used to say 8192.
+        let (pbs_rows, _) = implicit_reuse_pbs_plan("gfx1201", Some(8192), true);
+        assert_eq!(pbs_rows, 512);
+        for n in [4096usize, 16384, 513, 100] {
+            let planned = PrefillChunkReceipt {
+                requested: 8192,
+                admitted: 8192,
+                commit_stride: None,
+            };
+            let chunk_batch = prefill_effective_chunk_batch(8192, pbs_rows, None);
+            let (receipt, reason) = executed_chunk_receipt(planned, chunk_batch, n, pbs_rows, None);
+            // Physical: replay the production chunk loop.
+            let mut max_chunk = 0usize;
+            let mut at = 0usize;
+            while at < n {
+                let c = next_ordinary_chunk_len(false, false, n - at, chunk_batch).unwrap();
+                max_chunk = max_chunk.max(c);
+                at += c;
+            }
+            if n > 512 {
+                assert!(
+                    max_chunk <= receipt.admitted,
+                    "n={n}: physical {max_chunk} exceeds logged"
+                );
+                if n >= 4096 {
+                    assert_eq!(receipt.admitted, max_chunk, "n={n}: logged != physical");
+                }
+                assert_eq!(receipt.admitted, 512);
+                let r = reason.expect("downgrade must be named");
+                assert!(
+                    r.contains("8192") && r.contains("512") && r.contains("scratch"),
+                    "{r}"
+                );
+                assert!(format!("{receipt}").contains("admitted=512"));
+            } else {
+                // Short call: n-row chunk, the planned ceiling is not downgraded.
+                assert!(reason.is_none());
+                assert!(max_chunk <= receipt.admitted);
+            }
+        }
+    }
+
     use super::super::forward::unsupported_mq3_experts_uniform_from_dtypes;
     use super::super::weights::DeltaNetStatePlan;
     use super::*;
@@ -10526,6 +10743,14 @@ mod tests {
         assert_eq!(WIDENED_VRAM_HEADROOM_BYTES, 1 << 30);
         assert!(resident_moe_rung_fits(&fit(need, 0, 0)));
         assert!(!resident_moe_rung_fits(&fit(need - 1, 0, 0)));
+        // A transient foreign allocation (free -> need-1) used to flip the route;
+        // planned capacity is independent of the instantaneous free figure.
+        let total = need + (30usize << 30);
+        let planned = |free_now: usize| {
+            rdna_compute::PlannedCapacity::new(free_now, total, 4usize << 30, true).bytes
+        };
+        assert_eq!(planned(total), planned(need - 1));
+        assert!(resident_moe_rung_fits(&fit(planned(need - 1), 0, 0)));
         // Pending allocations are deducted from free bytes (saturating).
         assert!(resident_moe_rung_fits(&fit(need + 4096, 4096, 0)));
         assert!(!resident_moe_rung_fits(&fit(need + 4096, 4097, 0)));

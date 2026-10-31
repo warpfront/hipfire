@@ -798,6 +798,13 @@ pub struct HipRuntime {
     /// `set_launch_grid_limit_for_arch`. A standalone `HipRuntime` that nobody
     /// configures is unguarded.
     launch_grid_yz_limit: AtomicU32,
+    /// Device bytes this runtime has allocated and not yet freed (hipMalloc +
+    /// fine-grained + VMM physical handles). The process's own footprint, so
+    /// admission can plan from `total - own - reserve` instead of the
+    /// instantaneous (foreign-allocation-sensitive) free figure.
+    own_device_bytes: AtomicUsize,
+    /// VMM physical handle -> size, so `mem_release` can debit the ledger.
+    own_vmm_handles: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
     /// Per-device cache of `hipDeviceAttributeCanUseStreamWaitValue`.
     stream_wait_caps: [AtomicU8; STREAM_WAIT_CAP_SLOTS],
     /// Plan-mode tape (railgun design A authoring); idle unless a plan is active.
@@ -1687,6 +1694,8 @@ impl HipRuntime {
             },
             _lib: Arc::new(lib),
             launch_grid_yz_limit: AtomicU32::new(u32::MAX),
+            own_device_bytes: AtomicUsize::new(0),
+            own_vmm_handles: Default::default(),
             stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(STREAM_WAIT_CAP_UNKNOWN)),
             plan: PlanGate::default(),
             #[cfg(feature = "kernel-timing")]
@@ -2116,6 +2125,7 @@ impl HipRuntime {
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
         crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Malloc);
+        self.own_device_bytes.fetch_add(size, Ordering::Relaxed);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -2182,6 +2192,7 @@ impl HipRuntime {
             size,
             crate::registry::AllocationKind::FineGrained,
         );
+        self.own_device_bytes.fetch_add(size, Ordering::Relaxed);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -2225,14 +2236,25 @@ impl HipRuntime {
         // Emu charge (None when off): released only if hipFree succeeds; a
         // failed free drops the token without releasing, keeping the charge.
         let token = buf.take_charge();
+        let size = buf.size;
         crate::emu_budget::charged_free::<crate::emu_budget::Process>(token, || {
             // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
             // caller must ensure GPU work on it is quiesced (documented on free).
             let code = unsafe { (self.fn_free)(buf.ptr) };
             self.check(code, "hipFree")?;
             crate::registry::forget(buf.ptr as usize);
+            self.own_device_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(size))
+                })
+                .ok();
             Ok(())
         })
+    }
+
+    /// Device bytes this runtime currently owns (see `own_device_bytes`).
+    pub fn own_device_bytes(&self) -> usize {
+        self.own_device_bytes.load(Ordering::Relaxed)
     }
 
     /// Allocate host-pinned memory the GPU can read directly over PCIe.
@@ -2504,6 +2526,23 @@ impl HipRuntime {
         size: usize,
         prop: &HipMemAllocationProp,
     ) -> HipResult<HipMemGenericAllocationHandle> {
+        let handle = self.mem_create_inner(size, prop)?;
+        // Only device-placed backing counts against device capacity.
+        if prop.location.type_ == HIP_MEM_LOCATION_TYPE_DEVICE {
+            self.own_vmm_handles
+                .lock()
+                .unwrap()
+                .insert(handle as usize, size);
+            self.own_device_bytes.fetch_add(size, Ordering::Relaxed);
+        }
+        Ok(handle)
+    }
+
+    fn mem_create_inner(
+        &self,
+        size: usize,
+        prop: &HipMemAllocationProp,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
         self.plan_deny("hipMemCreate")?;
         let func = self.missing_vmm_symbol("hipMemCreate", self.fn_mem_create)?;
         let raw = || {
@@ -2586,6 +2625,24 @@ impl HipRuntime {
     /// `handle` must be live, owned by the caller, and no mapped range may
     /// still reference it.
     pub unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.mem_release_inner(handle) }?;
+        if let Some(size) = self
+            .own_vmm_handles
+            .lock()
+            .unwrap()
+            .remove(&(handle as usize))
+        {
+            self.own_device_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(size))
+                })
+                .ok();
+        }
+        Ok(())
+    }
+
+    unsafe fn mem_release_inner(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
         self.plan_deny("hipMemRelease")?;
         let func = self.missing_vmm_symbol("hipMemRelease", self.fn_mem_release)?;
         let raw = || {

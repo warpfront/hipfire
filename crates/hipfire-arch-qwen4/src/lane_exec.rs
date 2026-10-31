@@ -1100,42 +1100,56 @@ fn run_prefill_tiles(
     let n_prefill = tiles.len();
     // (prefill ordinal, plan row of its pick) of AR-lane completing tiles.
     let mut final_tiles: Vec<(usize, usize)> = Vec::new();
-    for (i, (r, lane)) in tiles.iter().zip(lanes.iter_mut()).enumerate() {
-        let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
-        let completes = wants_pick(&lane.host, r);
-        if lane.spec.is_some() {
-            let scratch = append.as_deref_mut().and_then(Option::as_mut);
-            let pick = prefill_tile(bundle, gpu, &mut **lane, tokens, scratch, sample_host)?;
-            if completes {
-                picks[r.rows.end() - 1] =
-                    pick.ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
+    // A step's prefill tiles are one whole-prompt entry: on an EP
+    // reserve-sharing load the donors are borrowed by every tile of more than
+    // the resident rows and restored ONCE when the entry ends (the decode rows
+    // of this step already ran, and the next step's decode rows need them
+    // restored), not once per tile. A no-op on every other load.
+    bundle.share_prompt_begin();
+    let tiles_ran: Result<(), String> = (|| {
+        for (i, (r, lane)) in tiles.iter().zip(lanes.iter_mut()).enumerate() {
+            let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
+            let completes = wants_pick(&lane.host, r);
+            if lane.spec.is_some() {
+                let scratch = append.as_deref_mut().and_then(Option::as_mut);
+                let pick = prefill_tile(bundle, gpu, &mut **lane, tokens, scratch, sample_host)?;
+                if completes {
+                    picks[r.rows.end() - 1] = pick
+                        .ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
+                }
+            } else if completes {
+                let row = logits.sub_offset((rows_cap + i) * vocab, vocab);
+                bundle
+                    .lane_prefill_tile(gpu, &mut lane.state, tokens, Some(&row))
+                    .map_err(|e| e.to_string())?;
+                let slot = top1.sub_offset(
+                    (rows_cap + i) * std::mem::size_of::<i32>(),
+                    std::mem::size_of::<i32>(),
+                );
+                argmax_f32(
+                    gpu,
+                    &ArgmaxF32 {
+                        logits: &row,
+                        indices: &slot,
+                        rows: 1,
+                        vocab,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                final_tiles.push((i, r.rows.end() - 1));
+            } else {
+                bundle
+                    .lane_prefill_tile(gpu, &mut lane.state, tokens, None)
+                    .map_err(|e| e.to_string())?;
             }
-        } else if completes {
-            let row = logits.sub_offset((rows_cap + i) * vocab, vocab);
-            bundle
-                .lane_prefill_tile(gpu, &mut lane.state, tokens, Some(&row))
-                .map_err(|e| e.to_string())?;
-            let slot = top1.sub_offset(
-                (rows_cap + i) * std::mem::size_of::<i32>(),
-                std::mem::size_of::<i32>(),
-            );
-            argmax_f32(
-                gpu,
-                &ArgmaxF32 {
-                    logits: &row,
-                    indices: &slot,
-                    rows: 1,
-                    vocab,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            final_tiles.push((i, r.rows.end() - 1));
-        } else {
-            bundle
-                .lane_prefill_tile(gpu, &mut lane.state, tokens, None)
-                .map_err(|e| e.to_string())?;
         }
-    }
+        Ok(())
+    })();
+    let ended = bundle
+        .share_prompt_end(gpu, tiles_ran.is_ok())
+        .map_err(|error| error.to_string());
+    tiles_ran?;
+    ended?;
     if !final_tiles.is_empty() {
         let used = (rows_cap + n_prefill) * std::mem::size_of::<i32>();
         gpu.hip

@@ -2925,7 +2925,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         "HIPFIRE_GFX12_PRODUCER_QUANT_FUSED",
-        "Fuse the int4 activation quantiser into the gfx1201 RMSNorm/rotate/gated-norm producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
+        "Fuse the activation quantiser into the gfx1201 producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out). IU4: emits block_i4_128 from the RMSNorm/rotate/gated-norm _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site. A8 (grouped MoE / gated-FFN down, W4A8 tier): one launch forms the SwiGLU/SiTU activation, casts, pads, divides by the AWQ scale, rotates and emits block_i8_128, replacing the activation + mq_rotate_x + quantize_int8_mmq_ds128 chain (the F32 activation/rotation planes are never written). Bit-identical."
     ),
     process_bool_field!(
         "kernel.g12_norm",

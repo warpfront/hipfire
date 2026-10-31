@@ -2174,11 +2174,20 @@ impl Qwen4Bundle {
         spec: Option<LaneSpecConfig>,
         copy: Option<LaneCopyConfig>,
     ) -> Result<(), BundleError> {
-        if self.ep_reserve_active() {
+        if spec.is_some() && self.ep_reserve_active() {
+            // AR lanes are admitted on a reserve-sharing load (lane decode
+            // steps run on the resident bank, lane prefill tiles borrow like
+            // a singleton prompt tile). The native-MTP window (draft rounds,
+            // verify block, head fill) is not bracketed that way, so a spec
+            // store is refused here with a label; the staging caller falls
+            // back to AR lanes. The loader never reserves a spec store under
+            // the decoupled reserve (`qwen4_ep_vram_layers`), so this fires
+            // only for a load that was not planned with MTP lanes.
             return Err(ep_err(
-                "lane staging is refused on an EP reserve-sharing load: lane steps and lane \
-                 prefill waves need the resident scratch bank and Full-table routes the borrowed \
-                 reserve does not provide",
+                "native-MTP lanes are refused on an EP reserve-sharing load: the mesh lane \
+                 protocol's draft/verify windows and head fill are not proven on the borrowed \
+                 reserve bank (AR lanes are admitted; load without `--spec mtp` or set \
+                 HIPFIRE_EP_MTP_LANES=0)",
             ));
         }
         if let Some(spec) = spec {
