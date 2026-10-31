@@ -112,7 +112,7 @@ if [[ $DRY != 1 && $MODE == shard ]]; then
     echo "model=$MODEL"; stat -c 'model size=%s mtime=%y inode=%i' "$MODEL"
     echo "kernel_cache=$KCACHE verified_home=$VHOME"; uname -r; uptime; free -g
   } > "$O/pre.txt" 2>&1
-  printf 'spec\trc\tstart\tend\twall_s\n' > "$O/summary.tsv"
+  printf 'spec\trc\tstart\tend\twall_s\tloadavg_start\tloadavg_end\n' > "$O/summary.tsv"
 fi
 T0=$(date +%s); worst=0
 for spec in "${specs[@]}"; do
@@ -131,13 +131,13 @@ for spec in "${specs[@]}"; do
   if [[ $DRY == 1 ]]; then printf 'timeout -k 15 <left> '; printf '%q ' "${cmd[@]}"; echo; continue; fi
   if (( left < 120 )); then echo "skip $spec: $left s left of the $BUDGET s budget" | tee -a "$O/logs/skipped.txt"; worst=1; continue; fi
   mkdir -p "$out"
-  s=$(date +%s); log=$O/logs/${arm}-L${lanes}-${range/../-}
+  s=$(date +%s); l0=$(cut -d' ' -f1-3 /proc/loadavg); log=$O/logs/${arm}-L${lanes}-${range/../-}
   setsid timeout -k 15 "$left" "${cmd[@]}" > "$log.out" 2> "$log.err" &
   PID=$!
   wait "$PID"; rc=$?
   PID=""
   e=$(date +%s)
-  printf '%s\t%s\t%s\t%s\t%s\n' "$spec" "$rc" "$(date -u -d @"$s" +%FT%TZ)" "$(date -u -d @"$e" +%FT%TZ)" "$((e - s))" >> "$O/summary.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$spec" "$rc" "$(date -u -d @"$s" +%FT%TZ)" "$(date -u -d @"$e" +%FT%TZ)" "$((e - s))" "$l0" "$(cut -d' ' -f1-3 /proc/loadavg)" >> "$O/summary.tsv"
   (( rc == 0 )) || worst=$rc
 done
 [[ $DRY == 1 ]] || echo "$worst" > "$O/rc.txt"
