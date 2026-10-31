@@ -7183,7 +7183,24 @@ fn gated_ffn_from_basis(
     w: &GroupedMoeShared<'_>,
     s: &GroupedMoeSharedScratch<'_>,
     out: &GpuTensor,
+    rows_exact: bool,
 ) -> Result<(), DispatchError> {
+    // Row-exact: every row equals the same row run alone as a `rows == 1` call.
+    // Q8_0 projections (the decode GEMV's weights) read once for all rows through
+    // `gemv_q8_0_rows_exact`; the activation, the rounding and the casts are
+    // per-element kernels whose per-row arithmetic does not read the row count.
+    // Any other weight dtype has no multi-row kernel with the decode reduction, so
+    // each row runs the single-row sequence.
+    let rows_exact = rows_exact && rows > 1;
+    if rows_exact
+        && ![&w.gate, &w.up, &w.down]
+            .iter()
+            .all(|p| p.dtype == DType::Q8_0)
+    {
+        return gated_ffn_per_row(
+            gpu, ctx, activation, cast, rows, hidden, mi, down_k, x, x_rot, w, s, out,
+        );
+    }
     static GEMM: std::sync::LazyLock<GemmFamily> = std::sync::LazyLock::new(GemmFamily::new);
     let gemm = &*GEMM;
     let (down_key, down_rotated) = projection_kind(w.down.dtype, "gated-ffn-down")?;
@@ -7253,6 +7270,9 @@ fn gated_ffn_from_basis(
                     ptr, &v.tiles, &v.sorted, xin, y, m, k, 1, rows, rows,
                 ));
             }
+        }
+        if rows_exact && weight.dtype == DType::Q8_0 {
+            return hip!(gpu.gemv_q8_0_rows_exact(weight.buf, xin, y, m, k, rows));
         }
         // A single row (decode) over a Q8_0 weight: the Q8 GEMV, not a
         // one-column WMMA tile.
@@ -7386,6 +7406,53 @@ fn gated_ffn_from_basis(
     Ok(())
 }
 
+/// [`gated_ffn_from_basis`] one row at a time on row views of every operand: the
+/// exact `rows == 1` sequence per row (the scratch tables are reused in order).
+#[allow(clippy::too_many_arguments)]
+fn gated_ffn_per_row(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    activation: FfnActivation,
+    cast: CastPolicy,
+    rows: usize,
+    hidden: usize,
+    mi: usize,
+    down_k: usize,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    w: &GroupedMoeShared<'_>,
+    s: &GroupedMoeSharedScratch<'_>,
+    out: &GpuTensor,
+) -> Result<(), DispatchError> {
+    for r in 0..rows {
+        let sv = GroupedMoeSharedScratch {
+            gate_out: &row_view(s.gate_out, mi, r),
+            up_out: &row_view(s.up_out, mi, r),
+            act: &row_view(s.act, down_k, r),
+            rot: &row_view(s.rot, down_k, r),
+            out: &row_view(s.out, hidden, r),
+            tables: s.tables,
+        };
+        gated_ffn_from_basis(
+            gpu,
+            ctx,
+            activation,
+            cast,
+            1,
+            hidden,
+            mi,
+            down_k,
+            &row_view(x, hidden, r),
+            &row_view(x_rot, hidden, r),
+            w,
+            &sv,
+            &row_view(out, hidden, r),
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 /// Dense gated FFN (the first-layer dense MLP, or any non-routed gated FFN) as
 /// a standalone program: one slot, no router.
 #[derive(Clone, Copy)]
@@ -7409,6 +7476,9 @@ pub struct GatedFfnOp<'a> {
     pub scratch: GroupedMoeSharedScratch<'a>,
     /// F32 `[rows, hidden]` result (aliasing `scratch.out` is allowed).
     pub out: &'a GpuTensor,
+    /// Every row bit-identical to the same row run alone as a `rows == 1` call
+    /// (speculative verify); see [`GroupedMoeProtocol::RowsExact`].
+    pub rows_exact: bool,
 }
 
 /// Execute a [`GatedFfnOp`].
@@ -7463,6 +7533,7 @@ pub fn execute_gated_ffn(gpu: &mut Gpu, op: &GatedFfnOp<'_>) -> Result<(), Dispa
         &op.weights,
         &op.scratch,
         op.out,
+        op.rows_exact,
     )
 }
 
@@ -7891,37 +7962,6 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
     // Ungated shared expert from the same rotated basis; cast on its own, then
     // added after the routed sum is cast.
     let shared_sum = match (op.shared.as_ref(), s.shared.as_ref()) {
-        (Some(w), Some(ss)) if rows_exact => {
-            // One single-row call per row: the exact decode sequence, on row
-            // views of every operand (the scratch tables are reused in order).
-            let hidden = g.hidden;
-            for r in 0..rows {
-                let sv = GroupedMoeSharedScratch {
-                    gate_out: &row_view(ss.gate_out, g.shared_mi, r),
-                    up_out: &row_view(ss.up_out, g.shared_mi, r),
-                    act: &row_view(ss.act, g.shared_down_k, r),
-                    rot: &row_view(ss.rot, g.shared_down_k, r),
-                    out: &row_view(ss.out, hidden, r),
-                    tables: ss.tables,
-                };
-                gated_ffn_from_basis(
-                    gpu,
-                    op.ctx,
-                    op.policy.activation,
-                    op.policy.cast,
-                    1,
-                    hidden,
-                    g.shared_mi,
-                    g.shared_down_k,
-                    &row_view(op.x, hidden, r),
-                    &row_view(s.x_rot, hidden, r),
-                    w,
-                    &sv,
-                    sv.out,
-                )?;
-            }
-            Some(ss.out)
-        }
         (Some(w), Some(ss)) => {
             gated_ffn_from_basis(
                 gpu,
@@ -7937,6 +7977,7 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                 w,
                 ss,
                 ss.out,
+                rows_exact,
             )?;
             Some(ss.out)
         }

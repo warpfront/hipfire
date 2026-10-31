@@ -632,6 +632,7 @@ pub fn raon_dense_op<'a>(
             tables: &scratch.tables,
         },
         out,
+        rows_exact: false,
     }
 }
 
@@ -654,6 +655,34 @@ pub fn forward_dense(
         ));
     }
     let op = raon_dense_op(ctx, dims, dense, rows, x, scratch, out, out);
+    execute_gated_ffn(gpu, &op).map_err(|e| e.to_string())
+}
+
+/// [`forward_dense`] with every row bit-identical to the same row run alone as a
+/// `rows == 1` decode call (pass the decode weight copies, `projections(1)`): Q8_0
+/// projections read their weights once for all rows (`gemv_q8_0_rows_exact`), any
+/// other dtype runs per row. For speculative verify blocks of up to 16 rows.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_dense_rows_exact(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    dims: &RaonMoeDims,
+    dense: &RaonDenseRefs<'_>,
+    rows: usize,
+    x: &GpuTensor,
+    scratch: &RaonDenseScratch,
+    out: &GpuTensor,
+) -> Result<(), String> {
+    if rows > scratch.max_rows {
+        return Err(format!(
+            "raon dense ffn: {rows} rows exceed the scratch capacity {}",
+            scratch.max_rows
+        ));
+    }
+    let op = GatedFfnOp {
+        rows_exact: true,
+        ..raon_dense_op(ctx, dims, dense, rows, x, scratch, out, out)
+    };
     execute_gated_ffn(gpu, &op).map_err(|e| e.to_string())
 }
 

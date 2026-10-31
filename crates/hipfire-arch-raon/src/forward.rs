@@ -54,7 +54,7 @@ use crate::config::{LayerKind, RaonConfig};
 use crate::mhc::{broadcast_embedding, final_mean_norm, RaonMhcShape, RaonMhcWork};
 use crate::mla::{raon_mla_scale, MlaRoute, RaonMlaWork, RAON_MLA_EPS};
 use crate::moe::{
-    forward_dense, forward_moe, forward_moe_rows_exact, RaonDenseRefs, RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs,
+    forward_dense, forward_dense_rows_exact, forward_moe, forward_moe_rows_exact, RaonDenseRefs, RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs,
     RaonMoeScratch,
 };
 use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
@@ -1053,28 +1053,22 @@ fn ffn_block(
             if (2..=crate::projection::ROWS_EXACT_MAX).contains(&rows)
                 && crate::projection::rows_exact() =>
         {
-            // Row-exact verify: every row runs the decode MLP itself (the decode
-            // weight copy, the single-row GEMVs), one row at a time through the
-            // same scratch, so row r equals the decode step's row bit for bit.
+            // Row-exact verify: every row equals the decode step's MLP row bit for
+            // bit: the decode weight copy (`projections(1)`), Q8 projections through
+            // the multi-row row-exact GEMV (weights read once), other dtypes per row.
             let (gate, up, down) = d.projections(1);
             let refs =
                 RaonDenseRefs::from_parts(gate, up, down)?.with_iu4_symmetric(d.iu4_symmetric);
-            let hidden = scratch.branch_in.numel() / scratch.rows;
-            for r in 0..rows {
-                let x_row = scratch.branch_in.sub_offset(r * hidden, hidden);
-                let out_row = scratch.ffn_out.sub_offset(r * hidden, hidden);
-                forward_dense(
-                    gpu,
-                    ctx,
-                    &work.moe_dims,
-                    &refs,
-                    1,
-                    &x_row,
-                    &work.dense,
-                    &out_row,
-                )?;
-            }
-            Ok(())
+            forward_dense_rows_exact(
+                gpu,
+                ctx,
+                &work.moe_dims,
+                &refs,
+                rows,
+                &scratch.branch_in,
+                &work.dense,
+                &scratch.ffn_out,
+            )
         }
         RaonFfn::Dense(d) => {
             let (gate, up, down) = d.projections(rows);

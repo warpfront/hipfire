@@ -2560,6 +2560,7 @@ fn gpu_shared_only(
                 tables: &ts[6],
             },
             out: &ts[5],
+            rows_exact: false,
         };
         let t0 = Instant::now();
         execute_gated_ffn(gpu, &op).map_err(classify)?;

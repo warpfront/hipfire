@@ -12,7 +12,10 @@
 //! It prints decode-step timings of `RowsExact` vs the default (`Auto`) route at
 //! K = 1, 2, 4, 8, 16.
 
-use hipfire_arch_raon::moe::{raon_moe_op, RaonMoeDims, RaonMoeLayerRefs, RaonMoeScratch};
+use hipfire_arch_raon::moe::{
+    forward_dense, forward_dense_rows_exact, raon_moe_op, RaonDenseRefs, RaonDenseScratch,
+    RaonMoeDims, RaonMoeLayerRefs, RaonMoeScratch,
+};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::{
@@ -60,6 +63,27 @@ fn qt44_bytes(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Random Q8_0 weight bytes for `[m, k]`: `m * (k / 32)` 34-byte blocks (f16 scale + 32 int8).
+fn q8_0_bytes(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(m * (k / 32) * 34);
+    for _ in 0..m * (k / 32) {
+        // Scales 2^-8 .. 2^-5, exact f16.
+        let scale: u16 = 0x1c00 + 0x0400 * (rng.next() % 4) as u16;
+        out.extend_from_slice(&scale.to_le_bytes());
+        for _ in 0..4 {
+            out.extend_from_slice(&rng.next().to_le_bytes());
+        }
+    }
+    out
+}
+
+fn q8_0_ref(t: &GpuTensor, m: usize, k: usize) -> WeightRef<'_> {
+    WeightRef {
+        dtype: DType::Q8_0,
+        ..qt44_ref(t, m, k)
+    }
 }
 
 fn up_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
@@ -199,6 +223,10 @@ fn rows_exact_is_bit_identical_to_single_row_decode_for_k_1_to_16() {
     let sh_gate = up_raw(&gpu, &qt44_bytes(&mut rng, mi, c));
     let sh_up = up_raw(&gpu, &qt44_bytes(&mut rng, mi, c));
     let sh_down = up_raw(&gpu, &qt44_bytes(&mut rng, c, down_k));
+    // The decode-weight copy of a Q8F16 / BF16-source shared expert.
+    let q8_gate = up_raw(&gpu, &q8_0_bytes(&mut rng, mi, c));
+    let q8_up = up_raw(&gpu, &q8_0_bytes(&mut rng, mi, c));
+    let q8_down = up_raw(&gpu, &q8_0_bytes(&mut rng, c, down_k));
     let router_w: Vec<f32> = (0..e * c).map(|_| rng.unit() * 0.05).collect();
     let router_w = up_f32(&mut gpu, &router_w);
     let bias: Vec<f32> = (0..e).map(|_| rng.unit() * 0.01).collect();
@@ -220,72 +248,193 @@ fn rows_exact_is_bit_identical_to_single_row_decode_for_k_1_to_16() {
         ),
         iu4_symmetric: false,
     };
+    let layer_q8 = RaonMoeLayerRefs {
+        shared: GroupedMoeShared::new(
+            q8_0_ref(&q8_gate, mi, c),
+            q8_0_ref(&q8_up, mi, c),
+            q8_0_ref(&q8_down, c, down_k),
+        ),
+        ..layer
+    };
 
-    for (label, cast) in [
-        ("bf16", CastPolicy::Bf16Boundaries),
-        ("exact32", CastPolicy::Exact32),
-    ] {
-        let mut run = Run {
-            gpu: &mut gpu,
-            ctx: &ctx,
-            dims,
-            layer,
-            scratch: &scratch,
-            cast,
-        };
-        // Reference: MAX_K single-row decode calls (Auto resolves to the
-        // indexed core at one row).
-        let mut want_out = Vec::new();
-        let mut want_routed = Vec::new();
-        for r in 0..MAX_K {
-            let (o, rt) = run
-                .call(GroupedMoeProtocol::Auto, 1, &x[r * c..(r + 1) * c])
-                .expect("single-row decode call");
-            want_out.extend(o);
-            want_routed.extend(rt);
-        }
-        assert!(want_out.iter().all(|v| v.is_finite()), "{label}: reference");
+    for (kind, layer) in [("shared qt44", layer), ("shared q8_0", layer_q8)] {
+        for (label, cast) in [
+            ("bf16", CastPolicy::Bf16Boundaries),
+            ("exact32", CastPolicy::Exact32),
+        ] {
+            let label = &format!("{kind} {label}");
+            let mut run = Run {
+                gpu: &mut gpu,
+                ctx: &ctx,
+                dims,
+                layer,
+                scratch: &scratch,
+                cast,
+            };
+            // Reference: MAX_K single-row decode calls (Auto resolves to the
+            // indexed core at one row).
+            let mut want_out = Vec::new();
+            let mut want_routed = Vec::new();
+            for r in 0..MAX_K {
+                let (o, rt) = run
+                    .call(GroupedMoeProtocol::Auto, 1, &x[r * c..(r + 1) * c])
+                    .expect("single-row decode call");
+                want_out.extend(o);
+                want_routed.extend(rt);
+            }
+            assert!(want_out.iter().all(|v| v.is_finite()), "{label}: reference");
 
-        for k in 1..=MAX_K {
-            let (o, rt) = run
-                .call(GroupedMoeProtocol::RowsExact, k, &x[..k * c])
-                .unwrap_or_else(|e| panic!("{label} K={k}: {e}"));
-            for (name, got, want) in [("out", &o, &want_out), ("routed_out", &rt, &want_routed)] {
-                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-                    assert_eq!(
-                        g.to_bits(),
-                        w.to_bits(),
-                        "{label} K={k} {name}: row {} col {} differs ({g} vs {w})",
-                        i / c,
-                        i % c
+            for k in 1..=MAX_K {
+                let (o, rt) = run
+                    .call(GroupedMoeProtocol::RowsExact, k, &x[..k * c])
+                    .unwrap_or_else(|e| panic!("{label} K={k}: {e}"));
+                for (name, got, want) in [("out", &o, &want_out), ("routed_out", &rt, &want_routed)]
+                {
+                    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "{label} K={k} {name}: row {} col {} differs ({g} vs {w})",
+                            i / c,
+                            i % c
+                        );
+                    }
+                }
+            }
+            eprintln!("{label}: RowsExact == single-row decode bitwise for K=1..={MAX_K}");
+
+            // Informational: does the default route (grouped core at K>1) match?
+            for k in [2usize, 16] {
+                if let Ok((o, _)) = run.call(GroupedMoeProtocol::Auto, k, &x[..k * c]) {
+                    let diff = o
+                        .iter()
+                        .zip(want_out.iter())
+                        .filter(|(g, w)| g.to_bits() != w.to_bits())
+                        .count();
+                    eprintln!(
+                        "{label}: default route K={k}: {diff}/{} words differ",
+                        k * c
                     );
                 }
             }
-        }
-        eprintln!("{label}: RowsExact == single-row decode bitwise for K=1..={MAX_K}");
 
-        // Informational: does the default route (grouped core at K>1) match?
-        for k in [2usize, 16] {
-            if let Ok((o, _)) = run.call(GroupedMoeProtocol::Auto, k, &x[..k * c]) {
-                let diff = o
-                    .iter()
-                    .zip(want_out.iter())
-                    .filter(|(g, w)| g.to_bits() != w.to_bits())
-                    .count();
-                eprintln!(
-                    "{label}: default route K={k}: {diff}/{} words differ",
-                    k * c
+            if label.ends_with("bf16") {
+                eprintln!("timings ({label}, ms per MoE layer call, 20 reps):");
+                for k in [1usize, 2, 4, 8, 16] {
+                    let exact = run.time(GroupedMoeProtocol::RowsExact, k, &x[..k * c]);
+                    let auto = run.time(GroupedMoeProtocol::Auto, k, &x[..k * c]);
+                    eprintln!("  K={k:2}: rows_exact {exact:?}  default {auto:?}");
+                }
+            }
+        }
+    }
+}
+
+/// Dense layer-0 MLP: `forward_dense_rows_exact` over K rows equals K single-row
+/// `forward_dense` calls bitwise, with Q8_0 (one multi-row GEMV per projection) and qt44
+/// (per-row fallback) weights at the Raon dense dims (hidden 2560, width 12032).
+#[test]
+#[ignore = "needs a GPU: run through the GPU fabric"]
+fn dense_rows_exact_is_bit_identical_to_single_row_decode_for_k_1_to_16() {
+    let mut gpu = Gpu::init().expect("gpu init");
+    let ctx = DispatchCtx::new(&gpu);
+    let dims = RaonMoeDims::raon();
+    let (c, mi) = (dims.hidden, dims.dense_mi);
+    let mut rng = Rng(0x1234_5678_9abc_def1);
+    let x: Vec<f32> = (0..MAX_K * c).map(|_| bf16_valued(rng.unit())).collect();
+    let xt = up_f32(&mut gpu, &x);
+    let scratch = RaonDenseScratch::new(&mut gpu, &dims, MAX_K).expect("dense scratch");
+    let nan = vec![f32::NAN; MAX_K * c];
+
+    let q8 = [
+        up_raw(&gpu, &q8_0_bytes(&mut rng, mi, c)),
+        up_raw(&gpu, &q8_0_bytes(&mut rng, mi, c)),
+        up_raw(&gpu, &q8_0_bytes(&mut rng, c, mi)),
+    ];
+    let q4 = [
+        up_raw(&gpu, &qt44_bytes(&mut rng, mi, c)),
+        up_raw(&gpu, &qt44_bytes(&mut rng, mi, c)),
+        up_raw(&gpu, &qt44_bytes(&mut rng, c, mi)),
+    ];
+    let sets = [
+        (
+            "dense q8_0",
+            RaonDenseRefs {
+                weights: GroupedMoeShared::new(
+                    q8_0_ref(&q8[0], mi, c),
+                    q8_0_ref(&q8[1], mi, c),
+                    q8_0_ref(&q8[2], c, mi),
+                ),
+                input_awq: None,
+            },
+        ),
+        (
+            "dense qt44",
+            RaonDenseRefs {
+                weights: GroupedMoeShared::new(
+                    qt44_ref(&q4[0], mi, c),
+                    qt44_ref(&q4[1], mi, c),
+                    qt44_ref(&q4[2], c, mi),
+                ),
+                input_awq: None,
+            },
+        ),
+    ];
+    for (label, refs) in &sets {
+        let out = up_f32(&mut gpu, &nan);
+        for r in 0..MAX_K {
+            let x_row = xt.sub_offset(r * c, c);
+            let out_row = out.sub_offset(r * c, c);
+            forward_dense(&mut gpu, &ctx, &dims, refs, 1, &x_row, &scratch, &out_row)
+                .expect("single-row dense");
+        }
+        gpu.hip.device_synchronize().expect("sync");
+        let want = gpu.download_f32(&out).expect("download");
+        assert!(want.iter().all(|v| v.is_finite()), "{label}: reference");
+        for k in 1..=MAX_K {
+            let got_t = up_f32(&mut gpu, &nan);
+            forward_dense_rows_exact(&mut gpu, &ctx, &dims, refs, k, &xt, &scratch, &got_t)
+                .unwrap_or_else(|e| panic!("{label} K={k}: {e}"));
+            gpu.hip.device_synchronize().expect("sync");
+            let got = gpu.download_f32(&got_t).expect("download");
+            for (i, (g, w)) in got.iter().zip(want.iter()).take(k * c).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "{label} K={k}: row {} col {} differs ({g} vs {w})",
+                    i / c,
+                    i % c
                 );
             }
+            let _ = gpu.free_tensor(got_t);
         }
-
-        if label == "bf16" {
-            eprintln!("timings ({label}, ms per MoE layer call, 20 reps):");
-            for k in [1usize, 2, 4, 8, 16] {
-                let exact = run.time(GroupedMoeProtocol::RowsExact, k, &x[..k * c]);
-                let auto = run.time(GroupedMoeProtocol::Auto, k, &x[..k * c]);
-                eprintln!("  K={k:2}: rows_exact {exact:?}  default {auto:?}");
-            }
+        eprintln!("{label}: dense RowsExact == single-row decode bitwise for K=1..={MAX_K}");
+        eprintln!("dense timings ({label}, ms per call, 20 reps):");
+        for k in [1usize, 2, 4, 8, 16] {
+            let mut time = |exact: bool| -> f64 {
+                let run = |gpu: &mut Gpu| {
+                    if exact {
+                        forward_dense_rows_exact(gpu, &ctx, &dims, refs, k, &xt, &scratch, &out)
+                    } else {
+                        forward_dense(gpu, &ctx, &dims, refs, k, &xt, &scratch, &out)
+                    }
+                    .expect("dense call")
+                };
+                for _ in 0..3 {
+                    run(&mut gpu);
+                }
+                gpu.hip.device_synchronize().expect("sync");
+                let t0 = Instant::now();
+                for _ in 0..20 {
+                    run(&mut gpu);
+                }
+                gpu.hip.device_synchronize().expect("sync");
+                t0.elapsed().as_secs_f64() * 1e3 / 20.0
+            };
+            let exact = time(true);
+            let auto = time(false);
+            eprintln!("  K={k:2}: rows_exact {exact:.4}  default {auto:.4}");
         }
+        let _ = gpu.free_tensor(out);
     }
 }
