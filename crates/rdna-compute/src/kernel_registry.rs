@@ -1747,6 +1747,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             crate::select_regrid::TOPK_VALUES_FIXUP_SRC,
             ["topk_values_fixup_f32"]
         );
+        add!(
+            "topk_values_tie_exact",
+            crate::select_regrid::TOPK_VALUES_TIE_SRC,
+            ["topk_values_tie_exact_f32"]
+        );
     }
     if arch == "gfx1100" {
         add!(
@@ -14310,6 +14315,7 @@ extern "C" __global__ void NAMED(int* p) {}
             ("railgun_fill", "railgun_fill_u32"),
             ("select_regrid", "topk_values_regrid_f32"),
             ("topk_values_fixup_f32", "topk_values_fixup_f32"),
+            ("topk_values_tie_exact", "topk_values_tie_exact_f32"),
             ("select_regrid", "argmax_f32_batched_regrid"),
             (
                 "attention_dflash_sliding_f32",

@@ -1293,7 +1293,7 @@ pub const DECISIONS: &[Decision] = &[
         predicates: &[IsRecording],
         condition: "select_regrid_enabled: (exact gfx1201 || exact gfx1151) && !select_regrid_off && !is_recording() (select_regrid.rs:46-50), consulted by the batched top-K and argmax selectors (sampling.rs:129, 838) and the developer online draft tuner (dflash_online.rs)",
         effect: KernelSelection,
-        switches: "eager or HipGraph: select_regrid 1024-thread row selectors (+ topk_values_fixup_f32 on tied rows); recorded: topk_values_batched_f32 / argmax_f32_batched",
+        switches: "eager or HipGraph: select_regrid 1024-thread row selectors (+ topk_values_tie_exact_f32 on tied rows); recorded: topk_values_batched_f32 / argmax_f32_batched",
         kernels: &["topk_values_batched_f32", "argmax_f32_batched"],
         verdict: ByteExact,
         evidence: "select_regrid.rs module header: outputs byte-identical to the shipping kernels for every input, ties and NaNs included; examples/test_select_regrid checks it on gfx1201 and gfx1151",
