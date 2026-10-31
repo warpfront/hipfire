@@ -26,16 +26,17 @@ use hipfire_runtime::hfq::HfqFile;
 
 /// The DFlash2 draft a load asks for, or `None` for plain AR.
 ///
-/// DFlash2 is opt-in: the draft runs only under `speculation.dflash = on` and
-/// needs its draft path. A draft without `dflash = on`, `dflash = on` without
-/// a draft, a second speculator beside it (native MTP, DSpark, n-gram) and
-/// any speculator this arch has no producer for are refused up front, before
-/// any allocation.
+/// The draft runs under `speculation.dflash = on` (needs its draft path; fails
+/// closed without one) and under `auto` when a draft path was wired (the
+/// registry pairs `raon-1-mini-preview` with its pulled DFlash2 sidecar and
+/// lowers `auto`; opt out with `speculation.dflash = off`). `auto` with no
+/// draft is plain AR, as Raon has no MTP. A draft under an explicit `off`, a
+/// second speculator beside it (native MTP, DSpark, n-gram) and any speculator
+/// this arch has no producer for are refused up front, before any allocation.
 pub fn dflash_draft<'a>(
     draft_path: Option<&'a str>,
     spec: SpecLoadCfg,
 ) -> Result<Option<&'a str>, String> {
-    let dflash = spec.dflash == Some(true);
     let other = [
         (spec.mtp == Some(true), "native MTP (speculation.mtp)"),
         (spec.dspark == Some(true), "DSpark (speculation.dspark)"),
@@ -54,19 +55,19 @@ pub fn dflash_draft<'a>(
             other.join(", ")
         ));
     }
-    match (dflash, draft_path) {
-        (true, Some(draft)) => Ok(Some(draft)),
-        (true, None) => Err(
+    match (spec.dflash, draft_path) {
+        (Some(true) | None, Some(draft)) => Ok(Some(draft)),
+        (Some(true), None) => Err(
             "raon1_mini: DFlash (speculation.dflash = on) needs a DFlash2 draft \
              (--model-draft / params.draft)"
                 .into(),
         ),
-        (false, Some(_)) => Err(
-            "raon1_mini: a draft model needs speculation.dflash = on (--spec dflash runs a \
-             DFlash2 draft)"
+        (Some(false), Some(_)) => Err(
+            "raon1_mini: a draft model conflicts with speculation.dflash = off (drop the draft \
+             or use speculation.dflash = on|auto)"
                 .into(),
         ),
-        (false, None) => Ok(None),
+        (Some(false) | None, None) => Ok(None),
     }
 }
 
@@ -83,6 +84,12 @@ pub fn pp_option_refusal(
 ) -> Result<(), String> {
     if pp < 2 {
         return Ok(());
+    }
+    // `speculation.dflash = auto` (the registry's paired draft) on a pipeline
+    // load: the draft is not run and the bands decode plain AR, as `auto`
+    // without a draft does; the other speculator refusals still apply.
+    if spec.dflash.is_none() {
+        return dflash_draft(None, spec).map(|_| ());
     }
     if dflash_draft(draft_path, spec)?.is_some() {
         return Err(format!(
@@ -804,12 +811,19 @@ mod dflash_tests {
     }
 
     #[test]
-    fn a_draft_without_dflash_on_is_refused() {
-        for dflash in [None, Some(false)] {
-            let spec = cfg(|s| s.dflash = dflash);
-            let error = dflash_draft(Some("d.hfq"), spec).unwrap_err();
-            assert!(error.contains("speculation.dflash = on"), "{error}");
-        }
+    fn auto_with_a_wired_draft_runs_it() {
+        // `dflash = auto` is `None` on the wire (`parse_tri_state`).
+        assert_eq!(
+            dflash_draft(Some("d.mq4"), SpecLoadCfg::default()),
+            Ok(Some("d.mq4"))
+        );
+    }
+
+    #[test]
+    fn a_draft_under_dflash_off_is_refused() {
+        let off = cfg(|s| s.dflash = Some(false));
+        let error = dflash_draft(Some("d.mq4"), off).unwrap_err();
+        assert!(error.contains("speculation.dflash = off"), "{error}");
     }
 
     #[test]
@@ -863,8 +877,11 @@ mod dflash_tests {
         assert!(error.contains("topology.pp = 2"), "{error}");
         assert!(error.contains("does not run speculation"), "{error}");
         // The single-device refusals of `dflash_draft` stay first.
-        let error = pp_option_refusal(2, Some("d.hfq"), SpecLoadCfg::default()).unwrap_err();
-        assert!(error.contains("speculation.dflash = on"), "{error}");
+        let off = cfg(|s| s.dflash = Some(false));
+        let error = pp_option_refusal(2, Some("d.hfq"), off).unwrap_err();
+        assert!(error.contains("speculation.dflash = off"), "{error}");
+        // `auto` with the registry's paired draft loads the bands as plain AR.
+        assert_eq!(pp_option_refusal(2, Some("d.hfq"), SpecLoadCfg::default()), Ok(()));
         // Plain AR and the single-device load are untouched.
         assert_eq!(pp_option_refusal(2, None, SpecLoadCfg::default()), Ok(()));
         assert_eq!(pp_option_refusal(1, Some("d.hfq"), on), Ok(()));

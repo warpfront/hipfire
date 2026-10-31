@@ -856,6 +856,10 @@ impl ModelEntry {
     }
 }
 
+/// Registry tags (besides the Qwen3.8-27B tiers) whose declared `dflash`
+/// sidecar lowers `speculation.dflash = "auto"`.
+const RAON_DFLASH_AUTO_TAG: &str = "raon-1-mini-preview";
+
 /// Tag-aware registry config layer. Starts from [`ModelEntry::config_layer`]
 /// then applies automatic load policy by canonical tag. This is the single
 /// canonical place for tag policy so validation and CLI stay in sync.
@@ -873,6 +877,11 @@ impl ModelEntry {
 /// stays in effect. The schema/BuiltIn default stays `off` for every other
 /// model; `arch_id=16`, draft/dflash sidecars, and tiers with no `dflash`
 /// declaration get no speculation policy.
+///
+/// `raon-1-mini-preview` (arch 19) that declares its DFlash2 `dflash` sidecar
+/// lowers the same `auto`: the Raon carrier builds the DFlash2 speculator when
+/// the pulled draft is wired and runs plain AR (Raon has no MTP) when it is not;
+/// `speculation.dflash = off` opts out.
 ///
 /// Explicit global/model/one-shot user config (including `dflash=off`) remains
 /// higher precedence than this registry layer.
@@ -893,6 +902,14 @@ pub fn config_layer_for_tag(
     }
     let is_qwen38_27b_tier = tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-");
     if is_qwen_tag_policy && is_qwen38_27b_tier && entry.dflash.is_some() {
+        layer
+            .set("speculation.dflash", ConfigValue::String("auto".into()))
+            .map_err(|error| error.to_string())?;
+    }
+    // Raon-1-mini-preview: the explicit allow-list entry for the arch-19 target
+    // that declares its DFlash2 sidecar (`raon-1-mini-preview:draft` and any
+    // other draft/dflash tag never match).
+    if tag == RAON_DFLASH_AUTO_TAG && !is_sidecar && entry.dflash.is_some() {
         layer
             .set("speculation.dflash", ConfigValue::String("auto".into()))
             .map_err(|error| error.to_string())?;
@@ -3664,6 +3681,38 @@ mod tests {
         );
     }
     #[test]
+    fn bundled_raon_dflash2_sidecar_is_declared_and_lowers_auto_on_the_target_only() {
+        let registry = bundled().unwrap();
+        let (tag, target) = registry.model("raon-1-mini-preview").unwrap();
+        let sidecar = target.dflash.as_ref().expect("raon declares its draft");
+        assert_eq!(sidecar.file, "raon-1-mini-preview-dflash2.mq4");
+        assert_eq!(sidecar.size_bytes, Some(748_250_112));
+        assert_eq!(
+            sidecar.sha256.as_deref(),
+            Some("f46b4257773afdfaf25370df47d558429e950b8825561a8f1c3ad5a0010758ee")
+        );
+        let (draft_tag, draft) = registry.model("raon-1-mini-preview:draft").unwrap();
+        assert_eq!(draft.file, sidecar.file);
+        assert_eq!(draft.repo, target.repo);
+        assert_eq!(draft.arch_id, Some(20));
+        assert_eq!(draft.sha256, sidecar.sha256);
+        assert_eq!(draft.size_bytes, sidecar.size_bytes);
+        let auto = ConfigValue::String("auto".into());
+        let layer = config_layer_for_tag(tag, target).unwrap();
+        assert_eq!(layer.get("speculation.dflash"), Some(&auto));
+        let mut bare = target.clone();
+        bare.dflash = None;
+        assert!(config_layer_for_tag(tag, &bare)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+        assert!(config_layer_for_tag(draft_tag, draft)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+    }
+
+    #[test]
     fn bundled_dflash_sidecars_name_pullable_files() {
         // Every `dflash.file` must name a file that some registry entry's
         // `file` also names, so `hipfire pull <target>` fetching the sidecar
@@ -4227,16 +4276,18 @@ mod tests {
     fn bundled_dflash_auto_matches_only_declared_qwen38_27b_tiers() {
         // Source-grounded against checked-in registry/v1.json: DFlash-paired
         // Qwen3.8-27B trunk tiers lower `auto`; mq5/mq6 tiers (no dflash
-        // declaration), Flash-Next, drafts, and other families do not.
+        // declaration), Flash-Next, drafts, and other families do not; the
+        // explicit `raon-1-mini-preview` allow-list entry lowers it too.
         let registry = bundled().unwrap();
         let mut auto_tiers = 0;
         for (tag, entry) in &registry.models {
             let layer = config_layer_for_tag(tag, entry).unwrap();
-            let expected = (tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-"))
+            let expected = ((tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-"))
                 && !tag.contains("draft")
                 && !tag.contains("dflash")
                 && entry.arch_id != Some(16)
-                && entry.dflash.is_some();
+                && entry.dflash.is_some())
+                || (tag == "raon-1-mini-preview" && entry.dflash.is_some());
             assert_eq!(
                 layer.get("speculation.dflash") == Some(&ConfigValue::String("auto".into())),
                 expected,

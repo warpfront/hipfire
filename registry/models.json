@@ -1750,7 +1750,7 @@
       "file": "raon-1-mini-preview-dflash2.mq4",
       "size_gb": 0.75,
       "min_vram_gb": 20.0,
-      "desc": "KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 fc, for raon-1-mini-preview (opt-in `--spec dflash`)."
+      "desc": "KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 fc, for raon-1-mini-preview; the paired auto draft (opt out with speculation.dflash=off)."
     },
     "qwen3.5:2b-mq3": {
       "repo": "hipfire-models/qwen3.5-2b",

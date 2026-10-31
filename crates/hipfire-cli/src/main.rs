@@ -13727,7 +13727,9 @@ effort = "high"
                 "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
                 "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
                 "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
-                "qwen3.5:9b":{{"repo":"x","file":"qwen3.5-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
+                "qwen3.5:9b":{{"repo":"x","file":"qwen3.5-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "raon-1-mini-preview":{{"repo":"x","file":"raon-1-mini-preview.mq4-xts","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":19,"dflash":{{"file":"raon-1-mini-preview-dflash2.mq4"}}}},
+                "raon-1-mini-preview:draft":{{"repo":"x","file":"raon-1-mini-preview-dflash2.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20}}
             }},
             "aliases":{{"qwen3.8":"qwen3.8:27b","qwen3.8:27b-mq4":"qwen3.8:27b"}}
         }}"#
@@ -13736,9 +13738,9 @@ effort = "high"
     }
 
     #[test]
-    pub(crate) fn resolved_for_model_defaults_dflash_auto_only_for_paired_qwen38_27b() {
+    pub(crate) fn resolved_for_model_defaults_dflash_auto_only_for_paired_qwen38_27b_and_raon() {
         // Registry layer lowers dflash=auto only for canonical qwen3.8:27b[-*]
-        // trunks that declare a dflash sidecar; BuiltIn off and MTP auto
+        // trunks and raon-1-mini-preview that declare a dflash sidecar; BuiltIn off and MTP auto
         // stay for everything else, including the no-registry path.
         let paths = test_paths("registry-dflash-default-scope");
         fs::create_dir_all(&paths.root).unwrap();
@@ -13752,6 +13754,8 @@ effort = "high"
             ("qwen3.8:27boops", "off"),
             ("qwen3.8:flash-next", "off"),
             ("qwen3.8:27b-draft-mq4", "off"),
+            ("raon-1-mini-preview", "auto"),
+            ("raon-1-mini-preview:draft", "off"),
             ("qwen3.6:27b", "off"),
             ("qwen3.5:9b", "off"),
         ] {

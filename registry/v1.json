@@ -2125,7 +2125,7 @@
       "file": "raon-1-mini-preview-dflash2.mq4",
       "size_gb": 0.75,
       "min_vram_gb": 20.0,
-      "desc": "KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 fc, for raon-1-mini-preview (opt-in `--spec dflash`).",
+      "desc": "KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 fc, for raon-1-mini-preview; the paired auto draft (opt out with speculation.dflash=off).",
       "sha256": "f46b4257773afdfaf25370df47d558429e950b8825561a8f1c3ad5a0010758ee",
       "size_bytes": 748250112,
       "arch_id": 20,
