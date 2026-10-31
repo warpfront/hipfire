@@ -700,7 +700,7 @@ impl QwenArSemanticProducer {
             emit_visible_token(stdout, &self.id, trailing);
         }
         // Tool-call events stay deferred until Commit (see
-        // `crate::qwen::qwen_client_commit_effects` / production finish orchestration).
+        // `ClientTerminalDecision::commit_effects` / production finish orchestration).
         Ok((finish, self.visible_acc))
     }
 
@@ -5951,8 +5951,7 @@ pub fn generate(
         let intended_release =
             finish.finish_reason == "tool_calls" && !finish.wire_tool_calls.is_empty();
         let intended_store = finish.store_cache;
-        let effects =
-            crate::qwen::qwen_client_commit_effects(decision, intended_release, intended_store);
+        let effects = decision.commit_effects(intended_release, intended_store);
         if !effects.emit_done {
             // The turn finished and every fed token is committed: the client
             // leaving before `done` keeps the prefix like a decode cancel.
