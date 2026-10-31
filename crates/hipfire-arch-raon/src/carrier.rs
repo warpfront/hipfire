@@ -153,7 +153,7 @@ pub fn build_raon_dflash2_speculator(
 /// The DFlash2 speculator, when requested, is built by the caller with
 /// [`build_raon_dflash2_speculator`] on the returned bundle.
 pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonBundle, String> {
-    dflash_draft(ctx.draft_path, ctx.spec)?;
+    let speculative = dflash_draft(ctx.draft_path, ctx.spec)?.is_some();
     let ep = hipfire_config::topology::ep()?;
     if ep > 1 {
         return Err(topology_refusal(
@@ -191,7 +191,15 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
     // Resolved before any device allocation so a malformed value fails fast.
     let forced_rows = forced_chunk_rows()?;
     let band = RaonBand::whole(&config);
-    assemble_raon_bundle(ctx.gpu, &hfq, &config, &band, ctx.max_seq, forced_rows)
+    assemble_raon_bundle(
+        ctx.gpu,
+        &hfq,
+        &config,
+        &band,
+        ctx.max_seq,
+        forced_rows,
+        speculative,
+    )
 }
 
 /// Build the Raon bundle of one layer band ([`RaonBand`]) on `gpu`: the same
@@ -230,7 +238,9 @@ pub fn load_raon_band_bundle(
         }
         None => forced_chunk_rows()?,
     };
-    assemble_raon_bundle(gpu, hfq, &config, band, max_seq, forced_rows)
+    // A band is never speculative: a `topology.pp` load refuses speculation
+    // ([`pp_option_refusal`]), so band slots take the non-speculative mirror rule.
+    assemble_raon_bundle(gpu, hfq, &config, band, max_seq, forced_rows, false)
 }
 
 /// Rows a mesh edge must carry for a Raon pipeline load reserving `max_seq`
@@ -405,7 +415,9 @@ pub fn load_raon_mesh_model(
 
 /// Load, state, chunk admission, scratch and work of `band` of the model
 /// `config` describes (the whole model's configuration; the bundle carries
-/// its band view).
+/// its band view). `speculative`: the load runs a speculator (DFlash2), so the
+/// slot keeps a BF16 mirror while it covers the reserved context
+/// ([`crate::state::mirror_is_q8`]); otherwise the mirror is Q8 when allowed.
 fn assemble_raon_bundle(
     gpu: &mut Gpu,
     hfq: &HfqFile,
@@ -413,10 +425,16 @@ fn assemble_raon_bundle(
     band: &RaonBand,
     max_seq: usize,
     forced_rows: Option<usize>,
+    speculative: bool,
 ) -> Result<RaonBundle, String> {
     let view = config.band_view(band)?;
+    // Resolved before any device allocation so a malformed value fails fast.
+    let mirror_forced = crate::mla::MlaPolicy::from_env()?.mirror_q8_forced;
     let weights = load_raon_weights_band(hfq, gpu, config, band)?;
-    let dims = view.state_dims();
+    let mut dims = view.state_dims();
+    // Speculative verify rows run the tiled kernel, which is faster on BF16 than on
+    // Q8 operands: such a slot keeps BF16 while it covers the reserved context.
+    dims.mirror_bf16_if_covered = speculative && !mirror_forced;
     let state = match RaonState::new(gpu, &dims, max_seq) {
         Ok(s) => s,
         Err(e) => {
