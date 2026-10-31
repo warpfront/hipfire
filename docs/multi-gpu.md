@@ -714,6 +714,15 @@ Lane **prefill** tiles are the singleton chunk program on a lane state, so a til
 as a singleton prompt tile does; a step's tiles are one whole-prompt entry, so the donors are restored once per step,
 not once per tile. A load without lanes is unchanged.
 
+**Native-MTP lanes (`--spec mtp`, `serve.batch_spec`) keep the ordinary placement.** The decoupled reserve admits AR
+lanes only: the mesh lane protocol's draft/verify windows and head fill are not run on the borrowed bank, so a load
+that will stage MTP lanes (the mixed store, `ep_lane_store_device_bytes_mixed`) is not given the reduced reserve (the
+load logs `qwen4 EP reserve decoupling: not applied (native-MTP EP lanes are staged ...)`) and keeps the ordinary reserve
+plus the mixed store (24 resident layers at the defaults). A spec store that still reaches a reserve-sharing load is
+refused at staging with a label (`native-MTP lanes are refused on an EP reserve-sharing load`) and the daemon stages AR
+lanes instead (`spec=off (...)`). Without `--spec mtp`, or with `HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes and
+take the 32-layer decoupled placement.
+
 **EP prefill-chunk auto-fit (opt-in, `HIPFIRE_EP_CHUNK_AUTOFIT=1`).** The PP lever steps the chunk down because a band
 must fit; an EP load always fits (host-mapped layers), so the question is only decode against prefill. EP2 mq4-xts, 2x
 R9700, no lanes, one binary, `hipfire bench --matrix` (`mgmtp/epfit/runs/pr1-*`): pp16384 / pp65536 tok/s at 4096 rows
