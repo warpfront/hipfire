@@ -6608,6 +6608,15 @@ pub enum GroupedMoeProtocol {
     Indexed,
     /// Stable scatter + grouped WMMA gate/up and down (prefill core).
     Grouped,
+    /// Every row bit-identical to the same row run alone as a `rows == 1`
+    /// decode call, for any `rows` (speculative verify). The routed experts run
+    /// the indexed core, whose kernels take the row as a grid axis and whose
+    /// per-row arithmetic does not read the row count (router GEMM, top-k,
+    /// rotation, indexed gate/up and down GEMVs, activation, combine). The
+    /// shared expert runs once per row through the single-row sequence, because
+    /// its projections pick a different kernel at `rows > 1`. Slower than
+    /// [`Self::Grouped`] at wide batches; never selected by [`Self::Auto`].
+    RowsExact,
 }
 
 /// Row count up to which [`GroupedMoeProtocol::Auto`] runs the indexed core.
@@ -6697,7 +6706,7 @@ impl GroupedMoeScratchPlan {
             ..Self::default()
         };
         match protocol.resolve(rows) {
-            GroupedMoeProtocol::Indexed => {
+            GroupedMoeProtocol::Indexed | GroupedMoeProtocol::RowsExact => {
                 p.down_rows = mul(slots, g.hidden)?;
                 p.indexed_gate = mul(slots, g.logical_mi)?;
                 p.indexed_up = p.indexed_gate;
@@ -7056,7 +7065,7 @@ impl<'a> GroupedMoeOp<'a> {
         scratch_need(s.rot, plan.rot, "rot")?;
         scratch_need(s.down_rows, plan.down_rows, "down_rows")?;
         match protocol {
-            GroupedMoeProtocol::Indexed => {
+            GroupedMoeProtocol::Indexed | GroupedMoeProtocol::RowsExact => {
                 let i = s
                     .indexed
                     .as_ref()
@@ -7125,6 +7134,15 @@ impl<'a> GroupedMoeOp<'a> {
             scratch_need(ss.tables, plan.shared_tables, "shared.tables")?;
         }
         Ok(plan)
+    }
+}
+
+/// Non-owning view of row `row` of an F32 `[rows, width]` tensor. Raw-typed
+/// tensors count bytes, so the offset is scaled by the F32 word size.
+fn row_view(t: &GpuTensor, width: usize, row: usize) -> GpuTensor {
+    match t.dtype {
+        DType::F32 => t.sub_offset(row * width, width),
+        _ => t.sub_offset(row * width * 4, width * 4),
     }
 }
 
@@ -7619,7 +7637,14 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
     let k = g.top_k;
     let slots = rows * k;
     let bf16 = op.policy.cast.bf16();
-    let protocol = op.protocol.resolve(rows);
+    let resolved = op.protocol.resolve(rows);
+    let rows_exact = resolved == GroupedMoeProtocol::RowsExact;
+    // Row-exact verify runs the routed experts on the decode (indexed) core.
+    let protocol = if rows_exact {
+        GroupedMoeProtocol::Indexed
+    } else {
+        resolved
+    };
     let tiers = if protocol == GroupedMoeProtocol::Grouped {
         grouped_moe_site_tiers(gpu, op)
     } else {
@@ -7858,12 +7883,45 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
             }
             Some(t.inverse_perm)
         }
-        GroupedMoeProtocol::Auto => unreachable!("resolve never returns Auto"),
+        GroupedMoeProtocol::Auto | GroupedMoeProtocol::RowsExact => {
+            unreachable!("resolve never returns Auto; RowsExact runs as Indexed")
+        }
     };
 
     // Ungated shared expert from the same rotated basis; cast on its own, then
     // added after the routed sum is cast.
     let shared_sum = match (op.shared.as_ref(), s.shared.as_ref()) {
+        (Some(w), Some(ss)) if rows_exact => {
+            // One single-row call per row: the exact decode sequence, on row
+            // views of every operand (the scratch tables are reused in order).
+            let hidden = g.hidden;
+            for r in 0..rows {
+                let sv = GroupedMoeSharedScratch {
+                    gate_out: &row_view(ss.gate_out, g.shared_mi, r),
+                    up_out: &row_view(ss.up_out, g.shared_mi, r),
+                    act: &row_view(ss.act, g.shared_down_k, r),
+                    rot: &row_view(ss.rot, g.shared_down_k, r),
+                    out: &row_view(ss.out, hidden, r),
+                    tables: ss.tables,
+                };
+                gated_ffn_from_basis(
+                    gpu,
+                    op.ctx,
+                    op.policy.activation,
+                    op.policy.cast,
+                    1,
+                    hidden,
+                    g.shared_mi,
+                    g.shared_down_k,
+                    &row_view(op.x, hidden, r),
+                    &row_view(s.x_rot, hidden, r),
+                    w,
+                    &sv,
+                    sv.out,
+                )?;
+            }
+            Some(ss.out)
+        }
         (Some(w), Some(ss)) => {
             gated_ffn_from_basis(
                 gpu,
@@ -7998,6 +8056,26 @@ mod grouped_moe_tests {
         assert_eq!(p.shared_up, 80 * 1088);
         assert_eq!(p.shared_out, 80 * 2560);
         assert_eq!(p.shared_act, 70 * 1280);
+    }
+
+    #[test]
+    fn rows_exact_is_never_chosen_by_auto_and_plans_the_indexed_scratch() {
+        let g = raon_geometry();
+        for rows in [1, 2, 16, 512] {
+            assert_eq!(
+                GroupedMoeProtocol::RowsExact.resolve(rows),
+                GroupedMoeProtocol::RowsExact
+            );
+            assert_ne!(
+                GroupedMoeProtocol::Auto.resolve(rows),
+                GroupedMoeProtocol::RowsExact
+            );
+            assert_eq!(
+                GroupedMoeScratchPlan::for_protocol(&g, rows, GroupedMoeProtocol::RowsExact)
+                    .unwrap(),
+                GroupedMoeScratchPlan::for_protocol(&g, rows, GroupedMoeProtocol::Indexed).unwrap()
+            );
+        }
     }
 
     #[test]

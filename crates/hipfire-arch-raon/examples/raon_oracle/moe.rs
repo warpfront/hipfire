@@ -1753,6 +1753,7 @@ fn proto_label(p: GroupedMoeProtocol) -> &'static str {
         GroupedMoeProtocol::Indexed => "indexed",
         GroupedMoeProtocol::Grouped => "grouped",
         GroupedMoeProtocol::Auto => "auto",
+        GroupedMoeProtocol::RowsExact => "rows_exact",
     }
 }
 

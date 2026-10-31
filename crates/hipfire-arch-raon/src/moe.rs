@@ -561,6 +561,41 @@ pub fn forward_moe(
     execute_grouped_moe(gpu, &op).map_err(|e| e.to_string())
 }
 
+/// Run one MoE layer with every row bit-identical to the same row run alone as
+/// a `rows == 1` decode call ([`GroupedMoeProtocol::RowsExact`]): the routed
+/// experts on the indexed core, the shared expert per row. For speculative
+/// verify blocks of up to 16 rows; slower than [`forward_moe`] at wide batches.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_moe_rows_exact(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    dims: &RaonMoeDims,
+    layer: &RaonMoeLayerRefs<'_>,
+    rows: usize,
+    x: &GpuTensor,
+    scratch: &RaonMoeScratch,
+    out: &GpuTensor,
+) -> Result<(), String> {
+    if rows > scratch.max_rows {
+        return Err(format!(
+            "raon moe: {rows} rows exceed the scratch capacity {}",
+            scratch.max_rows
+        ));
+    }
+    let op = raon_moe_op(
+        ctx,
+        dims,
+        layer,
+        GroupedMoeProtocol::RowsExact,
+        rows,
+        x,
+        scratch,
+        out,
+        None,
+    );
+    execute_grouped_moe(gpu, &op).map_err(|e| e.to_string())
+}
+
 /// Build the [`GatedFfnOp`] of the dense layer-0 MLP (SiTU, down K 12032).
 #[allow(clippy::too_many_arguments)]
 pub fn raon_dense_op<'a>(
