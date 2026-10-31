@@ -41,3 +41,9 @@ required-features = ["lab"]
 
 [dev-dependencies]
 md5 = "0.8"
+
+# One Raon RDA layer (`rda_forward_rows`) on synthetic raw projections: bit digest across
+# HIPFIRE_RAON_RDA_* flags and per-layer timing (needs a gfx1201 GPU). Built with --features lab.
+[[example]]
+name = "rda_layer_node"
+required-features = ["lab"]
