@@ -26,6 +26,7 @@ use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
+use hipfire_arch_lfm3 as lfm3;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
@@ -5636,6 +5637,7 @@ fn main() {
                             9 => "deepseek4",
                             10 => "minimax_m2",
                             11 => "lfm2moe",
+                            13 => "lfm3",
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
@@ -5662,6 +5664,11 @@ fn main() {
                                 b.config.vocab_size,
                             ),
                             Some(ModelState::Cohere2Moe(b)) => (
+                                b.config.hidden_size,
+                                b.config.num_hidden_layers,
+                                b.config.vocab_size,
+                            ),
+                            Some(ModelState::Lfm3(b)) => (
                                 b.config.hidden_size,
                                 b.config.num_hidden_layers,
                                 b.config.vocab_size,
@@ -6894,6 +6901,29 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if lfm2moe::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else if m.arch_id == 13 {
+                    // LFM3 warm-pass: per-token decode_step over the synthetic
+                    // prompt. Saturates the conv (K=7) + GQA + QK-norm +
+                    // per-type RoPE + sliding-window attention + sandwich norm
+                    // + sigmoid output gate kernel set before any user-facing
+                    // generate. This IS the production prefill shape (no
+                    // batched kernel).
+                    let b = m.lfm3_mut().expect("arch_id=13 requires lfm3 bundle");
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if lfm3::forward::decode_step(
                             config, weights, state, &mut gpu, tok, i as u32,
                         )
                         .is_err()
@@ -13636,6 +13666,7 @@ enum GenerationRoute {
     MiniMaxSpec,
     LfmAr,
     LfmSpec,
+    Lfm3Ar,
     LlamaAr,
     LlamaSpec,
     PipelineParallel,
@@ -13662,6 +13693,7 @@ impl GenerationRoute {
         Self::MiniMaxSpec,
         Self::LfmAr,
         Self::LfmSpec,
+        Self::Lfm3Ar,
         Self::LlamaAr,
         Self::LlamaSpec,
         Self::PipelineParallel,
@@ -13699,6 +13731,7 @@ impl GenerationRoute {
             Self::MiniMaxSpec => "minimax_spec",
             Self::LfmAr => "lfm_ar",
             Self::LfmSpec => "lfm_spec",
+            Self::Lfm3Ar => "lfm3_ar",
             Self::LlamaAr => "llama_ar",
             Self::LlamaSpec => "llama_spec",
             Self::PipelineParallel => "pipeline_parallel",
@@ -13769,6 +13802,10 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             } else {
                 GenerationRoute::LfmAr
             };
+        }
+        // LFM3 (arch_id 13): Phase 1 is AR-only (no SpecTarget impl yet).
+        13 => {
+            return GenerationRoute::Lfm3Ar;
         }
         12 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
@@ -14197,6 +14234,32 @@ fn generate(
             );
             let _ = (repeat_penalty, repeat_window);
             generate_lfm2moe(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                max_tokens,
+                max_think_tokens,
+                tools,
+                messages_history,
+            );
+            return;
+        }
+        GenerationRoute::Lfm3Ar => {
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                think_mode,
+            );
+            let _ = (repeat_penalty, repeat_window);
+            generate_lfm3(
                 m,
                 gpu,
                 stdout,
@@ -18565,6 +18628,284 @@ fn generate_lfm2moe(
     }
 
     m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_ms": prefill_ms,
+        "total_ms": total_ms,
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {}
+    }
+}
+
+/// LFM3 (arch_id=13) generate path — AR bring-up.
+///
+/// Mirrors `generate_lfm2moe`'s shape (per-token prefill decode loop, per-token
+/// decode loop, JSONL `token` / `done` events). LFM3 shares LFM2.5's
+/// characteristics that this path depends on: ChatML `<|im_end|>` eos, hybrid
+/// conv+GQA state (cold-rebuild every turn — the conv window chains back to
+/// token 0 so partial prefix-reuse is unsafe), and per-token decode (no batched
+/// prefill kernel yet). Phase 1 is AR-only (no spec route).
+fn generate_lfm3(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    if m.lfm3().is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "lfm3 bundle missing on arch_id=13 generate",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Prompt build (same Jinja/Plain two-path branch as lfm2moe) ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // LFM3 ships its own Jinja chat_template; render through it when present
+        // (default ON; opt out with HIPFIRE_JINJA_CHAT=0). Falls back to Plain.
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                            }
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                            synthesized = v;
+                            &synthesized
+                        }
+                    };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!("[daemon] jinja render failed in lfm3 path ({e}) — falling back to Plain");
+                    hipfire_runtime::prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        raw: false,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                raw: false,
+            }
+            .build()
+        }
+    };
+
+    if prompt_ids.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "empty prompt after tokenize",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.lfm3().unwrap().eos_tok;
+
+    // LFM3 (like LFM2.5) emits multiple EOS-class tokens inconsistently
+    // (`<|im_end|>`, ``, rarely `</s>`). Catch any whose literal string
+    // round-trips through `encode` to a single id; the rest are caught by the
+    // string-level guard in the decode loop below.
+    let stop_toks: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut v = vec![eos_tok];
+        for s in ["", "</s>", "<|im_end|>"] {
+            let ids = tk.encode(s);
+            if ids.len() == 1 && !v.contains(&ids[0]) {
+                v.push(ids[0]);
+            }
+        }
+        v
+    };
+
+    // Cross-conversation reset: LFM3's hybrid conv+GQA state can't be cheaply
+    // rewound to an arbitrary prefix (the conv window chains back to token 0),
+    // so cold-rebuild every turn from position 0 — same as LFM2.5.
+    let _ = m.lfm3_mut().unwrap().state.reset(gpu);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    let cap = m.lfm3().unwrap().state.max_seq;
+    if prompt_ids.len().saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
+            "context_length",
+            false,
+            false
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: decode_step per prompt token. The LAST decode_step's logits
+    // are the predictions for the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let b = m.lfm3_mut().unwrap();
+        let cfg = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            match lfm3::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("lfm3 prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── Decode loop. Sample host-side from the running logits vector. ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_toks.contains(&next_tok) {
+            break;
+        }
+
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        // String-level EOS-class guard (catches `` which doesn't id-round-trip).
+        if matches!(frag.trim(), "" | "</s>" | "<|im_end|>") {
+            break;
+        }
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+            "attempt_id": active_attempt_id(),
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        let step = {
+            let b = m.lfm3_mut().unwrap();
+            let cfg = &b.config;
+            let weights = &b.weights;
+            let state = &mut b.state;
+            let position = state.n_tokens as u32;
+            lfm3::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("lfm3 decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.lfm3().unwrap().state.n_tokens;
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);

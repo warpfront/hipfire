@@ -5706,6 +5706,7 @@ fn run_gguf_pipeline(
         "qwen3" | "qwen2" => 1,
         "qwen3_5" | "qwen3_5_text" | "qwen35" => 5,
         "qwen3moe" => 6,
+        "lfm3" => 13,
         other => {
             // Structural-pillar guard: a qwen3* GGUF that doesn't match an
             // explicit arm above must NOT be silently stamped arch_id=0
@@ -7322,6 +7323,13 @@ fn main() {
         // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
         // num_dense_layers == num_hidden_layers for the dense variant.
         "lfm2_moe" | "lfm2" => 11,
+        // LFM3 (LiquidAI): evolution of LFM2 with three layer types
+        // (conv / full_attention / sliding_attention), sandwich norm, per-head
+        // sigmoid output gate, conv_L_cache 7. Dense SwiGLU FFN only (no MoE in
+        // the text backbone). Crate hipfire-arch-lfm3 (arch_id 13). The ingest
+        // Q8s all tensors (the loader dequants norms / conv-filter / gate to
+        // F32); tensor names ship verbatim.
+        "lfm3" => 13,
         // Cohere2-MoE (CohereLabs/North-Mini-Code-1.0): parallel-block
         // transformer, interleaved sliding(RoPE)/global(NoPE) GQA, mean-centered
         // Cohere2LayerNorm, sigmoid 128-expert MoE (norm_topk_prob=false, no bias,
@@ -7365,6 +7373,11 @@ fn main() {
     // bit-width knob (--format f16|q8|mq6|mq4), attention/dense/router stay Q8
     // (F16 in the oracle), tied embed stays Q8, norms -> F16.
     let is_cohere2moe = arch_id == 12;
+    // LFM3 (arch_id 13): dense text backbone (conv/full-attn/sliding-attn +
+    // sandwich norm + sigmoid output gate). No MoE — the ingest Q8s every
+    // tensor verbatim (the loader dequants norms/conv-filter to F32), exactly
+    // like dense lfm2.
+    let is_lfm3 = arch_id == 13;
     // MiniMax-M2 (arch_id=10): MoE like DeepSeek V4, ships per-expert pre-split
     // 2D tensors (`...block_sparse_moe.experts.E.{w1,w2,w3}.weight`). Quantized
     // as HFQ4G256 (the only 4-bit format with a complete indexed-MoE GEMV
@@ -7388,6 +7401,9 @@ fn main() {
     }
     if is_cohere2moe {
         eprintln!("  Cohere2-MoE detected — experts → --format ({{f16|q8|mq6|mq4}}); attn/dense → Q8 (F16 in oracle); router/embed → Q8; norms → F16.");
+    }
+    if is_lfm3 {
+        eprintln!("  LFM3 detected — dense text backbone (conv/full-attn/sliding-attn + sandwich norm); Q8 all tensors verbatim.");
     }
 
     // Extract layer count for K-map edge-layer promotion.

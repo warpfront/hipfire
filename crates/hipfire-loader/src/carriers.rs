@@ -1408,3 +1408,96 @@ impl Carrier for Cohere2MoeCarrier {
         }
     }
 }
+
+// ─── Lfm3Carrier ─────────────────────────────────────────────────────
+
+pub struct Lfm3Carrier;
+impl Carrier for Lfm3Carrier {
+    fn name(&self) -> &'static str {
+        "lfm3"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 13
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err(match &src {
+                ModelSource::Hfq(_) => "lfm3: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "lfm3: safetensors + pp>1 unsupported",
+            }
+            .into());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+
+        use hipfire_arch_lfm3 as lfm3;
+        // ── source-varying seam: (config, weights) only ──
+        let (config, weights) = match src {
+            ModelSource::Hfq(mut hfq) => {
+                let config = lfm3::config::Lfm3Config::from_hfq(&hfq)?;
+                let weights = lfm3::lfm3::Lfm3Weights::load(&mut hfq, &config, ctx.gpu)?;
+                (config, weights)
+            }
+            ModelSource::Dir(source) => {
+                let config = lfm3::config_from_source(&source)
+                    .ok_or_else(|| "lfm3: failed to parse config from safetensors".to_string())?;
+                let weights = lfm3::load_weights_from_source(&source, &config, ctx.gpu)?;
+                (config, weights)
+            }
+        };
+        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+
+        let state = lfm3::lfm3::Lfm3State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
+            .map_err(|e| format!("lfm3: Lfm3State::new_with_max_seq failed: {e}"))?;
+        let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", ""]);
+        // Phase 1 is AR-only: LFM3 does not yet impl `SpecTarget`, so the
+        // default `spec_target_guard` returns Err. `build_speculator` returns
+        // None unless HIPFIRE_NGRAM_DRAFT is set (off by default) — and even
+        // then the daemon's spec guard dispatch would refuse cleanly.
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        // LFM3's chat_template.jinja uses transformers' `{% generation %}`…
+        // `{% endgeneration %}` block (marks assistant generated content in
+        // history). minijinja doesn't implement that custom block, so the
+        // template fails to parse and the daemon falls back to a bare Plain
+        // prompt (the model then echoes the prompt tail). For single-turn
+        // `add_generation_prompt` the generation block is never entered, so
+        // stripping the block markers (keeping their content) yields correct
+        // ChatML framing without changing the rendered output. Multi-turn
+        // history rendering of prior assistant turns may differ slightly.
+        let chat_template = meta.chat_template.map(|t| {
+            let s = t
+                .replace("{%- generation -%}", "")
+                .replace("{% generation %}", "")
+                .replace("{%- endgeneration -%}", "")
+                .replace("{% endgeneration %}", "");
+            if s != t {
+                eprintln!("lfm3: stripped unsupported {{% generation %}} block from chat template");
+            }
+            s
+        });
+        Ok(LoadedModel {
+            state: Some(ModelState::Lfm3(crate::Lfm3Bundle {
+                config,
+                weights,
+                state,
+                eos_tok,
+            })),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                chat_template,
+            )
+        })
+    }
+}

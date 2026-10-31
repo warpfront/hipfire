@@ -16,6 +16,7 @@ use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
+use hipfire_arch_lfm3 as lfm3;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
@@ -100,6 +101,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Deepseek4Carrier,
     &MinimaxCarrier,
     &Lfm2MoeCarrier,
+    &Lfm3Carrier,
     &Cohere2MoeCarrier,
 ];
 
@@ -257,6 +259,7 @@ pub enum ModelState {
     Qwen35(hipfire_arch_qwen35::Qwen35Bundle),
     Llama(hipfire_arch_llama::LlamaBundle),
     Lfm2Moe(Lfm2MoeBundle),
+    Lfm3(Lfm3Bundle),
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
@@ -268,6 +271,12 @@ pub enum ModelState {
 /// (orphan rule). Field-identical to the prior loader-local struct. `eos_tok` is
 /// resolved at load time and rides along so the generate path doesn't re-tokenize.
 pub use lfm2moe::Lfm2MoeBundle;
+
+/// LFM3 (arch_id=13) GPU bundle. Re-exported from the arch crate, which owns
+/// it so a future `SpecTarget` impl can live next to the forward it drives
+/// (orphan rule). Field-identical to `Lfm2MoeBundle` (`config`/`weights`/
+/// `state`/`eos_tok`); Phase 1 is AR-only (no spec target yet).
+pub use lfm3::Lfm3Bundle;
 
 /// MiniMax-M2 (arch_id=10) GPU bundle. Re-exported from the arch crate, which
 /// owns it so `impl SpecTarget for MiniMaxBundle` (the n-gram verify seam) can
@@ -429,6 +438,21 @@ impl LoadedModel {
     pub fn lfm2moe_mut(&mut self) -> Option<&mut Lfm2MoeBundle> {
         match &mut self.state {
             Some(ModelState::Lfm2Moe(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// LFM3 bundle if this model is arch_id=13, else None.
+    pub fn lfm3(&self) -> Option<&Lfm3Bundle> {
+        match &self.state {
+            Some(ModelState::Lfm3(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn lfm3_mut(&mut self) -> Option<&mut Lfm3Bundle> {
+        match &mut self.state {
+            Some(ModelState::Lfm3(b)) => Some(b),
             _ => None,
         }
     }
@@ -1853,6 +1877,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             Some(ModelState::Qwen2(_))
             | Some(ModelState::Llama(_))
             | Some(ModelState::Lfm2Moe(_))
+            | Some(ModelState::Lfm3(_))
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
             | Some(ModelState::Deepseek4(_))
@@ -1918,6 +1943,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 note(b.kv.free_gpu(gpu).map_err(|e| e.to_string()));
             }
             ModelState::Lfm2Moe(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
+            ModelState::Lfm3(b) => {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }

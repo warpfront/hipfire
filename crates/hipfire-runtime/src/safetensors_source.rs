@@ -253,6 +253,10 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         "minimax_m2" => 10,
         "lfm2_moe" | "lfm2" => 11,
         "cohere2_moe" => 12,
+        // LFM3 (LiquidAI): conv/full-attn/sliding-attn + sandwich norm. Crate
+        // hipfire-arch-lfm3. The text-only LFM3-1.7B dir routes here; the Omni
+        // text backbone (model_type "lfm3_omni") is phased later.
+        "lfm3" => 13,
         _ => {
             // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
             // carrier matches, so `load_model` fails cleanly with "no carrier for
@@ -433,6 +437,7 @@ mod tests {
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2_moe" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "cohere2_moe" })), 12);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3" })), 13);
     }
 
     /// C1: an unrecognized model_type must NOT silently become Qwen35 (arch_id=5).

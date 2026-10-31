@@ -4093,6 +4093,11 @@ pub const FUSED_SIGMOID_ALPHA_GATE_SRC: &str =
 /// `sigmoid_f32(gate)` + `mul_f32(attn_out, gate, attn_out)`.
 pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul.hip");
 
+/// LFM3 attention output gate: per-head sigmoid broadcast over
+/// `[n_heads * head_dim]` — `out[i] *= sigmoid(gate[i / head_dim])`.
+pub const SIGMOID_HEAD_GATE_MUL_SRC: &str =
+    include_str!("../../../kernels/src/sigmoid_head_gate_mul.hip");
+
 /// Top-K=128 extraction over a logits vector. Lets the host sampler work
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
 /// logits array. See kernel header for bit-exactness reasoning.
