@@ -1541,7 +1541,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_G5_CAPTURE` | crates/rdna-compute/tests/ffn_grouped_i8_producer_oracle.rs | harness |
 | `HIPFIRE_G5_ONLY_CAPTURE` | crates/rdna-compute/tests/ffn_grouped_i8_producer_oracle.rs | harness |
 | `HIPFIRE_G942_TRUNK_GEMV` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
-| `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` | crates/hipfire-arch-raon/src/rda.rs, crates/hipfire-dispatch/src/ops/delta_net.rs | developer |
+| `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
 | `HIPFIRE_GATED_DELTA_VECTOR_PM` | crates/rdna-compute/src/gated_delta_vector_pm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATED_NORM_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATED_NORM_FP8_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
@@ -2447,8 +2447,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAON_PREFILL` | crates/hipfire-arch-raon/src/bundle.rs | developer |
 | `HIPFIRE_RAON_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-raon/src/carrier.rs | developer |
 | `HIPFIRE_RAON_PREFILL_PRECISION` | crates/hipfire-arch-raon/src/moe.rs, crates/hipfire-arch-raon/src/precision.rs | developer |
-| `HIPFIRE_RAON_RDA_FUSED_PREP` | crates/hipfire-arch-raon/src/rda.rs | developer |
-| `HIPFIRE_RAON_RDA_SEGMENT` | crates/hipfire-arch-raon/src/rda.rs | developer |
+| `HIPFIRE_RAON_RDA_FUSED_PREP` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
+| `HIPFIRE_RAON_RDA_SEGMENT` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
 | `HIPFIRE_RAON_SHARED_FFN` | crates/hipfire-quantize/src/raon.rs | developer |
 | `HIPFIRE_RAON_TOKENIZER` | crates/hipfire-runtime/src/tokenizer.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_RAON_VERIFY_ROWEXACT` | crates/hipfire-arch-raon/src/projection.rs, crates/hipfire-arch-raon/src/projection.rs | developer |
