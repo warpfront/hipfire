@@ -33,5 +33,11 @@ required-features = ["lab"]
 name = "raon_dflash_oracle"
 required-features = ["lab"]
 
+# Prepared-A8 activation reuse node-chain bench (PLAN §6 G1); gfx1201, run through fabric.
+# Built with --features lab.
+[[example]]
+name = "bench_a8_reuse_chain"
+required-features = ["lab"]
+
 [dev-dependencies]
 md5 = "0.8"

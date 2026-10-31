@@ -58,6 +58,7 @@
 typedef int32_t __attribute__((ext_vector_type(2))) q8a8_i32x2_t;
 typedef int32_t __attribute__((ext_vector_type(8))) q8a8_i32x8_t;
 typedef float   __attribute__((ext_vector_type(8))) q8a8_f32x8_t;
+typedef unsigned __attribute__((ext_vector_type(4))) q8a8_u32x4_t;
 
 #define Q8A8_PITCH 80
 #define Q8A8_SLAB 64
@@ -112,7 +113,20 @@ extern "C" __global__ void quantize_x_q8_blk32(
 // ---------------------------------------------------------------------------
 // GEMM body.
 // ---------------------------------------------------------------------------
-template <int BM, int BN, int WM, int WN, bool FAST>
+// Bit-level RN-even F32 -> BF16 -> F32 round trip, the exact operation of
+// `bf16_round_trip_f32_strided` (qwen4_bf16_round_trip.hip): non-finite values pass
+// through unchanged. RBF16 kernels apply it to each output as it is stored, so the
+// result equals the plain kernel followed by the in-place round kernel.
+static __device__ __forceinline__ float q8a8_bf16_rn(float v) {
+    if (!isfinite(v)) return v;
+    union { float f; unsigned int u; } box;
+    box.f = v;
+    const unsigned int lsb = (box.u >> 16) & 1u;
+    box.u = (box.u + 0x7FFFu + lsb) & 0xFFFF0000u;
+    return box.f;
+}
+
+template <int BM, int BN, int WM, int WN, bool FAST, bool RBF16, bool PIPE = false, bool SB = false>
 static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
     const char*        __restrict__ Wq,
     const signed char* __restrict__ Xq,
@@ -133,7 +147,8 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
     constexpr int BUF_BYTES = W_BYTES + X_BYTES + WS_BYTES + XS_BYTES;
     constexpr int XCH = (4 * BN + NT - 1) / NT;      // 16 B X chunks per thread
     constexpr int XSCH = (2 * BN + NT - 1) / NT;     // X scale words per thread
-    __shared__ __attribute__((aligned(16))) char lds[2 * BUF_BYTES];
+    // SB: one LDS buffer (half the LDS, so twice the resident CTAs), two barriers per slab.
+    __shared__ __attribute__((aligned(16))) char lds[(SB ? 1 : 2) * BUF_BYTES];
 
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
@@ -167,7 +182,7 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
         x_row[i] = (long long)min(tile_n + (q >> 2), N - 1) * K;
     }
 
-    uint4 xr[XCH];
+    q8a8_u32x4_t xr[XCH];
     float xsr[XSCH];
     unsigned wr[9];
     unsigned short wsr = 0;   // SLOW: this thread's block scale bits
@@ -178,7 +193,7 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
             // Past-K chunks (K % 64 == 32 tail) re-read the row's last 16 B; their
             // scales are zero, so they contribute nothing.
             const int kofs = min(s * Q8A8_SLAB + (((tid + i * NT) & 3) * 16), K - 16);
-            xr[i] = *(const uint4*)(Xq + x_row[i] + kofs);
+            xr[i] = *(const q8a8_u32x4_t*)(Xq + x_row[i] + kofs);
         }
         #pragma unroll
         for (int i = 0; i < XSCH; i++) {
@@ -219,15 +234,16 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
         #pragma unroll
         for (int i = 0; i < XCH; i++) {
             const int q = tid + i * NT;
-            if ((q >> 2) < BN) {
-                *(uint4*)(b + W_BYTES + (q >> 2) * Q8A8_PITCH + (q & 3) * 16) = xr[i];
+            // XCH * NT == 4 * BN: every chunk of every thread is in range (no guard to diverge on).
+            if (XCH * NT == 4 * BN || (q >> 2) < BN) {
+                *(q8a8_u32x4_t*)(b + W_BYTES + (q >> 2) * Q8A8_PITCH + (q & 3) * 16) = xr[i];
             }
         }
         float* xs_l = (float*)(b + W_BYTES + X_BYTES + WS_BYTES);
         #pragma unroll
         for (int i = 0; i < XSCH; i++) {
             const int q = tid + i * NT;
-            if (q < 2 * BN) xs_l[q] = xsr[i];   // [b][t] = q
+            if (XSCH * NT == 2 * BN || q < 2 * BN) xs_l[q] = xsr[i];   // [b][t] = q
         }
         unsigned qd[8];
         unsigned short sc;
@@ -267,7 +283,7 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
     __syncthreads();
 
     for (int s = 0; s < nslab; s++) {
-        const int cur = s & 1;
+        const int cur = SB ? 0 : (s & 1);
         const bool more = (s + 1) < nslab;
         if (more) load_slab(s + 1);
 
@@ -275,6 +291,74 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
         const char* xb = b + W_BYTES;
         const float* ws_l = (const float*)(b + W_BYTES + X_BYTES);
         const float* xs_l = (const float*)(b + W_BYTES + X_BYTES + WS_BYTES);
+        if constexpr (PIPE) {
+            // Software pipeline: the WMMAs of tile t+1 are issued before the fold of tile t and
+            // sched_barrier pins that order, so the matrix pipe works while the VALU folds (the
+            // plain order below issues all 16 WMMAs, then all ~190 fold ops, in lockstep across
+            // the waves the slab barrier keeps together). Every accumulator still sees its K32
+            // blocks in ascending order with the same per-element operations as the plain order.
+            constexpr int NTILE = RG * NB;
+            #pragma unroll 1
+            for (int blk = 0; blk < 2; blk++) {
+                uint4 af[RG];
+                uint4 bf[NB];
+                #pragma unroll
+                for (int rg = 0; rg < RG; rg++) {
+                    af[rg] = *(const uint4*)(b + (wave_row0 + rg * 16 + m_lane) * Q8A8_PITCH
+                                               + blk * 32 + k_grp * 16);
+                }
+                #pragma unroll
+                for (int nb = 0; nb < NB; nb++) {
+                    bf[nb] = *(const uint4*)(xb + (wave_tok0 + nb * 16 + m_lane) * Q8A8_PITCH
+                                                + blk * 32 + k_grp * 16);
+                }
+                float wsv[RG][8];
+                #pragma unroll
+                for (int rg = 0; rg < RG; rg++) {
+                    const float4 w0 = *(const float4*)(ws_l + blk * BM + wave_row0 + rg * 16 + 8 * k_grp);
+                    const float4 w1 = *(const float4*)(ws_l + blk * BM + wave_row0 + rg * 16 + 8 * k_grp + 4);
+                    wsv[rg][0] = w0.x; wsv[rg][1] = w0.y; wsv[rg][2] = w0.z; wsv[rg][3] = w0.w;
+                    wsv[rg][4] = w1.x; wsv[rg][5] = w1.y; wsv[rg][6] = w1.z; wsv[rg][7] = w1.w;
+                }
+                float xsv[NB];
+                #pragma unroll
+                for (int nb = 0; nb < NB; nb++) {
+                    xsv[nb] = xs_l[blk * BN + wave_tok0 + nb * 16 + m_lane];
+                }
+                auto issue = [&](int t) {
+                    const int nb = t / RG;
+                    const int rg = t % RG;
+                    q8a8_i32x8_t c = {Q8A8_MAGIC, Q8A8_MAGIC, Q8A8_MAGIC, Q8A8_MAGIC,
+                                      Q8A8_MAGIC, Q8A8_MAGIC, Q8A8_MAGIC, Q8A8_MAGIC};
+                    const q8a8_i32x2_t a0 = {(int)af[rg].x, (int)af[rg].y};
+                    const q8a8_i32x2_t a1 = {(int)af[rg].z, (int)af[rg].w};
+                    const q8a8_i32x2_t b0 = {(int)bf[nb].x, (int)bf[nb].y};
+                    const q8a8_i32x2_t b1 = {(int)bf[nb].z, (int)bf[nb].w};
+                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a0, true, b0, c, false);
+                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a1, true, b1, c, false);
+                    return c;
+                };
+                auto fold = [&](int t, q8a8_i32x8_t c) {
+                    const int nb = t / RG;
+                    const int rg = t % RG;
+                    const q8a8_f32x8_t cf = __builtin_bit_cast(q8a8_f32x8_t, c) - 12582912.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        acc[rg][nb][j] = __builtin_fmaf(wsv[rg][j] * xsv[nb], cf[j], acc[rg][nb][j]);
+                    }
+                };
+                q8a8_i32x8_t ccur = issue(0);
+                #pragma unroll
+                for (int t = 0; t < NTILE; t++) {
+                    q8a8_i32x8_t cnext = ccur;
+                    if (t + 1 < NTILE) cnext = issue(t + 1);
+                    __builtin_amdgcn_sched_barrier(0);
+                    fold(t, ccur);
+                    __builtin_amdgcn_sched_barrier(0);
+                    ccur = cnext;
+                }
+            }
+        } else {
         // Not unrolled: unrolling both K32 blocks doubles the live fragment and
         // WMMA-result registers and spills the 128x128 tile.
         #pragma unroll 1
@@ -332,12 +416,29 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
                 }
             }
         }
-        if (more) store_slab(cur ^ 1);
-        __syncthreads();
+        }
+        if constexpr (SB) {
+            __syncthreads();   // every wave is done reading the single buffer
+            if (more) store_slab(0);
+            __syncthreads();
+        } else {
+            if (more) store_slab(cur ^ 1);
+            __syncthreads();
+        }
     }
 
     // Epilogue: acc[rg][nb][j] = Y[token = tile_n + wave_tok0 + nb*16 + m_lane]
     //                             [row   = tile_m + wave_row0 + rg*16 + 8*k_grp + j].
+    if constexpr (RBF16) {
+        #pragma unroll
+        for (int rg = 0; rg < RG; rg++) {
+            #pragma unroll
+            for (int nb = 0; nb < NB; nb++) {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) acc[rg][nb][j] = q8a8_bf16_rn(acc[rg][nb][j]);
+            }
+        }
+    }
     const bool vec_ok = ((M & 7) == 0) && (((uintptr_t)Y & 15u) == 0);
     #pragma unroll
     for (int nb = 0; nb < NB; nb++) {
@@ -362,21 +463,40 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_body(
     }
 }
 
-#define Q8A8_KERNEL(NAME, BM, BN, WM, WN, FAST)                                  \
+#define Q8A8_KERNEL(NAME, BM, BN, WM, WN, FAST, RBF16)                           \
     extern "C" __global__ __launch_bounds__(2 * (BM), 2) void NAME(              \
         const char* __restrict__ Wq, const signed char* __restrict__ Xq,         \
         const float* __restrict__ Xs, float* __restrict__ Y, int M, int K, int N) { \
-        gemm_q8_0_mmq_i8_body<BM, BN, WM, WN, FAST>(Wq, Xq, Xs, Y, M, K, N);     \
+        gemm_q8_0_mmq_i8_body<BM, BN, WM, WN, FAST, RBF16>(Wq, Xq, Xs, Y, M, K, N); \
     }
 
-Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x128, 128, 128, 4, 2, true)
-Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x64, 128, 64, 4, 2, true)
-Q8A8_KERNEL(gemm_q8_0_mmq_i8_t64x64, 64, 64, 2, 2, true)
-Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x128_slow, 128, 128, 4, 2, false)
-Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x64_slow, 128, 64, 4, 2, false)
-Q8A8_KERNEL(gemm_q8_0_mmq_i8_t64x64_slow, 64, 64, 2, 2, false)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x128, 128, 128, 4, 2, true, false)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x64, 128, 64, 4, 2, true, false)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t64x64, 64, 64, 2, 2, true, false)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x128_slow, 128, 128, 4, 2, false, false)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x64_slow, 128, 64, 4, 2, false, false)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t64x64_slow, 64, 64, 2, 2, false, false)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x128_bf16, 128, 128, 4, 2, true, true)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x64_bf16, 128, 64, 4, 2, true, true)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t64x64_bf16, 64, 64, 2, 2, true, true)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x128_slow_bf16, 128, 128, 4, 2, false, true)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t128x64_slow_bf16, 128, 64, 4, 2, false, true)
+Q8A8_KERNEL(gemm_q8_0_mmq_i8_t64x64_slow_bf16, 64, 64, 2, 2, false, true)
 
 #undef Q8A8_KERNEL
+
+// Production schedule of the 128x128 FAST tile (`_ps`): software-pipelined WMMA/fold (PIPE) over a
+// single LDS buffer (SB: half the LDS, so twice the resident CTAs). Same arithmetic, bit-identical
+// to the plain kernel (tests/gemm_q8_0_a8_gfx12.rs); +10..16% at 4096..16384 rows on gfx1201.
+#define Q8A8_KERNEL_PS(NAME, RBF16)                                              \
+    extern "C" __global__ __launch_bounds__(256, 2) void NAME(                   \
+        const char* __restrict__ Wq, const signed char* __restrict__ Xq,         \
+        const float* __restrict__ Xs, float* __restrict__ Y, int M, int K, int N) { \
+        gemm_q8_0_mmq_i8_body<128, 128, 4, 2, true, RBF16, true, true>(Wq, Xq, Xs, Y, M, K, N); \
+    }
+Q8A8_KERNEL_PS(gemm_q8_0_mmq_i8_t128x128_ps, false)
+Q8A8_KERNEL_PS(gemm_q8_0_mmq_i8_t128x128_ps_bf16, true)
+#undef Q8A8_KERNEL_PS
 
 #else
 
@@ -389,6 +509,14 @@ Q8A8_STUB(gemm_q8_0_mmq_i8_t64x64)
 Q8A8_STUB(gemm_q8_0_mmq_i8_t128x128_slow)
 Q8A8_STUB(gemm_q8_0_mmq_i8_t128x64_slow)
 Q8A8_STUB(gemm_q8_0_mmq_i8_t64x64_slow)
+Q8A8_STUB(gemm_q8_0_mmq_i8_t128x128_bf16)
+Q8A8_STUB(gemm_q8_0_mmq_i8_t128x64_bf16)
+Q8A8_STUB(gemm_q8_0_mmq_i8_t64x64_bf16)
+Q8A8_STUB(gemm_q8_0_mmq_i8_t128x128_slow_bf16)
+Q8A8_STUB(gemm_q8_0_mmq_i8_t128x64_slow_bf16)
+Q8A8_STUB(gemm_q8_0_mmq_i8_t64x64_slow_bf16)
+Q8A8_STUB(gemm_q8_0_mmq_i8_t128x128_ps)
+Q8A8_STUB(gemm_q8_0_mmq_i8_t128x128_ps_bf16)
 #undef Q8A8_STUB
 
 #endif

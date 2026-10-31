@@ -4440,11 +4440,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_Q8_0_MMQ_I8_GFX12_SRC,
             [
                 "gemm_q8_0_mmq_i8_t128x128",
+                "gemm_q8_0_mmq_i8_t128x128_bf16",
                 "gemm_q8_0_mmq_i8_t128x128_slow",
+                "gemm_q8_0_mmq_i8_t128x128_ps",
+                "gemm_q8_0_mmq_i8_t128x128_ps_bf16",
+                "gemm_q8_0_mmq_i8_t128x128_slow_bf16",
                 "gemm_q8_0_mmq_i8_t128x64",
+                "gemm_q8_0_mmq_i8_t128x64_bf16",
                 "gemm_q8_0_mmq_i8_t128x64_slow",
+                "gemm_q8_0_mmq_i8_t128x64_slow_bf16",
                 "gemm_q8_0_mmq_i8_t64x64",
+                "gemm_q8_0_mmq_i8_t64x64_bf16",
                 "gemm_q8_0_mmq_i8_t64x64_slow",
+                "gemm_q8_0_mmq_i8_t64x64_slow_bf16",
                 "quantize_x_q8_blk32",
             ]
         );

@@ -58,7 +58,7 @@ use crate::moe::{
     RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs, RaonMoeScratch,
 };
 use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
-use crate::projection::{project, OutRound};
+use crate::projection::{prepare_a8, project, project_prepared, OutRound};
 use crate::rda::{
     rda_forward_rows_taped, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
     RdaTape,
@@ -782,10 +782,14 @@ fn rda_mixer(
     };
     let qkvg = work.site_tiers.get(RaonPrecisionSite::RdaQkvg);
     let f16 = PrefillActTier::F16;
-    project(gpu, &w.q_proj, x, q_raw, rows, b, qkvg)?;
-    project(gpu, &w.k_proj, x, k_raw, rows, b, qkvg)?;
-    project(gpu, &w.v_proj, x, v_raw, rows, b, qkvg)?;
-    project(gpu, &w.g_proj, x, &scratch.rda_z, rows, b, qkvg)?;
+    // One A8 quantization of `x` serves q/k/v/g (same tier, same input); `None` -> each projection
+    // takes its ordinary route (reuse off, rows < 64, graph capture, non-A8 tier).
+    let prep = prepare_a8(gpu, &w.q_proj, x, rows, qkvg)?;
+    let prep = prep.as_ref();
+    project_prepared(gpu, &w.q_proj, x, q_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.k_proj, x, k_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.v_proj, x, v_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.g_proj, x, &scratch.rda_z, rows, b, qkvg, prep)?;
     project(gpu, &w.b_proj, x, &scratch.rda_b, rows, b, f16)?;
     project(gpu, &w.rda_w_proj, x, &scratch.rda_delta, rows, b, f16)?;
     project(gpu, &w.f_a_proj, x, &scratch.rda_f_lat, rows, b, f16)?;
@@ -959,9 +963,25 @@ fn mla_mixer(
     let q_tier = work.site_tiers.get(RaonPrecisionSite::MlaQ);
     let kv_tier = work.site_tiers.get(RaonPrecisionSite::MlaKv);
     let go_tier = work.site_tiers.get(RaonPrecisionSite::MlaGo);
-    project(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b, q_tier)?;
-    project(gpu, &w.kv_a_proj, x, &scratch.mla_kv_a, rows, b, kv_tier)?;
-    project(gpu, &w.g_proj, x, &scratch.mla_g, rows, b, go_tier)?;
+    // q_a / kv_a / g read the same `x`: quantize it once for whichever of them runs A8.
+    let prep = if [q_tier, kv_tier, go_tier].contains(&PrefillActTier::A8) {
+        prepare_a8(gpu, &w.q_a_proj, x, rows, PrefillActTier::A8)?
+    } else {
+        None
+    };
+    let prep = prep.as_ref();
+    project_prepared(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b, q_tier, prep)?;
+    project_prepared(
+        gpu,
+        &w.kv_a_proj,
+        x,
+        &scratch.mla_kv_a,
+        rows,
+        b,
+        kv_tier,
+        prep,
+    )?;
+    project_prepared(gpu, &w.g_proj, x, &scratch.mla_g, rows, b, go_tier, prep)?;
 
     run_latent(
         gpu,

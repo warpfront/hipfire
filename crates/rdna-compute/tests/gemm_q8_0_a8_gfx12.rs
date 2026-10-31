@@ -18,7 +18,7 @@
 //!
 //!   cargo test -p rdna-compute --release --test gemm_q8_0_a8_gfx12 -- --ignored
 
-use rdna_compute::{DType, Gpu, GpuTensor, Q8A8Tile};
+use rdna_compute::{DType, Gpu, GpuTensor, Q8A8Sched, Q8A8Tile};
 
 struct Rng(u64);
 impl Rng {
@@ -152,6 +152,60 @@ fn run_case(gpu: &mut Gpu, m: usize, k: usize, n: usize, misalign_base: bool, se
         gpu.gemm_q8_0_a8_gemm_tile(&w, &acts, &y, m, tile)
             .unwrap_or_else(|e| panic!("{}: {e:?}", tile.label()));
         check(gpu, &y, tile.label());
+    }
+    // BF16 epilogue: every tile equals the plain result followed by the in-place round kernel
+    // (`bf16_round_trip_f32_strided`, non-finite untouched) bit for bit.
+    let want_bf16: Vec<f32> = want
+        .iter()
+        .map(|&v| if v.is_finite() { bf16_round(v) } else { v })
+        .collect();
+    for tile in Q8A8Tile::ALL {
+        for bf16 in [false, true] {
+            let y = gpu.upload_f32(&vec![f32::NAN; n * m], &[n * m]).expect("y");
+            gpu.gemm_q8_0_a8_gemm_tile_ex(&w, &acts, &y, m, tile, bf16)
+                .unwrap_or_else(|e| panic!("{} bf16={bf16}: {e:?}", tile.label()));
+            let got = gpu.download_f32(&y).expect("download");
+            let exp = if bf16 { &want_bf16 } else { &want };
+            for (i, (g, e)) in got.iter().zip(exp).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    e.to_bits(),
+                    "{} bf16={bf16} m={m} k={k} n={n} misalign={misalign_base}: Y[{}][{}]",
+                    tile.label(),
+                    i / m,
+                    i % m
+                );
+            }
+        }
+    }
+    // Explicit schedules: Plain everywhere, PipelinedSb (T128x128 + FAST weights) with and
+    // without the BF16 epilogue: same bits as the emulation (and its BF16 round).
+    let fast = k % 64 == 0 && !misalign_base;
+    for tile in Q8A8Tile::ALL {
+        for sched in [Q8A8Sched::Plain, Q8A8Sched::PipelinedSb] {
+            let supported = sched == Q8A8Sched::Plain || (tile == Q8A8Tile::T128x128 && fast);
+            for bf16 in [false, true] {
+                let y = gpu.upload_f32(&vec![f32::NAN; n * m], &[n * m]).expect("y");
+                let r = gpu.gemm_q8_0_a8_gemm_sched(&w, &acts, &y, m, tile, bf16, sched);
+                if !supported {
+                    assert!(r.is_err(), "{sched:?} {} must be refused", tile.label());
+                    continue;
+                }
+                r.unwrap_or_else(|e| panic!("{sched:?} {}: {e:?}", tile.label()));
+                let got = gpu.download_f32(&y).expect("download");
+                let exp = if bf16 { &want_bf16 } else { &want };
+                for (i, (g, e)) in got.iter().zip(exp).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        e.to_bits(),
+                        "{sched:?} {} bf16={bf16} m={m} k={k} n={n} misalign={misalign_base}: Y[{}][{}]",
+                        tile.label(),
+                        i / m,
+                        i % m
+                    );
+                }
+            }
+        }
     }
     let y = gpu.upload_f32(&vec![f32::NAN; n * m], &[n * m]).expect("y");
     gpu.gemm_q8_0_a8_batched(&w, &xt, &y, m, k, n)

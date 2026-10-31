@@ -16,7 +16,9 @@
 //! so those never reach this layer; anything else is a named error, never a
 //! silent per-token loop.
 
-use hipfire_dispatch::pipeline::{q8_0_prefill_gemm, PrefillActTier};
+use hipfire_dispatch::pipeline::{
+    q8_0_prefill_gemm_prepared, q8_0_prefill_prepare, PrefillActTier, PreparedA8,
+};
 use hipfire_runtime::llama::{weight_gemm, weight_gemv, weight_gemv_rows_exact, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -145,25 +147,110 @@ pub fn project_rows_batched(
     round: OutRound,
     tier: PrefillActTier,
 ) -> Result<(), String> {
+    project_batched(gpu, w, x, y, rows, round, tier, None)
+}
+
+/// `HIPFIRE_RAON_A8_REUSE=0` restores one activation quantization per A8 projection call (the
+/// pre-reuse behavior); anything else, or unset, shares one quantization per node. Read once.
+fn a8_reuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_RAON_A8_REUSE", true));
+    *ON
+}
+
+/// Quantize the activation plane `x[rows, w.k]` once for every A8 Q8_0 projection of a node that
+/// reads it (RDA q/k/v/g, MLA q_a/kv_a/g); `w` is any one consumer (its `k` and dtype are the
+/// shared contract). `None` (nothing launched) when the reuse switch is off, the weight is not
+/// Q8_0, or the quantized route is not admitted at this `tier`/`rows`, in which case every consumer
+/// takes its ordinary route. The result is valid for one node: pass it to [`project_prepared`] for
+/// consumers of the same `x` before anything else quantizes (a stale value is detected and ignored).
+pub fn prepare_a8(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    rows: usize,
+    tier: PrefillActTier,
+) -> Result<Option<PreparedA8>, String> {
+    if rows <= 1 || w.gpu_dtype != DType::Q8_0 || !a8_reuse_enabled() {
+        return Ok(None);
+    }
+    q8_0_prefill_prepare(gpu, tier, x, w.m, w.k, rows)
+        .map_err(|e| format!("raon A8 prepare (rows={rows}): {e}"))
+}
+
+/// [`project_rows_batched`] whose A8 Q8_0 route consumes `prepared` (see [`prepare_a8`]) instead of
+/// quantizing `x` again and, for `OutRound::Bf16`, rounds in the GEMM epilogue. Bit-identical to
+/// [`project_rows`]: the same quantizer output feeds the same GEMM, the same RN-even round.
+#[allow(clippy::too_many_arguments)]
+fn project_batched(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    round: OutRound,
+    tier: PrefillActTier,
+    prepared: Option<&PreparedA8>,
+) -> Result<(), String> {
     check(w, x, y, rows, "rows")?;
     if rows == 1 {
         return project_row(gpu, w, x, y, round);
     }
+    let mut rounded = false;
     match w.gpu_dtype {
         DType::MQ4G256V2 => weight_gemm(gpu, w, x, y, rows).map_err(|e| format!("{e:?}")),
-        DType::Q8_0 => q8_0_prefill_gemm(gpu, tier, &w.buf, x, y, w.m, w.k, rows)
-            .map(|_| ())
-            .map_err(|e| e.to_string()),
+        DType::Q8_0 => q8_0_prefill_gemm_prepared(
+            gpu,
+            tier,
+            prepared,
+            &w.buf,
+            x,
+            y,
+            w.m,
+            w.k,
+            rows,
+            round == OutRound::Bf16 && a8_fuse_round_enabled(),
+        )
+        .map(|run| rounded = run.bf16_fused)
+        .map_err(|e| e.to_string()),
         DType::F32 => gpu
             .gemm_f32_batched(&w.buf, x, y, w.m, w.k, rows)
             .map_err(|e| format!("{e:?}")),
         other => unreachable!("dtype {other:?} rejected by check()"),
     }
     .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;
-    if round == OutRound::Bf16 {
+    if round == OutRound::Bf16 && !rounded {
         round_bf16_rows(gpu, y, rows, w.m)?;
     }
     Ok(())
+}
+
+/// `HIPFIRE_RAON_A8_FUSE_ROUND=0` runs the A8 projection's BF16 output round as its own pass
+/// (`bf16_round_trip_f32_strided`) instead of the GEMM epilogue; bit-identical either way. Read once.
+fn a8_fuse_round_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_RAON_A8_FUSE_ROUND", true)
+    });
+    *ON
+}
+
+/// [`project_rows`] for a consumer of a node whose activation was prepared once ([`prepare_a8`]).
+/// Row-exact verify blocks keep [`project_rows`]' exact route (the A8 tier is never admitted there).
+#[allow(clippy::too_many_arguments)]
+pub fn project_prepared(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    round: OutRound,
+    tier: PrefillActTier,
+    prepared: Option<&PreparedA8>,
+) -> Result<(), String> {
+    if rows <= ROWS_EXACT_MAX && rows_exact() {
+        return project_rows(gpu, w, x, y, rows, round, tier);
+    }
+    project_batched(gpu, w, x, y, rows, round, tier, prepared)
 }
 
 /// `rows` launches of the decode projection (`weight_gemv`) on row views: exact by

@@ -57,27 +57,63 @@ impl Q8A8Tile {
         }
     }
 
-    fn symbol(self, fast: bool) -> &'static str {
-        match (self, fast) {
-            (Q8A8Tile::T128x128, true) => "gemm_q8_0_mmq_i8_t128x128",
-            (Q8A8Tile::T128x128, false) => "gemm_q8_0_mmq_i8_t128x128_slow",
-            (Q8A8Tile::T128x64, true) => "gemm_q8_0_mmq_i8_t128x64",
-            (Q8A8Tile::T128x64, false) => "gemm_q8_0_mmq_i8_t128x64_slow",
-            (Q8A8Tile::T64x64, true) => "gemm_q8_0_mmq_i8_t64x64",
-            (Q8A8Tile::T64x64, false) => "gemm_q8_0_mmq_i8_t64x64_slow",
+    /// Kernel symbol. `ps` selects the pipelined single-buffer schedule (`T128x128` FAST only;
+    /// the caller checks [`Self::has_ps`]).
+    fn symbol(self, fast: bool, bf16_out: bool, ps: bool) -> &'static str {
+        match (self, fast, bf16_out, ps) {
+            (Q8A8Tile::T128x128, true, false, true) => "gemm_q8_0_mmq_i8_t128x128_ps",
+            (Q8A8Tile::T128x128, true, true, true) => "gemm_q8_0_mmq_i8_t128x128_ps_bf16",
+            (_, _, _, true) => unreachable!("pipelined schedule is T128x128 FAST only"),
+            (Q8A8Tile::T128x128, true, false, false) => "gemm_q8_0_mmq_i8_t128x128",
+            (Q8A8Tile::T128x128, false, false, false) => "gemm_q8_0_mmq_i8_t128x128_slow",
+            (Q8A8Tile::T128x64, true, false, false) => "gemm_q8_0_mmq_i8_t128x64",
+            (Q8A8Tile::T128x64, false, false, false) => "gemm_q8_0_mmq_i8_t128x64_slow",
+            (Q8A8Tile::T64x64, true, false, false) => "gemm_q8_0_mmq_i8_t64x64",
+            (Q8A8Tile::T64x64, false, false, false) => "gemm_q8_0_mmq_i8_t64x64_slow",
+            (Q8A8Tile::T128x128, true, true, false) => "gemm_q8_0_mmq_i8_t128x128_bf16",
+            (Q8A8Tile::T128x128, false, true, false) => "gemm_q8_0_mmq_i8_t128x128_slow_bf16",
+            (Q8A8Tile::T128x64, true, true, false) => "gemm_q8_0_mmq_i8_t128x64_bf16",
+            (Q8A8Tile::T128x64, false, true, false) => "gemm_q8_0_mmq_i8_t128x64_slow_bf16",
+            (Q8A8Tile::T64x64, true, true, false) => "gemm_q8_0_mmq_i8_t64x64_bf16",
+            (Q8A8Tile::T64x64, false, true, false) => "gemm_q8_0_mmq_i8_t64x64_slow_bf16",
         }
     }
+
+    /// Whether the pipelined single-buffer schedule exists for this tile and weight path.
+    fn has_ps(self, fast: bool) -> bool {
+        self == Q8A8Tile::T128x128 && fast
+    }
+}
+
+/// Kernel schedule of one GEMM launch (same arithmetic, bit-identical output).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Q8A8Sched {
+    /// The original two-LDS-buffer schedule.
+    Plain,
+    /// Software-pipelined WMMA/fold over a single LDS buffer (twice the resident CTAs):
+    /// `T128x128` with the FAST weight path only.
+    PipelinedSb,
+}
+
+/// `HIPFIRE_Q8A8_PS=0` keeps the plain schedule everywhere (kill switch of the default
+/// [`Q8A8Sched::PipelinedSb`] choice for `T128x128` FAST launches). Read once.
+fn ps_default_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_Q8A8_PS", true));
+    *ON
 }
 
 /// Quantized activations in the Gpu's W8A8 scratch. The pointers stay valid
 /// until the next [`Gpu::q8_a8_quantize_x`] (which overwrites them) or a
-/// scratch growth.
+/// scratch growth; [`Gpu::q8_a8_acts_current`] tells whether that happened, and the GEMM refuses
+/// stale activations.
 #[derive(Clone, Copy, Debug)]
 pub struct Q8A8Activations {
     xq: *mut c_void,
     xs: *mut c_void,
     n: usize,
     k: usize,
+    generation: u64,
 }
 
 impl Q8A8Activations {
@@ -97,6 +133,11 @@ impl Gpu {
     /// Whether the W8A8 Q8_0 route can run for this device and `k`.
     pub fn q8_a8_supported(&self, k: usize) -> bool {
         self.arch_caps.is_rdna4() && k > 0 && k % 32 == 0
+    }
+
+    /// Whether `acts` still describes the W8A8 scratch contents (no quantizer ran since).
+    pub fn q8_a8_acts_current(&self, acts: &Q8A8Activations) -> bool {
+        acts.generation == self.scratch.q8_a8_x_generation
     }
 
     /// Tile for a `(m, n)` call: the biggest tile whose grid still holds at
@@ -182,7 +223,13 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result?;
-        Ok(Q8A8Activations { xq, xs, n, k })
+        Ok(Q8A8Activations {
+            xq,
+            xs,
+            n,
+            k,
+            generation: self.scratch.q8_a8_x_generation,
+        })
     }
 
     /// W8A8 GEMM on already-quantized activations, tile chosen by
@@ -198,6 +245,20 @@ impl Gpu {
         self.gemm_q8_0_a8_gemm_tile(w_q8, acts, y, m, tile)
     }
 
+    /// [`Self::gemm_q8_0_a8_gemm`] whose epilogue rounds every output to BF16 (F32 plane holding
+    /// BF16 values): bit-identical to the plain GEMM followed by
+    /// [`Gpu::bf16_round_trip_f32_strided`] over the whole `[n, m]` plane, without that pass.
+    pub fn gemm_q8_0_a8_gemm_bf16(
+        &mut self,
+        w_q8: &GpuTensor,
+        acts: &Q8A8Activations,
+        y: &GpuTensor,
+        m: usize,
+    ) -> HipResult<()> {
+        let tile = self.q8_a8_pick_tile(m, acts.n);
+        self.gemm_q8_0_a8_gemm_tile_ex(w_q8, acts, y, m, tile, true)
+    }
+
     /// As [`Self::gemm_q8_0_a8_gemm`] with an explicit tile (bench / tests).
     pub fn gemm_q8_0_a8_gemm_tile(
         &mut self,
@@ -207,8 +268,58 @@ impl Gpu {
         m: usize,
         tile: Q8A8Tile,
     ) -> HipResult<()> {
+        self.gemm_q8_0_a8_gemm_tile_ex(w_q8, acts, y, m, tile, false)
+    }
+
+    /// Explicit tile and epilogue (`bf16_out`: round outputs to BF16, see
+    /// [`Self::gemm_q8_0_a8_gemm_bf16`]).
+    pub fn gemm_q8_0_a8_gemm_tile_ex(
+        &mut self,
+        w_q8: &GpuTensor,
+        acts: &Q8A8Activations,
+        y: &GpuTensor,
+        m: usize,
+        tile: Q8A8Tile,
+        bf16_out: bool,
+    ) -> HipResult<()> {
+        self.gemm_q8_0_a8_gemm_impl(w_q8, acts, y, m, tile, bf16_out, None)
+    }
+
+    /// As [`Self::gemm_q8_0_a8_gemm_tile_ex`] with an explicit kernel [`Q8A8Sched`] (bench /
+    /// tests); `PipelinedSb` errors unless the tile is `T128x128` and the weights take the FAST
+    /// path.
+    pub fn gemm_q8_0_a8_gemm_sched(
+        &mut self,
+        w_q8: &GpuTensor,
+        acts: &Q8A8Activations,
+        y: &GpuTensor,
+        m: usize,
+        tile: Q8A8Tile,
+        bf16_out: bool,
+        sched: Q8A8Sched,
+    ) -> HipResult<()> {
+        self.gemm_q8_0_a8_gemm_impl(w_q8, acts, y, m, tile, bf16_out, Some(sched))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q8_0_a8_gemm_impl(
+        &mut self,
+        w_q8: &GpuTensor,
+        acts: &Q8A8Activations,
+        y: &GpuTensor,
+        m: usize,
+        tile: Q8A8Tile,
+        bf16_out: bool,
+        sched: Option<Q8A8Sched>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let (n, k) = (acts.n, acts.k);
+        if !self.q8_a8_acts_current(acts) {
+            return Err(HipError::new(
+                1,
+                "gemm_q8_0_a8_gemm: activations were overwritten by a later quantizer",
+            ));
+        }
         if !self.q8_a8_supported(k) || m == 0 || n == 0 {
             return Err(HipError::new(
                 1,
@@ -227,7 +338,20 @@ impl Gpu {
         // FAST kernels read the 68-byte K64 slab with 4-byte loads: they need
         // an even number of Q8_0 blocks per row and a 4-byte aligned base.
         let fast = k % 64 == 0 && (w_q8.buf.as_ptr() as usize) % 4 == 0;
-        let symbol = tile.symbol(fast);
+        let ps = match sched {
+            Some(Q8A8Sched::PipelinedSb) => {
+                if !tile.has_ps(fast) {
+                    return Err(HipError::new(
+                        1,
+                        "gemm_q8_0_a8_gemm: the pipelined schedule is T128x128 FAST only",
+                    ));
+                }
+                true
+            }
+            Some(Q8A8Sched::Plain) => false,
+            None => tile.has_ps(fast) && ps_default_enabled(),
+        };
+        let symbol = tile.symbol(fast, bf16_out, ps);
         self.ensure_kernel(MODULE, kernels::GEMM_Q8_0_MMQ_I8_GFX12_SRC, symbol)?;
 
         let wp = w_q8.buf.as_ptr();
