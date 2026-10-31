@@ -980,8 +980,9 @@ pub(crate) fn gdn_batched_kernargs(a: &GdnBatchedKernargs) -> KernargBlob {
     args
 }
 
-pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
-    let format = p.format;
+/// Every shape, dtype and state-slot check of a batched GDN recurrence launch
+/// ([`gated_delta_step_batched`]), before any kernel work.
+fn validate_gated_delta_step_batched(p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
     for tensor in [p.projection, p.gate, p.beta, p.output] {
         ensure_f32(tensor)?;
     }
@@ -995,7 +996,7 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     validate_gdn_state(
-        format,
+        p.format,
         p.state,
         p.residual,
         p.row_states,
@@ -1022,6 +1023,12 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    Ok(())
+}
+
+pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
+    let format = p.format;
+    validate_gated_delta_step_batched(p)?;
     let rows = checked_i32(p.rows, "GDN batched rows")?;
     let qkv_width = checked_i32(p.qkv_width, "GDN batched qkv width")?;
     let key_heads = checked_i32(p.key_heads, "GDN batched key heads")?;
@@ -3757,6 +3764,503 @@ impl GdnCoreLanesPlan<'_, '_> {
             gpu.scratch.prerotated = Some((out0, r.buf.as_ptr() as usize, n * value));
         }
         Ok(rotation.is_some())
+    }
+}
+
+/// Most rows one lane of [`gated_delta_core_lanes_rows`] may carry (the
+/// capture ring's verify window).
+pub const GDN_CORE_ROWS_MAX: usize = 8;
+
+/// One verify lane's GDN Core under the armed capture ring: the arguments of
+/// its per-lane chain `copy_d2d(projection -> conv.input)`,
+/// [`gated_delta_conv_params_batched`], [`gated_delta_step_batched`] (with
+/// `row_states`) and [`gated_delta_gate_batched`], exactly as
+/// `execute_gated_delta_net_hc_impl` builds them.
+pub struct GdnCoreRowsLane<'a> {
+    /// The qkv projection rows `[rows, qkv]` the per-lane route copies into
+    /// `conv.input` (the capture's `inputs`); the lanes kernel does that copy.
+    pub projection: &'a GpuTensor,
+    pub conv: GatedDeltaConvBatched<'a>,
+    pub params: GatedDeltaParamsBatched<'a>,
+    pub step: GatedDeltaStepBatched<'a>,
+    pub gate: GatedDeltaGateBatched<'a>,
+}
+
+/// A validated, admitted set of 2..=[`GDN_CORE_LANES_MAX`] verify lanes, ready
+/// for [`GdnCoreRowsPlan::launch`]; produced only by
+/// [`gated_delta_core_lanes_rows`].
+pub struct GdnCoreRowsPlan<'a, 'l> {
+    lanes: &'a [GdnCoreRowsLane<'l>],
+    heads: usize,
+}
+
+/// The strict F32 convolution checks of [`gated_delta_conv_batched`] (the lanes
+/// kernel runs the F32 in / F32 out k4 route only).
+fn validate_gated_delta_conv_rows(p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
+    for tensor in [p.input, p.output, p.history, p.next_history] {
+        ensure_f32(tensor)?;
+    }
+    if p.kernel.dtype != DType::BF16
+        || p.rows == 0
+        || p.channels == 0
+        || p.history_rows != 3
+        || p.kernel_size != 4
+        || p.start_cursor >= p.history_rows
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let input_elements = checked_product(p.rows, p.channels, "GDN lane rows convolution input")?;
+    let history_elements = checked_product(
+        p.channels,
+        p.history_rows,
+        "GDN lane rows convolution history",
+    )?;
+    let kernel_elements = checked_product(p.channels, p.kernel_size, "GDN lane rows kernel")?;
+    if p.input.numel() != input_elements
+        || p.output.numel() != input_elements
+        || p.history.numel() != history_elements
+        || p.next_history.numel() != history_elements
+        || p.kernel.numel() != kernel_elements
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    Ok(())
+}
+
+/// `[start, end)` device ranges a lane's chain writes and reads (see
+/// [`gdn_rows_ranges_disjoint`]).
+fn gdn_rows_lane_ranges(lane: &GdnCoreRowsLane<'_>) -> ([(usize, usize); 8], [(usize, usize); 5]) {
+    let (c, p, s, g) = (&lane.conv, &lane.params, &lane.step, &lane.gate);
+    let at = |t: &GpuTensor, bytes: usize| {
+        let start = t.buf.as_ptr() as usize;
+        (start, start.saturating_add(bytes))
+    };
+    let rows = s.rows;
+    let value = s.value_heads * s.value_dim;
+    let slot = GdnStateFormat::Q8.state_bytes(s.value_heads, s.key_dim, s.value_dim);
+    let ring_slot = {
+        let ring = s.row_states.map_or(0, |r| r.buf.as_ptr() as usize);
+        let start = ring.saturating_add((rows - 1).saturating_mul(slot));
+        (start, start.saturating_add(slot))
+    };
+    (
+        [
+            at(c.history, c.history_rows * c.channels * 4),
+            at(c.output, rows * c.channels * 4),
+            at(p.gate, rows * p.heads * 4),
+            at(p.beta, rows * p.heads * 4),
+            at(c.input, rows * c.channels * 4),
+            ring_slot,
+            at(s.output, rows * value * 4),
+            at(g.output, rows * value * 4),
+        ],
+        [
+            at(lane.projection, rows * c.channels * 4),
+            at(p.a, rows * p.heads * 4),
+            at(p.b, rows * p.heads * 4),
+            at(g.z, rows * value * 4),
+            at(s.state, slot),
+        ],
+    )
+}
+
+/// Whether every written range of every lane is disjoint from every other
+/// written range and from every other lane's read ranges: lanes run
+/// concurrently, so any overlap (a duplicated state, ring, history or output,
+/// or a lane reading what another lane writes) would make the grouped result
+/// differ from the sequential per-lane one.
+fn gdn_rows_ranges_disjoint(lanes: &[GdnCoreRowsLane<'_>]) -> bool {
+    let all: Vec<_> = lanes.iter().map(gdn_rows_lane_ranges).collect();
+    gdn_rows_ranges_clear(&all)
+}
+
+/// [`gdn_rows_ranges_disjoint`] on the `(written, read)` ranges of each lane.
+fn gdn_rows_ranges_clear(all: &[([(usize, usize); 8], [(usize, usize); 5])]) -> bool {
+    for (i, (writes, _)) in all.iter().enumerate() {
+        for (w, &write) in writes.iter().enumerate() {
+            if write.0 >= write.1 {
+                return false;
+            }
+            for &other in &writes[w + 1..] {
+                if ranges_overlap(write, other) {
+                    return false;
+                }
+            }
+            for (j, (other_writes, other_reads)) in all.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                if other_writes.iter().any(|&o| ranges_overlap(write, o))
+                    || other_reads.iter().any(|&o| ranges_overlap(write, o))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    // Lanes never share a live Q8 state (read only, but a duplicated pointer
+    // marks a lane table gone wrong): the live-state reads (index 4) are
+    // pairwise disjoint as well.
+    for (i, (_, reads)) in all.iter().enumerate() {
+        if all[i + 1..]
+            .iter()
+            .any(|(_, other)| ranges_overlap(reads[4], other[4]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Kernargs of `gated_delta_gate_bf16_f32_rows_lanes`: `norm`, `value_heads`,
+/// then the by-value `GdnGateRowsLanes` table: three pointer arrays
+/// (`recurrent`, `z`, `output`) and the rows.
+fn rows_gate_kernargs(
+    norm: *mut std::ffi::c_void,
+    value_heads: i32,
+    tables: &[[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]],
+    rows: &[u32; GDN_CORE_LANES_MAX],
+) -> KernargBlob {
+    debug_assert_eq!(tables.len(), 3);
+    let mut args = KernargBlob::new();
+    args.push_ptr(norm);
+    args.push_i32(value_heads);
+    for table in tables {
+        for &ptr in table {
+            args.push_ptr(ptr);
+        }
+    }
+    for &v in rows {
+        args.push_u32(v);
+    }
+    args.pad_to(16);
+    args
+}
+
+/// Per-lane pointer tables of `fields`, padded with null to
+/// [`GDN_CORE_LANES_MAX`] entries.
+fn rows_ptr_tables(
+    lanes: &[GdnCoreRowsLane<'_>],
+    fields: &[fn(&GdnCoreRowsLane<'_>) -> *mut std::ffi::c_void],
+) -> Vec<[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]> {
+    fields
+        .iter()
+        .map(|field| {
+            let mut table = [std::ptr::null_mut(); GDN_CORE_LANES_MAX];
+            for (slot, lane) in table.iter_mut().zip(lanes) {
+                *slot = field(lane);
+            }
+            table
+        })
+        .collect()
+}
+
+/// Kernargs of `gated_delta_conv_params_bf16_f32_rows_lanes` (`gdn_lanes.hip`):
+/// `kernel, a_log, dt_bias`, `channels, heads, max_rows`, then the by-value
+/// `GdnConvRowsLanes` table: eight pointer arrays (`input, inputs, output,
+/// history, a, b, gate, beta`), the rows and the conv cursors.
+fn rows_conv_kernargs(
+    shared: [*mut std::ffi::c_void; 3],
+    dims: [i32; 3],
+    tables: &[[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]],
+    rows: &[u32; GDN_CORE_LANES_MAX],
+    cursors: &[u32; GDN_CORE_LANES_MAX],
+) -> KernargBlob {
+    debug_assert_eq!(tables.len(), 8);
+    let mut args = KernargBlob::new();
+    for ptr in shared {
+        args.push_ptr(ptr);
+    }
+    for v in dims {
+        args.push_i32(v);
+    }
+    for table in tables {
+        for &ptr in table {
+            args.push_ptr(ptr);
+        }
+    }
+    for &v in rows.iter().chain(cursors) {
+        args.push_u32(v);
+    }
+    args.pad_to(16);
+    args
+}
+
+/// Kernargs of `gated_delta_step_halves_state128_persistent256_capture_q8_lanes`:
+/// `qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale`, then
+/// the by-value `GdnStepRowsLanes` table: six pointer arrays (`projection, gate,
+/// beta, state, output, ring`), the rows and the Q8 frames.
+fn rows_step_kernargs(
+    dims: [i32; 5],
+    query_scale: f32,
+    tables: &[[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]],
+    rows: &[u32; GDN_CORE_LANES_MAX],
+    frames: &[u32; GDN_CORE_LANES_MAX],
+) -> KernargBlob {
+    debug_assert_eq!(tables.len(), 6);
+    let mut args = KernargBlob::new();
+    for v in dims {
+        args.push_i32(v);
+    }
+    args.push_f32(query_scale);
+    for table in tables {
+        for &ptr in table {
+            args.push_ptr(ptr);
+        }
+    }
+    for &v in rows.iter().chain(frames) {
+        args.push_u32(v);
+    }
+    args.pad_to(16);
+    args
+}
+
+/// Admission of the per-lane verify chains of 2..=[`GDN_CORE_LANES_MAX`] lanes
+/// with 2..=[`GDN_CORE_ROWS_MAX`] rows each as three launches (see
+/// [`GdnCoreRowsPlan::launch`]), under `HIPFIRE_QWEN4_GDN_LANES_ROWS`
+/// ([`crate::feature_flags::FeatureFlags::qwen4_gdn_lanes_rows_enabled`]: exact
+/// gfx1201, opt-in, killed by `HIPFIRE_QWEN4_GDN_LANES=0`). Lanes hold Q8 slots on the exact-gfx1201
+/// 128x128 route with their capture ring armed (`step.row_states`: the
+/// token-exact capture recurrence; the unarmed route requantizes once and is
+/// not this kernel; every lane has 2..=[`GDN_CORE_ROWS_MAX`] rows, so a set
+/// that holds a one-row lane is never admitted: one-row AR lanes take
+/// [`gated_delta_core_lanes`]) and share the weights and shapes. Every
+/// refusal happens
+/// here, before anything launches: `Ok(None)` means run the lanes one by one;
+/// a malformed lane is an `Err`, as in the singleton launchers. Never while a
+/// replay tape records (per-lane cursors and frames are not declared).
+pub fn gated_delta_core_lanes_rows<'a, 'l>(
+    gpu: &Gpu,
+    lanes: &'a [GdnCoreRowsLane<'l>],
+    heads: usize,
+) -> HipResult<Option<GdnCoreRowsPlan<'a, 'l>>> {
+    let Some(first) = lanes.first() else {
+        return Ok(None);
+    };
+    if lanes.len() < 2
+        || lanes.len() > GDN_CORE_LANES_MAX
+        || gpu.replay.is_recording()
+        || !gpu.flags.qwen4_gdn_lanes_rows_enabled()
+        || !gpu.arch_caps.has_gfx11_plus_simt()
+    {
+        return Ok(None);
+    }
+    let (c0, p0, s0, g0) = (&first.conv, &first.params, &first.step, &first.gate);
+    for lane in lanes {
+        let (c, p, s, g) = (&lane.conv, &lane.params, &lane.step, &lane.gate);
+        validate_gated_delta_conv_rows(c)?;
+        validate_gated_delta_params_batched(p)?;
+        validate_gated_delta_step_batched(s)?;
+        validate_gated_delta_gate_batched(g)?;
+        ensure_f32(lane.projection)?;
+        // The position seeds a u32 Q8 frame (checked like the singleton).
+        checked_u32(s.position + s.rows - 1, "GDN lane Q8 frame")?;
+        let fits = s.format == GdnStateFormat::Q8
+            && s.residual.is_none()
+            && s.row_states.is_some()
+            && (2..=GDN_CORE_ROWS_MAX).contains(&s.rows)
+            && c.rows == s.rows
+            && p.rows == s.rows
+            && g.rows == s.rows
+            && p.heads == heads
+            && s.value_heads == heads
+            && g.value_heads == heads
+            && c.channels == s.qkv_width
+            && lane.projection.numel() == c.input.numel()
+            && c.next_history.buf.as_ptr() == c.history.buf.as_ptr()
+            && s.projection.buf.as_ptr() == c.output.buf.as_ptr()
+            && s.gate.buf.as_ptr() == p.gate.buf.as_ptr()
+            && s.beta.buf.as_ptr() == p.beta.buf.as_ptr()
+            && g.recurrent_output.buf.as_ptr() == s.output.buf.as_ptr()
+            && (
+                s.key_heads,
+                s.value_heads,
+                s.key_dim,
+                s.value_dim,
+                s.qkv_width,
+            ) == (
+                s0.key_heads,
+                s0.value_heads,
+                s0.key_dim,
+                s0.value_dim,
+                s0.qkv_width,
+            )
+            && c.kernel.buf.as_ptr() == c0.kernel.buf.as_ptr()
+            && p.a_log.buf.as_ptr() == p0.a_log.buf.as_ptr()
+            && p.dt_bias.buf.as_ptr() == p0.dt_bias.buf.as_ptr()
+            && g.norm.buf.as_ptr() == g0.norm.buf.as_ptr();
+        if !fits {
+            return Ok(None);
+        }
+    }
+    if !gdn_rows_ranges_disjoint(lanes) {
+        return Ok(None);
+    }
+    Ok(Some(GdnCoreRowsPlan { lanes, heads }))
+}
+
+impl GdnCoreRowsPlan<'_, '_> {
+    /// The admitted lanes as three launches (convolution + gate parameters +
+    /// the fused capture copy, the capture recurrence, the gated norm over all
+    /// rows): each lane's blocks run the per-lane chain's device bodies on its
+    /// own rows, Q8 frame and ring, so every output, capture and state byte
+    /// equals the per-lane calls'.
+    pub fn launch(self, gpu: &mut Gpu) -> HipResult<()> {
+        let Self { lanes, heads } = self;
+        let first = &lanes[0];
+        let (c0, p0, s0, g0) = (&first.conv, &first.params, &first.step, &first.gate);
+        let n = lanes.len();
+
+        let max_rows = lanes.iter().map(|l| l.step.rows).max().unwrap_or(0);
+        let conv_blocks = blocks(c0.channels)? as usize;
+        let conv_tiles = checked_product(
+            conv_blocks,
+            max_rows.div_ceil(16),
+            "GDN lane rows convolution tile grid",
+        )?;
+        let param_blocks = (max_rows * heads).div_ceil(256);
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_conv_params_bf16_f32_rows_lanes",
+        )?;
+        let mut rows_table = [0u32; GDN_CORE_LANES_MAX];
+        let mut cursor_table = [0u32; GDN_CORE_LANES_MAX];
+        for (i, lane) in lanes.iter().enumerate() {
+            rows_table[i] = lane.conv.rows as u32;
+            cursor_table[i] = lane.conv.start_cursor as u32;
+        }
+        let mut args = rows_conv_kernargs(
+            [
+                c0.kernel.buf.as_ptr(),
+                p0.a_log.buf.as_ptr(),
+                p0.dt_bias.buf.as_ptr(),
+            ],
+            [
+                checked_i32(c0.channels, "GDN lane rows channels")?,
+                checked_i32(heads, "GDN lane rows heads")?,
+                checked_i32(max_rows, "GDN lane rows max rows")?,
+            ],
+            &rows_ptr_tables(
+                lanes,
+                &[
+                    |l| l.projection.buf.as_ptr(),
+                    |l| l.conv.input.buf.as_ptr(),
+                    |l| l.conv.output.buf.as_ptr(),
+                    |l| l.conv.history.buf.as_ptr(),
+                    |l| l.params.a.buf.as_ptr(),
+                    |l| l.params.b.buf.as_ptr(),
+                    |l| l.params.gate.buf.as_ptr(),
+                    |l| l.params.beta.buf.as_ptr(),
+                ],
+            ),
+            &rows_table,
+            &cursor_table,
+        );
+        gpu.launch_blob_recorded(
+            "gated_delta_conv_params_bf16_f32_rows_lanes",
+            [
+                checked_u32(conv_tiles + param_blocks, "GDN lane rows convolution grid")?,
+                n as u32,
+                1,
+            ],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_step_halves_state128_persistent256_capture_q8_lanes",
+        )?;
+        let mut rows_table = [0u32; GDN_CORE_LANES_MAX];
+        let mut frame_table = [0u32; GDN_CORE_LANES_MAX];
+        for (i, lane) in lanes.iter().enumerate() {
+            rows_table[i] = lane.step.rows as u32;
+            // Admission checked `position + rows - 1` against u32.
+            frame_table[i] = (lane.step.position + lane.step.rows - 1) as u32;
+        }
+        let mut args = rows_step_kernargs(
+            [
+                checked_i32(s0.qkv_width, "GDN lane rows qkv width")?,
+                checked_i32(s0.key_heads, "GDN lane rows key heads")?,
+                checked_i32(s0.value_heads, "GDN lane rows value heads")?,
+                checked_i32(s0.key_dim, "GDN lane rows key width")?,
+                checked_i32(s0.value_dim, "GDN lane rows value width")?,
+            ],
+            (s0.key_dim as f32).sqrt().recip(),
+            &rows_ptr_tables(
+                lanes,
+                &[
+                    |l| l.step.projection.buf.as_ptr(),
+                    |l| l.step.gate.buf.as_ptr(),
+                    |l| l.step.beta.buf.as_ptr(),
+                    |l| l.step.state.buf.as_ptr(),
+                    |l| l.step.output.buf.as_ptr(),
+                    |l| {
+                        l.step
+                            .row_states
+                            .expect("admitted lane has a capture ring")
+                            .buf
+                            .as_ptr()
+                    },
+                ],
+            ),
+            &rows_table,
+            &frame_table,
+        );
+        gpu.launch_blob_recorded(
+            "gated_delta_step_halves_state128_persistent256_capture_q8_lanes",
+            [
+                checked_u32(s0.value_heads, "GDN lane rows value-head grid")?,
+                1,
+                n as u32,
+            ],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+
+        // The gated norm is row independent: the same head body per lane's
+        // rows; the lanes' scratch need not be adjacent (AR lanes of the same
+        // step sit between verify lanes in the packed rows).
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_gate_bf16_f32_rows_lanes",
+        )?;
+        let mut gate_rows = [0u32; GDN_CORE_LANES_MAX];
+        for (slot, lane) in gate_rows.iter_mut().zip(lanes) {
+            *slot = lane.gate.rows as u32;
+        }
+        let mut args = rows_gate_kernargs(
+            g0.norm.buf.as_ptr(),
+            checked_i32(g0.value_heads, "GDN lane rows gate heads")?,
+            &rows_ptr_tables(
+                lanes,
+                &[
+                    |l| l.gate.recurrent_output.buf.as_ptr(),
+                    |l| l.gate.z.buf.as_ptr(),
+                    |l| l.gate.output.buf.as_ptr(),
+                ],
+            ),
+            &gate_rows,
+        );
+        gpu.launch_blob_recorded(
+            "gated_delta_gate_bf16_f32_rows_lanes",
+            [
+                checked_u32(max_rows * g0.value_heads, "GDN lane rows gate grid")?,
+                n as u32,
+                1,
+            ],
+            [32, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
     }
 }
 
@@ -22485,6 +22989,268 @@ mod gdn_core_lanes_tests {
         assert!(gated_delta_core_lanes(&gpu, &lanes, 48).unwrap().is_none());
         std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes = false;
         assert!(gated_delta_core_lanes(&gpu, &lanes[..2], 48)
+            .unwrap()
+            .is_none());
+        drop(lanes);
+        gpu.free_tensor(t).expect("free");
+    }
+
+    /// Writes `[w0..w1)`-style ranges of one lane: eight written, five read.
+    fn lane_ranges(base: usize) -> ([(usize, usize); 8], [(usize, usize); 5]) {
+        let range = |i: usize| (base + i * 0x100, base + i * 0x100 + 0x80);
+        (
+            [
+                range(0),
+                range(1),
+                range(2),
+                range(3),
+                range(4),
+                range(5),
+                range(6),
+                range(7),
+            ],
+            [range(8), range(9), range(10), range(11), range(12)],
+        )
+    }
+
+    #[test]
+    fn rows_lane_ranges_must_be_disjoint_across_writes_and_other_lanes_reads() {
+        let (a, b) = (lane_ranges(0x10_0000), lane_ranges(0x20_0000));
+        assert!(gdn_rows_ranges_clear(&[a, b]));
+        // A duplicated written range (state, ring, history, output).
+        let mut dup = b;
+        dup.0[5] = a.0[5];
+        assert!(!gdn_rows_ranges_clear(&[a, dup]));
+        // A partial overlap of two written ranges.
+        let mut partial = b;
+        partial.0[1] = (a.0[1].0 + 0x40, a.0[1].1 + 0x40);
+        assert!(!gdn_rows_ranges_clear(&[a, partial]));
+        // A lane writing what another lane reads, either way round.
+        let mut reads_a = b;
+        reads_a.1[2] = a.0[3];
+        assert!(!gdn_rows_ranges_clear(&[a, reads_a]));
+        assert!(!gdn_rows_ranges_clear(&[reads_a, a]));
+        // Two lanes reading the same range is fine (shared inputs).
+        let mut shared = b;
+        shared.1[0] = a.1[0];
+        assert!(gdn_rows_ranges_clear(&[a, shared]));
+        // Two lanes naming one live Q8 state (read only, but a duplicated
+        // state pointer is refused: it marks a lane table gone wrong).
+        let mut dup_state = b;
+        dup_state.1[4] = a.1[4];
+        assert!(!gdn_rows_ranges_clear(&[a, dup_state]));
+        // Overlaps inside one lane's own writes, and empty ranges, are refused.
+        let mut self_overlap = a;
+        self_overlap.0[1] = self_overlap.0[0];
+        assert!(!gdn_rows_ranges_clear(&[self_overlap, b]));
+        let mut empty = b;
+        empty.0[2] = (0x30_0000, 0x30_0000);
+        assert!(!gdn_rows_ranges_clear(&[a, empty]));
+    }
+
+    #[test]
+    fn rows_gate_kernargs_follow_the_device_struct_layout() {
+        let p = |i: usize| (0x2_0000 + i * 0x10) as *mut std::ffi::c_void;
+        let tables: Vec<[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]> = (0..3)
+            .map(|f| {
+                let mut t = [std::ptr::null_mut(); GDN_CORE_LANES_MAX];
+                for (l, slot) in t.iter_mut().enumerate().take(4) {
+                    *slot = p(f * 16 + l);
+                }
+                t
+            })
+            .collect();
+        let rows = [2u32, 8, 3, 5, 0, 0, 0, 0];
+        let mut blob = rows_gate_kernargs(p(900), 48, &tables, &rows);
+        assert_eq!(word(&mut blob, 0), p(900) as u64);
+        assert_eq!(half(&mut blob, 8), 48);
+        // The table starts at the next 8-byte boundary (offset 16).
+        for f in 0..3usize {
+            for l in 0..GDN_CORE_LANES_MAX {
+                let at = 16 + (f * GDN_CORE_LANES_MAX + l) * 8;
+                let want = if l < 4 { p(f * 16 + l) as u64 } else { 0 };
+                assert_eq!(word(&mut blob, at), want, "field {f} lane {l}");
+            }
+        }
+        let ints = 16 + 3 * GDN_CORE_LANES_MAX * 8;
+        for (l, want) in rows.iter().enumerate() {
+            assert_eq!(half(&mut blob, ints + 4 * l), *want);
+        }
+        assert_eq!(
+            blob.len(),
+            (ints + 4 * GDN_CORE_LANES_MAX).next_multiple_of(16)
+        );
+    }
+
+    fn word(blob: &mut KernargBlob, at: usize) -> u64 {
+        let s = blob.as_mut_slice();
+        u64::from_ne_bytes(s[at..at + 8].try_into().unwrap())
+    }
+
+    fn half(blob: &mut KernargBlob, at: usize) -> u32 {
+        let s = blob.as_mut_slice();
+        u32::from_ne_bytes(s[at..at + 4].try_into().unwrap())
+    }
+
+    /// The kernarg blobs match the HIP structs `GdnConvRowsLanes` /
+    /// `GdnStepRowsLanes` (`gdn_lanes.hip`): shared scalars, the by-value table
+    /// at 8-byte alignment, pointer arrays in field order, then the int arrays.
+    #[test]
+    fn rows_kernarg_blobs_follow_the_device_struct_layout() {
+        let p = |i: usize| (0x1_0000 + i * 0x10) as *mut std::ffi::c_void;
+        let tables: Vec<[*mut std::ffi::c_void; GDN_CORE_LANES_MAX]> = (0..8)
+            .map(|f| {
+                let mut t = [std::ptr::null_mut(); GDN_CORE_LANES_MAX];
+                for (l, slot) in t.iter_mut().enumerate().take(3) {
+                    *slot = p(f * 16 + l);
+                }
+                t
+            })
+            .collect();
+        let rows = [2u32, 5, 8, 0, 0, 0, 0, 0];
+        let aux = [1u32, 2, 0, 0, 0, 0, 0, 0];
+
+        let mut conv = rows_conv_kernargs(
+            [p(900), p(901), p(902)],
+            [10240, 48, 8],
+            &tables,
+            &rows,
+            &aux,
+        );
+        assert_eq!(word(&mut conv, 0), p(900) as u64);
+        assert_eq!(word(&mut conv, 16), p(902) as u64);
+        assert_eq!(half(&mut conv, 24), 10240);
+        assert_eq!(half(&mut conv, 28), 48);
+        assert_eq!(half(&mut conv, 32), 8);
+        // The table starts at the next 8-byte boundary (offset 40).
+        for f in 0..8usize {
+            for l in 0..GDN_CORE_LANES_MAX {
+                let at = 40 + (f * GDN_CORE_LANES_MAX + l) * 8;
+                let want = if l < 3 { p(f * 16 + l) as u64 } else { 0 };
+                assert_eq!(word(&mut conv, at), want, "field {f} lane {l}");
+            }
+        }
+        let ints = 40 + 8 * GDN_CORE_LANES_MAX * 8;
+        assert_eq!(half(&mut conv, ints + 4), 5);
+        assert_eq!(half(&mut conv, ints + 8), 8);
+        assert_eq!(half(&mut conv, ints + 4 * GDN_CORE_LANES_MAX + 4), 2);
+        assert_eq!(conv.len() % 16, 0);
+        assert_eq!(
+            conv.len(),
+            (ints + 2 * 4 * GDN_CORE_LANES_MAX).next_multiple_of(16)
+        );
+
+        let mut step =
+            rows_step_kernargs([10240, 16, 48, 128, 128], 0.0883, &tables[..6], &rows, &aux);
+        assert_eq!(half(&mut step, 0), 10240);
+        assert_eq!(half(&mut step, 16), 128);
+        assert_eq!(f32::from_bits(half(&mut step, 20)), 0.0883);
+        for f in 0..6usize {
+            for l in 0..GDN_CORE_LANES_MAX {
+                let at = 24 + (f * GDN_CORE_LANES_MAX + l) * 8;
+                let want = if l < 3 { p(f * 16 + l) as u64 } else { 0 };
+                assert_eq!(word(&mut step, at), want, "field {f} lane {l}");
+            }
+        }
+        let ints = 24 + 6 * GDN_CORE_LANES_MAX * 8;
+        assert_eq!(half(&mut step, ints), 2);
+        assert_eq!(half(&mut step, ints + 4 * GDN_CORE_LANES_MAX + 4), 2);
+        assert_eq!(
+            step.len(),
+            (ints + 2 * 4 * GDN_CORE_LANES_MAX).next_multiple_of(16)
+        );
+    }
+
+    /// The count and flag refusals of the verify route return `Ok(None)` before
+    /// anything is validated. Needs a GPU for the tensor handles only; skipped
+    /// without one.
+    #[test]
+    fn rows_admission_refuses_bad_counts_and_a_killed_flag() {
+        let Some(mut gpu) = crate::gpu_test::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let t = gpu.zeros(&[16], DType::F32).expect("tensor");
+        fn one(t: &GpuTensor) -> GdnCoreRowsLane<'_> {
+            GdnCoreRowsLane {
+                projection: t,
+                conv: GatedDeltaConvBatched {
+                    input: t,
+                    kernel: t,
+                    history: t,
+                    output: t,
+                    next_history: t,
+                    rows: 2,
+                    channels: 1,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor: 0,
+                },
+                params: GatedDeltaParamsBatched {
+                    a: t,
+                    b: t,
+                    a_log: t,
+                    dt_bias: t,
+                    gate: t,
+                    beta: t,
+                    rows: 2,
+                    heads: 48,
+                },
+                step: GatedDeltaStepBatched {
+                    projection: t,
+                    gate: t,
+                    beta: t,
+                    state: t,
+                    format: GdnStateFormat::Q8,
+                    residual: None,
+                    output: t,
+                    row_states: Some(t),
+                    rows: 2,
+                    qkv_width: 1,
+                    key_heads: 16,
+                    value_heads: 48,
+                    key_dim: 128,
+                    value_dim: 128,
+                    position: 0,
+                },
+                gate: GatedDeltaGateBatched {
+                    recurrent_output: t,
+                    z: t,
+                    norm: t,
+                    output: t,
+                    rows: 2,
+                    value_heads: 48,
+                    value_dim: 128,
+                },
+            }
+        }
+        let lanes: Vec<GdnCoreRowsLane<'_>> =
+            (0..GDN_CORE_LANES_MAX + 1).map(|_| one(&t)).collect();
+        {
+            let flags = std::sync::Arc::make_mut(&mut gpu.flags);
+            flags.qwen4_gdn_lanes = true;
+            flags.qwen4_gdn_lanes_rows = true;
+        }
+        assert!(gated_delta_core_lanes_rows(&gpu, &[], 48)
+            .unwrap()
+            .is_none());
+        assert!(gated_delta_core_lanes_rows(&gpu, &lanes[..1], 48)
+            .unwrap()
+            .is_none());
+        assert!(gated_delta_core_lanes_rows(&gpu, &lanes, 48)
+            .unwrap()
+            .is_none());
+        // The rows flag is its own switch: lanes on, rows off refuses.
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes_rows = false;
+        assert!(gated_delta_core_lanes_rows(&gpu, &lanes[..2], 48)
+            .unwrap()
+            .is_none());
+        {
+            let flags = std::sync::Arc::make_mut(&mut gpu.flags);
+            flags.qwen4_gdn_lanes_rows = true;
+            flags.qwen4_gdn_lanes = false;
+        }
+        assert!(gated_delta_core_lanes_rows(&gpu, &lanes[..2], 48)
             .unwrap()
             .is_none());
         drop(lanes);

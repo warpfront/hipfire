@@ -235,4 +235,163 @@ extern "C" __global__ void gated_delta_step_gate_norm128_q8_lanes_fuse(
         key_heads, value_heads, key_dim, value_dim, query_scale, lanes.rotated[l], signs1, signs2,
         pair_counters + l * (value_heads / 2), lanes.frame[l]);
 }
+
+// ---------------------------------------------------------------------------
+// Multi-lane verify core (phase 3): lanes with 2..=8 rows each under the armed
+// capture ring, the per-lane chain
+//   copy_d2d projection -> capture.inputs
+//   gated_delta_conv_params_batched  (gated_delta_conv_bf16_f32_batched_k4)
+//   gated_delta_step_batched         (..._persistent256_capture_q8)
+// as one launch per kernel for every lane. The gate that follows is row
+// independent: gated_delta_gate_bf16_f32_rows_lanes runs the same head body per
+// lane (the lanes' row scratch need not be adjacent: AR lanes of the same step
+// sit between verify lanes in the packed rows).
+// ---------------------------------------------------------------------------
+
+struct GdnConvRowsLanes {
+    // The lane's projection rows [rows, channels] (read) and the capture inputs
+    // [rows, channels] they are copied into (the fused copy_d2d; may be null).
+    const float* input[GDN_LANES_MAX];
+    float* inputs[GDN_LANES_MAX];
+    float* output[GDN_LANES_MAX];
+    float* history[GDN_LANES_MAX];
+    const float* a[GDN_LANES_MAX];
+    const float* b[GDN_LANES_MAX];
+    float* gate[GDN_LANES_MAX];
+    float* beta[GDN_LANES_MAX];
+    int rows[GDN_LANES_MAX];
+    int cursor[GDN_LANES_MAX];
+};
+
+// gated_delta_conv_bf16_f32_batched_k4 (F32 in/out, no qk-norm, with the gate
+// parameters) on each lane's own rows. Grid [conv_blocks * ceil(max_rows / 16) +
+// ceil(max_rows * heads / 256), lanes], block 256, lane = blockIdx.y. Tile i <
+// conv_total is (channel block i % conv_blocks, 16-row block i / conv_blocks); the
+// rest are parameter blocks. The tile body is the singleton kernel's, row for
+// row (the same expression sequence and ring tail); additionally every input row
+// value the tile reads for its own rows is stored to `inputs` (bit copy).
+extern "C" __global__ void gated_delta_conv_params_bf16_f32_rows_lanes(
+    const __hip_bfloat16* kernel,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    int channels,
+    int heads,
+    int max_rows,
+    GdnConvRowsLanes lanes) {
+    const int l = (int)blockIdx.y;
+    const int rows = lanes.rows[l];
+    const unsigned conv_blocks = (unsigned)(channels + 255) / 256u;
+    const unsigned conv_total = conv_blocks * (((unsigned)max_rows + 15u) / 16u);
+    if (blockIdx.x >= conv_total) {
+        const int flat = (int)(blockIdx.x - conv_total) * 256 + (int)threadIdx.x;
+        if (flat < rows * heads) {
+            gated_delta_params_flat(lanes.a[l], lanes.b[l], a_log, dt_bias, lanes.gate[l],
+                                    lanes.beta[l], flat, heads);
+        }
+        return;
+    }
+    const unsigned by = blockIdx.x / conv_blocks;
+    const unsigned bx = blockIdx.x - by * conv_blocks;
+    const int channel = (int)(bx * blockDim.x + threadIdx.x);
+    const int r0 = (int)by * 16;
+    if (channel >= channels || r0 >= rows) return;
+    const int start_cursor = lanes.cursor[l];
+    const float* input = lanes.input[l];
+    float* inputs = lanes.inputs[l];
+    float* output = lanes.output[l];
+    float* next_history = lanes.history[l];
+    const float* history = lanes.history[l];
+    auto x = [&](int j) {
+        return j >= 0 ? bf16_round(input[j * channels + channel])
+                      : bf16_round(history[((start_cursor + j + 3) % 3) * channels + channel]);
+    };
+    const float k0 = bf16_to_f32(kernel[channel * 4 + 0]);
+    const float k1 = bf16_to_f32(kernel[channel * 4 + 1]);
+    const float k2 = bf16_to_f32(kernel[channel * 4 + 2]);
+    const float k3 = bf16_to_f32(kernel[channel * 4 + 3]);
+    __hip_bfloat16 h0 = x(r0 - 3), h1 = x(r0 - 2), h2 = x(r0 - 1);
+    __hip_bfloat16 tail[3];
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s) {
+            const int j = rows - 3 + ((s - (start_cursor + rows) % 3) + 6) % 3;
+            tail[s] = x(j);
+        }
+    }
+    const int r1 = min(r0 + 16, rows);
+    for (int r = r0; r < r1; ++r) {
+        const float raw = input[r * channels + channel];
+        if (inputs != nullptr) inputs[r * channels + channel] = raw;
+        const __hip_bfloat16 current_bf16 = bf16_round(raw);
+        float value = k3 * bf16_to_f32(current_bf16);
+        value += k0 * bf16_to_f32(h0);
+        value += k1 * bf16_to_f32(h1);
+        value += k2 * bf16_to_f32(h2);
+        const __hip_bfloat16 out = bf16_round(value * (1.0f / (1.0f + expf(-value))));
+        output[r * channels + channel] = bf16_to_f32(out);
+        h0 = h1;
+        h1 = h2;
+        h2 = current_bf16;
+    }
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s)
+            next_history[s * channels + channel] = bf16_to_f32(tail[s]);
+    }
+}
+
+struct GdnStepRowsLanes {
+    // The lane's convolution output rows [rows, qkv] (q | k | v per row), gate and
+    // beta rows, the live Q8 slot (read only), the recurrent output rows, and the
+    // base of its capture ring (the final state lands in slot rows - 1).
+    const float* projection[GDN_LANES_MAX];
+    const float* gate[GDN_LANES_MAX];
+    const float* beta[GDN_LANES_MAX];
+    signed char* state[GDN_LANES_MAX];
+    float* output[GDN_LANES_MAX];
+    signed char* ring[GDN_LANES_MAX];
+    int rows[GDN_LANES_MAX];
+    unsigned int frame[GDN_LANES_MAX];
+};
+
+// gated_delta_step_halves_state128_persistent256_capture_q8 per lane (grid
+// [value_heads, 1, lanes], block 256, lane = blockIdx.z): the same device body
+// and template instantiation, a lane's rows run in order inside one block per
+// value head. `frame` is the lane's last row's position.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_capture_q8_lanes(
+    int qkv_width,
+    int key_heads,
+    int value_heads,
+    int key_dim,
+    int value_dim,
+    float query_scale,
+    GdnStepRowsLanes lanes) {
+    const int l = (int)blockIdx.z;
+    gated_delta_step_persistent256_body<true, true>(lanes.projection[l], lanes.gate[l],
+        lanes.beta[l], lanes.state[l], lanes.output[l], lanes.ring[l], lanes.rows[l], qkv_width,
+        key_heads, value_heads, key_dim, value_dim, query_scale, lanes.frame[l]);
+}
+
+struct GdnGateRowsLanes {
+    // The lane's recurrent output rows, z rows and gdn output rows
+    // [rows, value_heads * 128]; lanes need not be adjacent in memory.
+    float* recurrent[GDN_LANES_MAX];
+    const float* z[GDN_LANES_MAX];
+    float* output[GDN_LANES_MAX];
+    int rows[GDN_LANES_MAX];
+};
+
+// gated_delta_gate_bf16_f32_batched on each lane's own rows (the gate is
+// row independent: the same head body on the same flat head index). Grid
+// [max_rows * value_heads, lanes], block 32, lane = blockIdx.y.
+extern "C" __global__ __launch_bounds__(32) void gated_delta_gate_bf16_f32_rows_lanes(
+    const __hip_bfloat16* norm,
+    int value_heads,
+    GdnGateRowsLanes lanes) {
+    const int l = (int)blockIdx.y;
+    const int flat_head = (int)blockIdx.x;
+    if (flat_head >= lanes.rows[l] * value_heads) return;
+    __shared__ float rounded[128];
+    gated_delta_gate_head128(lanes.recurrent[l], lanes.z[l], norm, lanes.output[l],
+                             flat_head * 128, (int)threadIdx.x, rounded);
+}
 #undef GDN_LANES_MAX

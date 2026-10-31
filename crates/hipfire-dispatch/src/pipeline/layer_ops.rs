@@ -43,12 +43,12 @@ use rdna_compute::tensor_ops::{
 };
 use rdna_compute::tensor_ops::{
     gated_delta_conv_params_batched_mixed, gated_delta_conv_params_qknorm_batched_mixed,
-    gated_delta_core_lanes, gated_delta_gate_batched_arena, gated_delta_gate_batched_rotate_arena,
-    gated_delta_step_gate_wmma_arena, gated_delta_step_gate_wmma_qknormed_arena,
-    indexed_attention_cache_append_batch_arena, indexed_attention_index_key_append_batch_arena,
-    indexed_attention_norm_rope_batch_arena, indexed_attention_rope_table, qsa_core_lanes,
-    qsa_lanes_fuse_enabled, Bf16Arena, GdnCoreLane, QsaCoreLane, QsaOutRotate, QSA_CORE_LANES_MAX,
-    QSA_CORE_LANE_ROWS,
+    gated_delta_core_lanes, gated_delta_core_lanes_rows, gated_delta_gate_batched_arena,
+    gated_delta_gate_batched_rotate_arena, gated_delta_step_gate_wmma_arena,
+    gated_delta_step_gate_wmma_qknormed_arena, indexed_attention_cache_append_batch_arena,
+    indexed_attention_index_key_append_batch_arena, indexed_attention_norm_rope_batch_arena,
+    indexed_attention_rope_table, qsa_core_lanes, qsa_lanes_fuse_enabled, Bf16Arena, GdnCoreLane,
+    GdnCoreRowsLane, QsaCoreLane, QsaOutRotate, QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS,
 };
 use rdna_compute::{
     DType, Gpu, GpuTensor, TrunkFamily, QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM,
@@ -2886,16 +2886,61 @@ pub fn execute_gated_delta_net_uncovered(
     execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, None, Some(covered), None)
 }
 
-/// The Core phase of several one-row AR lanes' GDN mixers (consecutive
-/// `Step::GatedDeltaNet` Core steps of a lane step) through the multi-lane
-/// kernels: each lane gets exactly the per-row branch's arguments for its row
-/// (convolution + gate parameters, then the fused step + gated norm), minus
-/// the decode rotation, which a Core phase's output projection never reads (the
-/// interpreter drops the memo after the step). `Ok(false)`: the set does not
-/// take the route, nothing launched and `before_launch` was not called; run
-/// the ops one by one. `before_launch` runs exactly once, after every refusal
-/// check and before the first launch; its error is returned as is and nothing
-/// launches.
+/// Whether `op` can join an [`execute_gated_delta_net_core_lanes`] group: a
+/// Core step that is either one AR row (no capture ring, the per-row branch) or
+/// a 2..=[`rdna_compute::tensor_ops::GDN_CORE_ROWS_MAX`]-row verify window under
+/// its armed capture ring (the persistent-batch capture route), the latter only
+/// under `HIPFIRE_QWEN4_GDN_LANES_ROWS` ([`rdna_compute::feature_flags::FeatureFlags::qwen4_gdn_lanes_rows_enabled`]).
+pub fn gdn_core_lane_groupable(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
+    op.phase == MixerPhase::Core
+        && if op.rows == 1 {
+            op.row_capture.is_none() && !gdn_persistent_batch(gpu, op, 1)
+        } else {
+            gpu.flags.qwen4_gdn_lanes_rows_enabled()
+                && (2..=rdna_compute::tensor_ops::GDN_CORE_ROWS_MAX).contains(&op.rows)
+                && op.row_capture.is_some()
+                && gdn_persistent_batch(gpu, op, op.rows)
+        }
+}
+
+/// The row views of one verify lane's Core chain, as the capture branch of
+/// `execute_gated_delta_net_hc_impl` takes them (`lo = 0`).
+struct VerifyCoreViews {
+    projection: GpuTensor,
+    inputs: GpuTensor,
+    conv_output: GpuTensor,
+    gate: GpuTensor,
+    beta: GpuTensor,
+    a: GpuTensor,
+    b: GpuTensor,
+    z: GpuTensor,
+    recurrent: GpuTensor,
+    output: GpuTensor,
+}
+
+/// The Core phase of several lanes' GDN mixers (consecutive
+/// `Step::GatedDeltaNet` Core steps of a lane step, each passing
+/// [`gdn_core_lane_groupable`]) through the multi-lane kernels.
+///
+/// One-row AR lanes (two or more) go through `gated_delta_core_lanes`: each
+/// lane gets exactly the per-row branch's arguments for its row
+/// (convolution + gate parameters, then the fused step + gated norm), launched
+/// as one fused launch under `HIPFIRE_QWEN4_GDN_LANES_FUSE`, which also rotates
+/// the gated outputs for the output projection when the group is AR lanes only
+/// (with verify lanes among them the projection batch is the packed rows, so
+/// nothing is armed). Armed verify lanes with 2..=8
+/// rows (two or more, under `HIPFIRE_QWEN4_GDN_LANES_ROWS`) go through
+/// `gated_delta_core_lanes_rows`: the capture
+/// branch's chain (input copy, convolution + gate parameters, capture
+/// recurrence, gated norm) in three launches, with the gate's rotation dropped
+/// (a Core phase's output projection never reads it). In a mixed group each
+/// kernel of both sets launches once for the whole group. A set with fewer than two members, or that its admission
+/// refuses, runs per lane here. `Ok(false)`: no set takes a route, nothing
+/// launched and `before_launch` was not called; run the ops one by one.
+/// `before_launch` runs exactly once, after every refusal check and before the
+/// first launch; its error is returned as is and nothing launches. Host
+/// bookkeeping (ring commit, positions) is the caller's, as on the per-lane
+/// path.
 pub fn execute_gated_delta_net_core_lanes(
     gpu: &mut Gpu,
     ops: &[&GatedDeltaNetOp<'_>],
@@ -2904,46 +2949,54 @@ pub fn execute_gated_delta_net_core_lanes(
     let Some(first) = ops.first() else {
         return Ok(false);
     };
-    let qkv = 2 * first.key_heads * first.key_dim + first.value_heads * first.value_dim;
+    let qk = first.key_heads * first.key_dim;
+    let qkv = 2 * qk + first.value_heads * first.value_dim;
     let value = first.value_heads * first.value_dim;
     let heads = first.value_heads;
-    let mut views = Vec::with_capacity(ops.len());
-    for op in ops {
+    let mut ar_ops: Vec<&GatedDeltaNetOp<'_>> = Vec::new();
+    let mut verify_ops: Vec<(&GatedDeltaNetOp<'_>, &GdnRowCapture<'_>)> = Vec::new();
+    for &op in ops {
         op.check_phase()?;
-        if op.phase != MixerPhase::Core
-            || op.rows != 1
-            || op.row_capture.is_some()
-            || gdn_persistent_batch(gpu, op, 1)
+        if !gdn_core_lane_groupable(gpu, op)
             || 2 * op.key_heads * op.key_dim + op.value_heads * op.value_dim != qkv
             || op.value_heads != heads
         {
             return Ok(false);
         }
-        let projection2 = view(op.projection2, 0, qkv);
-        views.push((
-            view(op.projection, 0, qkv),
-            view(&projection2, 0, op.key_heads * op.key_dim),
-            view(
-                &projection2,
-                op.key_heads * op.key_dim,
-                op.key_heads * op.key_dim,
-            ),
-            view(&projection2, 2 * op.key_heads * op.key_dim, value),
-            projection2,
-            [
-                view(op.a, 0, heads),
-                view(op.b, 0, heads),
-                view(op.gate, 0, heads),
-                view(op.beta, 0, heads),
-            ],
-            [
-                view(op.recurrent_output, 0, value),
-                view(op.z_output, 0, value),
-                view(op.output_scratch, 0, value),
-            ],
-        ));
+        match op.row_capture.as_ref() {
+            Some(capture) => verify_ops.push((op, capture)),
+            None => ar_ops.push(op),
+        }
     }
-    let lanes: Vec<GdnCoreLane<'_>> = ops
+    let views: Vec<_> = ar_ops
+        .iter()
+        .map(|op| {
+            let projection2 = view(op.projection2, 0, qkv);
+            (
+                view(op.projection, 0, qkv),
+                view(&projection2, 0, op.key_heads * op.key_dim),
+                view(
+                    &projection2,
+                    op.key_heads * op.key_dim,
+                    op.key_heads * op.key_dim,
+                ),
+                view(&projection2, 2 * op.key_heads * op.key_dim, value),
+                projection2,
+                [
+                    view(op.a, 0, heads),
+                    view(op.b, 0, heads),
+                    view(op.gate, 0, heads),
+                    view(op.beta, 0, heads),
+                ],
+                [
+                    view(op.recurrent_output, 0, value),
+                    view(op.z_output, 0, value),
+                    view(op.output_scratch, 0, value),
+                ],
+            )
+        })
+        .collect();
+    let lanes: Vec<GdnCoreLane<'_>> = ar_ops
         .iter()
         .zip(&views)
         .map(
@@ -3005,23 +3058,134 @@ pub fn execute_gated_delta_net_core_lanes(
             },
         )
         .collect();
-    let Some(plan) = hip(gated_delta_core_lanes(gpu, &lanes, heads))? else {
-        return Ok(false);
-    };
-    before_launch(gpu)?;
-    gpu.scratch.prerotated = None;
-    // `HIPFIRE_QWEN4_GDN_LANES_FUSE`: the launch also rotates each lane's gated output
-    // for the batched output projection (rows = lanes, in lane order) and arms
-    // `prerotated` for it; otherwise it is the two incumbent launches and nothing is armed.
-    let rotation = ops
+    let ar_plan = hip(gated_delta_core_lanes(gpu, &lanes, heads))?;
+
+    let verify_views: Vec<VerifyCoreViews> = verify_ops
         .iter()
-        .all(|op| {
-            rotation_basis(op.output.dtype) == Some(RotationBasis::Aligned256)
-                && op.output.k == value
-                && op.rotation.buf.as_ptr() == first.rotation.buf.as_ptr()
+        .map(|(op, capture)| {
+            let rows = op.rows;
+            let heads_rows = rows * op.value_heads;
+            VerifyCoreViews {
+                projection: view(op.projection, 0, rows * qkv),
+                inputs: view(capture.inputs, 0, rows * qkv),
+                conv_output: view(capture.recurrence, 0, rows * qkv),
+                gate: view(capture.recurrence, rows * qkv, heads_rows),
+                beta: view(capture.recurrence, rows * qkv + heads_rows, heads_rows),
+                a: view(op.a, 0, heads_rows),
+                b: view(op.b, 0, heads_rows),
+                z: view(op.z_output, 0, rows * value),
+                recurrent: view(op.recurrent_output, 0, rows * value),
+                output: view(op.output_scratch, 0, rows * value),
+            }
         })
-        .then_some(first.rotation);
-    hip(plan.launch_rotated(gpu, rotation))?;
+        .collect();
+    let verify_lanes: Vec<GdnCoreRowsLane<'_>> = verify_ops
+        .iter()
+        .zip(&verify_views)
+        .map(|((op, capture), v)| {
+            let rows = op.rows;
+            let history_rows = op.conv_kernel.saturating_sub(1);
+            GdnCoreRowsLane {
+                projection: &v.projection,
+                conv: GatedDeltaConvBatched {
+                    input: &v.inputs,
+                    kernel: op.conv,
+                    history: op.conv_state,
+                    output: &v.conv_output,
+                    next_history: op.conv_state,
+                    rows,
+                    channels: qkv,
+                    history_rows,
+                    kernel_size: op.conv_kernel,
+                    start_cursor: if history_rows == 0 {
+                        0
+                    } else {
+                        op.start_position % history_rows
+                    },
+                },
+                params: GatedDeltaParamsBatched {
+                    a: &v.a,
+                    b: &v.b,
+                    a_log: op.a_log,
+                    dt_bias: op.dt_bias,
+                    gate: &v.gate,
+                    beta: &v.beta,
+                    rows,
+                    heads: op.value_heads,
+                },
+                step: GatedDeltaStepBatched {
+                    projection: &v.conv_output,
+                    gate: &v.gate,
+                    beta: &v.beta,
+                    state: op.recurrent,
+                    format: op.format,
+                    residual: op.residual,
+                    output: &v.recurrent,
+                    row_states: Some(&capture.states),
+                    rows,
+                    qkv_width: qkv,
+                    key_heads: op.key_heads,
+                    value_heads: op.value_heads,
+                    key_dim: op.key_dim,
+                    value_dim: op.value_dim,
+                    position: op.start_position,
+                },
+                gate: GatedDeltaGateBatched {
+                    recurrent_output: &v.recurrent,
+                    z: &v.z,
+                    norm: op.norm,
+                    output: &v.output,
+                    rows,
+                    value_heads: op.value_heads,
+                    value_dim: op.value_dim,
+                },
+            }
+        })
+        .collect();
+    let rows_plan = hip(gated_delta_core_lanes_rows(gpu, &verify_lanes, heads))?;
+
+    if ar_plan.is_none() && rows_plan.is_none() {
+        return Ok(false);
+    }
+    before_launch(gpu)?;
+    let (ar_grouped, rows_grouped) = (ar_plan.is_some(), rows_plan.is_some());
+    gpu.scratch.prerotated = None;
+    if let Some(plan) = rows_plan {
+        hip(plan.launch(gpu))?;
+    }
+    if let Some(plan) = ar_plan {
+        // `HIPFIRE_QWEN4_GDN_LANES_FUSE`: the one-row launch also rotates each lane's
+        // gated output for the batched output projection (rows = lanes, in lane
+        // order) and arms `prerotated` for it; otherwise it is the two incumbent
+        // launches and nothing is armed. Only for a group of one-row lanes only: with
+        // verify lanes among them the output projection's batch is the packed rows,
+        // not the AR lanes alone.
+        let rotation = verify_ops
+            .is_empty()
+            .then(|| {
+                ops.iter()
+                    .all(|op| {
+                        rotation_basis(op.output.dtype) == Some(RotationBasis::Aligned256)
+                            && op.output.k == value
+                            && op.rotation.buf.as_ptr() == first.rotation.buf.as_ptr()
+                    })
+                    .then_some(first.rotation)
+            })
+            .flatten();
+        hip(plan.launch_rotated(gpu, rotation))?;
+    }
+    // Lanes of a set no plan took run the plain per-lane route (announced
+    // above with the rest of the group).
+    if !ar_grouped {
+        for op in &ar_ops {
+            execute_gated_delta_net(gpu, op)?;
+        }
+    }
+    if !rows_grouped {
+        for (op, _) in &verify_ops {
+            execute_gated_delta_net(gpu, op)?;
+        }
+    }
     Ok(true)
 }
 

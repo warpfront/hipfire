@@ -1088,19 +1088,23 @@ fn execute_window<'a>(
     let row_fold_mixer_1201 =
         !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_hc_row_fold_mixer_gfx1201_enabled();
     while i < end {
-        // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
-        // as one multi-lane launch per kernel; otherwise one by one below. The
+        // fn-lanes: consecutive GDN Core steps (one per lane: one AR row, or a
+        // 2..=8-row verify window under its armed capture ring) run as
+        // multi-lane launches; otherwise one by one below. The
         // group's steps are announced here, once each in program order, after
         // every refusal check and before the grouped launch; a refused group
         // announced nothing and each step is announced by the plain path below.
-        if matches!(&steps[i], Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1)
+        if matches!(&steps[i], Step::GatedDeltaNet(op)
+                if crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op))
             && !cpu_exec::cpu_exec_enabled()
         {
             let ops: Vec<_> = steps[i..end]
                 .iter()
                 .take(rdna_compute::tensor_ops::GDN_CORE_LANES_MAX)
                 .map_while(|s| match s {
-                    Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1 => {
+                    Step::GatedDeltaNet(op)
+                        if crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op) =>
+                    {
                         Some(op)
                     }
                     _ => None,

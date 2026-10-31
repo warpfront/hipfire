@@ -2518,7 +2518,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "scale_f32",
                 "gated_delta_conv_params_bf16_f32_lanes",
                 "gated_delta_step_gate_norm128_q8_lanes",
-                "gated_delta_step_gate_norm128_q8_lanes_fuse"
+                "gated_delta_step_gate_norm128_q8_lanes_fuse",
+                "gated_delta_conv_params_bf16_f32_rows_lanes",
+                "gated_delta_step_halves_state128_persistent256_capture_q8_lanes",
+                "gated_delta_gate_bf16_f32_rows_lanes"
             ]
         );
     }
@@ -3645,7 +3648,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "scale_f32",
                 "gated_delta_conv_params_bf16_f32_lanes",
                 "gated_delta_step_gate_norm128_q8_lanes",
-                "gated_delta_step_gate_norm128_q8_lanes_fuse"
+                "gated_delta_step_gate_norm128_q8_lanes_fuse",
+                "gated_delta_conv_params_bf16_f32_rows_lanes",
+                "gated_delta_step_halves_state128_persistent256_capture_q8_lanes",
+                "gated_delta_gate_bf16_f32_rows_lanes"
             ]
         );
         // Exact-gfx1201 multi-lane fn-lanes QSA decode core (off unless HIPFIRE_QWEN4_QSA_LANES=1; qsa_core_lanes.rs qsa_core_lanes).
@@ -13601,7 +13607,10 @@ mod tests {
                 lane_kernels,
                 [
                     "gated_delta_conv_params_bf16_f32_lanes",
-                    "gated_delta_step_gate_norm128_q8_lanes"
+                    "gated_delta_step_gate_norm128_q8_lanes",
+                    "gated_delta_conv_params_bf16_f32_rows_lanes",
+                    "gated_delta_step_halves_state128_persistent256_capture_q8_lanes",
+                    "gated_delta_gate_bf16_f32_rows_lanes"
                 ],
                 "{arch}"
             );
@@ -13614,8 +13623,11 @@ mod tests {
                 extra,
                 [
                     "gated_delta_conv_params_bf16_f32_lanes",
+                    "gated_delta_conv_params_bf16_f32_rows_lanes",
+                    "gated_delta_gate_bf16_f32_rows_lanes",
                     "gated_delta_step_gate_norm128_q8_lanes",
-                    "gated_delta_step_gate_norm128_q8_lanes_fuse"
+                    "gated_delta_step_gate_norm128_q8_lanes_fuse",
+                    "gated_delta_step_halves_state128_persistent256_capture_q8_lanes"
                 ],
                 "{arch}"
             );

@@ -1367,6 +1367,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-gdn-core-lanes-rows",
+        predicates: &[IsRecording],
+        condition: "gated_delta_core_lanes_rows (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive GDN Core steps that are 2..=GDN_CORE_ROWS_MAX-row verify windows under the armed capture ring (Q8 states, 128x128, no residual), HIPFIRE_QWEN4_GDN_LANES_ROWS (`qwen4_gdn_lanes_rows_enabled`: exact gfx1201 only, opt-in `=1` and default off, needs and is killed by HIPFIRE_QWEN4_GDN_LANES=0) and `!is_recording()`; never recorded: the per-lane cursor, Q8 frame and ring pointers are launch-time kernargs that no replay binding declares, so admission refuses under a recorder",
+        effect: KernelSelection,
+        switches: "eager verify lane step: gdn_lanes (gated_delta_conv_params_bf16_f32_rows_lanes, gated_delta_step_halves_state128_persistent256_capture_q8_lanes, gated_delta_gate_bf16_f32_rows_lanes), 3 launches per layer for every verify lane instead of 4 per lane; a set holding a one-row lane is never admitted (the AR lanes of a mixed group take qwen4-gdn-core-lanes, their fused one-launch kernel included, so every kernel of both sets launches once for the whole group; a class with a single lane runs per lane); flag off: gdn_core_lane_groupable refuses every verify window and the group is the one-row set exactly as before; recorded: the per-lane incumbent chain (copy_d2d, conv + params, capture step, gate)",
+        kernels: &["gated_delta_conv_bf16_f32_batched_k4", "gated_delta_step_halves_state128_persistent256_capture_q8", "gated_delta_gate_bf16_f32_batched"],
+        verdict: ByteExact,
+        evidence: "by construction: the step lanes kernel instantiates the incumbent gated_delta_step_persistent256_body<true, true> on lane-derived pointers, rows and Q8 frame (a lane's rows run in one block per value head), the convolution lanes kernel repeats the batched k4 body expression for expression with the capture copy fused, the gate lanes kernel runs the incumbent gate head body per lane; GPU byte oracle rdna-compute examples/gdn_lanes_rows_oracle on gfx1201 (R9700 card C, StepShep c0-runs/oracle1, per-lane chain vs grouped launches): 70 cases (N = 1, 2, 3, 4, 8; uniform 1/2/4/8 rows, ragged, verify_ragged, mixed AR + verify incl. rows [1,4,1,4,2,1,3,8], ragged cursors, Q8 frames up to u32::MAX, carried ring halves) byte-identical (bad_bytes 0, guards 0, no stray ring writes), every class of two or more lanes on its grouped route, 33 negative controls (swapped rings / live slots, wrong Q8 frame, wrong conv cursor, rows short, AR wrong frame) detected, flag and shape admission probes PASS; all-1-row groups keep the HIPFIRE_QWEN4_GDN_LANES_FUSE one-launch kernel unchanged",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-qsa-core-lanes",
         predicates: &[IsRecording, CaptureMode],
         condition: "qsa_core_lanes_min (qsa_core_lanes.rs): 2..=QSA_CORE_LANES_MAX consecutive QSA Core steps (fp8 K/V, BF16 index keys, 1..=8 rows per lane, fused LDS-resident select below QSA_BF16_SPLIT_MIN_BLOCKS, per-head attention), HIPFIRE_QWEN4_QSA_LANES (exact gfx1201, default on, 0 kills) and `!is_recording() && !capture_mode`",
@@ -3785,6 +3796,12 @@ pub const SITES: &[Site] = &[
         function: "gated_delta_core_lanes",
         occurrences: 1,
         decisions: &["qwen4-gdn-core-lanes"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "gated_delta_core_lanes_rows",
+        occurrences: 1,
+        decisions: &["qwen4-gdn-core-lanes-rows"],
     },
     Site {
         file: "rdna-compute/src/qsa_core_lanes.rs",
