@@ -1211,6 +1211,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     // generic RoPE, gated short-conv and sampler kernels. A host without hipcc
     // can only run what the pack carries, so each is packaged for all three
     // (`pack_carries_every_shared_launcher_module_on_every_arch`).
+    if matches!(arch, "gfx1201" | "gfx1100") {
+        add!(
+            "gemv_q8_0_fast",
+            kernels::GEMV_Q8_0_FAST_SRC,
+            ["gemv_q8_0_fast_r1"]
+        );
+    }
     if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
         add!(
             "gemv_q8_0_wide",
@@ -10747,11 +10754,11 @@ mod tests {
         // MQ4V2 verify-tile (`*_vt`) GEMM modules, the expert-parallel row
         // gathers, the 27B AR route's plain q8 attention and slab sigmoid
         // producer, plus the opt-in twins, decode twins, QSA modules, slab
-        // planner, pruned router, Q8 wide module and DFlash-draft overwrite
-        // twins. Those 158 are the pre-S1 inventory; the S1 slow-link kernels
+        // planner, pruned router, Q8 wide module, the fast narrow Q8 GEMV
+        // module and DFlash-draft overwrite twins. Those 159 are the pre-S1 inventory; the S1 slow-link kernels
         // add exactly the modules in `S1_ADDED_MODULES` (not P0 modules, not
         // in the provenance fixture), each its own isolated source.
-        const PRE_S1_ADDED_SINCE_P0: usize = 158;
+        const PRE_S1_ADDED_SINCE_P0: usize = 159;
         const S1_ADDED_MODULES: [&str; 1] = ["slowlink_prefill"];
         for module in S1_ADDED_MODULES {
             assert!(by_name.contains_key(module), "missing S1 module {module}");

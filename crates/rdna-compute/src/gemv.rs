@@ -310,6 +310,39 @@ fn q8_0_rows_exact_extents(m: usize, k: usize, rows: usize) -> Option<[usize; 3]
         .then_some(bytes)
 }
 
+/// Weight rows one block of `gemv_q8_0_fast_r*` serves (one wave32 each).
+pub const Q8_0_FAST_ROWS_PER_BLOCK: usize = 8;
+/// Threads per block of `gemv_q8_0_fast_r*`.
+pub const Q8_0_FAST_THREADS: usize = Q8_0_FAST_ROWS_PER_BLOCK * 32;
+
+/// `HIPFIRE_Q8_GEMV_FAST` (developer, read once, default on): `0` keeps the legacy
+/// one-wave-per-row narrow kernel everywhere. The two are bit-identical; the switch is a
+/// kill switch / A-B handle only.
+static Q8_0_GEMV_FAST: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_Q8_GEMV_FAST", true));
+
+/// Whether `gemv_q8_0_fast_r*` serves a Q8_0 weight of in-dim `k` on `arch`: exact
+/// gfx1100 / gfx1201 (wave32), the narrow arm (`k` above the wide cutoff), an even
+/// block count per row (`k % 64 == 0`: every row start and every staged chunk 4-byte
+/// aligned) and the 4-byte / 16-byte alignment of the weight / activation base the
+/// kernel's dword / float4 loads need. Pure; the caller adds the kill switch.
+pub fn q8_0_fast_admits(arch: &str, k: usize, a_addr: usize, x_addr: usize) -> bool {
+    matches!(arch, "gfx1100" | "gfx1201")
+        && k > Q8_0_DECODE_WIDE_MAX_K
+        && k.is_multiple_of(64)
+        && a_addr.is_multiple_of(4)
+        && x_addr.is_multiple_of(16)
+}
+
+/// `gemv_q8_0_fast_r1` .. (index `rows - 1`).
+const Q8_0_FAST_SYMBOLS: [&str; 1] = ["gemv_q8_0_fast_r1"];
+
+fn q8_0_fast_symbol(rows: usize) -> Option<&'static str> {
+    rows.checked_sub(1)
+        .and_then(|i| Q8_0_FAST_SYMBOLS.get(i))
+        .copied()
+}
+
 /// `gemv_q8_0_wide_rows_exact_r1` ..= `_r16` (index `rows - 1`).
 const Q8_0_WIDE_ROWS_EXACT_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS] = [
     "gemv_q8_0_wide_rows_exact_r1",
@@ -20670,6 +20703,48 @@ impl Gpu {
                 },
             );
         }
+        // gfx1100/gfx1201 narrow arm (K > 1536, K % 64 == 0): the high-occupancy kernel,
+        // bit-identical to the legacy one below (see `kernels/src/gemv_q8_0_fast.hip`).
+        if self.q8_0_fast_narrow_ok(k, a_ptr as usize, x_ptr as usize) {
+            return self.launch_q8_0_fast(1, a_raw, x, y, m, k);
+        }
+        self.gemv_q8_0_narrow_legacy(a_raw, x, y, m, k)
+    }
+
+    /// The pre-`gemv_q8_0_fast` narrow-arm launch of [`Gpu::gemv_q8_0`] (one 32-thread
+    /// block per output row, single ascending chain per lane + shuffle tree). Kept as the
+    /// fallback for shapes/pointers the fast kernel does not admit, and as the
+    /// bit-exactness reference of `tests/gemv_q8_0_fast_parity.rs`.
+    pub fn gemv_q8_0_narrow_legacy(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        };
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
         let block_size = 32u32;
         let bytes = m * (k / 32) * 34 + k * 4 + m * 4;
@@ -20846,6 +20921,82 @@ impl Gpu {
                 b.push_i32(k_val);
                 b
             });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Whether the narrow-arm Q8_0 GEMV (K > 1536) runs `gemv_q8_0_fast_r*` here:
+    /// exact gfx1100 / gfx1201 (wave32), `HIPFIRE_Q8_GEMV_FAST` not `0`, and
+    /// [`q8_0_fast_admits`] for the shape and operand alignment.
+    pub(crate) fn q8_0_fast_narrow_ok(&self, k: usize, a_addr: usize, x_addr: usize) -> bool {
+        *Q8_0_GEMV_FAST && q8_0_fast_admits(&self.arch, k, a_addr, x_addr)
+    }
+
+    /// One `gemv_q8_0_fast_r<rows>` launch (`rows` in `1..=Q8_0_ROWS_EXACT_KERNELS`;
+    /// `rows == 1` is the decode kernel): y `[rows, m]` = A x `[rows, k]`, 8 weight rows
+    /// per 256-thread block. The caller checked [`Gpu::q8_0_fast_narrow_ok`].
+    fn launch_q8_0_fast(
+        &mut self,
+        rows: usize,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let func = q8_0_fast_symbol(rows).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "gemv_q8_0_fast: row count outside the kernel set")
+        })?;
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_q8_0_fast", kernels::GEMV_Q8_0_FAST_SRC, func)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let grid = m.div_ceil(Q8_0_FAST_ROWS_PER_BLOCK) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * (k / 32) * 34 + rows * k * 4 + rows * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_q8_0_fast", bytes);
+        #[cfg(feature = "lab")]
+        self.lab_observe_projection(crate::dispatch::LabProjectionLaunch {
+            symbol: func,
+            family: WideTwinFamily::Q8,
+            form: "single",
+            weights: [Some((a_raw, m)), None, None, None],
+            x,
+            rows,
+            k,
+            scale: None,
+            hc_act: false,
+            grid: [grid, 1, 1],
+            block: [Q8_0_FAST_THREADS as u32, 1, 1],
+            shared_mem: 0,
+        })?;
+        let result = self.launch_maybe_blob(
+            func,
+            [grid, 1, 1],
+            [Q8_0_FAST_THREADS as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -26562,10 +26713,21 @@ mod rowtile_launch_tests {
             .unwrap();
         assert!(singleton.contains("if k <= 1536 {"));
         let wide = singleton.find("\"gemv_q8_0_wide\"").unwrap();
-        let narrow = singleton.rfind("\"gemv_q8_0\"").unwrap();
-        assert!(wide < narrow);
+        // The narrow arm: the fast kernel where admitted, else the legacy launch (the
+        // two are bit-identical; `tests/gemv_q8_0_fast_parity.rs`), after the wide arm.
+        let fast = singleton.find("self.q8_0_fast_narrow_ok(").unwrap();
+        let legacy = singleton.find("self.gemv_q8_0_narrow_legacy(").unwrap();
+        assert!(wide < fast && fast < legacy);
         assert!(singleton.contains("kernels::GEMV_Q8_0_WIDE_SRC"));
-        assert!(singleton.contains("kernels::GEMV_Q8_0_SRC"));
+        let legacy_fn = source
+            .split("    pub fn gemv_q8_0_narrow_legacy(")
+            .nth(1)
+            .unwrap()
+            .split("\n    pub fn ")
+            .next()
+            .unwrap();
+        assert!(legacy_fn.contains("kernels::GEMV_Q8_0_SRC"));
+        assert!(legacy_fn.contains("\"gemv_q8_0\""));
     }
 
     #[test]
@@ -26586,6 +26748,39 @@ mod rowtile_launch_tests {
         }
         assert!(kernels::GEMV_Q8_0_WIDE_ROWS_EXACT_SRC.contains("gemv_q8_0_wide_rows_exact_r##R"));
         assert!(kernels::GEMV_Q8_0_ROWS_EXACT_SRC.contains("gemv_q8_0_rows_exact_r##R"));
+    }
+
+    /// The fast narrow kernel admits exactly what its loads need and never the wide arm.
+    #[test]
+    fn q8_fast_narrow_admission_follows_the_kernel_contract() {
+        for arch in ["gfx1201", "gfx1100"] {
+            for k in [2560, 5120, 10240, 1600, 2624, 2688] {
+                assert!(q8_0_fast_admits(arch, k, 256, 256), "{arch} K={k}");
+            }
+            // Wide arm (K <= 1536): other kernel.
+            for k in [128, 512, 576, 1536] {
+                assert!(!q8_0_fast_admits(arch, k, 256, 256), "{arch} K={k}");
+            }
+            // Odd block count (K % 64 != 0): row starts are 2 mod 4.
+            for k in [1568, 2592, 2656] {
+                assert!(!q8_0_fast_admits(arch, k, 256, 256), "{arch} K={k}");
+            }
+            // dword weight / float4 activation loads.
+            assert!(!q8_0_fast_admits(arch, 2560, 258, 256));
+            assert!(q8_0_fast_admits(arch, 2560, 260, 256));
+            assert!(!q8_0_fast_admits(arch, 2560, 256, 260));
+        }
+        // Wave32 gfx11/gfx12 only; gfx1151 keeps its own staged kernels.
+        for arch in ["gfx1151", "gfx1150", "gfx942", "gfx906", "gfx1030"] {
+            assert!(!q8_0_fast_admits(arch, 2560, 256, 256), "{arch}");
+        }
+        assert_eq!(q8_0_fast_symbol(1), Some("gemv_q8_0_fast_r1"));
+        assert_eq!(q8_0_fast_symbol(0), None);
+        for rows in 1..=Q8_0_FAST_SYMBOLS.len() {
+            let want = format!("gemv_q8_0_fast_r{rows}");
+            assert_eq!(q8_0_fast_symbol(rows), Some(want.as_str()));
+            assert!(kernels::GEMV_Q8_0_FAST_SRC.contains(&format!("GEMV_Q8_0_FAST({rows})\n")));
+        }
     }
 
     #[test]
