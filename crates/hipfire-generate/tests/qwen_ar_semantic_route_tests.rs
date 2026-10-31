@@ -17,10 +17,7 @@ use hipfire_generate::ar::*;
 use hipfire_generate::batch::*;
 use hipfire_generate::common::*;
 
-use hipfire_generate::{
-    common::emit_spec_cancel_after_rollback, qwen::qwen_client_commit_effects,
-    qwen::QwenClientCommitEffects,
-};
+use hipfire_generate::common::emit_spec_cancel_after_rollback;
 use std::collections::HashMap;
 struct TerminalTestGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -119,8 +116,7 @@ fn drive_ar_semantic_path_with_stop(
         Ok((fin, visible)) => {
             // Default Commit path: stage calls on done (production
             // embeds calls in commit_ready/done; no post-commit event).
-            let effects = hipfire_generate::qwen::qwen_client_commit_effects(
-                ClientTerminalDecision::Commit,
+            let effects = ClientTerminalDecision::Commit.commit_effects(
                 fin.finish_reason == "tool_calls" && !fin.wire_tool_calls.is_empty(),
                 fin.store_cache,
             );
@@ -1441,56 +1437,6 @@ fn wire_helpers_used_by_gen_start_and_cancel_writers() {
 }
 
 #[test]
-fn client_commit_effects_commit_preserves_intended_flags() {
-    let e = hipfire_generate::qwen::qwen_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        true,
-        true,
-    );
-    assert_eq!(
-        e,
-        hipfire_generate::qwen::QwenClientCommitEffects {
-            release_tool_calls: true,
-            store_cache: true,
-            emit_done: true,
-        }
-    );
-    let e = hipfire_generate::qwen::qwen_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        false,
-        true,
-    );
-    assert!(!e.release_tool_calls);
-    assert!(e.store_cache);
-    assert!(e.emit_done);
-    let e = hipfire_generate::qwen::qwen_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        false,
-        false,
-    );
-    assert!(!e.release_tool_calls);
-    assert!(!e.store_cache);
-    assert!(e.emit_done);
-}
-
-#[test]
-fn client_commit_effects_abort_suppresses_all() {
-    let e = hipfire_generate::qwen::qwen_client_commit_effects(
-        ClientTerminalDecision::Abort,
-        true,
-        true,
-    );
-    assert_eq!(
-        e,
-        hipfire_generate::qwen::QwenClientCommitEffects {
-            release_tool_calls: false,
-            store_cache: false,
-            emit_done: false,
-        }
-    );
-}
-
-#[test]
 fn finish_defers_tool_calls_until_commit_effects() {
     let _guard = begin_terminal_test("t-commit", 11);
     set_active_attempt_id(11);
@@ -1528,8 +1474,7 @@ fn finish_defers_tool_calls_until_commit_effects() {
     );
 
     // Commit path: release + cache + done.
-    let effects = hipfire_generate::qwen::qwen_client_commit_effects(
-        ClientTerminalDecision::Commit,
+    let effects = ClientTerminalDecision::Commit.commit_effects(
         fin.finish_reason == "tool_calls" && !fin.wire_tool_calls.is_empty(),
         fin.store_cache,
     );
@@ -1603,8 +1548,7 @@ fn abort_effects_suppress_calls_cache_and_normal_done() {
     }
     let (fin, visible) = producer.finish(&mut sink, false).expect("finish");
     assert_eq!(fin.finish_reason, "tool_calls");
-    let effects = hipfire_generate::qwen::qwen_client_commit_effects(
-        ClientTerminalDecision::Abort,
+    let effects = ClientTerminalDecision::Abort.commit_effects(
         fin.finish_reason == "tool_calls" && !fin.wire_tool_calls.is_empty(),
         fin.store_cache,
     );
