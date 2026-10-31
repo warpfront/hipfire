@@ -15,7 +15,8 @@
 //! | routed/shared/dense gate,up,down | symmetric qt44 |
 //! | routed + shared `down_proj` (natural K1088) | qt44 `[N,1280]`, tail zero-padded **before** FWHT |
 //! | RMS gammas, conv, mHC alpha/b/phi | lossless: F16 when every value round-trips, else F32 |
-//! | router, `A_log`, `dt_bias`, correction bias, mHC `eta` | F32 |
+//! | router `moe.gate.weight` | BF16 (qt16, unpadded `[rows,k]`); F32 (qt2) if any value is not exactly BF16 |
+//! | `A_log`, `dt_bias`, correction bias, mHC `eta` | F32 |
 //!
 //! Every qt44 tensor gets a unit F16 (qt1) `<stem>.awq_scale.weight` sidecar of
 //! the full physical input width. The routed-expert source is MXFP8: E4M3
@@ -77,6 +78,9 @@ pub(crate) enum Storage {
     Bf16Padded,
     /// F16 when exactly representable, else F32.
     Lossless,
+    /// BF16 (qt16) when every value is exactly BF16-representable -- lossless for the
+    /// BF16 source checkpoint -- else F32 (qt2); never rounds.
+    RouterBf16,
     /// Always F32.
     F32,
 }
@@ -298,7 +302,8 @@ pub(crate) fn classify_with(
         "mlp.gate_proj.weight" | "mlp.up_proj.weight" | "mlp.down_proj.weight" => {
             shared.storage(false)
         }
-        "moe.gate.weight" | "moe.gate.e_score_correction_bias" => Storage::F32,
+        "moe.gate.weight" => Storage::RouterBf16,
+        "moe.gate.e_score_correction_bias" => Storage::F32,
         "moe.shared_experts.gate_proj.weight" | "moe.shared_experts.up_proj.weight" => {
             shared.storage(false)
         }
@@ -896,6 +901,37 @@ fn convert(src: &SourceIndex, name: &str, storage: Storage) -> Result<JobOut, St
                 spilled_len: 0,
             });
         }
+        Storage::RouterBf16 => {
+            if shape.len() != 2 || shape[1] == 0 {
+                return Err(format!(
+                    "{name}: router BF16 needs a 2-D weight, got {shape:?}"
+                ));
+            }
+            let exact = data.par_iter().all(|&v| {
+                f32::from_bits((f32_to_bf16_bits(v) as u32) << 16).to_bits() == v.to_bits()
+            });
+            let (qt, bytes): (QuantType, Vec<u8>) = if exact {
+                (
+                    QuantType::BF16,
+                    data.iter()
+                        .flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes())
+                        .collect(),
+                )
+            } else {
+                (
+                    QuantType::F32,
+                    data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                )
+            };
+            out.tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: qt,
+                shape: shape_u32,
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+        }
         Storage::F32 => {
             out.tensors.push(HfqTensor {
                 name: name.to_string(),
@@ -1206,6 +1242,7 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
             Storage::Bf16 | Storage::Bf16Padded => t.quant_type == 16,
             Storage::Lossless => matches!(t.quant_type, 1 | 2),
             Storage::F32 => t.quant_type == 2,
+            Storage::RouterBf16 => matches!(t.quant_type, 16 | 2),
         };
         if !ok_qt {
             return Err(format!(

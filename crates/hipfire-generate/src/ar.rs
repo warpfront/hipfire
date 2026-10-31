@@ -4104,6 +4104,14 @@ pub fn generate(
 
     // ── Prompt cache (LCP-based) — Qwen3.5/3.6 only ──────────────────────
     //
+    // This is the Qwen3.5/3.6 AR body's own live-extension cache (DeltaNet
+    // state continued from decode, session-exact). Other architectures reuse
+    // prompts through the engine session cache contract
+    // (`hipfire_runtime::session_cache::SessionState` + `SessionDriver`:
+    // Qwen4, Gemma 4, Raon-1-mini), which an arch implements by describing its
+    // cumulative state (fixed parts + append-only rows), its live position and
+    // the cold-prefill boundaries where a snapshot is canonical.
+    //
     // Mirrors V4F's prefix-cache (daemon.rs ~5390). Eligible when:
     //   - HIPFIRE_QWEN_PROMPT_CACHE != "0"  (default on)
     //   - messages_history is provided (full-conversation context)

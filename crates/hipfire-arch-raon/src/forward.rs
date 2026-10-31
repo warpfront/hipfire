@@ -57,6 +57,7 @@ use crate::moe::{
     forward_dense, forward_moe, RaonDenseRefs, RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs,
     RaonMoeScratch,
 };
+use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
 use crate::projection::{project, OutRound};
 use crate::rda::{
     rda_forward_rows_taped, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
@@ -66,6 +67,7 @@ use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
 use crate::weights::{
     MhcSiteWeights, MlaWeights, RaonFfn, RaonLayerWeights, RaonMixer, RaonWeights, RdaWeights,
 };
+use hipfire_dispatch::pipeline::PrefillActTier;
 
 // ───────────────────────── module scratch ─────────────────────────
 
@@ -83,12 +85,18 @@ pub struct RaonWork {
     dense: RaonDenseScratch,
     /// MLA route controls, split-KV workspace and absorbed-route operands.
     pub mla: RaonMlaWork,
+    /// Effective prefill activation tier of every site, resolved once at load
+    /// ([`crate::precision`]).
+    site_tiers: RaonSiteTiers,
 }
 
 impl RaonWork {
-    /// Select the activation tier of the grouped routed-expert GEMMs (bundle load, once).
-    pub fn set_routed_tier(&mut self, tier: hipfire_dispatch::pipeline::GroupedMoeActTier) {
-        self.moe_dims.routed_tier = tier;
+    /// Install the load-resolved effective prefill tier of every site (bundle load, once). The
+    /// FFN sites are carried to the MoE/dense programs through the dims; the mixer sites are
+    /// read by the projections.
+    pub fn set_site_tiers(&mut self, tiers: RaonSiteTiers) {
+        self.site_tiers = tiers;
+        self.moe_dims.tiers = tiers;
     }
 
     /// Module geometries every work buffer is derived from.
@@ -124,7 +132,7 @@ impl RaonWork {
             value_beta: cfg.situ_linear_beta,
             router_eps: cfg.router_eps,
             router_scale: cfg.routed_scale,
-            routed_tier: hipfire_dispatch::pipeline::GroupedMoeActTier::F16,
+            tiers: RaonSiteTiers::ALL_F16,
         };
         moe_dims.validate()?;
         Ok((mhc_shape, rda_geom, moe_dims))
@@ -196,6 +204,7 @@ impl RaonWork {
             moe,
             dense,
             mla,
+            site_tiers: RaonSiteTiers::ALL_F16,
         })
     }
 
@@ -575,13 +584,15 @@ fn rda_mixer(
         Some(t) => (&t.q_raw, &t.k_raw, &t.v_raw),
         None => (&scratch.rda_q_raw, &scratch.rda_k_raw, &scratch.rda_v_raw),
     };
-    project(gpu, &w.q_proj, x, q_raw, rows, b)?;
-    project(gpu, &w.k_proj, x, k_raw, rows, b)?;
-    project(gpu, &w.v_proj, x, v_raw, rows, b)?;
-    project(gpu, &w.g_proj, x, &scratch.rda_z, rows, b)?;
-    project(gpu, &w.b_proj, x, &scratch.rda_b, rows, b)?;
-    project(gpu, &w.rda_w_proj, x, &scratch.rda_delta, rows, b)?;
-    project(gpu, &w.f_a_proj, x, &scratch.rda_f_lat, rows, b)?;
+    let qkvg = work.site_tiers.get(RaonPrecisionSite::RdaQkvg);
+    let f16 = PrefillActTier::F16;
+    project(gpu, &w.q_proj, x, q_raw, rows, b, qkvg)?;
+    project(gpu, &w.k_proj, x, k_raw, rows, b, qkvg)?;
+    project(gpu, &w.v_proj, x, v_raw, rows, b, qkvg)?;
+    project(gpu, &w.g_proj, x, &scratch.rda_z, rows, b, qkvg)?;
+    project(gpu, &w.b_proj, x, &scratch.rda_b, rows, b, f16)?;
+    project(gpu, &w.rda_w_proj, x, &scratch.rda_delta, rows, b, f16)?;
+    project(gpu, &w.f_a_proj, x, &scratch.rda_f_lat, rows, b, f16)?;
     project(
         gpu,
         &w.f_b_proj,
@@ -589,6 +600,7 @@ fn rda_mixer(
         &scratch.rda_f,
         rows,
         b,
+        PrefillActTier::F16,
     )?;
 
     let layer = RaonRdaLayer {
@@ -634,6 +646,7 @@ fn rda_mixer(
         &scratch.branch_out,
         rows,
         b,
+        work.site_tiers.get(RaonPrecisionSite::RdaO),
     )
 }
 
@@ -665,6 +678,7 @@ fn mla_expand(
     mirror: DMirror<'_>,
     range: RowRange,
     count: usize,
+    tier: PrefillActTier,
 ) -> Result<(), String> {
     let geometry = latent_geometry(cfg);
     run_latent(
@@ -683,6 +697,7 @@ fn mla_expand(
         &scratch.mla_kv_tile,
         count,
         OutRound::Exact,
+        tier,
     )?;
     run_latent(
         gpu,
@@ -745,9 +760,12 @@ fn mla_mixer(
         host_pos: Some(start),
     };
 
-    project(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b)?;
-    project(gpu, &w.kv_a_proj, x, &scratch.mla_kv_a, rows, b)?;
-    project(gpu, &w.g_proj, x, &scratch.mla_g, rows, b)?;
+    let q_tier = work.site_tiers.get(RaonPrecisionSite::MlaQ);
+    let kv_tier = work.site_tiers.get(RaonPrecisionSite::MlaKv);
+    let go_tier = work.site_tiers.get(RaonPrecisionSite::MlaGo);
+    project(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b, q_tier)?;
+    project(gpu, &w.kv_a_proj, x, &scratch.mla_kv_a, rows, b, kv_tier)?;
+    project(gpu, &w.g_proj, x, &scratch.mla_g, rows, b, go_tier)?;
 
     run_latent(
         gpu,
@@ -767,6 +785,7 @@ fn mla_mixer(
         &scratch.mla_q,
         rows,
         b,
+        q_tier,
     )?;
     run_latent(
         gpu,
@@ -790,6 +809,7 @@ fn mla_mixer(
                 dm,
                 RowRange::NewRows { count: rows },
                 rows,
+                kv_tier,
             )?;
         } else {
             // A chunk wider than the decompression tile: expand the new rows
@@ -811,6 +831,7 @@ fn mla_mixer(
                         count,
                     },
                     count,
+                    kv_tier,
                 )?;
                 done += count;
             }
@@ -845,6 +866,7 @@ fn mla_mixer(
         &scratch.branch_out,
         rows,
         b,
+        work.site_tiers.get(RaonPrecisionSite::MlaGo),
     )
 }
 
@@ -861,7 +883,8 @@ fn ffn_block(
     match &layer.ffn {
         RaonFfn::Dense(d) => {
             let (gate, up, down) = d.projections(rows);
-            let refs = RaonDenseRefs::from_parts(gate, up, down)?;
+            let refs =
+                RaonDenseRefs::from_parts(gate, up, down)?.with_iu4_symmetric(d.iu4_symmetric);
             forward_dense(
                 gpu,
                 ctx,
@@ -886,7 +909,7 @@ fn ffn_block(
                 m.gate_up_awq.as_ref(),
                 m.expert_down_awq_ptrs.as_ref(),
             )
-            .with_iu4_symmetric(m.iu4_symmetric);
+            .with_iu4_symmetric(m.iu4_symmetric, m.shared.iu4_symmetric);
             forward_moe(
                 gpu,
                 ctx,
@@ -969,6 +992,7 @@ fn ensure_context(
                             dmirror,
                             RowRange::Absolute { start: done, count },
                             count,
+                            work.site_tiers.get(RaonPrecisionSite::MlaKv),
                         )?;
                         done += count;
                     }
@@ -1086,6 +1110,7 @@ pub fn readout_logits(
         out,
         count,
         OutRound::Bf16,
+        PrefillActTier::F16,
     )
 }
 
@@ -1446,6 +1471,9 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`):
+            // names this layer and its first row's position; a no-op when both are unset.
+            hipfire_dispatch::pipeline::moe_capture::set_site(l, start);
             ffn_block(gpu, &ctx, work, layer, scratch, rows)
                 .map_err(|e| format!("raon1_mini L{l} ffn: {e}"))?;
             mhc_postmix(gpu, work, rows, cur, &scratch.ffn_out, oth)?;
@@ -1499,6 +1527,7 @@ fn forward_body(
             &scratch.logits,
             1,
             OutRound::Bf16,
+            PrefillActTier::F16,
         )?;
     }
     Ok(())

@@ -10583,7 +10583,39 @@ impl Carrier for RaonCarrier {
         // `load_raon_bundle` refuses every speculation request this arch
         // cannot serve before allocating; only a DFlash2 draft under
         // `speculation.dflash = on` reaches the builder below.
+        // The cache domain is built before the loader consumes `src`.
+        let session_domain = match &src {
+            ModelSource::Hfq(hfq) => Some(hipfire_runtime::serve_contract::CacheDomain::for_model(
+                hfq,
+                &meta.tokenizer,
+                meta.chat_template.as_deref(),
+                "raon1_mini",
+                ctx.gpu.device_id,
+            )),
+            ModelSource::Dir(_) => None,
+        };
         let mut bundle = hipfire_arch_raon::load_raon_bundle(src, ctx)?;
+        // Engine-owned prefill snapshot cache (cold-exact; same wiring as
+        // Gemma 4). Attached before the speculator build so its error path
+        // (`free_all`) still frees everything.
+        let session_budget = hipfire_config::memory::session_cache_bytes();
+        let snapshots = hipfire_runtime::session_cache::SessionState::snapshot_scope(
+            &bundle,
+            hipfire_runtime::session_cache::SessionRoute::Ar,
+        )
+        .is_some();
+        if let Some(domain) = session_domain.filter(|_| session_budget > 0 && snapshots) {
+            bundle.attach_session_cache(hipfire_runtime::session_cache::SessionCache::new(
+                domain,
+                session_budget,
+            ));
+            eprintln!(
+                "  raon1_mini session cache: {} MiB budget, {} MiB per {}-token snapshot",
+                session_budget >> 20,
+                bundle.session_snapshot_bytes() >> 20,
+                bundle.session_stride_tokens(),
+            );
+        }
         let speculator = match hipfire_arch_raon::carrier::dflash_draft(ctx.draft_path, ctx.spec)? {
             Some(draft) => match hipfire_arch_raon::carrier::build_raon_dflash2_speculator(
                 ctx.gpu,

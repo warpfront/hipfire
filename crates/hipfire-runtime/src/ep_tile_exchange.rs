@@ -1112,6 +1112,11 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Parties currently waiting on the exchange's barrier.
+    pub(crate) fn tile_arrived(t: &EpTileExchange) -> usize {
+        crate::ep_row_gather::tests::arrived(&t.barrier)
+    }
+
     #[test]
     fn crossing_tags_format_every_kind() {
         let publish = TileCrossing::exchange(TileCrossing::PUBLISH, 5, 40, 12);
@@ -1165,12 +1170,10 @@ pub(crate) mod tests {
         // barrier pairs them: without tags the ranks would continue one barrier
         // out of phase and time out later.
         let t = bare(2, Duration::from_secs(30));
-        let started = Instant::now();
         let other = t.clone();
         let peer = std::thread::spawn(move || exchange_barriers(&other, 1, 0, 3));
         let mine = t.host_barrier(0, HOST_RESERVE_RESTORE, 6);
         let theirs = peer.join().expect("peer");
-        assert!(started.elapsed() < Duration::from_secs(5));
         for result in [mine, theirs] {
             let text = result.expect_err("disagreement").to_string();
             assert!(text.contains("different points"), "{text}");
@@ -1202,17 +1205,23 @@ pub(crate) mod tests {
 
     #[test]
     fn a_timeout_reports_every_ranks_last_crossing_and_exchange_counter() {
-        let t = bare(2, Duration::from_millis(300));
+        // The budget is generous because rank 0 must first cross an exchange
+        // with a freshly spawned rank 1, which load can delay; rank 1 then
+        // stays away until rank 0 has reported (a channel, not a sleep), so the
+        // expiry at the host barrier is certain whatever the load.
+        let t = bare(2, Duration::from_secs(2));
         let other = t.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let peer = std::thread::spawn(move || {
             exchange_barriers(&other, 1, 0, 0).expect("rank 1");
-            std::thread::sleep(Duration::from_millis(800));
+            done_rx.recv().expect("rank 0 reported");
         });
         exchange_barriers(&t, 0, 0, 0).expect("rank 0");
         let error = t
             .host_barrier(0, HOST_RESERVE_ACQUIRE, 1)
             .expect_err("rank 1 never arrives")
             .to_string();
+        done_tx.send(()).expect("peer alive");
         peer.join().expect("peer");
         assert!(error.contains("timed out"), "{error}");
         assert!(

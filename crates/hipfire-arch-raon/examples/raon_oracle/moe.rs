@@ -1744,7 +1744,7 @@ fn dims_of(c: &CaseData) -> RaonMoeDims {
         value_beta,
         router_eps: ROUTER_EPS,
         router_scale: ROUTER_SCALE,
-        routed_tier: hipfire_dispatch::pipeline::GroupedMoeActTier::F16,
+        tiers: hipfire_arch_raon::precision::RaonSiteTiers::ALL_F16,
     }
 }
 
@@ -1789,11 +1789,11 @@ fn gated_refs<'a>(
     mi: usize,
     down_k: usize,
 ) -> GroupedMoeShared<'a> {
-    GroupedMoeShared {
-        gate: qt44_ref(&d.gate, mi, c, awq_in),
-        up: qt44_ref(&d.up, mi, c, awq_in),
-        down: qt44_ref(&d.down, c, down_k, d.awq_down.as_ref()),
-    }
+    GroupedMoeShared::new(
+        qt44_ref(&d.gate, mi, c, awq_in),
+        qt44_ref(&d.up, mi, c, awq_in),
+        qt44_ref(&d.down, c, down_k, d.awq_down.as_ref()),
+    )
 }
 
 struct DevIn {
@@ -1805,7 +1805,16 @@ struct DevIn {
 impl DevIn {
     fn new(gpu: &mut Gpu, c: &CaseData) -> Result<Self, String> {
         let x = up_f32(gpu, &c.x)?;
-        let router_w = up_f32(gpu, &c.router_w)?;
+        // The production loader path: BF16 when every value is BF16-exact (the
+        // generator rounds, as the checkpoint is BF16), else F32.
+        let router_w = hipfire_arch_raon::upload_rows_weight(
+            gpu,
+            &c.router_w,
+            c.geom.e,
+            c.geom.c,
+            "router_w",
+        )?
+        .buf;
         let bias = up_f32(gpu, &c.e_bias)?;
         Ok(Self { x, router_w, bias })
     }
@@ -1885,11 +1894,11 @@ fn gpu_moe_run_inner(
     }
     let shared_refs = match &wd.shared {
         Some(d) => gated_refs(d, wd.awq_gu.as_ref(), g.c, g.i, g.ipad),
-        None => GroupedMoeShared {
-            gate: qt44_ref(&wd.gate_up_ptrs, g.i, g.c, None),
-            up: qt44_ref(&wd.gate_up_ptrs, g.i, g.c, None),
-            down: qt44_ref(&wd.down_ptrs, g.c, g.ipad, None),
-        },
+        None => GroupedMoeShared::new(
+            qt44_ref(&wd.gate_up_ptrs, g.i, g.c, None),
+            qt44_ref(&wd.gate_up_ptrs, g.i, g.c, None),
+            qt44_ref(&wd.down_ptrs, g.c, g.ipad, None),
+        ),
     };
     let layer = RaonMoeLayerRefs {
         router_weight: &dev.router_w,

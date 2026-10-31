@@ -3062,6 +3062,8 @@ impl Gpu {
                 int4_mmq_down_scratch_bytes: 0,
                 int4_mmq_down_generation: 0,
                 int4_mmq_slab_generation: None,
+                q8_a8_x_scratch: None,
+                q8_a8_x_scratch_bytes: 0,
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
                 int8_mmq_generation: 0,
@@ -5616,6 +5618,49 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         self.scratch.ensure_int8_mmq_x(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.replay,
+            self.device_id,
+            x,
+            n,
+            k,
+        )
+    }
+
+    /// Quantize f32 activations into the gfx1201 `block_fp8_128` (e4m3) sidecar consumed by
+    /// [`Gpu::gemm_mq4g256v2_moe_grouped_fp8_sym`]. Shares the `ensure_int8_mmq_x` scratch, so it
+    /// overwrites a live int8 sidecar; gfx1201 only, `k % 128 == 0`.
+    pub fn ensure_fp8_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "ensure_fp8_mmq_x: gfx1201 only",
+            ));
+        }
+        if k == 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(0, "ensure_fp8_mmq_x: k % 128"));
+        }
+        let needed = crate::scratch::int8_mmq_x_needed(k, n);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.int8_mmq_x_scratch_bytes,
+            self.scratch.int8_mmq_x_scratch.is_some(),
+            needed,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch.ensure_fp8_mmq_x(
             &self.hip,
             &mut self.compiler,
             &mut self.modules,

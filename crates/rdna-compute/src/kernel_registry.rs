@@ -4206,6 +4206,32 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemm_q8_0_wmma_gfx12"]
         );
         add!(
+            "gemm_q8_0_mmq_i8_gfx12",
+            kernels::GEMM_Q8_0_MMQ_I8_GFX12_SRC,
+            [
+                "gemm_q8_0_mmq_i8_t128x128",
+                "gemm_q8_0_mmq_i8_t128x128_slow",
+                "gemm_q8_0_mmq_i8_t128x64",
+                "gemm_q8_0_mmq_i8_t128x64_slow",
+                "gemm_q8_0_mmq_i8_t64x64",
+                "gemm_q8_0_mmq_i8_t64x64_slow",
+                "quantize_x_q8_blk32",
+            ]
+        );
+        add!(
+            "gemm_q8_0_mmq_fp8_gfx12",
+            kernels::GEMM_Q8_0_MMQ_FP8_GFX12_SRC,
+            [
+                "gemm_q8_0_mmq_fp8_t128x128",
+                "gemm_q8_0_mmq_fp8_t128x128_slow",
+                "gemm_q8_0_mmq_fp8_t128x64",
+                "gemm_q8_0_mmq_fp8_t128x64_slow",
+                "gemm_q8_0_mmq_fp8_t64x64",
+                "gemm_q8_0_mmq_fp8_t64x64_slow",
+                "quantize_x_fp8_blk32",
+            ]
+        );
+        add!(
             "gemm_qkv_hfq6g256_wmma_gfx12",
             kernels::GEMM_QKV_HFQ6G256_WMMA_GFX12_SRC,
             ["gemm_qkv_hfq6g256_wmma_gfx12"]
@@ -5080,10 +5106,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_F32_SRC,
             ["gemm_f32_batched"]
         );
+        // Raon mHC selector and grouped-MoE router: BF16-weight x F32-activation
+        // GEMMs, batched (decode / verify / chunks) and x-stationary tiled (gfx1201
+        // prefill).
         add!(
-            "gemm_f32_tiled_rows",
-            kernels::GEMM_F32_TILED_ROWS_SRC,
-            ["gemm_f32_tiled_rows", "gemm_f32_tiled_rows_mp4"]
+            "gemm_bf16_xf32_batched",
+            kernels::GEMM_BF16_XF32_BATCHED_SRC,
+            ["gemm_bf16_xf32_batched"]
+        );
+        add!(
+            "gemm_bf16_xf32_tiled_rows",
+            kernels::GEMM_BF16_XF32_TILED_ROWS_SRC,
+            ["gemm_bf16_xf32_tiled_rows", "gemm_bf16_xf32_tiled_rows_mp4"]
         );
     }
     // lm_head rm2 muse tile (`gemm_hfq4g256_residual_muse_gfx1100_rm` rm=2):
@@ -10776,12 +10810,29 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // x-stationary tiled F32 GEMM for the mHC selector and grouped-MoE router.
-        const F32_TILED_ROWS_ADDED_MODULES: [&str; 1] = ["gemm_f32_tiled_rows"];
-        for module in F32_TILED_ROWS_ADDED_MODULES {
+        // gfx12 W8A8 / W8-FP8 Q8_0 prefill GEMMs (quantized-activation tiers).
+        const Q8_0_MMQ_ACT_ADDED_MODULES: [&str; 2] =
+            ["gemm_q8_0_mmq_i8_gfx12", "gemm_q8_0_mmq_fp8_gfx12"];
+        for module in Q8_0_MMQ_ACT_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
-                "missing F32 tiled rows module {module}"
+                "missing Q8_0 MMQ module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // BF16-weight GEMMs (batched + x-stationary tiled) for the Raon mHC selector
+        // and grouped-MoE router.
+        const BF16_XF32_ROWS_ADDED_MODULES: [&str; 2] =
+            ["gemm_bf16_xf32_batched", "gemm_bf16_xf32_tiled_rows"];
+        for module in BF16_XF32_ROWS_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing BF16-weight rows module {module}"
             );
             assert!(
                 !expected
@@ -10861,7 +10912,8 @@ mod tests {
                 + A3B_LANE_WO_ADDED_MODULES.len()
                 + A3B_MOE_DEDUP_ADDED_MODULES.len()
                 + A3B_LANE_PROJ_ADDED_MODULES.len()
-                + F32_TILED_ROWS_ADDED_MODULES.len(),
+                + BF16_XF32_ROWS_ADDED_MODULES.len()
+                + Q8_0_MMQ_ACT_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

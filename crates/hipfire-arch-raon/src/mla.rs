@@ -33,6 +33,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::config::RaonConfig;
 use crate::projection::{project, OutRound};
 use crate::weights::{RaonMixer, RaonWeights};
+use hipfire_dispatch::pipeline::PrefillActTier;
 
 /// Released geometry (config.json `q_lora_rank`, `kv_lora_rank`, `qk_*`, `v_head_dim`).
 pub const RAON_MLA_HEADS: usize = 40;
@@ -337,7 +338,16 @@ impl RaonMlaWork {
                 let RaonMixer::Mla(mw) = &w.layers[layer_idx].mixer else {
                     return Err(format!("layer {layer_idx} is not an MLA layer"));
                 };
-                project(gpu, &mw.kv_b_proj, &ident, &plane, latent, OutRound::Exact)?;
+                // The absorbed pack is built from an exact identity expansion: never tiered.
+                project(
+                    gpu,
+                    &mw.kv_b_proj,
+                    &ident,
+                    &plane,
+                    latent,
+                    OutRound::Exact,
+                    PrefillActTier::F16,
+                )?;
                 let packed = gpu.zeros(&[elems], DType::BF16).map_err(hip)?;
                 if let Err(e) = gpu.latent_attention_absorb_pack(
                     &plane,

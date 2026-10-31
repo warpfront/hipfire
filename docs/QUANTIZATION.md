@@ -139,7 +139,10 @@ Flash-Next bench fixture”) and the registry rows in [MODELS.md](MODELS.md).
   attention: 0.102 / 0.019). Source-exact BF16 for the same tensors measured no better
   (0.075 / 0.0118) and costs 0.8 GB more device memory, so it is not shipped.
   Prefill activation precision resolves once at load via
-  `HIPFIRE_RAON_PREFILL_PRECISION` (default f16; A4 is opt-in).
+  `HIPFIRE_RAON_PREFILL_PRECISION` (per-site policy; gfx1201 default: int8 activations at
+  every site, W4A8 FFN + W8A8 attention class, table in
+  `crates/hipfire-arch-raon/src/precision.rs`; `f16` is the kill switch, `<site>=f16` a
+  per-site one).
 
 **Historical sweep vs current registry.** The `mq4-xt` / `mq4` / `mq4 pro` ladder
 cells in [ladder.md](quant-formats/ladder.md) are the 2026-08 candidate sweep on

@@ -7366,6 +7366,9 @@ pub(crate) fn forward_batch_chunk_impl(
     let tap = tap_fn.get();
 
     for layer_idx in layer_start..layer_end {
+        // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`): names this
+        // layer and the chunk's first position for the sealed-MoE hooks; a no-op when both are unset.
+        hipfire_dispatch::pipeline::moe_capture::set_site(layer_idx, start_pos);
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 let qkvza_dtype = if mq3_scan {

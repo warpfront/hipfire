@@ -2,8 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Row-tiled F32 GEMM, bit-identical to gemm_f32_batched (gemm_f32.hip):
-//   Y[n, m] = sum_k A[m, k] * X[n, k]
+// Row-tiled BF16-weight x F32-activation GEMM, bit-identical to gemm_f32_batched
+// (gemm_f32.hip) run on the exactly widened weight:
+//   Y[n, m] = sum_k float(A[m, k]) * X[n, k]
+// A is BF16 (u16 words); the widening is the high-half shift, exact in F32.
 // Block = 256 threads = 8 groups of 32 lanes. A block owns NT=4 rows n; the
 // X[NT, KT] tile is staged in LDS (KT=1024) and shared by all 8 groups.
 // Group g owns outputs m = m0 + g + 8*i, i < MPW (m0 = blockIdx.x * 8*MPW).
@@ -19,8 +21,8 @@
 #define TR_KT 1024
 
 template <int MPW>
-__device__ __forceinline__ void gemm_f32_tiled_rows_body(
-    const float* __restrict__ A,
+__device__ __forceinline__ void gemm_bf16_xf32_tiled_rows_body(
+    const unsigned short* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ Y,
     int M, int K, int N
@@ -59,7 +61,8 @@ __device__ __forceinline__ void gemm_f32_tiled_rows_body(
             for (int i = 0; i < MPW; ++i) {
                 const int m = m0 + grp + ngrp * i;
                 if (m < M) {
-                    const float a = A[(size_t)m * K + kbase + kk];
+                    const float a = __uint_as_float(
+                        ((unsigned int)A[(size_t)m * K + kbase + kk]) << 16);
                     #pragma unroll
                     for (int j = 0; j < TR_NT; ++j)
                         sum[i][j] += a * x[j];
@@ -85,18 +88,18 @@ __device__ __forceinline__ void gemm_f32_tiled_rows_body(
 
 // MPW=16: any M (grid.x chunks M by 128). Router M=128 -> 16 x 4 = 64 acc.
 extern "C" __launch_bounds__(256)
-__global__ void gemm_f32_tiled_rows(
-    const float* __restrict__ A, const float* __restrict__ B,
+__global__ void gemm_bf16_xf32_tiled_rows(
+    const unsigned short* __restrict__ A, const float* __restrict__ B,
     float* __restrict__ Y, int M, int K, int N
 ) {
-    gemm_f32_tiled_rows_body<16>(A, B, Y, M, K, N);
+    gemm_bf16_xf32_tiled_rows_body<16>(A, B, Y, M, K, N);
 }
 
 // MPW=4: M <= 32 (selector M=17 -> 3 outputs per group).
 extern "C" __launch_bounds__(256)
-__global__ void gemm_f32_tiled_rows_mp4(
-    const float* __restrict__ A, const float* __restrict__ B,
+__global__ void gemm_bf16_xf32_tiled_rows_mp4(
+    const unsigned short* __restrict__ A, const float* __restrict__ B,
     float* __restrict__ Y, int M, int K, int N
 ) {
-    gemm_f32_tiled_rows_body<4>(A, B, Y, M, K, N);
+    gemm_bf16_xf32_tiled_rows_body<4>(A, B, Y, M, K, N);
 }

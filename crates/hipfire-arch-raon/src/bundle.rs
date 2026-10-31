@@ -2,8 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 //! RaonBundle (config, weights, state, scratch, work, eos) and the generation
 //! entry points built on the forward. Owner: slice A/I.
+//!
+//! The bundle is also the model's [`hipfire_runtime::session_cache::SessionState`]
+//! (see [`crate::session`]): with a cache attached, a prefill restores the
+//! snapshot `ArchModel::session_plan` returned and captures new ones on the
+//! cold prefill chunk grid, byte-identical to a cold prefill.
 
-use hipfire_dispatch::pipeline::GroupedMoeActTier;
+use crate::precision::{RaonPrecisionPlan, RaonPrecisionPolicy, SiteWeights};
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
@@ -11,9 +16,13 @@ use crate::forward::{
     admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
     stage_decode_token, stage_decode_token_on_stream, RaonWork,
 };
+use crate::session::session_stride;
 use crate::spec_impl::RaonSpecState;
 use crate::state::{RaonPrefillScratch, RaonState};
-use crate::weights::{RaonMixer, RaonWeights};
+use crate::weights::RaonWeights;
+use hipfire_runtime::session_cache::{
+    SessionCache, SessionCacheUsage, SessionDriver, SessionRoute,
+};
 
 /// Decode-step execution route (`HIPFIRE_GRAPH`, PLAN §3.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,151 +116,17 @@ impl PrefillMode {
     }
 }
 
-/// Activation precision of batched qt44 projections (`HIPFIRE_RAON_PREFILL_PRECISION`,
-/// PLAN §3.6). `Default` (unset) runs the grouped routed experts W4A8 on gfx1201 for
-/// symmetric-verified qt44 experts and keeps every other qt44 GEMM at FP16; `F16` is the kill
-/// switch (FP16 everywhere); `A8` additionally admits the int8-activation attention-class
-/// prefill GEMMs (gfx1201 `a8_prefill`, gfx11 `gfx11_a8_prefill`); `A4` admits the device's
-/// default symmetric IU4 route and W4A4 routed experts (fails the KLD gate, opt-in only).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrefillPrecision {
-    Default,
-    F16,
-    A8,
-    A4,
-}
-
-impl PrefillPrecision {
-    pub fn from_env() -> Result<Self, String> {
-        match hipfire_config::developer_var("HIPFIRE_RAON_PREFILL_PRECISION") {
-            Err(_) => Ok(Self::Default),
-            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "" => Ok(Self::Default),
-                "f16" => Ok(Self::F16),
-                "a8" => Ok(Self::A8),
-                "a4" => Ok(Self::A4),
-                other => Err(format!(
-                    "HIPFIRE_RAON_PREFILL_PRECISION={other:?}: expected `f16`, `a8` or `a4`"
-                )),
-            },
-        }
-    }
-
-    /// Activation tier of the grouped routed-expert GEMMs (`GroupedMoeRouted::act_tier`); admitted
-    /// only on gfx1201 for symmetric-verified qt44 experts, otherwise the F16 core runs.
-    pub fn routed_tier(self) -> GroupedMoeActTier {
-        match self {
-            Self::Default | Self::A8 => GroupedMoeActTier::A8,
-            Self::F16 => GroupedMoeActTier::F16,
-            Self::A4 => GroupedMoeActTier::A4,
-        }
-    }
-
-    /// Resolve the policy onto the device's feature flags once, at load.
-    /// `Default` and `F16` turn off every activation-quantized prefill route for this
-    /// process's device (the routed-expert tier is separate, see [`Self::routed_tier`]); `A8`
-    /// turns IU4 off and int8 on; `A4` leaves the device defaults untouched.
-    fn apply(self, gpu: &mut Gpu) {
-        let mut flags = (*gpu.flags).clone();
-        match self {
-            Self::Default | Self::F16 => {
-                flags.iu4_prefill = Some(false);
-                flags.a8_prefill = false;
-                flags.gfx11_a8_prefill = false;
-            }
-            Self::A8 => {
-                flags.iu4_prefill = Some(false);
-                flags.a8_prefill = true;
-                flags.gfx11_a8_prefill = true;
-            }
-            Self::A4 => return,
-        }
-        gpu.flags = std::sync::Arc::new(flags);
-    }
-
-    /// One load-time line per weight class that an `A8`/`A4` request does not
-    /// reach, so the setting never silently does nothing. Only qt44
-    /// (`MQ4G256V2`) attention-class projections go through the
-    /// activation-quantized batched GEMMs (device-dependent admission);
-    /// Q8F16/F32 projections have no such route, and every FFN class (dense
-    /// layer, shared and routed experts) runs the grouped F16-WMMA core.
-    fn report_coverage(self, weights: &RaonWeights, arch: &str) {
-        let label = match self {
-            Self::F16 => return,
-            Self::Default => {
-                let (verified, total) =
-                    weights
-                        .layers
-                        .iter()
-                        .fold((0usize, 0usize), |(v, t), l| match &l.ffn {
-                            crate::weights::RaonFfn::Moe(m) => {
-                                (v + usize::from(m.iu4_symmetric), t + 1)
-                            }
-                            _ => (v, t),
-                        });
-                eprintln!(
-                    "raon1_mini: routed experts run W4A8 (grouped int8-activation GEMMs) on {verified} of {total} MoE layers \
-                     (gfx1201 [{arch}] + loader-verified symmetric qt44); shared experts, the dense layer and \
-                     attention-class projections stay F16; HIPFIRE_RAON_PREFILL_PRECISION=f16 restores all-F16"
-                );
-                return;
-            }
-            Self::A8 => "a8",
-            Self::A4 => "a4",
-        };
-        let mut by_dtype: std::collections::BTreeMap<String, usize> = Default::default();
-        let mut note = |w: &hipfire_runtime::llama::WeightTensor| {
-            *by_dtype.entry(format!("{:?}", w.gpu_dtype)).or_default() += 1;
-        };
-        for layer in &weights.layers {
-            match &layer.mixer {
-                RaonMixer::Rda(r) => {
-                    for w in [
-                        &r.q_proj,
-                        &r.k_proj,
-                        &r.v_proj,
-                        &r.g_proj,
-                        &r.o_proj,
-                        &r.f_a_proj,
-                        &r.f_b_proj,
-                        &r.b_proj,
-                        &r.rda_w_proj,
-                    ] {
-                        note(w);
-                    }
-                }
-                RaonMixer::Mla(m) => {
-                    for w in [
-                        &m.q_a_proj,
-                        &m.q_b_proj,
-                        &m.kv_a_proj,
-                        &m.kv_b_proj,
-                        &m.g_proj,
-                        &m.o_proj,
-                    ] {
-                        note(w);
-                    }
-                }
-            }
-        }
-        let eligible = by_dtype.remove("MQ4G256V2").unwrap_or(0);
-        eprintln!(
-            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: {eligible} qt44 attention-class \
-             projections may take the activation-quantized prefill GEMM (device admission)"
-        );
-        for (dtype, n) in by_dtype {
-            eprintln!(
-                "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: {n} {dtype} attention-class \
-                 projections stay F16/F32 (no activation-quantized route for {dtype})"
-            );
-        }
-        eprintln!(
-            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: routed experts run the grouped {} GEMMs \
-             on gfx1201 for symmetric-verified qt44 experts; the dense layer and shared experts stay on the \
-             grouped F16-WMMA core",
-            if label == "a4" { "W4A4 (fails the KLD gate)" } else { "W4A8" }
-        );
-    }
+/// Pin the device's activation-quantized prefill feature flags OFF for this process: the qt44
+/// attention-class projections (`weight_gemm`: gfx1201 `a8_prefill`, IU4, gfx11 `gfx11_a8_prefill`)
+/// never take a tier in the typed policy ([`crate::precision`]), and the device defaults of those
+/// flags would otherwise quantize activations behind the policy's back. Every tiered site is
+/// reached through the policy's own routes instead.
+fn pin_flag_quant_routes_off(gpu: &mut Gpu) {
+    let mut flags = (*gpu.flags).clone();
+    flags.iu4_prefill = Some(false);
+    flags.a8_prefill = false;
+    flags.gfx11_a8_prefill = false;
+    gpu.flags = std::sync::Arc::new(flags);
 }
 
 /// Everything one loaded Raon-1-mini model owns on the device.
@@ -270,9 +145,18 @@ pub struct RaonBundle {
     prefill_mode: PrefillMode,
     decode_mode: DecodeMode,
     graph: DecodeGraph,
+    /// Prefill precision policy resolved at load ([`crate::precision`]): the request and the
+    /// effective tier of every site.
+    precision: RaonPrecisionPlan,
     /// Speculative-decode state (DFlash2 capture, per-row verify head); empty
     /// until a speculator arms it, never touched by AR prefill or decode.
     pub(crate) spec: RaonSpecState,
+    /// Device architecture string (`gfx1201`, ...), part of the snapshot scope:
+    /// kernels differ per device, so their bits do too.
+    pub(crate) gpu_arch: String,
+    /// Prefill snapshot cache shared by every session; `None` = off. Taken out
+    /// of the bundle while it drives the bundle as its `SessionState`.
+    pub(crate) session: Option<SessionDriver>,
 }
 
 impl RaonBundle {
@@ -286,21 +170,23 @@ impl RaonBundle {
         state: RaonState,
         scratch: RaonPrefillScratch,
     ) -> Result<Self, String> {
+        let arch = gpu.arch.clone();
         let built = PrefillMode::from_env()
-            .and_then(|m| PrefillPrecision::from_env().map(|p| (m, p)))
-            .and_then(|(m, p)| {
-                p.apply(gpu);
-                p.report_coverage(&weights, &gpu.arch);
+            .and_then(|m| RaonPrecisionPolicy::from_env(&arch).map(|p| (m, p)))
+            .and_then(|(m, policy)| {
+                pin_flag_quant_routes_off(gpu);
+                let precision = policy.resolve(&arch, &SiteWeights::collect(&weights));
+                eprintln!("{}", precision.coverage_line());
                 let mut work = RaonWork::new(gpu, &config, scratch.rows)?;
-                work.set_routed_tier(p.routed_tier());
+                work.set_site_tiers(precision.effective);
                 if let Err(e) = work.mla.pack_absorbed(gpu, &config, &weights) {
                     work.free(gpu);
                     return Err(e);
                 }
-                Ok((m, work))
+                Ok((m, work, precision))
             });
         match built {
-            Ok((prefill_mode, work)) => {
+            Ok((prefill_mode, work, precision)) => {
                 let mut state = state;
                 match state.fit_mirror_budget(gpu) {
                     Ok(rows) => eprintln!(
@@ -321,9 +207,12 @@ impl RaonBundle {
                     work,
                     eos,
                     prefill_mode,
+                    precision,
                     decode_mode: DecodeMode::resolve(gpu),
                     graph: DecodeGraph::default(),
                     spec: RaonSpecState::default(),
+                    gpu_arch: arch,
+                    session: None,
                 })
             }
             Err(e) => {
@@ -347,6 +236,12 @@ impl RaonBundle {
     /// Prefill route selected at load (see [`PrefillMode::from_env`]).
     pub fn prefill_mode(&self) -> PrefillMode {
         self.prefill_mode
+    }
+
+    /// The prefill precision policy resolved at load: the request and the effective tier of every
+    /// site ([`crate::precision`]).
+    pub fn precision_plan(&self) -> &RaonPrecisionPlan {
+        &self.precision
     }
 
     /// Rows of one batched prefill chunk: the admitted scratch/work rows (see
@@ -480,6 +375,141 @@ impl RaonBundle {
         let n_chunks = tokens.len().div_ceil(chunk);
         for (ci, piece) in tokens.chunks(chunk).enumerate() {
             self.forward_chunk(gpu, piece, ci + 1 == n_chunks)?;
+        }
+        Ok(())
+    }
+
+    /// Attach the session cache: [`session_prefill`](Self::session_prefill)
+    /// then restores and captures snapshots through it.
+    pub fn attach_session_cache(&mut self, cache: SessionCache) {
+        self.session = Some(SessionDriver::new(cache));
+    }
+
+    /// The attached session cache, if any.
+    pub fn session_cache(&self) -> Option<&SessionCache> {
+        self.session.as_ref().map(SessionDriver::cache)
+    }
+
+    /// `SessionCache::usage` of the attached cache.
+    pub fn session_usage(&self) -> Option<SessionCacheUsage> {
+        self.session.as_ref().map(|s| s.cache().usage())
+    }
+
+    /// Snapshot stride in prompt tokens: the smallest multiple of the prefill
+    /// width that is at least [`crate::session::SESSION_STRIDE_TOKENS`].
+    pub fn session_stride_tokens(&self) -> usize {
+        session_stride(self.prefill_step_rows())
+    }
+
+    /// Device bytes of one stride snapshot: the persistent slab plus one stride
+    /// of rows of every latent stream.
+    pub fn session_snapshot_bytes(&self) -> usize {
+        let (_, persist) = self.state.persist_part();
+        persist
+            + self.session_stride_tokens()
+                * self.state.dims().latent_row_bytes()
+                * self.state.mla_cache.len()
+    }
+
+    /// Device bytes the live state may still map before it holds `through`
+    /// tokens: unmapped latent growth of every MLA layer plus the expanded
+    /// mirror's growth up to `min(through, mirror_budget_rows)` rows.
+    pub fn context_growth_bytes(&self, gpu: &Gpu, through: usize) -> u64 {
+        self.state.context_growth_bytes(gpu, through)
+    }
+
+    /// Before a request that may hold up to `through` tokens: have the cache
+    /// free snapshots until [`context_growth_bytes`](Self::context_growth_bytes)
+    /// more device bytes fit (the cache never takes memory the context needs).
+    /// No-op without a cache.
+    pub fn release_session_for_growth(&mut self, gpu: &mut Gpu, through: usize) {
+        if self.session.is_none() {
+            return;
+        }
+        let need = self.context_growth_bytes(gpu, through);
+        if let Some(session) = self.session.as_mut() {
+            session.release_for(gpu, need);
+        }
+    }
+
+    /// Run `f` with the driver taken out, so it can drive `self` as its
+    /// `SessionState`. `None` without a cache.
+    fn with_session<R>(&mut self, f: impl FnOnce(&mut SessionDriver, &mut Self) -> R) -> Option<R> {
+        let mut session = self.session.take()?;
+        let result = f(&mut session, self);
+        self.session = Some(session);
+        Some(result)
+    }
+
+    /// Prefill `prompt` skipping the `reused` tokens `ArchModel::session_plan`
+    /// returned (0 = cold): begin through the driver (restore, or cold reset),
+    /// run the rest in prefill chunks that stop at every armed snapshot
+    /// boundary, and leave the LAST prompt token's logits in
+    /// [`logits`](Self::logits). Without a cache `reused` must be 0. Reports
+    /// `prefill_progress` after every chunk. A failure leaves the slot
+    /// partially advanced: the caller resets it.
+    ///
+    /// The driver runs without live continuation, so every resume point is a
+    /// position of the cold chunk grid and the result equals a cold prefill's.
+    pub fn session_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+    ) -> Result<(), String> {
+        let len = prompt.len();
+        if reused >= len {
+            return Err(format!(
+                "raon1_mini: reusing {reused} of {len} prompt tokens leaves nothing to compute"
+            ));
+        }
+        if len > self.state.max_seq() {
+            return Err(format!(
+                "raon1_mini: {len} prompt tokens exceed the reserved context of {} rows",
+                self.state.max_seq()
+            ));
+        }
+        match self.with_session(|session, bundle| {
+            session.begin(gpu, bundle, prompt, SessionRoute::Ar, reused, false)
+        }) {
+            Some(result) => {
+                result?;
+            }
+            None if reused == 0 => self.state.reset(gpu)?,
+            None => {
+                return Err(format!(
+                    "raon1_mini: session cache is not attached; cannot reuse {reused} tokens"
+                ))
+            }
+        }
+        if self.state.n_tokens() != reused {
+            return Err(format!(
+                "raon1_mini: session begin left the state at {} tokens, expected {reused}",
+                self.state.n_tokens()
+            ));
+        }
+        let step = self.prefill_step_rows();
+        let mut pos = reused;
+        while pos < len {
+            let boundary = self.session.as_ref().and_then(SessionDriver::next_boundary);
+            if boundary.is_some_and(|b| b <= pos) {
+                return Err(format!(
+                    "raon1_mini: session boundary {} is not past position {pos}",
+                    boundary.unwrap_or(0)
+                ));
+            }
+            let stop = boundary.unwrap_or(len).min(len);
+            for piece in prompt[pos..stop].chunks(step) {
+                pos += piece.len();
+                self.forward_chunk(gpu, piece, pos == len)?;
+                hipfire_runtime::prefill_progress::report(pos, len);
+            }
+            if boundary == Some(stop) {
+                self.with_session(|session, bundle| {
+                    session.at_boundary(gpu, bundle, &prompt[..stop])
+                })
+                .unwrap_or(Ok(()))?;
+            }
         }
         Ok(())
     }
@@ -625,9 +655,13 @@ impl RaonBundle {
         Ok(())
     }
 
-    /// Start a cold request (zero recurrent state, conv history, length). A
+    /// Start a cold request (zero recurrent state, conv history, length) and
+    /// forget the session driver's live state, whose rows this overwrites. A
     /// recorded decode graph stays valid: addresses and extents are unchanged.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if let Some(session) = self.session.as_mut() {
+            session.forget_live();
+        }
         self.state.reset(gpu)
     }
 
@@ -662,10 +696,16 @@ impl RaonBundle {
             work,
             eos: _,
             prefill_mode: _,
+            precision: _,
             decode_mode: _,
             graph,
             spec,
+            gpu_arch: _,
+            session,
         } = self;
+        if let Some(mut session) = session {
+            session.clear(gpu);
+        }
         // A recording of this bundle reads the buffers freed below.
         if graph.binding != 0 && gpu.graphs.ar_forward_binding == graph.binding {
             gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);

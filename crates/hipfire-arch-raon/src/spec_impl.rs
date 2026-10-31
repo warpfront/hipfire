@@ -62,6 +62,7 @@ use crate::projection::{project, OutRound};
 use crate::rollback::{RdaRingBuf, RollbackMode};
 use crate::state::RaonStateSnapshot;
 use crate::verify_graph::VerifyGraphs;
+use hipfire_dispatch::pipeline::PrefillActTier;
 
 // ───────────────────────── host planning ─────────────────────────
 
@@ -787,6 +788,7 @@ impl SpecTarget for RaonBundle {
             &logits,
             n,
             OutRound::Bf16,
+            PrefillActTier::F16,
         )?;
         logits.shape = vec![n, vocab];
         Ok(logits)

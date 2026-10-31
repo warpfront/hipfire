@@ -186,19 +186,25 @@ fn gamma<'a>(norm: Option<StreamNorm<'a>>) -> Option<StreamGamma<'a>> {
     })
 }
 
-/// Batched F32 GEMM `y[n, m] = a[m, :] . x[n, :]` for the small-M, large-K
-/// shapes of the mHC selector and the MoE router. The x-stationary tiled kernel
-/// keeps the per-output arithmetic of `gemm_f32_batched` (lane-strided FMA sum,
-/// width-32 shuffle tree) and is bit-identical to it. It reads each activation
-/// row once per 8*MPW outputs instead of once per output.
-/// Admitted on gfx1201 only, and only for `n >= F32_TILED_ROWS_MIN_N` rows: it is
-/// measured faster there at prefill row counts (Raon pp512..16384), but its few-block
-/// grid is far slower at decode and verify row counts (n = 1..16 on R9700: Raon decode
-/// step 13.8 -> 25.5 ms). It measured 2.3-2.9% slower end to end on gfx1100 (7900 XTX,
-/// Raon pp512/4096/16384); other archs are unmeasured. Both kernels are bit-identical,
-/// so the row floor changes speed only. `HIPFIRE_F32_TILED_ROWS=0` restores
-/// `gemm_f32_batched` everywhere (kill switch).
-pub(crate) fn f32_rows_gemm(
+/// Batched GEMM `y[n, m] = a[m, :] . x[n, :]` (F32 activation `x`, F32 output) for
+/// the small-M, large-K shapes of the mHC selector and the MoE router.
+///
+/// The weight `a` is BF16 (the checkpoint's own dtype; widening to F32 is exact,
+/// so the kernels read half the bytes and widen in registers). Every kernel keeps
+/// the per-output arithmetic of `gemm_f32_batched` (lane-strided FMA sum, width-32
+/// shuffle tree), so the output is bit-identical to that kernel run on the widened
+/// weight at every `n`.
+///
+/// `n < BF16_TILED_ROWS_MIN_N` (decode, speculative verify) and every arch but
+/// gfx1201 run `gemm_bf16_xf32_batched`. gfx1201 with `n >= BF16_TILED_ROWS_MIN_N`
+/// (prefill, Raon pp512..16384) runs the x-stationary `gemm_bf16_xf32_tiled_rows`,
+/// which reads each activation row once per 8*MPW outputs instead of once per
+/// output; its few-block grid is far slower at n = 1..16 and it measured slower on
+/// gfx1100. `HIPFIRE_BF16W_TILED_ROWS=0` runs the batched kernel everywhere.
+///
+/// A tensor the loader kept F32 (its source values were not all exactly
+/// BF16-representable) runs `gemm_f32_batched`.
+pub(crate) fn rows_gemm(
     gpu: &mut Gpu,
     a: &GpuTensor,
     x: &GpuTensor,
@@ -207,44 +213,61 @@ pub(crate) fn f32_rows_gemm(
     k: usize,
     n: usize,
 ) -> rdna_compute::HipResult<()> {
-    if n >= F32_TILED_ROWS_MIN_N
-        && gpu.arch == "gfx1201"
-        && hipfire_config::developer_bool("HIPFIRE_F32_TILED_ROWS", true)
-    {
-        gpu.gemm_f32_tiled_rows(a, x, y, m, k, n)
-    } else {
-        gpu.gemm_f32_batched(a, x, y, m, k, n)
+    match a.dtype {
+        DType::BF16 => {
+            if n >= BF16_TILED_ROWS_MIN_N
+                && gpu.arch == "gfx1201"
+                && hipfire_config::developer_bool("HIPFIRE_BF16W_TILED_ROWS", true)
+            {
+                gpu.gemm_bf16_xf32_tiled_rows(a, x, y, m, k, n)
+            } else {
+                gpu.gemm_bf16_xf32_batched(a, x, y, m, k, n)
+            }
+        }
+        _ => gpu.gemm_f32_batched(a, x, y, m, k, n),
     }
 }
 
 /// Smallest row count that takes the tiled kernel: the measured prefill region
 /// (pp512 and up). Decode (n = 1) and speculative verify (n <= 16) stay on
-/// `gemm_f32_batched`.
-pub(crate) const F32_TILED_ROWS_MIN_N: usize = 512;
+/// `gemm_bf16_xf32_batched`.
+pub(crate) const BF16_TILED_ROWS_MIN_N: usize = 512;
+
+/// True for a device tensor the selector / router GEMMs accept as the weight:
+/// BF16, or F32 when the loader kept the F32 values.
+pub(crate) fn rows_gemm_weight_ok(a: &GpuTensor) -> bool {
+    matches!(a.dtype, DType::BF16 | DType::F32)
+}
 
 /// JITs every kernel [`execute_stream_mix`] can launch (stream-mix kernels and
-/// the batched F32 selector GEMM) so a later graph capture compiles nothing.
+/// the selector GEMMs) so a later graph capture compiles nothing.
 pub fn preload_stream_mix(gpu: &mut Gpu) -> Result<(), DispatchError> {
     gpu.stream_mix_preload()
         .map_err(|e| hip_err("stream_mix preload", e))?;
+    gpu.ensure_kernel_public(
+        "gemm_bf16_xf32_batched",
+        rdna_compute::kernels::GEMM_BF16_XF32_BATCHED_SRC,
+        "gemm_bf16_xf32_batched",
+    )
+    .map_err(|e| hip_err("stream_mix selector gemm preload", e))?;
+    gpu.ensure_kernel_public(
+        "gemm_bf16_xf32_tiled_rows",
+        rdna_compute::kernels::GEMM_BF16_XF32_TILED_ROWS_SRC,
+        "gemm_bf16_xf32_tiled_rows",
+    )
+    .map_err(|e| hip_err("stream_mix selector tiled gemm preload", e))?;
+    gpu.ensure_kernel_public(
+        "gemm_bf16_xf32_tiled_rows",
+        rdna_compute::kernels::GEMM_BF16_XF32_TILED_ROWS_SRC,
+        "gemm_bf16_xf32_tiled_rows_mp4",
+    )
+    .map_err(|e| hip_err("stream_mix selector tiled gemm mp4 preload", e))?;
     gpu.ensure_kernel_public(
         "gemm_f32_batched",
         rdna_compute::kernels::GEMM_F32_SRC,
         "gemm_f32_batched",
     )
-    .map_err(|e| hip_err("stream_mix selector gemm preload", e))?;
-    gpu.ensure_kernel_public(
-        "gemm_f32_tiled_rows",
-        rdna_compute::kernels::GEMM_F32_TILED_ROWS_SRC,
-        "gemm_f32_tiled_rows",
-    )
-    .map_err(|e| hip_err("stream_mix selector tiled gemm preload", e))?;
-    gpu.ensure_kernel_public(
-        "gemm_f32_tiled_rows",
-        rdna_compute::kernels::GEMM_F32_TILED_ROWS_SRC,
-        "gemm_f32_tiled_rows_mp4",
-    )
-    .map_err(|e| hip_err("stream_mix selector tiled gemm mp4 preload", e))
+    .map_err(|e| hip_err("stream_mix selector f32 gemm preload", e))
 }
 
 /// Validates and launches one stream-mix stage.
@@ -273,15 +296,15 @@ pub fn execute_stream_mix(gpu: &mut Gpu, op: &StreamMixOp<'_>) -> Result<(), Dis
             } => {
                 let zdim = StreamMixOp::helmert_selector_rows(n);
                 let x_dim = n * width;
-                if selector.dtype != DType::F32 || selector.numel() < zdim * x_dim {
+                if !rows_gemm_weight_ok(selector) || selector.numel() < zdim * x_dim {
                     return Err(geometry(format!(
-                        "HelmertBounded selector must be F32 [{zdim}, {x_dim}]"
+                        "HelmertBounded selector must be BF16 (or F32) [{zdim}, {x_dim}]"
                     )));
                 }
                 // Selector projection: selector_out[r, :] = selector . streams[r, :].
                 // The kernel below applies the model-dtype round and the inverse-RMS
                 // scale.
-                f32_rows_gemm(gpu, selector, streams, selector_out, zdim, x_dim, rows)
+                rows_gemm(gpu, selector, streams, selector_out, zdim, x_dim, rows)
                     .map_err(|e| hip_err("stream_mix selector gemm", e))?;
                 gpu.stream_mix_route_helmert(&StreamRouteHelmert {
                     streams,

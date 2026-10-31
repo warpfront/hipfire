@@ -48,6 +48,7 @@ run bash scripts/ci-rustfmt-changed.sh
 run cargo clippy --workspace --all-targets --locked
 run python3 scripts/check-env-docs.py
 run python3 scripts/check-lifecycle.py
+run python3 scripts/check-selector-receipts.py
 
 echo
 if [[ ${#failed[@]} -gt 0 ]]; then

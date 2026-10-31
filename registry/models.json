@@ -1729,7 +1729,7 @@
     },
     "raon-1-mini-preview": {
       "repo": "hipfire-models/raon-1-mini-preview",
-      "file": "raon-1-mini-preview-v2.mq4-xts",
+      "file": "raon-1-mini-preview.mq4-xts",
       "size_gb": 17.9,
       "min_vram_gb": 20.0,
       "recommended_settings": {

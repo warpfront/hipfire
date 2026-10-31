@@ -14600,8 +14600,8 @@ impl Qwen4GpuForward {
                     Some("the QSA parity tap")
                 } else if self.route_trace.is_some() {
                     Some("the routing trace (HIPFIRE_QWEN4_ROUTE_TRACE)")
-                } else if n > 1 && hipfire_config::developer_var("HIPFIRE_QWEN4_PREFILL_ROUTE_DUMP").is_ok() {
-                    Some("HIPFIRE_QWEN4_PREFILL_ROUTE_DUMP")
+                } else if n > 1 && hipfire_dispatch::pipeline::moe_capture::enabled() {
+                    Some("HIPFIRE_MOE_ROUTE_DUMP / HIPFIRE_MOE_ACT_CAPTURE")
                 } else if self.ep.is_some() {
                     Some("expert parallelism")
                 } else {
@@ -14904,13 +14904,14 @@ impl Qwen4GpuForward {
                             }
                             traced = true;
                         }
-                        // Developer capture, off by default: per layer, the chunk's routed expert
-                        // ids as `u32 LE layer, rows, topk, start_pos` then rows*topk i32 (slot = row*topk + j).
-                        (split, None) if n > 1 && hipfire_config::developer_var("HIPFIRE_QWEN4_PREFILL_ROUTE_DUMP").is_ok() => {
-                            let path = hipfire_config::developer_var("HIPFIRE_QWEN4_PREFILL_ROUTE_DUMP").map_err(|e| invalid(format!("{e:?}")))?;
-                            let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-                                .map_err(|e| invalid(format!("HIPFIRE_QWEN4_PREFILL_ROUTE_DUMP={path}: {e}")))?;
-                            let (k, mut start, mut layer) = (config.num_experts_per_tok, 0usize, 0usize);
+                        // Developer capture, off by default (`HIPFIRE_MOE_ROUTE_DUMP`,
+                        // `HIPFIRE_MOE_ACT_CAPTURE`): run the steps up to and including each MoE step
+                        // eagerly, tagged with its layer ordinal and the chunk's first position, so
+                        // the shared sealed-MoE hooks (`hipfire_dispatch::pipeline::moe_capture`)
+                        // write the route record (`u32 LE layer, rows, topk, position` then
+                        // rows*topk i32, slot = row*topk + j) and the activation rows.
+                        (split, None) if n > 1 && hipfire_dispatch::pipeline::moe_capture::enabled() => {
+                            let (mut start, mut layer) = (0usize, 0usize);
                             for index in 0..steps.len() {
                                 if split == Some(index) {
                                     if start < index { execute(gpu, &steps[start..index])?; }
@@ -14918,14 +14919,9 @@ impl Qwen4GpuForward {
                                     start = index;
                                 }
                                 if matches!(steps[index], Step::Moe(_)) {
+                                    hipfire_dispatch::pipeline::moe_capture::set_site(layer, bundle.state.position);
                                     execute(gpu, &steps[start..=index])?;
                                     start = index + 1;
-                                    gpu.hip.device_synchronize()?;
-                                    let mut ids = vec![0u8; n * k * 4];
-                                    gpu.hip.memcpy_dtoh(&mut ids, &self.scratch.moe_topk_indices.buf)?;
-                                    let mut rec: Vec<u8> = [layer, n, k, bundle.state.position].iter().flat_map(|v| (*v as u32).to_le_bytes()).collect();
-                                    rec.extend_from_slice(&ids);
-                                    std::io::Write::write_all(&mut out, &rec).map_err(|e| invalid(format!("HIPFIRE_QWEN4_PREFILL_ROUTE_DUMP: {e}")))?;
                                     layer += 1;
                                 }
                             }

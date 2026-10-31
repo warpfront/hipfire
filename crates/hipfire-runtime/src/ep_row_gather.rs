@@ -1281,6 +1281,33 @@ pub(crate) mod tests {
         gather.cross(rank, tag)
     }
 
+    /// Publish `rank`'s tag for a crossing without crossing yet (the first half
+    /// of [`cross_once`]), so a test can order the ranks' crossings.
+    pub(crate) fn enter_tag(
+        gather: &EpRowGather,
+        rank: usize,
+        kind: GatherKind,
+        layer: usize,
+        slots: usize,
+    ) -> CrossingTag {
+        gather.enter(rank, kind, layer % 2, layer, slots)
+    }
+
+    /// The barrier half of [`cross_once`] for a tag from [`enter_tag`].
+    pub(crate) fn cross_tag(gather: &EpRowGather, rank: usize, tag: CrossingTag) -> HipResult<()> {
+        gather.cross(rank, tag)
+    }
+
+    /// Parties currently waiting on `barrier` (0 once a crossing completes).
+    pub(crate) fn arrived(barrier: &SpinBarrier) -> usize {
+        barrier.arrived.load(Ordering::Acquire)
+    }
+
+    /// Parties currently waiting on the gather's barrier.
+    pub(crate) fn gather_arrived(gather: &EpRowGather) -> usize {
+        arrived(&gather.barrier)
+    }
+
     #[test]
     fn crossing_tag_packs_and_formats_every_field() {
         let tag = CrossingTag::new(GatherKind::Explicit, 3, 47, 80, 0x12_3456);

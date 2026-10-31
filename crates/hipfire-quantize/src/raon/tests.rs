@@ -329,7 +329,7 @@ fn class_map_matches_plan_table() {
         ("model.layers.0.mlp.gate_proj.weight", Qt44),
         ("model.layers.0.mlp.up_proj.weight", Qt44),
         ("model.layers.0.mlp.down_proj.weight", Qt44),
-        ("model.layers.3.moe.gate.weight", F32),
+        ("model.layers.3.moe.gate.weight", RouterBf16),
         ("model.layers.3.moe.gate.e_score_correction_bias", F32),
         ("model.layers.1.self_attn.q_proj.weight", Q8F16),
         ("model.layers.1.self_attn.k_proj.weight", Q8F16),
@@ -860,7 +860,7 @@ fn end_to_end_synthetic_artifact_matches_class_table_and_is_reproducible() {
         !by.contains_key("lm_head.awq_scale.weight"),
         "no sidecar for Q8 lm_head"
     );
-    assert_eq!(qt(&format!("{p}moe.gate.weight")), 2);
+    assert_eq!(qt(&format!("{p}moe.gate.weight")), 16);
     assert_eq!(
         by[format!("{p}moe.gate.weight").as_str()].shape,
         vec![NEXP as u32, 256]
@@ -1249,7 +1249,7 @@ fn shared_ffn_class_map_is_pure_in_name_and_choice() {
             ("model.layers.1.self_attn.q_proj.weight", Q8F16),
             ("model.embed_tokens.weight", Q8F16),
             ("model.norm.weight", Lossless),
-            ("model.layers.3.moe.gate.weight", F32),
+            ("model.layers.3.moe.gate.weight", RouterBf16),
         ] {
             assert_eq!(classify_with(n, Q8F16, choice).unwrap(), want, "{n}");
         }
@@ -1302,6 +1302,59 @@ fn bf16_bits_round_nearest_even_and_exact_for_bf16_sources() {
     for v in vals(7, 2000, 3.0) {
         assert_eq!(f32_to_bf16_bits(v), bf16::from_f32(v).to_bits(), "{v}");
     }
+}
+
+fn router_name() -> String {
+    "model.layers.1.moe.gate.weight".to_string()
+}
+
+fn convert_router(dtype: Dtype, data: Vec<u8>) -> JobOut {
+    let name = router_name();
+    let dir = make_source(|t| {
+        let r = t.iter_mut().find(|x| x.name == name).unwrap();
+        r.dtype = dtype;
+        r.data = data;
+    });
+    let src = SourceIndex::open(dir.path()).unwrap();
+    convert(&src, &name, Storage::RouterBf16).unwrap()
+}
+
+#[test]
+fn router_bf16_exact_source_is_stored_as_raw_bf16() {
+    let name = router_name();
+    let src_bytes = bf16_bytes(&vals(91, NEXP * H, 0.2));
+    let out = convert_router(Dtype::BF16, src_bytes.clone());
+    assert_eq!(out.tensors.len(), 1, "no sidecar");
+    let t = &out.tensors[0];
+    assert_eq!(t.name, name);
+    assert_eq!(t.quant_type as u32, 16);
+    assert_eq!(t.shape, vec![NEXP as u32, H as u32], "unpadded [rows,k]");
+    assert_eq!(t.group_size, 0);
+    assert_eq!(t.data, src_bytes, "byte-exact source bf16 bits");
+    assert!(out.padded.is_none());
+}
+
+#[test]
+fn router_with_inexact_value_falls_back_to_f32_without_rounding() {
+    let mut v: Vec<f32> = bf16_bytes(&vals(92, NEXP * H, 0.2))
+        .chunks_exact(2)
+        .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
+        .collect();
+    v[7] = 1.000_000_1;
+    assert_ne!(
+        f32::from_bits((f32_to_bf16_bits(v[7]) as u32) << 16).to_bits(),
+        v[7].to_bits(),
+        "test value must not be bf16-exact"
+    );
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let out = convert_router(Dtype::F32, bytes.clone());
+    let t = &out.tensors[0];
+    assert_eq!(t.quant_type as u32, 2);
+    assert_eq!(t.shape, vec![NEXP as u32, H as u32]);
+    assert_eq!(
+        t.data, bytes,
+        "F32 payload keeps the source value bit-exact"
+    );
 }
 
 fn check_swap(target: SharedFfn) {
@@ -1423,9 +1476,11 @@ fn check_swap(target: SharedFfn) {
         .map(|v| v.as_u64().unwrap())
         .sum();
     assert_eq!(census_total as usize, fb.tensors().len());
+    // The two synthetic MoE layers' routers are BF16 in every artifact; the always-active
+    // FFN adds nine BF16 tensors only for the BF16 target.
     assert_eq!(
         meta["hipfire_recipe_census"]["BF16"].as_u64(),
-        (target == SharedFfn::Bf16).then_some(9)
+        Some(if target == SharedFfn::Bf16 { 11 } else { 2 })
     );
 
     // The read-only proof accepts it and counts every class.

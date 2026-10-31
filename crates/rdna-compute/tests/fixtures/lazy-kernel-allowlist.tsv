@@ -369,7 +369,6 @@ module	gdn_chunk_scan_emu_f16	developer-opt-in	Non-default developer override: H
 module	gelu_new_mul_f32	non-core-family	Non-core family route: Flux/VAE; rdna-compute/src/text_encoder.rs:179
 module	gelu_tanh_f32	config-opt-in	Non-default configuration: vision.mode / vision.rs; qwen35_vl.rs:1386
 module	gemm_bf16_mfma_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:32743
-module	gemm_bf16_xf32_batched	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemm.rs:28772-28800
 module	gemm_bf16_xf32_multirow_r16_gfx1151	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemm.rs:30257-30266
 module	gemm_bq1g128_prefill	codec-outside-core-rungs	BQ1G128 route absent from admitted core artifact rungs; rdna-compute/src/gemv.rs:9837
 module	gemm_bq1g128_wmma	codec-outside-core-rungs	BQ1G128/TQ2G128 route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:31959

@@ -574,6 +574,20 @@ pub fn gate(
     shape: Value,
     seed: u64,
 ) -> (bool, Value) {
+    gate_syms(symbol, symbol, case, base, cand, shape, seed)
+}
+
+/// [`gate`] for arms that launch different kernel symbols (`--vs`: two shipped kernels of one contract
+/// signature).
+pub fn gate_syms(
+    base_symbol: &str,
+    cand_symbol: &str,
+    case: &mut EmuCase,
+    base: (&[u8], &Geometry),
+    cand: (&[u8], &Geometry),
+    shape: Value,
+    seed: u64,
+) -> (bool, Value) {
     // The two arms are independent runs on the same inputs: the baseline on its own copy of the case, side by side.
     let mut base_case = case.clone();
     let (b, c) = std::thread::scope(|s| {
@@ -581,13 +595,13 @@ pub fn gate(
             run_arm(
                 "baseline",
                 base.0,
-                symbol,
+                base_symbol,
                 base.1,
                 &mut base_case,
                 &WgSel::All,
             )
         });
-        let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::All);
+        let c = run_arm("candidate", cand.0, cand_symbol, cand.1, case, &WgSel::All);
         (
             hb.join().unwrap_or_else(|_| {
                 Err(fail(
@@ -661,7 +675,7 @@ pub fn gate(
     let r = run_arm(
         "candidate-reversed",
         cand.0,
-        symbol,
+        cand_symbol,
         cand.1,
         case,
         &WgSel::List(&order),
@@ -781,6 +795,21 @@ pub fn extent_gate(
     shape: Value,
     seed: u64,
 ) -> (bool, Value) {
+    extent_gate_syms(label, symbol, symbol, case, base, cand, shape, seed)
+}
+
+/// [`extent_gate`] for arms that launch different kernel symbols (`--vs`).
+#[allow(clippy::too_many_arguments)]
+pub fn extent_gate_syms(
+    label: &str,
+    base_symbol: &str,
+    cand_symbol: &str,
+    case: &mut EmuCase,
+    base: (&[u8], &Geometry, Owner),
+    cand: (&[u8], &Geometry, Owner),
+    shape: Value,
+    seed: u64,
+) -> (bool, Value) {
     let (gb, gc) = (base.1.grid, cand.1.grid);
     let nelem = case.bufs[case.out].bytes.len() / 4;
     let mut rec = json!({
@@ -848,8 +877,22 @@ pub fn extent_gate(
     }
     rec["first_wgs"] = json!({"baseline": wb.iter().take(6).collect::<Vec<_>>(), "candidate": wc.iter().take(6).collect::<Vec<_>>()});
     // 3. run both arms on their lists.
-    let b = run_arm("baseline", base.0, symbol, base.1, case, &WgSel::List(&wb));
-    let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::List(&wc));
+    let b = run_arm(
+        "baseline",
+        base.0,
+        base_symbol,
+        base.1,
+        case,
+        &WgSel::List(&wb),
+    );
+    let c = run_arm(
+        "candidate",
+        cand.0,
+        cand_symbol,
+        cand.1,
+        case,
+        &WgSel::List(&wc),
+    );
     let (bn, cn) = (counts(&b), counts(&c));
     rec["instructions"] = json!({"baseline": bn.0, "candidate": cn.0});
     rec["workgroups"] = json!({"baseline": bn.1, "candidate": cn.1});

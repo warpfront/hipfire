@@ -52,7 +52,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use hipfire_arch_raon::bundle::{PrefillMode, PrefillPrecision, RaonBundle};
+use hipfire_arch_raon::bundle::{PrefillMode, RaonBundle};
 use hipfire_arch_raon::forward::readout_logits;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::loader_api::ModelSource;
@@ -1083,12 +1083,9 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         ));
     }
 
-    let precision = match PrefillPrecision::from_env()? {
-        PrefillPrecision::Default => "default",
-        PrefillPrecision::F16 => "f16",
-        PrefillPrecision::A8 => "a8",
-        PrefillPrecision::A4 => "a4",
-    };
+    // Raw request; the resolved per-site effective tiers are reported from the loaded bundle.
+    let precision = hipfire_config::developer_var(hipfire_arch_raon::precision::PRECISION_ENV)
+        .unwrap_or_else(|_| "default".to_string());
     let mut gpu = Gpu::init().map_err(|e| format!("bench: gpu init: {e:?}"))?;
     let pci = gpu.hip.device_pci_bus_id(gpu.device_id).unwrap_or_default();
     let gpu_json = json!({
@@ -1207,6 +1204,12 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
             "controls": {
                 "prefill_mode": mode_name(bundle.prefill_mode()),
                 "prefill_precision": precision,
+                "prefill_precision_effective": bundle
+                    .precision_plan()
+                    .sites
+                    .iter()
+                    .map(|(site, r)| (site.name().to_string(), r.effective.name()))
+                    .collect::<BTreeMap<_, _>>(),
                 "decode_route": bundle.decode_mode(),
                 "max_seq": max_seq,
                 "mirror_budget_rows": bundle.state.mirror_budget_rows(),

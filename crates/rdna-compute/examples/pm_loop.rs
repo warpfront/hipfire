@@ -316,7 +316,7 @@ struct Opts {
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--pool | --flush-l2 | --flush] [--out DIR] [--rip FILE.rip] [--cand-object FILE] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--pool | --flush-l2 | --flush] [--out DIR] [--rip FILE.rip] [--cand-object FILE] [--null-control aa] [--noise-floor FILE] [--inputs capture:ACT_CAPTURE.json[@site]] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -467,9 +467,9 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         ));
     }
     if o.cand_object.is_some() {
-        if o.kernel != "qwen4_moe_sym" || o.arch != "gfx1100" {
+        if o.kernel != "qwen4_moe_sym" || !matches!(o.arch, "gfx1100" | "gfx1201") {
             return Err(format!(
-                "--cand-object is only supported with --kernel qwen4_moe_sym --arch gfx1100 (got --kernel {} --arch {})",
+                "--cand-object is only supported with --kernel qwen4_moe_sym --arch gfx1100|gfx1201 (got --kernel {} --arch {})",
                 o.kernel, o.arch
             ));
         }
@@ -1905,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn cand_object_is_gfx1100_qwen4_moe_sym_only() {
+    fn cand_object_is_gfx1100_or_gfx1201_qwen4_moe_sym_only() {
         let ok = "--kernel qwen4_moe_sym --arch gfx1100 --offline --cand-object /tmp/c.co";
         let o = parse_args(args(ok)).unwrap();
         assert_eq!(
@@ -1918,7 +1918,7 @@ mod tests {
             .is_none());
         for bad in [
             "--kernel qwen4_moe_sym --arch gfx1151 --cand-object /tmp/c.co",
-            "--kernel qwen4_moe_sym --cand-object /tmp/c.co",
+            "--kernel qwen4_moe_sym --arch gfx1201 --cand-object /tmp/c.co --rip /tmp/a.rip",
             "--kernel iu4_gemm --arch gfx1100 --cand-object /tmp/c.co",
             "--kernel qwen4_moe_sym --arch gfx1100 --cand-object /tmp/c.co --rip /tmp/a.rip",
             "--kernel qwen4_moe_sym --arch gfx1100 --cand-object /tmp/c.co --null-control aa",

@@ -7930,13 +7930,12 @@ pub fn sample_top_k_p(
     top_k: Option<u32>,
     min_p: Option<f32>,
 ) -> u32 {
-    use std::sync::atomic::Ordering;
-    let mut state = SAMPLER_STATE.load(Ordering::Relaxed);
+    let mut state = sampler_state_load();
     if state == 0 {
         state = time_seed_rng_state();
     }
     let token = sample_top_k_p_with_state(logits, temperature, top_p, top_k, min_p, &mut state);
-    SAMPLER_STATE.store(state, Ordering::Relaxed);
+    sampler_state_store(state);
     token
 }
 
@@ -8496,13 +8495,11 @@ pub fn sample_top_p_from_candidates(
 /// to run two samplers against the same seed so token differences reflect
 /// real divergence and not just RNG stream drift.
 pub fn sampler_rng_snapshot() -> u32 {
-    use std::sync::atomic::Ordering;
-    SAMPLER_STATE.load(Ordering::Relaxed)
+    sampler_state_load()
 }
 
 pub fn sampler_rng_restore(state: u32) {
-    use std::sync::atomic::Ordering;
-    SAMPLER_STATE.store(state, Ordering::Relaxed);
+    sampler_state_store(state);
 }
 
 /// hunt3 M-E: deterministic per-request reset entry point for the CPU sampler
@@ -8512,20 +8509,51 @@ pub fn sampler_rng_restore(state: u32) {
 /// Note: `simple_rand` treats a stored 0 as "seed from time"; we map a 0 seed to
 /// 1 so the reset stays deterministic. The RNG algorithm itself is unchanged.
 pub fn reset_cpu_sampler_rng(seed: u32) {
-    use std::sync::atomic::Ordering;
     let s = if seed == 0 { 1 } else { seed };
-    SAMPLER_STATE.store(s, Ordering::Relaxed);
+    sampler_state_store(s);
 }
 
+#[cfg(not(test))]
 use std::sync::atomic::AtomicU32;
+#[cfg(not(test))]
 static SAMPLER_STATE: AtomicU32 = AtomicU32::new(0);
 
-/// Test-only exclusive hold on `SAMPLER_STATE`. The RNG is process-global and
-/// `cargo test` runs every test in the crate's lib binary on parallel threads,
-/// so ANY test in ANY module that resets or draws from the CPU sampler RNG
-/// must hold this guard for its whole reset→draw→assert span; otherwise a
-/// sibling's `simple_rand` advances the state mid-stream. Poison is ignored:
-/// the guarded value is `()`, and a failing test must not cascade into
+#[cfg(not(test))]
+#[inline]
+fn sampler_state_load() -> u32 {
+    SAMPLER_STATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn sampler_state_store(state: u32) {
+    SAMPLER_STATE.store(state, std::sync::atomic::Ordering::Relaxed);
+}
+
+// Under `cargo test` the state is per thread: every test runs on its own thread,
+// so a test that draws from the CPU sampler without holding
+// `sampler_rng_test_guard` can no longer advance another test's stream mid-run.
+// Production keeps the single process-global state above.
+#[cfg(test)]
+thread_local! {
+    static SAMPLER_STATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn sampler_state_load() -> u32 {
+    SAMPLER_STATE.with(|s| s.get())
+}
+
+#[cfg(test)]
+fn sampler_state_store(state: u32) {
+    SAMPLER_STATE.with(|s| s.set(state));
+}
+
+/// Test-only exclusive hold on the CPU sampler RNG. Under `cargo test` the
+/// state is already per thread (see `sampler_state_load`), so a sibling test can
+/// no longer advance it mid-stream; the guard still serializes tests that also
+/// touch other process-global sampler configuration. Poison is ignored: the
+/// guarded value is `()`, and a failing test must not cascade into
 /// `PoisonError`s in every later RNG test.
 #[cfg(test)]
 pub(crate) fn sampler_rng_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -8564,15 +8592,13 @@ fn time_seed_rng_state() -> u32 {
 /// Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampling.
 /// State lives in SAMPLER_STATE so that HIPFIRE_SAMPLE_COMPARE can snapshot/restore it.
 fn simple_rand() -> f32 {
-    use std::sync::atomic::Ordering;
-
     // Seed from time on first call
-    let mut s = SAMPLER_STATE.load(Ordering::Relaxed);
+    let mut s = sampler_state_load();
     if s == 0 {
         s = time_seed_rng_state();
     }
     let r = xorshift32_unit(&mut s);
-    SAMPLER_STATE.store(s, Ordering::Relaxed);
+    sampler_state_store(s);
     r
 }
 

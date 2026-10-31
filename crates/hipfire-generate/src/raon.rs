@@ -21,8 +21,12 @@
 //!   appended);
 //! * the `generation_config.json` sampling defaults and the generated-only
 //!   presence penalty ([`RaonSampling::resolve`]);
-//! * the two bundle callbacks (batched prefill in bounded chunks, one decode
-//!   step per token) that hand logits to the shared body;
+//! * the two bundle callbacks (batched prefill through the bundle's session
+//!   cache in bounded chunks, one decode step per token) that hand logits to
+//!   the shared body; prior turns and shared prefixes (system prompt, tools)
+//!   restore cold-exact prefill snapshots from the engine session cache
+//!   (`memory.session_cache_bytes`), so a hit is byte-identical to a cold
+//!   prefill, and decoded rows are recomputed;
 //! * the speculative adapter [`generate_raon_spec`]: the shared DFlash2 body
 //!   ([`crate::qwen::generate_dflash`]) serves the same turn, from the same
 //!   prompt tokens and sampling, under the same wire contract.
@@ -311,10 +315,53 @@ pub fn generate_raon(
     }
 
     let resolved = sampling.resolve(&defaults, max_tokens);
-    // Prior turns reach the model through the rendered prompt, never through
-    // retained state (PLAN 3.5: no prefix hit until RDA+conv snapshots exist).
-    // The device reset itself runs inside the prefill callback, after
-    // `gen_start`, so a failed reset takes the one fail-closed terminal.
+    // Trace-only measurements, taken before the conversation mirror is
+    // cleared: how much of the previous turn the new render reproduces
+    // verbatim (what a live-extension cache could reuse) and how many prior
+    // assistant turns the turn cache still knows. The prompt is never changed
+    // (exact HF render parity; decoded rows are not reused).
+    let prev = m.conversation_tokens.len();
+    let lcp_prev = common_prefix_len(&m.conversation_tokens, &prompt_tokens);
+    let render_extends_prev = prev > 0 && lcp_prev == prev;
+    let (asst_turns, asst_fp_hits, asst_token_exact) =
+        asst_cache_probe(m, messages_history, &prompt_tokens);
+    // Prior turns and shared prefixes (system prompt, tools) reuse cold-exact
+    // prefill snapshots through the engine session cache
+    // (`memory.session_cache_bytes`): a hit restores the state a cold prefill
+    // of the same tokens leaves on the same chunk grid, so the output is
+    // byte-identical to a cold prefill. Decoded rows are never reused: they
+    // are recomputed by the batched prefill. Snapshots yield to this
+    // request's context growth first, so the plan never names a snapshot the
+    // release would then evict.
+    if let Some(b) = m.raon_mut() {
+        b.release_session_for_growth(gpu, prompt_tokens.len() + max_tokens + 1);
+    }
+    let reused = m.raon().map_or(0, |b| {
+        hipfire_runtime::arch_model::ArchModel::session_plan(
+            b,
+            &prompt_tokens,
+            hipfire_runtime::session_cache::SessionRoute::Ar,
+        )
+    });
+    let usage = m.raon().and_then(|b| b.session_usage());
+    let mib = |bytes: u64| bytes >> 20;
+    let (pool_mib, resident_mib, budget_mib) = match usage {
+        Some(u) => (
+            mib(u.pool_bytes).to_string(),
+            mib(u.resident_bytes).to_string(),
+            mib(u.budget_bytes).to_string(),
+        ),
+        None => ("off".to_string(), "off".to_string(), "off".to_string()),
+    };
+    eprintln!(
+        "[raon-cache] id={id} prompt={} reused={reused} prev={prev} lcp_prev={lcp_prev} \
+         render_extends_prev={render_extends_prev} asst_turns={asst_turns} \
+         asst_fp_hits={asst_fp_hits} asst_token_exact={asst_token_exact} \
+         pool_mib={pool_mib} resident_mib={resident_mib} budget_mib={budget_mib}",
+        prompt_tokens.len(),
+    );
+    // The device restore/reset itself runs inside the prefill callback, after
+    // `gen_start`, so a failed restore takes the one fail-closed terminal.
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
@@ -340,8 +387,9 @@ pub fn generate_raon(
         started_in_think,
         stop,
         tools.is_some_and(|t| !t.is_empty()),
-        // No prefix reuse: every prompt token is computed.
-        0,
+        // The prompt tokens the session plan restored from a snapshot; the
+        // prefill callback computes the rest.
+        reused,
         // The GPU penalty prepass is not wired for this arch: penalized greedy
         // downloads the row and samples on the host.
         false,
@@ -350,14 +398,7 @@ pub fn generate_raon(
             let bundle = model
                 .raon_mut()
                 .ok_or_else(|| "raon bundle disappeared before prefill".to_string())?;
-            bundle.reset(device)?;
-            let total = tokens.len();
-            let mut done = 0usize;
-            for chunk in tokens.chunks(bundle.prefill_chunk_rows()) {
-                bundle.prefill(device, chunk)?;
-                done += chunk.len();
-                hipfire_runtime::prefill_progress::report(done, total);
-            }
+            bundle.session_prefill(device, tokens, reused)?;
             copy_logits(device, bundle.logits(), logits, vocab)
         },
         |model, device, token, logits| {
@@ -379,7 +420,11 @@ pub fn generate_raon(
             copy_logits(device, bundle.logits(), logits, vocab)?;
             Ok(token)
         },
-        |_| {},
+        |model| {
+            if let Some(b) = model.raon_mut() {
+                hipfire_runtime::arch_model::ArchModel::session_commit(b);
+            }
+        },
     );
 }
 
@@ -441,9 +486,11 @@ fn spec_prompt_matches_ar(
 ///   no `reasoning_effort` is forwarded (the template reads none), and a
 ///   request the shared body would render differently
 ///   ([`spec_prompt_matches_ar`]) takes the AR route;
-/// * there is no prefix reuse (as on the AR route): the device state, the
-///   conversation mirror and the assistant-turn cache are cleared first, so
-///   the shared body plans a cold prefill of the full render and never
+/// * the speculative route prefills cold and never touches the session
+///   cache (the AR route reuses cold-exact session snapshots): the device
+///   state (the bundle's public reset also forgets the live session state),
+///   the conversation mirror and the assistant-turn cache are cleared first,
+///   so the shared body plans a cold prefill of the full render and never
 ///   splices cached tokens into it;
 /// * the sampling is the AR route's: `top_k` after the card defaults
 ///   ([`RaonSampling::resolve`]); route selection already kept every request
@@ -503,6 +550,12 @@ pub fn generate_raon_spec(
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     m.asst_turn_cache.clear();
+    // The speculative prefill and verify windows may grow the context up to
+    // the reserved rows: session snapshots (kept for the AR route) yield first.
+    if let Some(b) = m.raon_mut() {
+        let cap = b.max_seq();
+        b.release_session_for_growth(gpu, cap);
+    }
     if crate::qwen::generate_dflash(
         m,
         gpu,
@@ -536,6 +589,50 @@ pub fn generate_raon_spec(
         return;
     }
     ar(m, gpu, stdout)
+}
+
+/// Length of the longest common prefix of `a` and `b`.
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// `needle` (non-empty) occurs as a contiguous sub-slice of `hay`.
+fn contains_subslice(hay: &[u32], needle: &[u32]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Assistant-turn cache probe over the request history (measurement only):
+/// `(assistant turns, fingerprint hits, hits whose cached content token ids
+/// occur verbatim in `prompt_tokens`)`. Uses the Qwen AR path's fingerprint.
+fn asst_cache_probe(
+    m: &mut LoadedModel,
+    history: Option<&[Message]>,
+    prompt_tokens: &[u32],
+) -> (usize, usize, usize) {
+    let (mut turns, mut hits, mut exact) = (0usize, 0usize, 0usize);
+    for msg in history.unwrap_or(&[]) {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        turns += 1;
+        let stripped = crate::common::strip_think_for_fingerprint(&msg.content);
+        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint(&normalized, &msg.tool_calls);
+        if let Some(turn) = m
+            .asst_turn_cache
+            .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
+        {
+            hits += 1;
+            if turn
+                .content
+                .as_ref()
+                .is_some_and(|c| contains_subslice(prompt_tokens, &c.token_ids))
+            {
+                exact += 1;
+            }
+        }
+    }
+    (turns, hits, exact)
 }
 
 fn copy_logits(
@@ -1292,5 +1389,28 @@ mod tests {
             "arch 19 must never look like Qwen DFlash"
         );
         assert!(!caps.supports_continuous_batch);
+    }
+
+    #[test]
+    fn common_prefix_len_is_the_longest_shared_prefix() {
+        assert_eq!(common_prefix_len(&[], &[]), 0);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[]), 0);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3]), 3);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]), 3);
+        assert_eq!(common_prefix_len(&[1, 2, 9, 4], &[1, 2, 3, 4]), 2);
+        assert_eq!(common_prefix_len(&[7], &[8]), 0);
+    }
+
+    #[test]
+    fn contains_subslice_requires_a_contiguous_nonempty_match() {
+        let hay = [5u32, 6, 7, 8, 9];
+        assert!(contains_subslice(&hay, &[5, 6]));
+        assert!(contains_subslice(&hay, &[7, 8, 9]));
+        assert!(contains_subslice(&hay, &hay));
+        assert!(!contains_subslice(&hay, &[5, 7]));
+        assert!(!contains_subslice(&hay, &[9, 10]));
+        assert!(!contains_subslice(&hay, &[5, 6, 7, 8, 9, 10]));
+        assert!(!contains_subslice(&hay, &[]));
+        assert!(!contains_subslice(&[], &[1]));
     }
 }

@@ -12,10 +12,12 @@ pub mod forward;
 pub mod mhc;
 pub mod mla;
 pub mod moe;
+pub mod precision;
 pub mod prefill;
 pub mod projection;
 pub mod rda;
 pub mod rollback;
+pub mod session;
 pub mod spec_impl;
 pub mod state;
 mod verify_graph;
@@ -35,7 +37,7 @@ pub use projection::{project, project_row, project_rows, round_bf16_rows, OutRou
 pub use rollback::{RollbackMode, ROLLBACK_ENV};
 pub use spec_impl::RaonSpecScratch;
 pub use weights::{
-    check_inventory, load_raon_weights, tensor_inventory, ExpertWeights, GatedFfnWeights,
-    MhcSiteWeights, MlaWeights, MoeFfnWeights, RaonFfn, RaonLayerWeights, RaonMixer, RaonWeights,
-    RdaWeights, TensorClass, TensorSpec,
+    check_inventory, load_raon_weights, tensor_inventory, upload_rows_weight, ExpertWeights,
+    GatedFfnWeights, MhcSiteWeights, MlaWeights, MoeFfnWeights, RaonFfn, RaonLayerWeights,
+    RaonMixer, RaonWeights, RdaWeights, TensorClass, TensorSpec,
 };

@@ -16,6 +16,7 @@
 //! so those never reach this layer; anything else is a named error, never a
 //! silent per-token loop.
 
+use hipfire_dispatch::pipeline::{q8_0_prefill_gemm, PrefillActTier};
 use hipfire_runtime::llama::{weight_gemm, weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -96,6 +97,11 @@ pub fn project_row(
 
 /// `Y[rows, m] = X[rows, k] W^T`: one batched GEMM (prefill). `rows == 1`
 /// takes the decode route so the two paths agree bit for bit on a single row.
+///
+/// `tier` is the site's resolved activation precision (`precision::RaonPrecisionPlan`): Q8_0
+/// weights take [`q8_0_prefill_gemm`] (which runs the F16 batched GEMM whenever the quantized
+/// tier is not admitted: rows < 64, graph capture, non-gfx1201); qt44 and F32 weights ignore it
+/// and keep their F16/F32 routes. Pass `F16` for sites that are never tiered.
 pub fn project_rows(
     gpu: &mut Gpu,
     w: &WeightTensor,
@@ -103,18 +109,23 @@ pub fn project_rows(
     y: &GpuTensor,
     rows: usize,
     round: OutRound,
+    tier: PrefillActTier,
 ) -> Result<(), String> {
     check(w, x, y, rows, "rows")?;
     if rows == 1 {
         return project_row(gpu, w, x, y, round);
     }
     match w.gpu_dtype {
-        DType::MQ4G256V2 => weight_gemm(gpu, w, x, y, rows),
-        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, rows),
-        DType::F32 => gpu.gemm_f32_batched(&w.buf, x, y, w.m, w.k, rows),
+        DType::MQ4G256V2 => weight_gemm(gpu, w, x, y, rows).map_err(|e| format!("{e:?}")),
+        DType::Q8_0 => q8_0_prefill_gemm(gpu, tier, &w.buf, x, y, w.m, w.k, rows)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        DType::F32 => gpu
+            .gemm_f32_batched(&w.buf, x, y, w.m, w.k, rows)
+            .map_err(|e| format!("{e:?}")),
         other => unreachable!("dtype {other:?} rejected by check()"),
     }
-    .map_err(|e| format!("raon projection (rows={rows}): {e:?}"))?;
+    .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;
     if round == OutRound::Bf16 {
         round_bf16_rows(gpu, y, rows, w.m)?;
     }
@@ -129,6 +140,7 @@ pub fn project(
     y: &GpuTensor,
     rows: usize,
     round: OutRound,
+    tier: PrefillActTier,
 ) -> Result<(), String> {
-    project_rows(gpu, w, x, y, rows, round)
+    project_rows(gpu, w, x, y, rows, round, tier)
 }

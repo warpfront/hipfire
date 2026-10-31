@@ -15,6 +15,10 @@
 // by shifting their raw high 16 bits into an F32 word; no F16 shadow or host
 // conversion is introduced.  Qwen4 uses this for all four shared-expert
 // projections, so the downloaded BF16 values remain the exact source values.
+// Raon's mHC selector and MoE router read their BF16 checkpoint weights through
+// it too: the per-output arithmetic (lane-strided FMA over k, width-32
+// shfl_down tree) is that of gemm_f32_batched, so it is bit-identical to that
+// kernel run on the widened weight.
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemm_bf16_xf32_batched(
     const unsigned short* __restrict__ W,

@@ -1103,6 +1103,27 @@ impl RaonState {
         &self.persist
     }
 
+    /// The persistent slab as one session-cache state part: the buffer and the
+    /// bytes of it that are state (RDA matrices, conv histories, device
+    /// `seq_len`), overwritten in place by every forward.
+    pub fn persist_part(&self) -> (&hip_bridge::DeviceBuffer, usize) {
+        (&self.persist.buf, self.layout.total)
+    }
+
+    /// Set the host token count after a session restore. The device `seq_len`
+    /// came with the restored slab, so nothing is written to the device (use
+    /// [`Self::set_n_tokens`] when the device count must change too).
+    pub fn set_host_tokens(&mut self, n: usize) -> Result<(), String> {
+        if n > self.max_seq {
+            return Err(format!(
+                "raon state: n_tokens {n} exceeds reserved max_seq {}",
+                self.max_seq
+            ));
+        }
+        self.n_tokens = n;
+        Ok(())
+    }
+
     /// Uniform q/k/v conv-history layout of the slab (identical in any
     /// [`RaonStateSnapshot`] of it): layer `ri`'s plane `p` (0 q, 1 k, 2 v)
     /// starts at `conv_off + ri * layer_stride + p * plane_pitch` bytes and is
@@ -1148,6 +1169,37 @@ impl RaonState {
     /// device: fixed at slot admission from the free device memory.
     pub fn mirror_budget_rows(&self) -> usize {
         self.mirror_budget_rows
+    }
+
+    /// Device bytes this slot may still map before it holds `through` tokens:
+    /// the unmapped latent growth of every MLA layer (VMM backend; the dense
+    /// backend committed `max_seq` rows up front) plus the expanded mirror's
+    /// growth up to `min(through, mirror_budget_rows)` rows, rounded up to
+    /// the mirror's growth chunk. An upper bound: a context that ends up on
+    /// the absorbed route backs no more mirror than this.
+    pub fn context_growth_bytes(&self, gpu: &Gpu, through: usize) -> u64 {
+        let through = through.min(self.max_seq);
+        let latent: usize = match (self.backend, self.plan) {
+            (LatentBackend::Vmm, Some(plan)) => {
+                let want = plan.mapped_bytes_for_tokens(through).unwrap_or(0);
+                self.mla_cache
+                    .iter()
+                    .map(|t| want.saturating_sub(gpu.vmm_mapped_bytes(t).unwrap_or(0)))
+                    .sum()
+            }
+            _ => 0,
+        };
+        let mirror = if self.dims.n_mla == 0 {
+            0
+        } else {
+            let rows = through
+                .min(self.mirror_budget_rows)
+                .next_multiple_of(MIRROR_CHUNK_ROWS)
+                .min(self.mirror_budget_rows);
+            mirror_row_bytes(&self.dims)
+                .saturating_mul(rows.saturating_sub(self.mirror_backed_rows()))
+        };
+        (latent as u64).saturating_add(mirror as u64)
     }
 
     /// Latent-cache bytes this slot may still map up to `max_seq`.

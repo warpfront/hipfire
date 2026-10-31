@@ -1241,3 +1241,8 @@ required-features = ["lab"]
 [[example]]
 name = "latent_attention_flash_check"
 required-features = ["lab"]
+
+# W8A8 Q8_0 gfx12 node bench + accuracy (needs a gfx12 GPU).
+[[example]]
+name = "bench_q8_0_a8_gfx12"
+required-features = ["lab"]

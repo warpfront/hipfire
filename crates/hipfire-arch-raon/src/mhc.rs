@@ -20,8 +20,9 @@
 //! | `res.b_z`                  | `[9]`       | chart bias                         |
 //! | `res.eta`                  | scalar F32  | identity/chart blend `sigmoid(eta)`|
 //!
-//! The selector is uploaded as one `[17, 10240]` F32 matrix (BF16 values
-//! widened losslessly, rows `pre|post|z`); alphas, biases and `eta` as one F32
+//! The selector is uploaded as one `[17, 10240]` BF16 matrix (rows `pre|post|z`;
+//! F32 only when a value is not BF16-representable, see
+//! [`crate::weights::upload_rows_weight`]); alphas, biases and `eta` as one F32
 //! vector `[alpha_pre, alpha_post, alpha_z, eta, b_pre, b_post, b_z]`.
 
 use hipfire_dispatch::pipeline::stream_mix::{
@@ -215,9 +216,14 @@ impl RaonMhcSite {
         if selector.iter().chain(params.iter()).any(|v| !v.is_finite()) {
             return Err("mhc: non-finite site parameter".into());
         }
-        let selector_t = gpu
-            .upload_f32(&selector, &[shape.selector_rows(), cols])
-            .map_err(|e| herr("mhc selector upload", e))?;
+        let selector_t = crate::weights::upload_rows_weight(
+            gpu,
+            &selector,
+            shape.selector_rows(),
+            cols,
+            "mhc selector",
+        )?
+        .buf;
         let params_t = match gpu.upload_f32(&params, &[params.len()]) {
             Ok(t) => t,
             Err(e) => {

@@ -358,6 +358,8 @@ jobs:
         run: python3 scripts/check-scratch-growth.py
       - name: Released CHANGELOG sections match their tags
         run: python3 scripts/check-changelog.py
+      - name: Row-predicate selector constants carry a covering receipt
+        run: python3 scripts/check-selector-receipts.py
       - name: No committed expectation was loosened
         # PR-only: on a push there is no proposed base to compare against.
         if: github.event_name == 'pull_request'

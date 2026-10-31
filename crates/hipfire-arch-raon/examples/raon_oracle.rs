@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-//! Raon oracle CLI (PLAN §6.2): module | state | logits | bench. Owner: slice O.
+//! Raon oracle CLI (PLAN §6.2): module | state | logits | generate | bench | session. Owner: slice O.
 //!
 //! This file is argument parsing, dispatch and verdict logic only. Each
 //! subcommand calls `raon_oracle::<module>::run(fixtures, &opts)` in
@@ -15,6 +15,8 @@
 //! raon_oracle logits --model M --tokens F (--teacher F | --kld REF.kldref.bin) --out FILE [--k v ...]
 //! raon_oracle generate --model M [--k v ...]   (generate::run streams text to stdout, exit 0/1; `--json 1` also prints the result object; no --out)
 //! raon_oracle bench  --model M --pp 512,8192 --tg 128 --out FILE [--k v ...]
+//! raon_oracle session --model M --tokens F --out FILE [--split N] [--decode 16] [--budget-mib 4096] [--prefill serial|batched] [--k v ...]
+//!     (a session-cache hit is bit-identical to a cold prefill: resident follow-up, pool restore after an unrelated prompt, budget; per-case verdict)
 //! ```
 //!
 //! `--negative` points the module at `<fixtures>/negative_controls` and
@@ -36,6 +38,7 @@ mod raon_oracle {
     pub mod mla;
     pub mod moe;
     pub mod rda;
+    pub mod session;
     pub mod state;
 }
 
@@ -48,6 +51,7 @@ const USAGE: &str = "usage:
   raon_oracle generate --model M ... (streams text to stdout; no --out)
   raon_oracle bench  --model M --pp 512,8192 --tg 128 [--reps 3] [--warmup 1] [--profile] --out FILE
   raon_oracle bench  --bucket-json PROFILE.json --out FILE   (CPU-only re-bucketing of a saved --profile result)
+  raon_oracle session --model M --tokens F [--split N] [--decode 16] [--budget-mib 4096] [--prefill serial|batched] --out FILE
 (extra `--key value` pairs are forwarded to the module as opts)";
 
 struct Cli {
@@ -61,7 +65,7 @@ fn parse_cli() -> Result<Cli, String> {
     let sub = argv.first().cloned().ok_or("missing subcommand")?;
     if !matches!(
         sub.as_str(),
-        "module" | "state" | "logits" | "bench" | "generate"
+        "module" | "state" | "logits" | "bench" | "generate" | "session"
     ) {
         return Err(format!("unknown subcommand `{sub}`"));
     }
@@ -261,12 +265,25 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
             fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
             label = "bench".into();
         }
+        "session" => {
+            require(&cli.opts, "model")?;
+            require(&cli.opts, "tokens")?;
+            run_fn = raon_oracle::session::run;
+            fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
+            label = "session".into();
+        }
         _ => unreachable!(),
     }
 
     let result = run_fn(&fixtures, &opts).map_err(|e| format!("{label}: {e}"))?;
     let (ok, lines) = match cli.sub.as_str() {
         "module" => case_verdict(&result, cli.negative),
+        "session" => {
+            // Per-case verdicts; the top-level `pass` must also be an explicit true.
+            let (ok, lines) = case_verdict(&result, false);
+            let top = result.get("pass").and_then(Value::as_bool) == Some(true);
+            (ok && top, lines)
+        }
         "bench" => {
             // A measurement probe: verdict is "ran without error and did not
             // self-report failure".
