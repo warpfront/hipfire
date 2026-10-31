@@ -7,7 +7,7 @@
 //! ```text
 //! raon_dflash_oracle capture  --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--max-seq N]
 //! raon_dflash_oracle emit     --model M.hfq --draft D.hfq --prompt-file P.txt --out DIR [--block N] [--max-seq N]
-//! raon_dflash_oracle rowexact --model M.hfq --prompt-file P.txt [--out DIR] [--max-seq N]
+//! raon_dflash_oracle rowexact --model M.hfq --prompt-file P.txt [--out DIR] [--max-seq N] [--census on [--census-k 2,4]]
 //! raon_dflash_oracle greedy   --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N]
 //! raon_dflash_oracle rollback  --model M.hfq [--draft D.hfq] --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
 //! raon_dflash_oracle verifygraph --model M.hfq --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
@@ -41,6 +41,15 @@
 //!   Exit 0 iff every row of every K is bit-identical (byte-identical greedy is
 //!   then guaranteed); otherwise the per-K max |diff| and argmax agreement are
 //!   printed and the exit is 1 (greedy must be tie-judged).
+//!   `--census on` (K from `--census-k`, default 2,4; instead of the K sweep): from the
+//!   same snapshot, K eager decode steps and the verify block through the product
+//!   `verify_block_logits` path, every stage tapped (embedding, per-site mHC controls /
+//!   aggregate, RDA projections / conv / prepare / recurrence / gated, MLA projections /
+//!   norm / q / gated attention, mixer out, FFN in / out, postmix streams, head norm).
+//!   Prints per layer the stages whose rows are not bitwise equal to the decode rows,
+//!   the first divergent (layer, stage) per row, and whether the eager decode logits
+//!   equal the graph decode logits; `census.json` under `--out`. Exit 0 iff every stage
+//!   and every logits row is bitwise equal.
 //! * `greedy` (gate 4): AR greedy vs DFlash greedy (`build_dflash2_speculator` +
 //!   the `Speculator` trait) over `--tokens` tokens, both cut at the first EOS.
 //!   Prints both streams' md5, the first divergence and the AR top-2 margin
@@ -124,7 +133,7 @@ use serde_json::{json, Value};
 const USAGE: &str = "usage:
   raon_dflash_oracle capture  --model M --draft D --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle emit     --model M --draft D --prompt-file P --out DIR [--block N] [--max-seq N]
-  raon_dflash_oracle rowexact --model M --prompt-file P [--out DIR] [--max-seq N]
+  raon_dflash_oracle rowexact --model M --prompt-file P [--out DIR] [--max-seq N] [--census on [--census-k 2,4]]
   raon_dflash_oracle greedy   --model M --draft D --prompt-file P [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N]
   raon_dflash_oracle rollback --model M [--draft D] --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle verifygraph --model M --prompt-file P [--out DIR] [--chat on] [--max-seq N]
@@ -760,6 +769,7 @@ fn run_rowexact(
     gpu: &mut Gpu,
     bundle: &mut RaonBundle,
     prompt: &[u32],
+    opts: &Opts,
     out: Option<&Path>,
 ) -> Result<bool, String> {
     const KMAX: usize = 16;
@@ -799,6 +809,12 @@ fn run_rowexact(
     }
 
     let mut scratch: Box<dyn SpecScratch> = SpecTarget::new_spec_scratch(bundle, gpu, KMAX)?;
+    if on_off(opts, "census", false)? {
+        let ks = census_ks(opts)?;
+        let r = run_census(gpu, bundle, &chain, &seq_rows, &ks, scratch.as_mut(), out);
+        scratch.free(gpu);
+        return r;
+    }
     let mut all_exact = true;
     let mut per_k = Vec::new();
     println!("rowexact: prompt {position} tokens; chain {chain:?}");
@@ -869,6 +885,138 @@ fn run_rowexact(
             &dir.join("rowexact.json"),
             &json!({"pass": all_exact, "position": position, "chain": chain, "per_k": per_k}),
         )?;
+    }
+    Ok(all_exact)
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// rowexact --census
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn census_ks(opts: &Opts) -> Result<Vec<usize>, String> {
+    let raw = opts.get("census-k").map(String::as_str).unwrap_or("2,4");
+    let mut ks = Vec::new();
+    for part in raw.split(',') {
+        let k: usize = part
+            .trim()
+            .parse()
+            .map_err(|e| format!("--census-k `{raw}`: {e}"))?;
+        if !(1..=16).contains(&k) {
+            return Err(format!("--census-k {k} outside 1..=16"));
+        }
+        ks.push(k);
+    }
+    Ok(ks)
+}
+
+/// Census of a K-row verify block against K sequential decode steps, per layer and stage.
+fn run_census(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    chain: &[u32],
+    graph_rows: &[Vec<f32>],
+    ks: &[usize],
+    scratch: &mut dyn SpecScratch,
+    out: Option<&Path>,
+) -> Result<bool, String> {
+    let mut all_exact = true;
+    let mut json_ks = Vec::new();
+    for &k in ks {
+        let rep = bundle.census_rows(gpu, &chain[..k], scratch)?;
+        println!("== census K={k}: {} stages tapped", rep.stages.len());
+        // Eager decode (the census reference) against the graph decode of the sweep.
+        let eager_eq_graph: Vec<bool> = (0..k)
+            .map(|r| {
+                rep.decode_logits[r].len() == graph_rows[r].len()
+                    && rep.decode_logits[r]
+                        .iter()
+                        .zip(&graph_rows[r])
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+            })
+            .collect();
+        println!(
+            "  eager decode logits == graph decode logits per row: {eager_eq_graph:?}"
+        );
+        let mut layers: Vec<usize> = rep.stages.iter().map(|s| s.layer).collect();
+        layers.dedup();
+        let mut json_layers = Vec::new();
+        for l in layers {
+            let stages: Vec<_> = rep.stages.iter().filter(|s| s.layer == l).collect();
+            let bad: Vec<_> = stages
+                .iter()
+                .filter(|s| s.row_equal.iter().any(|e| !e))
+                .collect();
+            let tag = if l == bundle.config.n_layers {
+                "head".to_string()
+            } else {
+                format!("L{l:02}")
+            };
+            println!(
+                "  {tag}: {}/{} stages bit-equal on every row{}",
+                stages.len() - bad.len(),
+                stages.len(),
+                if bad.is_empty() { "" } else { " — DIVERGENT:" }
+            );
+            for s in &bad {
+                let rows: Vec<String> = s
+                    .row_equal
+                    .iter()
+                    .enumerate()
+                    .map(|(r, &e)| {
+                        if e {
+                            format!("r{r}=ok")
+                        } else {
+                            format!(
+                                "r{r}=DIFF(max {:.3e}, first elem {})",
+                                s.row_max_abs[r],
+                                s.row_first_diff[r].unwrap_or(0)
+                            )
+                        }
+                    })
+                    .collect();
+                println!("      {:<16} w={:<6} {}", s.name, s.width, rows.join(" "));
+            }
+            json_layers.push(json!({
+                "layer": l,
+                "stages": stages.iter().map(|s| json!({
+                    "name": s.name, "width": s.width, "row_equal": s.row_equal,
+                    "row_max_abs": s.row_max_abs, "row_first_diff": s.row_first_diff,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+        let mut firsts = Vec::new();
+        for r in 0..k {
+            match rep.first_divergent(r) {
+                Some(s) => {
+                    println!("  row {r}: FIRST DIVERGENT stage = (layer {}, {})", s.layer, s.name);
+                    firsts.push(json!({"row": r, "layer": s.layer, "stage": s.name}));
+                }
+                None => {
+                    println!("  row {r}: every tapped stage bit-equal");
+                    firsts.push(json!({"row": r, "layer": null, "stage": null}));
+                }
+            }
+        }
+        println!(
+            "  logits bit-equal per row: {:?} (max |diff| {:?})",
+            rep.logits_equal, rep.logits_max_abs
+        );
+        let exact = rep.logits_equal.iter().all(|&e| e) && rep.divergent_stages().next().is_none();
+        all_exact &= exact;
+        json_ks.push(json!({
+            "k": k, "exact": exact, "eager_equals_graph": eager_eq_graph,
+            "first_divergent": firsts, "layers": json_layers,
+            "logits_equal": rep.logits_equal, "logits_max_abs": rep.logits_max_abs,
+        }));
+    }
+    println!(
+        "{} rowexact census: every tapped stage and logits row {}",
+        if all_exact { "PASS" } else { "FAIL" },
+        if all_exact { "bit-equal" } else { "NOT all bit-equal" }
+    );
+    if let Some(dir) = out {
+        write_json(&dir.join("census.json"), &json!({"pass": all_exact, "ks": json_ks}))?;
     }
     Ok(all_exact)
 }
@@ -3206,7 +3354,7 @@ fn run() -> Result<bool, String> {
                 &opts,
                 out.as_deref().ok_or("missing `--out`")?,
             ),
-            "rowexact" => run_rowexact(&mut gpu, &mut bundle, &prompt, out.as_deref()),
+            "rowexact" => run_rowexact(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
             "greedy" => run_greedy(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
             "rollback" => run_rollback(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
             "verifygraph" => run_verifygraph(&mut gpu, &mut bundle, &prompt, out.as_deref()),

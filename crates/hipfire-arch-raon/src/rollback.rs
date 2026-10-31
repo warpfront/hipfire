@@ -47,7 +47,7 @@ use std::sync::LazyLock;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::bundle::RaonBundle;
-use crate::forward::{forward_rows_verify, RdaRing};
+use crate::forward::{forward_rows_verify_tapped, RdaRing};
 use crate::rda::{rda_recurrence, RdaGeometry, RdaLayerState};
 use crate::spec_impl::RaonSpecState;
 use crate::state::RaonStateSnapshot;
@@ -230,10 +230,12 @@ impl RaonBundle {
         }
         self.spec.clear_ring_ticket();
         let pos = self.state.n_tokens() as u32;
-        {
+        // Census observer (oracle only): taken out so the forward can borrow `spec`.
+        let mut census = self.spec.census_tap.take();
+        let forwarded = {
             let capture = capture_row0.map(|r| self.spec.capture(r)).transpose()?;
             let ring = if arm { self.spec.ring() } else { None };
-            forward_rows_verify(
+            forward_rows_verify_tapped(
                 &self.config,
                 &self.weights,
                 &mut self.state,
@@ -245,8 +247,11 @@ impl RaonBundle {
                 false,
                 capture.as_ref(),
                 ring.as_ref(),
-            )?;
-        }
+                census.as_mut().map(|t| &mut **t as crate::forward::LayerTap<'_>),
+            )
+        };
+        self.spec.census_tap = census;
+        forwarded?;
         if arm {
             self.spec.mark_ring_recorded(position, block.len());
         }

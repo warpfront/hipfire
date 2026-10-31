@@ -115,6 +115,9 @@ pub(crate) struct RaonSpecState {
     pub(crate) rollback: Option<RollbackMode>,
     /// Recorded verify graphs (one per row count and capture flag).
     pub(crate) verify_graphs: VerifyGraphs,
+    /// Census observer ([`crate::census`]): while set, verify runs the eager
+    /// forward with every stage tapped (never the graph route).
+    pub(crate) census_tap: Option<crate::census::CensusTap>,
 }
 
 impl RaonSpecState {
@@ -341,7 +344,7 @@ impl RaonBundle {
         // Graph route: one recorded replay of forward + capture + readout +
         // argmax. The first use of a row count (and a non-capturable artifact)
         // runs the eager forward below instead.
-        let graph_mode = self.decode_mode() == "graph";
+        let graph_mode = self.decode_mode() == "graph" && self.spec.census_tap.is_none();
         let graphed = graph_mode && self.verify_graph_try(gpu, block, position, with_features)?;
         if !graphed {
             self.forward_verify_chunk(gpu, block, position, with_features.then_some(0))?;
@@ -357,6 +360,19 @@ impl RaonBundle {
                 rows,
                 &logits,
             )?;
+            if let Some(mut tap) = self.spec.census_tap.take() {
+                // Census: the normalized hidden rows the lm_head just read.
+                let width = self.config.hidden;
+                let view = self.scratch.branch_in.sub_offset(0, rows * width);
+                let fired = tap(
+                    gpu,
+                    crate::forward::TapSite::Stage(self.config.n_layers, "head.norm"),
+                    &view,
+                    rows,
+                );
+                self.spec.census_tap = Some(tap);
+                fired?;
+            }
             if graph_mode {
                 self.verify_graph_mark_warm(gpu, rows, with_features);
             }

@@ -808,6 +808,10 @@ fn dump_layers(
         let row0 = pos;
         let mut tap =
             |g: &mut Gpu, site: TapSite, streams: &GpuTensor, rows: usize| -> Result<(), String> {
+                // Census stage taps are not stream rows.
+                if matches!(site, TapSite::Stage(..)) {
+                    return Ok(());
+                }
                 if rows != len {
                     return Err(format!("tap {site:?}: {rows} rows, piece has {len}"));
                 }
@@ -836,6 +840,7 @@ fn dump_layers(
                             .ok_or_else(|| format!("tap layer {l} out of range"))?,
                         1,
                     ),
+                    TapSite::Stage(..) => return Ok(()),
                 };
                 file.write_rows(t, row0, &host)
             };

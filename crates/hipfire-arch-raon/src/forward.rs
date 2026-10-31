@@ -264,6 +264,10 @@ pub enum TapSite {
     Attn(usize),
     /// After the FFN-site postmix of this layer.
     Ffn(usize),
+    /// An intermediate buffer of this layer (census taps): `Stage(layer, name)`
+    /// with a `[rows, width]` F32 view (`width = numel / rows`). The head uses
+    /// layer `n_layers`. Fired only when a tap is armed; never under capture.
+    Stage(usize, &'static str),
 }
 
 /// Observer of the stream state (`[rows, streams, hidden]` F32 holding BF16
@@ -280,6 +284,170 @@ fn fire(
 ) -> Result<(), String> {
     if let Some(t) = tap.as_mut() {
         (**t)(gpu, site, streams, rows)?;
+    }
+    Ok(())
+}
+
+/// Fire a stage tap with the first `rows` rows of a `[cap_rows, width]` plane
+/// (`width = numel / cap_rows`) as a `[rows, width]` view.
+fn fire_stage_scratch(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    layer: usize,
+    name: &'static str,
+    t: &GpuTensor,
+    rows: usize,
+    cap_rows: usize,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    fire_stage_width(tap, gpu, layer, name, t, rows, t.numel() / cap_rows)
+}
+
+/// [`fire_stage_scratch`] with an explicit row width (ring planes).
+fn fire_stage_width(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    layer: usize,
+    name: &'static str,
+    t: &GpuTensor,
+    rows: usize,
+    width: usize,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    let view = t.sub_offset(0, rows * width);
+    fire(tap, gpu, TapSite::Stage(layer, name), &view, rows)
+}
+
+/// Census taps of an mHC site's controls (`prefix` is `attn` or `ffn`).
+fn stage_route(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    work: &RaonWork,
+    l: usize,
+    rows: usize,
+    prefix: &'static str,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    let names: [&'static str; 4] = if prefix == "attn" {
+        ["attn.route.sel", "attn.route.pre", "attn.route.post", "attn.route.res"]
+    } else {
+        ["ffn.route.sel", "ffn.route.pre", "ffn.route.post", "ffn.route.res"]
+    };
+    let c = work.mhc.controls();
+    let planes = [work.mhc.selector_out(), c.pre, c.post, c.res];
+    for (name, t) in names.into_iter().zip(planes) {
+        fire_stage_scratch(tap, gpu, l, name, t, rows, work.rows)?;
+    }
+    Ok(())
+}
+
+/// Census taps of an RDA layer's intermediates (after `rda_mixer`): the
+/// projections, the conv / prepare / recurrence outputs and the gated plane.
+/// With an armed ring the raw projections and prepare outputs live in the ring
+/// planes, not the scratch ones.
+#[allow(clippy::too_many_arguments)]
+fn stage_rda(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    l: usize,
+    rows: usize,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    ring: Option<&RdaRing<'_>>,
+    ri: usize,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    let proj = work.rda_geom.proj();
+    let heads = work.rda_geom.n_heads;
+    let cap = scratch.rows;
+    let rcap = work.rda.max_rows;
+    let tape = ring.map(|r| r.tape(ri, &work.rda_geom));
+    match &tape {
+        Some(t) => {
+            for (name, p, w) in [
+                ("rda.q_raw", &t.q_raw, proj),
+                ("rda.k_raw", &t.k_raw, proj),
+                ("rda.v_raw", &t.v_raw, proj),
+            ] {
+                fire_stage_width(tap, gpu, l, name, p, rows, w)?;
+            }
+        }
+        None => {
+            fire_stage_scratch(tap, gpu, l, "rda.q_raw", &scratch.rda_q_raw, rows, cap)?;
+            fire_stage_scratch(tap, gpu, l, "rda.k_raw", &scratch.rda_k_raw, rows, cap)?;
+            fire_stage_scratch(tap, gpu, l, "rda.v_raw", &scratch.rda_v_raw, rows, cap)?;
+        }
+    }
+    for (name, t) in [
+        ("rda.z", &scratch.rda_z),
+        ("rda.b", &scratch.rda_b),
+        ("rda.delta", &scratch.rda_delta),
+        ("rda.f_lat", &scratch.rda_f_lat),
+        ("rda.f", &scratch.rda_f),
+    ] {
+        fire_stage_scratch(tap, gpu, l, name, t, rows, cap)?;
+    }
+    fire_stage_scratch(tap, gpu, l, "rda.qconv", &work.rda.qconv, rows, rcap)?;
+    fire_stage_scratch(tap, gpu, l, "rda.kconv", &work.rda.kconv, rows, rcap)?;
+    fire_stage_scratch(tap, gpu, l, "rda.vconv", &work.rda.vconv, rows, rcap)?;
+    match &tape {
+        Some(t) => {
+            for (name, p, w) in [
+                ("rda.q", &t.q, proj),
+                ("rda.k", &t.k, proj),
+                ("rda.vprime", &t.vprime, proj),
+                ("rda.log_alpha", &t.log_alpha, proj),
+                ("rda.beta", &t.beta, heads),
+            ] {
+                fire_stage_width(tap, gpu, l, name, p, rows, w)?;
+            }
+        }
+        None => {
+            for (name, p) in [
+                ("rda.q", &work.rda.q),
+                ("rda.k", &work.rda.k),
+                ("rda.vprime", &work.rda.vprime),
+                ("rda.log_alpha", &work.rda.log_alpha),
+                ("rda.beta", &work.rda.beta),
+            ] {
+                fire_stage_scratch(tap, gpu, l, name, p, rows, rcap)?;
+            }
+        }
+    }
+    fire_stage_scratch(tap, gpu, l, "rda.y", &work.rda.y, rows, rcap)?;
+    fire_stage_scratch(tap, gpu, l, "rda.gated", &scratch.rda_gated, rows, cap)
+}
+
+/// Census taps of an MLA layer's intermediates (after `mla_mixer`): the
+/// projections, the normed q_a, q, and the gated attention output.
+fn stage_mla(
+    tap: &mut Option<LayerTap<'_>>,
+    gpu: &mut Gpu,
+    l: usize,
+    rows: usize,
+    scratch: &RaonPrefillScratch,
+) -> Result<(), String> {
+    if tap.is_none() {
+        return Ok(());
+    }
+    let cap = scratch.rows;
+    for (name, t) in [
+        ("mla.qa", &scratch.mla_qa),
+        ("mla.kv_a", &scratch.mla_kv_a),
+        ("mla.g", &scratch.mla_g),
+        ("mla.qa_norm", &scratch.mla_qa_norm),
+        ("mla.q", &scratch.mla_q),
+        ("mla.attn_gated", &scratch.mla_attn),
+    ] {
+        fire_stage_scratch(tap, gpu, l, name, t, rows, cap)?;
     }
     Ok(())
 }
@@ -881,6 +1049,33 @@ fn ffn_block(
     rows: usize,
 ) -> Result<(), String> {
     match &layer.ffn {
+        RaonFfn::Dense(d)
+            if (2..=crate::projection::ROWS_EXACT_MAX).contains(&rows)
+                && crate::projection::rows_exact() =>
+        {
+            // Row-exact verify: every row runs the decode MLP itself (the decode
+            // weight copy, the single-row GEMVs), one row at a time through the
+            // same scratch, so row r equals the decode step's row bit for bit.
+            let (gate, up, down) = d.projections(1);
+            let refs =
+                RaonDenseRefs::from_parts(gate, up, down)?.with_iu4_symmetric(d.iu4_symmetric);
+            let hidden = scratch.branch_in.numel() / scratch.rows;
+            for r in 0..rows {
+                let x_row = scratch.branch_in.sub_offset(r * hidden, hidden);
+                let out_row = scratch.ffn_out.sub_offset(r * hidden, hidden);
+                forward_dense(
+                    gpu,
+                    ctx,
+                    &work.moe_dims,
+                    &refs,
+                    1,
+                    &x_row,
+                    &work.dense,
+                    &out_row,
+                )?;
+            }
+            Ok(())
+        }
         RaonFfn::Dense(d) => {
             let (gate, up, down) = d.projections(rows);
             let refs =
@@ -1411,6 +1606,7 @@ fn forward_body(
                 (&scratch.stream_b, &scratch.stream_a)
             };
             mhc_route(gpu, work, &layer.attn_mhc, rows, cur)?;
+            stage_route(tap, gpu, work, l, rows, "attn")?;
             mhc_aggregate(
                 gpu,
                 work,
@@ -1422,6 +1618,7 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            fire_stage_scratch(tap, gpu, l, "attn.agg", &scratch.branch_in, rows, scratch.rows)?;
             match (kind, &layer.mixer) {
                 (LayerKind::Rda, RaonMixer::Rda(rw)) => {
                     let ri = cfg
@@ -1429,6 +1626,7 @@ fn forward_body(
                         .ok_or_else(|| format!("raon1_mini: layer {l} has no RDA slot"))?;
                     rda_mixer(gpu, rw, ri, s, scratch, work, rows, ring)
                         .map_err(|e| format!("raon1_mini L{l} rda: {e}"))?;
+                    stage_rda(tap, gpu, l, rows, scratch, work, ring, ri)?;
                 }
                 (LayerKind::Mla, RaonMixer::Mla(mw)) => {
                     let mi = cfg
@@ -1436,6 +1634,7 @@ fn forward_body(
                         .ok_or_else(|| format!("raon1_mini: layer {l} has no MLA slot"))?;
                     mla_mixer(gpu, cfg, mw, mi, s, scratch, work, rows, start)
                         .map_err(|e| format!("raon1_mini L{l} mla: {e}"))?;
+                    stage_mla(tap, gpu, l, rows, scratch)?;
                 }
                 _ => {
                     return Err(format!(
@@ -1443,6 +1642,7 @@ fn forward_body(
                     ))
                 }
             }
+            fire_stage_scratch(tap, gpu, l, "attn.out", &scratch.branch_out, rows, scratch.rows)?;
             mhc_postmix(gpu, work, rows, cur, &scratch.branch_out, oth)?;
         }
         cur_is_a = !cur_is_a;
@@ -1466,6 +1666,7 @@ fn forward_body(
                 (&scratch.stream_b, &scratch.stream_a)
             };
             mhc_route(gpu, work, &layer.ffn_mhc, rows, cur)?;
+            stage_route(tap, gpu, work, l, rows, "ffn")?;
             mhc_aggregate(
                 gpu,
                 work,
@@ -1480,8 +1681,10 @@ fn forward_body(
             // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`):
             // names this layer and its first row's position; a no-op when both are unset.
             hipfire_dispatch::pipeline::moe_capture::set_site(l, start);
+            fire_stage_scratch(tap, gpu, l, "ffn.agg", &scratch.branch_in, rows, scratch.rows)?;
             ffn_block(gpu, &ctx, work, layer, scratch, rows)
                 .map_err(|e| format!("raon1_mini L{l} ffn: {e}"))?;
+            fire_stage_scratch(tap, gpu, l, "ffn.out", &scratch.ffn_out, rows, scratch.rows)?;
             mhc_postmix(gpu, work, rows, cur, &scratch.ffn_out, oth)?;
         }
         cur_is_a = !cur_is_a;
@@ -1668,6 +1871,28 @@ pub fn forward_rows_verify(
     capture: Option<&DflashCapture<'_>>,
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
+    forward_rows_verify_tapped(
+        cfg, w, s, scratch, work, gpu, tokens, start_pos, want_logits, capture, ring, None,
+    )
+}
+
+/// [`forward_rows_verify`] with an optional observer (census: the same verify
+/// launch sequence, every stage tapped; not graph-capturable).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_rows_verify_tapped(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &mut RaonPrefillScratch,
+    work: &mut RaonWork,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: u32,
+    want_logits: bool,
+    capture: Option<&DflashCapture<'_>>,
+    ring: Option<&RdaRing<'_>>,
+    tap: Option<LayerTap<'_>>,
+) -> Result<(), String> {
     forward_impl(
         cfg,
         w,
@@ -1678,7 +1903,7 @@ pub fn forward_rows_verify(
         tokens,
         start_pos,
         want_logits,
-        None,
+        tap,
         capture,
         ring,
     )
