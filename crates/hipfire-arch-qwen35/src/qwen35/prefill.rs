@@ -2084,20 +2084,26 @@ fn next_ordinary_chunk_len(
 /// sequential prefill runs eager, with no tree/chain verify or MoE/TP/EP.
 /// Check the exact same producer predicates used by the fallback decisions.
 fn lean_pbs_route(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, n: usize) -> bool {
+    // An A8-owned site has a fused A8 producer only with A8_FUSED_PROD on;
+    // FFN down additionally needs F1-lite (the w_down AWQ scale, 128-row hidden).
+    let a8 = |k: usize| gpu.flags.a8_fused_prod && gpu.a8_prefill_active(n, k);
+    let a8_down = a8(config.hidden_dim) && config.hidden_dim % 128 == 0;
     matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
         && config.num_experts == 0
         && config.linear_value_head_dim == 128
         && dense_layers_are_all_mq4v2(weights)
-        && gpu.iu4_producer_sidecar_active(n, config.dim)
-        && gpu.iu4_producer_sidecar_active(n, config.hidden_dim)
-        && gpu.iu4_gfx11_producer_quant_fused_active(
-            n,
+        && (gpu.iu4_producer_sidecar_active(n, config.dim) || a8(config.dim))
+        && (gpu.iu4_producer_sidecar_active(n, config.hidden_dim) || a8_down)
+        && [
             config.linear_num_value_heads * config.linear_value_head_dim,
-        )
-        && gpu.iu4_gfx11_producer_quant_fused_active(n, config.n_heads * config.head_dim)
+            config.n_heads * config.head_dim,
+        ]
+        .into_iter()
+        .all(|k| gpu.iu4_gfx11_producer_quant_fused_active(n, k) || a8(k))
         && weights.layers.iter().all(|layer| match layer {
             LayerWeights::DeltaNet(layer) => {
                 layer.wo.k == config.linear_num_value_heads * config.linear_value_head_dim
+                    && (!a8_down || layer.w_down.awq_scale.is_some())
             }
             LayerWeights::FullAttn(layer) => {
                 let k = config.n_heads * config.head_dim;
@@ -2107,6 +2113,7 @@ fn lean_pbs_route(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, n: 
                         .awq_scale
                         .as_ref()
                         .is_some_and(|awq| awq.numel() >= k)
+                    && (!a8_down || layer.w_down.awq_scale.is_some())
             }
             _ => false,
         })

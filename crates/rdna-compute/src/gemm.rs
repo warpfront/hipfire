@@ -35877,7 +35877,12 @@ impl Gpu {
         n: usize,
     ) -> bool {
         matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && self.iu4_producer_sidecar_active(n, k)
+            // The load-time Z fold stays on for fused-A8 loads (the A8 SETs read
+            // only Z's leading rows); the IU4 sidecar gate itself declines A8 shapes.
+            && (self.iu4_producer_sidecar_active(n, k)
+                || (self.flags.iu4_producer_sidecar_enabled()
+                    && self.flags.a8_fused_prod
+                    && self.a8_prefill_active(n, k)))
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
             && *DISPATCH_IU4_SYMFOLD
