@@ -31,8 +31,14 @@
 #[cfg(feature = "deltanet")]
 pub mod arch;
 #[cfg(feature = "deltanet")]
+pub mod codec;
+#[cfg(feature = "deltanet")]
 pub mod depth;
 
+#[cfg(feature = "deltanet")]
+pub use codec::{
+    codec_decode, load_codec_weights, write_wav, CodecConfig, CodecWeights,
+};
 #[cfg(feature = "deltanet")]
 pub use depth::{
     depth_config_from_hfq, get_audio_out_embeds, load_depth_weights, sample_audio_frame,
