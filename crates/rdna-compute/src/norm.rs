@@ -1455,6 +1455,9 @@ impl Gpu {
                 b.push_i32(hd);
                 b.push_f32(fb);
                 b.push_i32(bs);
+                b.push_f32(l3f);
+                b.push_f32(l3m);
+                b.push_f32(l3a);
                 b
             },
         )
