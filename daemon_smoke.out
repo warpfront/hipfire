@@ -1,0 +1,2 @@
+{"type":"error","message":"load failed: lfm3: parsing config failed: missing field `vocab_size`. GPU: gfx1151 (124528 MB free / 131072 MB total)","class":"internal","retryable":false,"rolled_back":false,"attempt_id":0,"id":""}
+{"type":"error","message":"generate missing attempt_id","class":"validation","retryable":false,"rolled_back":false,"attempt_id":0,"id":"r1"}

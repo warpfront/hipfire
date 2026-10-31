@@ -4642,6 +4642,7 @@ fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool 
     load_tp > 1 && !model_present
 }
 
+#[derive(Clone, Copy)]
 enum ImageSource<'a> {
     Path(&'a str),
     Base64(&'a str),
@@ -18961,7 +18962,7 @@ fn generate_lfm3_vl(
         max_think_tokens: _,
         repeat_penalty: _,
         repeat_window: _,
-    } = params;
+    } = *params;
 
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_vision_weights.is_none() {
         emit_active_attempt_error(
@@ -19068,26 +19069,77 @@ fn generate_lfm3_vl(
         return;
     }
 
-    // ── Prompt build: vision_start, image_pad×N, vision_end, \n, prompt ──
+    // ── Prompt build: render the LFM3 chat template (exact framing — system /
+    // user / assistant `<|im_start|>assistant\n IMDA`), then splice the vision
+    // tokens [vision_start, image_pad×N, vision_end, \n] before the user
+    // content. This matches generate_lfm3's Jinja path (which produces long
+    // coherent thinking); the ChatFrame scaffold + OpenThink approximation
+    // mismatched LFM3's ` IMDA` (no trailing \n) and truncated early.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let nl = tokenizer.encode("\n");
     let q_tokens = tokenizer.encode(prompt);
-    let mut user_body: Vec<u32> = Vec::with_capacity(n_visual_tokens + q_tokens.len() + 4);
-    user_body.push(vision_start_id);
+
+    let mut vision_seq: Vec<u32> = Vec::with_capacity(n_visual_tokens + 4);
+    vision_seq.push(vision_start_id);
     for _ in 0..n_visual_tokens {
-        user_body.push(image_pad_id);
+        vision_seq.push(image_pad_id);
     }
-    user_body.push(vision_end_id);
-    user_body.extend_from_slice(&nl);
-    user_body.extend_from_slice(&q_tokens);
-    let prompt_tokens = ChatFrame {
-        tokenizer,
-        system: system_prompt,
-        user: "", // passed as tokens via build_with_user_tokens
-        assistant_prefix: AssistantPrefix::Plain,
-        raw: false,
-    }
-    .build_with_user_tokens(&user_body);
+    vision_seq.push(vision_end_id);
+    vision_seq.extend_from_slice(&nl);
+
+    let prompt_tokens: Vec<u32> = if let Some(template) = m.chat_template.as_ref() {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: true,
+            bos_token: None,
+        };
+        match frame.render() {
+            Ok(rendered) => {
+                let mut toks = tokenizer.encode(&rendered);
+                // Insert the vision sequence immediately before the user
+                // content (the prompt tokens) in the rendered stream.
+                if !q_tokens.is_empty() {
+                    if let Some(pos) = toks.windows(q_tokens.len()).position(|w| w == q_tokens) {
+                        toks.splice(pos..pos, vision_seq.clone());
+                    } else {
+                        eprintln!(
+                            "[lfm3-vl] warning: could not locate user content for vision splice"
+                        );
+                    }
+                }
+                toks
+            }
+            Err(e) => {
+                eprintln!(
+                    "[daemon] jinja render failed in lfm3-vl path ({e}) — falling back to ChatFrame"
+                );
+                let mut body = vision_seq.clone();
+                body.extend_from_slice(&q_tokens);
+                ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: "",
+                    assistant_prefix: AssistantPrefix::OpenThink,
+                    raw: false,
+                }
+                .build_with_user_tokens(&body)
+            }
+        }
+    } else {
+        let mut body = vision_seq.clone();
+        body.extend_from_slice(&q_tokens);
+        ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: "",
+            assistant_prefix: AssistantPrefix::OpenThink,
+            raw: false,
+        }
+        .build_with_user_tokens(&body)
+    };
 
     if prompt_tokens.is_empty() {
         write_error(stdout, id, "lfm3-vl: empty prompt after tokenize");
@@ -19187,7 +19239,12 @@ fn generate_lfm3_vl(
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
-        if matches!(frag.trim(), "" | "</s>" | "<|im_end|>") {
+        // Only break on a real EOS / turn-close token. The bare `""` frag case
+        // (whitespace / the LFM3 think-close marker) is intentionally NOT a stop
+        // here — the model thinks ( IMDA… IMDA-close) then emits the visible
+        // answer, and breaking on whitespace would truncate mid-think before the
+        // answer. stop_toks (eos / <|im_end|>) handles the real turn end.
+        if matches!(frag.trim(), "</s>" | "<|im_end|>") {
             break;
         }
         let envelope = serde_json::json!({
