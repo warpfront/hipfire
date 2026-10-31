@@ -523,6 +523,22 @@ forward. Singleton forward bytes and numerics are unchanged.
   load, nothing is charged and the placement is the same plan as before. The
   request is a per-load field on the loader's admission, not an environment
   variable, and the plain `load_model` entry points leave it off.
+- **No snapshot mirror on AR lane states.** An AR lane is only stepped and
+  reset: its window is one committed row, and the only lane code that snapshots
+  a state (a `Verify` window) needs an MTP window. Its state is therefore
+  built without the snapshot arena's device copy of everything a forward
+  overwrites in place (GDN recurrent and conv per layer, QSA partial K/V,
+  selection and raw-index block, PLE conv history, hyper feedback), and the
+  reservation above, `stage_rank_lanes` and the loader's batch staging charge
+  none of it (`StateMirror::Absent`; a snapshot, restore or verify ring on such
+  a state is the typed `StateError::MirrorAbsent`). At the Flash-Next geometry
+  (QSA fp8) that is 34,263,184 bytes per lane with the Q8 GDN state and
+  118,313,104 with F32 (274,105,472 / 946,504,832 at 8 lanes), whatever the
+  context; the freed bytes are what the plan can spend on resident expert
+  layers. The resident request state, MTP lane stores (on every band) and the
+  MTP head keep the mirror, and a promotion into an AR lane moves the request
+  while each slot keeps its own. No forward reads or writes the mirror of an
+  AR lane, so no forward changes.
 - **Trade line.** A charged load logs exactly one line:
   `[daemon] qwen4 EP lane reservation: lanes=N max_seq=S -> X GiB/rank; resident expert layers A -> B`.
   `A` is the resident expert layer count the plan would have chosen without
