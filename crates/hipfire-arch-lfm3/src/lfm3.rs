@@ -42,8 +42,14 @@ fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
     // checkpoint's `Lfm3VlModel.language_model`). Text-only LFM3-1.7B uses
     // `model.*` directly, so this fallback is a no-op there; for VL it resolves
     // `model.embed_tokens.weight` → `model.language_model.embed_tokens.weight`.
+    // LFM3-Audio nests the text backbone under `lfm.model.*` (the audio
+    // checkpoint's `Lfm3AudioModel.lfm.model`) — second fallback.
     if let Some(stripped) = name.strip_prefix("model.") {
         let prefixed = format!("model.language_model.{stripped}");
+        if let Some((info, data)) = hfq.tensor_data_vec(&prefixed) {
+            return Ok((info.quant_type, data));
+        }
+        let prefixed = format!("lfm.model.{stripped}");
         if let Some((info, data)) = hfq.tensor_data_vec(&prefixed) {
             return Ok((info.quant_type, data));
         }
@@ -451,9 +457,14 @@ fn read_tensor_from_source<'a>(
     if let Some((info, data)) = source.tensor_data(name) {
         return Ok((effective_quant_type(info, data), info.dtype.as_str(), data));
     }
-    // LFM3-VL nests the text backbone under `model.language_model.*`.
+    // LFM3-VL nests the text backbone under `model.language_model.*`;
+    // LFM3-Audio nests it under `lfm.model.*`.
     if let Some(stripped) = name.strip_prefix("model.") {
         let prefixed = format!("model.language_model.{stripped}");
+        if let Some((info, data)) = source.tensor_data(&prefixed) {
+            return Ok((effective_quant_type(info, data), info.dtype.as_str(), data));
+        }
+        let prefixed = format!("lfm.model.{stripped}");
         if let Some((info, data)) = source.tensor_data(&prefixed) {
             return Ok((effective_quant_type(info, data), info.dtype.as_str(), data));
         }

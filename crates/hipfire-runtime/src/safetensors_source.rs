@@ -256,9 +256,11 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         // LFM3 (LiquidAI): conv/full-attn/sliding-attn + sandwich norm. Crate
         // hipfire-arch-lfm3. The text-only LFM3-1.7B dir routes here; the VL
         // variant (model_type "lfm3_vl") reuses arch_id 13 — vision is detected
-        // by tensor presence in Lfm3Carrier (the qwen35-vl precedent). The Omni
-        // text backbone (model_type "lfm3_omni") is phased later.
-        "lfm3" | "lfm3_vl" => 13,
+        // by tensor presence in Lfm3Carrier (the qwen35-vl precedent). The
+        // audio variant (model_type "lfm3_audio") reuses arch_id 13 too — audio
+        // is detected by `encoder.downsample.*` tensor presence. The Omni text
+        // backbone (model_type "lfm3_omni") is phased later.
+        "lfm3" | "lfm3_vl" | "lfm3_audio" => 13,
         _ => {
             // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
             // carrier matches, so `load_model` fails cleanly with "no carrier for

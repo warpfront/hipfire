@@ -555,6 +555,82 @@ pub struct AudioWeights {
     pub projector: ProjectorWeights,
 }
 
+// ─── GPU teardown ────────────────────────────────────────────────────────────
+
+impl EncConvWeights {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        self.in_proj.free_all(gpu);
+        let _ = gpu.free_tensor(self.conv_weight);
+        self.out_proj.free_all(gpu);
+    }
+}
+
+impl EncAttnWeights {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        self.wq.free_all(gpu);
+        self.wk.free_all(gpu);
+        self.wv.free_all(gpu);
+        self.wo.free_all(gpu);
+        let _ = gpu.free_tensor(self.q_norm);
+        let _ = gpu.free_tensor(self.k_norm);
+    }
+}
+
+impl EncMixer {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            EncMixer::Conv(c) => c.free_gpu(gpu),
+            EncMixer::Attention(a) => a.free_gpu(gpu),
+        }
+    }
+}
+
+impl DenseFfn {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        self.w1.free_all(gpu);
+        self.w3.free_all(gpu);
+        self.w2.free_all(gpu);
+    }
+}
+
+impl EncLayerWeights {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.operator_norm);
+        let _ = gpu.free_tensor(self.ffn_norm);
+        self.mixer.free_gpu(gpu);
+        self.ffn.free_gpu(gpu);
+    }
+}
+
+impl EncoderWeights {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.embedding_norm);
+        for l in self.layers {
+            l.free_gpu(gpu);
+        }
+    }
+}
+
+impl ProjectorWeights {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.layer_norm_w);
+        let _ = gpu.free_tensor(self.layer_norm_b);
+        let _ = gpu.free_tensor(self.linear_1_w);
+        let _ = gpu.free_tensor(self.linear_1_b);
+        let _ = gpu.free_tensor(self.linear_2_w);
+        let _ = gpu.free_tensor(self.linear_2_b);
+    }
+}
+
+impl AudioWeights {
+    /// Free GPU tensors (encoder + projector). The downsampler weights are
+    /// host-side CPU `Vec<f32>` and are dropped automatically.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.encoder.free_gpu(gpu);
+        self.projector.free_gpu(gpu);
+    }
+}
+
 // ─── Weight loading ──────────────────────────────────────────────────────────
 
 fn load_downsampler(hfq: &HfqFile) -> Result<DownsamplerWeights, String> {

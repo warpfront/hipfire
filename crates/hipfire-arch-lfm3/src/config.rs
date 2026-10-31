@@ -148,8 +148,13 @@ impl Lfm3Config {
             .get("config")
             .ok_or_else(|| "lfm3: metadata_json missing `config` wrapper".to_string())?;
         // LFM3-VL nests the text backbone config under `text_config`; the
-        // text-only LFM3-1.7B has the fields at the top level of `config`.
-        let text = inner.get("text_config").unwrap_or(inner);
+        // text-only LFM3-1.7B has the fields at the top level of `config`;
+        // LFM3-Audio nests it under `lfm` (the audio config.json's text
+        // backbone key). Try all three.
+        let text = inner
+            .get("text_config")
+            .or_else(|| inner.get("lfm"))
+            .unwrap_or(inner);
         Self::from_config_value(text)
     }
 
@@ -281,8 +286,12 @@ pub fn config_from_source(source: &dyn ModelSource) -> Option<Lfm3Config> {
     let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
     // Envelope form: { "config": { ... } }.
     if let Some(inner) = meta.get("config") {
-        // LFM3-VL nests the text backbone config under `text_config`.
-        let text = inner.get("text_config").unwrap_or(inner);
+        // LFM3-VL nests the text backbone under `text_config`; LFM3-Audio
+        // nests it under `lfm`; text-only LFM3-1.7B has it at the top level.
+        let text = inner
+            .get("text_config")
+            .or_else(|| inner.get("lfm"))
+            .unwrap_or(inner);
         return Lfm3Config::from_config_value(text).ok();
     }
     // Bare config.json form (no wrapper): the metadata_json IS the config.

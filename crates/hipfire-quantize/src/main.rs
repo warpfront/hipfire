@@ -4791,16 +4791,19 @@ fn should_quantize(name: &str) -> bool {
     // Vision encoder weights stay FP16 (only ~500M params, run once per image).
     // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
     // `vision_tower.*`; LFM3-VL uses `model.vision_tower.*` /
-    // `model.multi_modal_projector.*`. All arches keep vision F16 during
-    // bring-up so the per-stage diff against the HF reference activations
-    // (`benchmarks/references/<image>_activations/`) doesn't have to absorb
-    // both forward-pass implementation noise AND quant noise — clean
-    // attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
+    // `model.multi_modal_projector.*`. LFM3-Audio uses `encoder.downsample.*`
+    // (conv2d downsampler, CPU) + `mlp.model.*` (audio projector). All arches
+    // keep these F16 during bring-up so the per-stage diff against the HF
+    // reference activations (`benchmarks/references/<image>_activations/`)
+    // doesn't have to absorb both forward-pass implementation noise AND quant
+    // noise — clean attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
     if name.starts_with("model.visual.")
         || name.starts_with("visual.")
         || name.starts_with("vision_tower.")
         || name.starts_with("model.vision_tower.")
         || name.starts_with("model.multi_modal_projector.")
+        || name.starts_with("encoder.downsample.")
+        || name.starts_with("mlp.model.")
     {
         return false;
     }
@@ -7335,8 +7338,13 @@ fn main() {
         // reuses arch_id 13 — its vision/projector tensors (`model.vision_tower.*`
         // / `model.multi_modal_projector.*`) are kept F16 via should_quantize,
         // and the text tensors' `model.language_model.` prefix is stripped to
-        // `model.` so the existing Lfm3Weights loader finds them.
-        "lfm3" | "lfm3_vl" => 13,
+        // `model.` so the existing Lfm3Weights loader finds them. The audio
+        // variant (model_type "lfm3_audio") reuses arch_id 13 too — its
+        // downsampler (`encoder.downsample.*`) + projector (`mlp.model.*`)
+        // are kept F16; the encoder backbone (`encoder.lfm.*`) quantizes Q8
+        // like the text backbone; the text tensors sit at `lfm.model.*` and
+        // are resolved by the Lfm3Weights loader's prefix fallback.
+        "lfm3" | "lfm3_vl" | "lfm3_audio" => 13,
         // Cohere2-MoE (CohereLabs/North-Mini-Code-1.0): parallel-block
         // transformer, interleaved sliding(RoPE)/global(NoPE) GQA, mean-centered
         // Cohere2LayerNorm, sigmoid 128-expert MoE (norm_topk_prob=false, no bias,

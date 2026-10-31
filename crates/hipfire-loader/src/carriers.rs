@@ -1431,11 +1431,16 @@ impl Carrier for Lfm3Carrier {
         let meta = resolve_source_meta(&src, ctx.path)?;
 
         use hipfire_arch_lfm3 as lfm3;
+        use hipfire_arch_lfm3_audio::lfm3_audio;
         use hipfire_arch_lfm3_vl::lfm3_vl;
         // LFM3-VL vision tower + projector (loaded when the HFQ carries vision
         // tensors). Text-only LFM3-1.7B leaves these None.
         let mut lfm3_vision_config: Option<lfm3_vl::VisionConfig> = None;
         let mut lfm3_vision_weights: Option<lfm3_vl::VisionWeights> = None;
+        // LFM3-Audio speech encoder + projector (loaded when the HFQ carries
+        // audio tensors). Phase 3 of the LFM3 port.
+        let mut lfm3_audio_config: Option<lfm3_audio::AudioConfig> = None;
+        let mut lfm3_audio_weights: Option<lfm3_audio::AudioWeights> = None;
         // ── source-varying seam: (config, weights) only ──
         let (config, weights) = match src {
             ModelSource::Hfq(mut hfq) => {
@@ -1452,6 +1457,18 @@ impl Carrier for Lfm3Carrier {
                         .map_err(|e| format!("lfm3-vl: load_vision_weights: {e:?}"))?;
                     lfm3_vision_config = Some(vc);
                     lfm3_vision_weights = Some(vw);
+                }
+                // Detect the LFM3-Audio speech encoder by tensor presence
+                // (encoder.downsample.conv_in.weight). arch_id stays 13; audio
+                // is opt-in by tensor presence, mirroring the VL precedent.
+                if hfq.tensor_data("encoder.downsample.conv_in.weight").is_some() {
+                    eprintln!("lfm3: LFM3-Audio speech encoder detected — loading downsampler + encoder + projector weights");
+                    let ac = lfm3_audio::audio_config_from_hfq(&hfq)
+                        .ok_or_else(|| "lfm3-audio: audio_config not found in HFQ metadata".to_string())?;
+                    let aw = lfm3_audio::load_audio_weights(&hfq, &ac, ctx.gpu)
+                        .map_err(|e| format!("lfm3-audio: load_audio_weights: {e:?}"))?;
+                    lfm3_audio_config = Some(ac);
+                    lfm3_audio_weights = Some(aw);
                 }
                 (config, weights)
             }
@@ -1509,6 +1526,8 @@ impl Carrier for Lfm3Carrier {
             speculator,
             lfm3_vision_config,
             lfm3_vision_weights,
+            lfm3_audio_config,
+            lfm3_audio_weights,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
