@@ -72,6 +72,14 @@ pub struct VisionConfig {
     pub rope_theta: f32,           // 1e6 (axial)
     pub layer_types: Vec<VisionLayerKind>,
     pub projector: ProjectorConfig,
+    // Special-token ids (top-level Lfm3VlConfig fields) for prompt building.
+    // Resolved from config.json rather than the tokenizer because the image
+    // placeholder token (``) is a 9-byte special string that is awkward to
+    // look up by name.
+    pub image_token_id: u32,        // 125030
+    pub video_token_id: u32,        // 125029
+    pub vision_start_token_id: u32, // 125009
+    pub vision_end_token_id: u32,   // 125010
 }
 
 impl VisionConfig {
@@ -176,6 +184,10 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
         rope_theta,
         layer_types,
         projector,
+        image_token_id: config.get("image_token_id").and_then(|v| v.as_u64()).unwrap_or(125_030) as u32,
+        video_token_id: config.get("video_token_id").and_then(|v| v.as_u64()).unwrap_or(125_029) as u32,
+        vision_start_token_id: config.get("vision_start_token_id").and_then(|v| v.as_u64()).unwrap_or(125_009) as u32,
+        vision_end_token_id: config.get("vision_end_token_id").and_then(|v| v.as_u64()).unwrap_or(125_010) as u32,
     })
 }
 

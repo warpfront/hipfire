@@ -1053,6 +1053,7 @@ dependencies = [
  "hipfire-arch-dots-ocr",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-lfm3",
+ "hipfire-arch-lfm3-vl",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
  "hipfire-arch-qwen2",

@@ -27,6 +27,7 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_lfm3 as lfm3;
+use hipfire_arch_lfm3_vl::lfm3_vl;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
@@ -5650,7 +5651,7 @@ fn main() {
                                 gpu.replay.transport_name()
                             );
                         }
-                        let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
+                        let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some() || m.lfm3_vision_config.is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
@@ -6287,7 +6288,8 @@ fn main() {
 
                 let has_image = image_base64.is_some() || image.is_some();
                 let is_dots_ocr = m.arch_id == 8;
-                let has_vl = m.vision_config.is_some() || is_dots_ocr;
+                let is_lfm3_vl = m.lfm3_vision_config.is_some();
+                let has_vl = m.vision_config.is_some() || is_dots_ocr || is_lfm3_vl;
 
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
@@ -6412,6 +6414,8 @@ fn main() {
                     };
                     if is_dots_ocr {
                         generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params);
+                    } else if is_lfm3_vl {
+                        generate_lfm3_vl(m, &mut gpu, &mut stdout, &params);
                     } else {
                         generate_vl(m, &mut gpu, &mut stdout, &params);
                     }
@@ -18929,7 +18933,313 @@ fn generate_lfm3(
     }
 }
 
-/// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
+/// LFM3-VL (arch_id 13 + vision tower) generate path — Phase 2.
+///
+/// Mirrors `generate_lfm3` (AR prefill + sample loop) with the vision splice
+/// from `generate_vl`: preprocess image → `lfm3_vl::vision_forward` → projected
+/// visual tokens → splice into the prefill at `image_token_id` positions via
+/// `lfm3::forward::decode_step_with_embed`. LFM3 is AR-only (no DFlash /
+/// eviction / adaptive KV), so this is the text route plus the vision encoder +
+/// splice — simpler than `generate_vl`.
+fn generate_lfm3_vl(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    params: &GenerateVLParams,
+) {
+    use base64::Engine as _;
+    use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
+
+    let GenerateVLParams {
+        id,
+        prompt,
+        system_prompt,
+        image_source,
+        temp,
+        top_p,
+        max_tokens,
+        max_think_tokens: _,
+        repeat_penalty: _,
+        repeat_window: _,
+    } = params;
+
+    if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_vision_weights.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "lfm3-vl: tokenizer / lfm3 bundle / vision weights missing",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    let vision_config = m.lfm3_vision_config.as_ref().unwrap();
+    let image_pad_id = vision_config.image_token_id;
+    let vision_start_id = vision_config.vision_start_token_id;
+    let vision_end_id = vision_config.vision_end_token_id;
+    let sms = vision_config.spatial_merge_size;
+
+    // ── Image preprocessing (CPU decode + smart resize + patch extract) ──
+    let (pixels, img_h, img_w) = match image_source {
+        ImageSource::Path(path) => {
+            eprintln!("[lfm3-vl] preprocessing image: path: {}", path);
+            match image::load_and_preprocess(
+                Path::new(path),
+                vision_config.patch_size,
+                vision_config.spatial_merge_size,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    write_error(stdout, id, &e);
+                    return;
+                }
+            }
+        }
+        ImageSource::Base64(b64) => {
+            let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+                match rest.split_once(',') {
+                    Some((_, after)) => after,
+                    None => {
+                        write_error(stdout, id, "malformed data URL: missing ',' separator");
+                        return;
+                    }
+                }
+            } else {
+                b64
+            };
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(raw_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    write_error(stdout, id, &format!("failed to decode base64 image data: {e}"));
+                    return;
+                }
+            };
+            match image::load_and_preprocess_from_bytes(
+                &bytes,
+                vision_config.patch_size,
+                vision_config.spatial_merge_size,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    write_error(stdout, id, &e);
+                    return;
+                }
+            }
+        }
+    };
+    let grid_h = img_h / vision_config.patch_size;
+    let grid_w = img_w / vision_config.patch_size;
+    let n_visual_tokens = grid_h * grid_w / (sms * sms);
+
+    let patches = image::extract_patches(
+        &pixels,
+        3,
+        img_h,
+        img_w,
+        vision_config.patch_size,
+        vision_config.temporal_patch_size,
+        vision_config.spatial_merge_size,
+    );
+
+    // ── Vision tower + projector → projected visual tokens ──
+    let visual_tokens = {
+        let vw = m.lfm3_vision_weights.as_ref().unwrap();
+        match lfm3_vl::vision_forward(gpu, vw, vision_config, &patches, grid_h, grid_w) {
+            Ok(v) => v,
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm3-vl: vision_forward failed: {e:?}"));
+                return;
+            }
+        }
+    };
+    if visual_tokens.len() != n_visual_tokens * m.lfm3().unwrap().config.hidden_size {
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "lfm3-vl: visual token count mismatch: got {} expected {}x{}",
+                visual_tokens.len(),
+                n_visual_tokens,
+                m.lfm3().unwrap().config.hidden_size
+            ),
+        );
+        return;
+    }
+
+    // ── Prompt build: vision_start, image_pad×N, vision_end, \n, prompt ──
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let nl = tokenizer.encode("\n");
+    let q_tokens = tokenizer.encode(prompt);
+    let mut user_body: Vec<u32> = Vec::with_capacity(n_visual_tokens + q_tokens.len() + 4);
+    user_body.push(vision_start_id);
+    for _ in 0..n_visual_tokens {
+        user_body.push(image_pad_id);
+    }
+    user_body.push(vision_end_id);
+    user_body.extend_from_slice(&nl);
+    user_body.extend_from_slice(&q_tokens);
+    let prompt_tokens = ChatFrame {
+        tokenizer,
+        system: system_prompt,
+        user: "", // passed as tokens via build_with_user_tokens
+        assistant_prefix: AssistantPrefix::Plain,
+        raw: false,
+    }
+    .build_with_user_tokens(&user_body);
+
+    if prompt_tokens.is_empty() {
+        write_error(stdout, id, "lfm3-vl: empty prompt after tokenize");
+        return;
+    }
+
+    let eos_tok = m.lfm3().unwrap().eos_tok;
+    let stop_toks: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut v = vec![eos_tok];
+        for s in ["", "</s>", "<|im_end|>"] {
+            let ids = tk.encode(s);
+            if ids.len() == 1 && !v.contains(&ids[0]) {
+                v.push(ids[0]);
+            }
+        }
+        v
+    };
+
+    // Cross-conversation reset (LFM3 hybrid conv+GQA state can't rewind).
+    let _ = m.lfm3_mut().unwrap().state.reset(gpu);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    let cap = m.lfm3().unwrap().state.max_seq;
+    if prompt_tokens.len().saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "lfm3-vl: prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={}",
+                prompt_tokens.len(),
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let text_hidden = m.lfm3().unwrap().config.hidden_size;
+    let t0 = Instant::now();
+
+    // ── Prefill: per-token decode_step, splicing visual embeddings at
+    //    image_pad positions via decode_step_with_embed. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    let mut visual_idx = 0usize;
+    {
+        let b = m.lfm3_mut().unwrap();
+        let cfg = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_tokens {
+            let res = if tok == image_pad_id && visual_idx < n_visual_tokens {
+                let emb = &visual_tokens[visual_idx * text_hidden..(visual_idx + 1) * text_hidden];
+                visual_idx += 1;
+                lfm3::forward::decode_step_with_embed(cfg, weights, state, gpu, emb, position)
+            } else {
+                lfm3::forward::decode_step(cfg, weights, state, gpu, tok, position)
+            };
+            match res {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("lfm3-vl prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_tokens {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── Decode loop (host-side sampling, same as generate_lfm3). ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_toks.contains(&next_tok) {
+            break;
+        }
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        if matches!(frag.trim(), "" | "</s>" | "<|im_end|>") {
+            break;
+        }
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+            "attempt_id": active_attempt_id(),
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        let step = {
+            let b = m.lfm3_mut().unwrap();
+            let cfg = &b.config;
+            let weights = &b.weights;
+            let state = &mut b.state;
+            let position = state.n_tokens as u32;
+            lfm3::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("lfm3-vl decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.lfm3().unwrap().state.n_tokens;
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_ms": prefill_ms,
+        "total_ms": total_ms,
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {}
+    }
+}
 ///
 /// Mirrors `generate_lfm2moe`'s shape (prefill loop / chunked batched prefill,
 /// per-token decode loop, JSONL `token` / `done` events) with two differences:
