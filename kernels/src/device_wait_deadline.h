@@ -60,6 +60,10 @@ struct hf_device_wait_block {
 #define HF_WAIT_SITE_TP_PEER_PUSH_GFX1201 9u
 #define HF_WAIT_SITE_TP_PEER_PUSHN_GFX1201 10u
 #define HF_WAIT_SITE_AR_HC_WRITE_GFX1201 11u
+// 12u, 13u: SP sites, defined in sp_hc_rs_ag.gfx1201.hip.
+#define HF_WAIT_SITE_EP_BOUNDARY_WAIT 14u
+// Never stored by a kernel: the host writes it to poison an EP mesh's waits.
+#define HF_WAIT_SITE_EP_BOUNDARY_POISON 15u
 
 // Polls between counter reads. A wait that ends within this many polls never
 // reads the counter.

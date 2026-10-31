@@ -1193,6 +1193,25 @@ impl MoeTileExchange for Qwen4EpTileExchangeHook {
     }
 }
 
+/// `HIPFIRE_EP_BOUNDARY` (developer, #863): `kernel` crosses every row gather
+/// on a device boundary (`EpRowGatherBuilder::kernel_boundaries`) instead of
+/// producer events and the host barrier; unset or `host` keeps the host
+/// barrier.
+pub const QWEN4_EP_BOUNDARY_ENV: &str = "HIPFIRE_EP_BOUNDARY";
+
+fn qwen4_ep_kernel_boundaries() -> Result<bool, String> {
+    match hipfire_config::developer_var(QWEN4_EP_BOUNDARY_ENV)
+        .ok()
+        .as_deref()
+    {
+        None | Some("" | "host") => Ok(false),
+        Some("kernel") => Ok(true),
+        Some(other) => Err(format!(
+            "{QWEN4_EP_BOUNDARY_ENV}={other:?}: expected `host` or `kernel`"
+        )),
+    }
+}
+
 /// The attached mesh, owned by rank 0's bundle (`Qwen4Bundle::ep`).
 pub struct Qwen4EpMesh {
     pool: RankPool<Qwen4EpPeer>,
@@ -1272,14 +1291,16 @@ impl Qwen4EpMesh {
     /// Run `job` on every peer while `local` runs rank 0 on the caller's
     /// thread. Results in rank order. Any rank's error or panic aborts the
     /// row-gather barrier, poisons the mesh, and is returned (the first one).
-    /// Every rank's trunk split hook is installed for the call.
+    /// Every rank's trunk split hook is installed for the call. With kernel
+    /// boundaries the ranks' boundary ledgers must then match
+    /// (`EpRowGather::check_step`); a refusal poisons the mesh.
     pub(crate) fn run<R: Send>(
         &self,
         local: impl FnOnce() -> Result<R, String>,
         job: PeerJob<'_, R>,
     ) -> Result<Vec<R>, String> {
         let local_split = self.split.as_ref().and_then(TrunkSplitRank::hook);
-        self.pool.run_all(
+        let values = self.pool.run_all(
             || {
                 let _scope = local_split.map(|hook| split_scope(hook));
                 local()
@@ -1289,7 +1310,13 @@ impl Qwen4EpMesh {
                 let _scope = hook.map(|hook| split_scope(hook));
                 job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
             },
-        )
+        )?;
+        if let Err(error) = self.gather.check_step() {
+            let message = error.to_string();
+            self.pool.poison_mesh(&message);
+            return Err(message);
+        }
+        Ok(values)
     }
 
     /// Run `job` on peer `rank` alone (rank 0 is not a peer).
@@ -1554,7 +1581,12 @@ impl Qwen4Bundle {
         // same copies in the same stream order, no host round trip per MoE layer.
         let device_waits = gpu.arch_caps.is_gfx1201()
             && hipfire_config::developer_bool("HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT", true);
-        let builder = Mutex::new(Some(EpRowGather::builder(spec).device_waits(device_waits)));
+        let kernel_boundaries = qwen4_ep_kernel_boundaries()?;
+        let builder = Mutex::new(Some(
+            EpRowGather::builder(spec)
+                .device_waits(device_waits)
+                .kernel_boundaries(kernel_boundaries),
+        ));
         let register = |rank: usize, bundle: &Qwen4Bundle, gpu: &mut Gpu| -> Result<(), String> {
             let buffers = bundle
                 .execution
@@ -1691,6 +1723,14 @@ impl Qwen4Bundle {
             Ok(mode) => mode,
             Err(error) => return Err(release_rank0(gpu, error)),
         };
+        // The band exchange crosses on the host barrier and its buffers are not
+        // in the boundary ledger, so the two are not mixed.
+        if split_mode.is_some() && kernel_boundaries {
+            return Err(release_rank0(
+                gpu,
+                format!("{QWEN4_EP_BOUNDARY_ENV}=kernel does not cover HIPFIRE_EP_TRUNK_SPLIT"),
+            ));
+        }
         if split_mode.is_some() {
             let layout = |bundle: &Qwen4Bundle| -> Result<(Vec<SplitWeight>, usize), String> {
                 let census = split_census(bundle)?;
