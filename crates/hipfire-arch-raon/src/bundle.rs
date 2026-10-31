@@ -281,6 +281,17 @@ impl RaonBundle {
         Ok(edge_view(&self.config, &self.scratch, rows))
     }
 
+    /// Bytes of one stream element of the edge (the `stream_a` plane's dtype:
+    /// 4 for F32, 2 for BF16 streams).
+    pub fn edge_elem_bytes(&self) -> usize {
+        self.scratch.stream_a.dtype.size()
+    }
+
+    /// Bytes of an edge of `rows` rows in the stream plane's dtype.
+    pub fn edge_bytes(&self, rows: usize) -> usize {
+        crate::band::edge_bytes(&self.config, rows, self.edge_elem_bytes())
+    }
+
     /// One batched prefill call of this band over one chunk: the first band
     /// takes `BandInput::Tokens(piece)`, a later band `BandInput::Streams`
     /// with the previous band's rows already imported into its

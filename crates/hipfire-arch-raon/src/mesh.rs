@@ -60,7 +60,6 @@ use hipfire_runtime::weight_manifest::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-use crate::band::edge_bytes;
 use crate::bundle::{DecodeMode, PrefillMode, RaonBundle};
 use crate::config::{FfnKind, LayerKind, RaonConfig};
 use crate::forward::BandInput;
@@ -388,8 +387,11 @@ impl RaonMeshProgram {
 }
 
 /// Bytes `Gpus::provision_mesh_edges` must reserve per edge for epochs of up
-/// to `chunk_rows` rows of `cfg`'s mHC streams (F32): the largest payload a
-/// prefill chunk hands to the next band.
+/// to `chunk_rows` rows of `cfg`'s mHC streams: the largest payload a prefill
+/// chunk hands to the next band. Sized for F32 stream planes, the upper bound:
+/// BF16 stream planes (fused mHC) move half the bytes per epoch
+/// ([`RaonBundle::edge_bytes`](crate::RaonBundle::edge_bytes)) within it, so
+/// one capacity serves both settings.
 pub fn raon_edge_capacity_bytes(cfg: &RaonConfig, chunk_rows: usize) -> Result<usize> {
     if chunk_rows == 0 {
         return Err("Raon mesh edge of zero rows".into());
@@ -592,8 +594,8 @@ impl MeshStepBindings for RaonMeshBindings<'_> {
                     .ok_or("missing Raon mesh edge epoch")?,
                 op: epoch.op_id,
                 rows: epoch.actual_rows,
-                dtype_bytes: 4,
-                bytes: edge_bytes(&self.bands[owner].config, epoch.actual_rows),
+                dtype_bytes: self.bands[owner].edge_elem_bytes(),
+                bytes: self.bands[owner].edge_bytes(epoch.actual_rows),
             },
             partial_slot: None,
         })
@@ -1324,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_capacity_is_the_chunk_of_streams_in_f32() {
+    fn edge_capacity_is_the_chunk_of_streams_in_f32_as_the_upper_bound() {
         let cfg = released();
         let bytes = raon_edge_capacity_bytes(&cfg, 512).unwrap();
         assert_eq!(bytes, 512 * cfg.mhc_streams * cfg.hidden * 4);
@@ -1335,7 +1337,11 @@ mod tests {
         );
         assert!(raon_edge_capacity_bytes(&cfg, 0).is_err());
         // One row is a whole number of 16-byte units.
-        assert_eq!(edge_bytes(&cfg, 1) % 16, 0);
+        assert_eq!(crate::band::edge_bytes(&cfg, 1, 4) % 16, 0);
+        // A BF16 stream plane halves the per-epoch payload and stays 16-byte aligned.
+        let bf16 = crate::band::edge_bytes(&cfg, 512, 2);
+        assert_eq!(bf16 * 2, bytes);
+        assert_eq!(crate::band::edge_bytes(&cfg, 1, 2) % 16, 0);
     }
 
     #[test]

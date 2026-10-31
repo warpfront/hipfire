@@ -4,8 +4,9 @@
 //! for and runs on its own device.
 //!
 //! A band is the unit of pipeline placement. The only tensor crossing a band
-//! boundary is the mHC stream `[rows, streams, hidden]` F32 in
-//! `scratch.stream_a` (rows contiguous from row 0): every layer has two mHC
+//! boundary is the mHC stream `[rows, streams, hidden]` in
+//! `scratch.stream_a` (F32, or BF16 bits when the fused-mHC BF16 stream planes are on; the edge is
+//! sized by that plane's dtype) (rows contiguous from row 0): every layer has two mHC
 //! sites (ping-pong), so `stream_a` holds the result at the end of every layer.
 //!
 //! * the embedding lives on the band containing layer 0 ([`RaonBand::is_first`]);
@@ -163,8 +164,9 @@ impl RaonConfig {
     }
 }
 
-/// The edge view: the `[rows, streams, hidden]` F32 stream rows (from row 0) of
-/// `scratch.stream_a`, the tensor a band hands to its successor at band end
+/// The edge view: the `[rows, streams, hidden]` stream rows (from row 0) of
+/// `scratch.stream_a` in the stream plane's own element type (F32, or BF16 bits
+/// under the fused-mHC BF16 stream planes: the view is sized by that dtype), the tensor a band hands to its successor at band end
 /// (export) and receives from its predecessor at band start (import). A view,
 /// not an owner: never free it.
 pub fn edge_view(cfg: &RaonConfig, scratch: &RaonPrefillScratch, rows: usize) -> GpuTensor {
@@ -173,9 +175,10 @@ pub fn edge_view(cfg: &RaonConfig, scratch: &RaonPrefillScratch, rows: usize) ->
         .sub_offset(0, rows * cfg.mhc_streams * cfg.hidden)
 }
 
-/// Bytes of an edge of `rows` rows.
-pub fn edge_bytes(cfg: &RaonConfig, rows: usize) -> usize {
-    rows * cfg.mhc_streams * cfg.hidden * 4
+/// Bytes of an edge of `rows` rows of `elem_bytes`-byte stream elements (4 for
+/// an F32 plane, 2 for BF16: [`edge_view`]'s `stream_a` dtype size).
+pub fn edge_bytes(cfg: &RaonConfig, rows: usize, elem_bytes: usize) -> usize {
+    rows * cfg.mhc_streams * cfg.hidden * elem_bytes
 }
 
 /// Device-to-device copy of an edge between two bands on the SAME device

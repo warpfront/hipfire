@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use hipfire_arch_raon::bundle::{DecodeMode, PrefillMode};
 use hipfire_arch_raon::{
-    copy_edge_same_device, edge_bytes, load_raon_band_bundle, BandInput, RaonBand, RaonBundle,
+    copy_edge_same_device, load_raon_band_bundle, BandInput, RaonBand, RaonBundle,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -215,7 +215,7 @@ fn run_whole(
 fn hop(gpu: &Gpu, bands: &[RaonBundle], i: usize, rows: usize) -> Result<(), String> {
     let src = bands[i].edge_view(rows)?;
     let dst = bands[i + 1].edge_view(rows)?;
-    copy_edge_same_device(gpu, &dst, &src, edge_bytes(&bands[i].config, rows))
+    copy_edge_same_device(gpu, &dst, &src, bands[i].edge_bytes(rows))
 }
 
 /// The model as `bands` (loaded on `gpu`), driven band after band.
