@@ -4088,6 +4088,54 @@ fn redirect_owned_entries(
     Ok(bytes)
 }
 
+/// One rank's G2 EP stage layout, read from its seal `bound`: its own donor bytes
+/// (`[gate/up, down]`), every rank's one-layer donor share (the restore-mirror charge) and
+/// its sealed compact slots per MoE layer (empty below `first_host`). Refuses a seal of
+/// another rank or mesh and a rank without a sealed span.
+#[allow(clippy::type_complexity)]
+fn ep_stage_layout(
+    bound: Option<&crate::ep_seal::Qwen4EpRankSeal>,
+    placement: Qwen4EpPlacement,
+    moe_layers: usize,
+    first_host: usize,
+) -> Result<([usize; 2], Vec<usize>, Vec<Vec<Option<usize>>>), String> {
+    let bound = bound
+        .filter(|bound| bound.rank == placement.rank && bound.seal.ranks() == placement.ranks)
+        .ok_or("an EP stage needs the rank's own seal (bind_ep_seal)")?;
+    let spans = bound.seal.expert_spans()?;
+    let local = |rank| {
+        spans
+            .local(rank)
+            .ok_or_else(|| format!("G2 EP stage: rank {rank} has no sealed span"))
+    };
+    let rank_layer_bytes = (0..spans.ranks())
+        .map(|rank| local(rank).map(|n| stage_donor_bytes(n).iter().sum::<usize>()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let slots = (0..moe_layers)
+        .map(|layer| {
+            if layer < first_host {
+                Ok(Vec::new())
+            } else {
+                bound.local_slots(layer)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        stage_donor_bytes(local(bound.rank)?),
+        rank_layer_bytes,
+        slots,
+    ))
+}
+
+/// Whether two of the donor parts' device spans share a byte.
+fn donor_spans_overlap(spans: &[std::ops::Range<usize>]) -> bool {
+    spans.iter().enumerate().any(|(index, span)| {
+        spans[..index]
+            .iter()
+            .any(|other| other.start < span.end && span.start < other.end)
+    })
+}
+
 /// One rank's owner-routed chunk MoE state. The buffers exist from forward construction
 /// (before the mesh enables peers, so a peer-mapped allocation never lags the mapping);
 /// the hook is installed once every rank agreed on the per-layer verdicts (symmetric IU4
@@ -6994,37 +7042,10 @@ impl Qwen4ExpertStage {
                 (bytes, vec![bytes[0] + bytes[1]], None)
             }
             Some(placement) => {
-                let bound = bundle
-                    .ep_seal()
-                    .filter(|bound| {
-                        bound.rank == placement.rank && bound.seal.ranks() == placement.ranks
-                    })
-                    .ok_or_else(|| {
-                        invalid("an EP stage needs the rank's own seal (bind_ep_seal)")
-                    })?;
-                let spans = bound.seal.expert_spans().map_err(invalid)?;
-                let local = |rank| {
-                    spans.local(rank).ok_or_else(|| {
-                        invalid(format!("G2 EP stage: rank {rank} has no sealed span"))
-                    })
-                };
-                let rank_layer_bytes = (0..spans.ranks())
-                    .map(|rank| local(rank).map(|n| stage_donor_bytes(n).iter().sum::<usize>()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let slots = (0..moe.len())
-                    .map(|layer| {
-                        if layer < first_host {
-                            Ok(Vec::new())
-                        } else {
-                            bound.local_slots(layer).map_err(invalid)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                (
-                    stage_donor_bytes(local(bound.rank)?),
-                    rank_layer_bytes,
-                    Some(slots),
-                )
+                let (bytes, rank_layer_bytes, slots) =
+                    ep_stage_layout(bundle.ep_seal(), placement, moe.len(), first_host)
+                        .map_err(invalid)?;
+                (bytes, rank_layer_bytes, Some(slots))
             }
         };
         let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(&rank_layer_bytes)
@@ -7092,14 +7113,11 @@ impl Qwen4ExpertStage {
                     return off("a donor expert owner is not device memory of the stage size");
                 }
                 let start = owner.buf.as_ptr() as usize;
-                let span = start..start + owner.buf.size();
-                if donor_spans.iter().any(|other: &std::ops::Range<usize>| {
-                    other.start < span.end && span.start < other.end
-                }) {
-                    return Err(invalid("G2 stage donor parts share a device allocation"));
-                }
-                donor_spans.push(span);
+                donor_spans.push(start..start + owner.buf.size());
             }
+        }
+        if donor_spans_overlap(&donor_spans) {
+            return Err(invalid("G2 stage donor parts share a device allocation"));
         }
         let is_ep = ep_slots.is_some();
         gpu.ensure_capture_stream()?;
@@ -22602,6 +22620,53 @@ mod ep_rank_generic_tests {
         assert!(redirect_owned_entries(&shared, capacity, 0, stride, &entries).is_err());
         // A slot map of another expert count.
         assert!(redirect_owned_entries(&slots[..511], capacity, 0, stride, &entries).is_err());
+    }
+
+    /// The stage's seal-derived layout runs GPU-free: own share, every rank's mirror
+    /// share, sealed slots per host layer; another rank's or mesh's seal is refused.
+    #[test]
+    fn ep_stage_layout_reads_the_rank_seal_and_refuses_another() {
+        use crate::ep_seal::{tests::source_of, Qwen4EpRankSeal, Qwen4EpSeal};
+        let manifest =
+            crate::weights::Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        let seal = |ranks: usize| {
+            let devices: Vec<i32> = (0..ranks as i32).collect();
+            std::sync::Arc::new(
+                Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g").unwrap(),
+            )
+        };
+        let per = QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES;
+        let three = seal(3);
+        let bound = |seal: &std::sync::Arc<Qwen4EpSeal>, rank| Qwen4EpRankSeal {
+            seal: seal.clone(),
+            rank,
+        };
+        let own = Qwen4EpPlacement { rank: 2, ranks: 3 };
+        let (bytes, rank_layer_bytes, slots) =
+            ep_stage_layout(Some(&bound(&three, 2)), own, 48, 40).unwrap();
+        assert_eq!(bytes, stage_donor_bytes(170));
+        assert_eq!(rank_layer_bytes, [171 * per, 171 * per, 170 * per]);
+        assert_eq!(slots.len(), 48);
+        assert!(slots[..40].iter().all(Vec::is_empty));
+        for layer in &slots[40..] {
+            assert!((0..512).all(|e| layer[e] == own.owns(e).then(|| e / 3)));
+        }
+        // No seal, another rank's seal, another mesh's seal: refused.
+        assert!(ep_stage_layout(None, own, 48, 40).is_err());
+        assert!(ep_stage_layout(Some(&bound(&three, 1)), own, 48, 40).is_err());
+        assert!(ep_stage_layout(Some(&bound(&seal(4), 2)), own, 48, 40).is_err());
+        // A layer the seal has no group for: refused.
+        assert!(ep_stage_layout(Some(&bound(&three, 2)), own, 50, 40).is_err());
+    }
+
+    #[test]
+    fn donor_spans_overlap_is_any_shared_byte() {
+        assert!(!donor_spans_overlap(&[0..10, 10..20, 30..40, 20..30]));
+        assert!(donor_spans_overlap(&[0..10, 20..30, 9..12]));
+        assert!(donor_spans_overlap(&[0..100, 40..50]));
+        assert!(donor_spans_overlap(&[5..6, 0..10]));
+        assert!(donor_spans_overlap(&[0..10, 0..10]));
     }
 }
 

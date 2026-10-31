@@ -8575,8 +8575,15 @@ mod tests {
         }
         // A seal that is not the stride split charges what it seals: the
         // largest rank budgets residency, each rank pins its own share.
-        let uneven = EpExpertSpans::new(512, vec![300, 212]).unwrap();
-        assert_eq!(uneven.largest_rank(), 0);
+        let uneven = EpExpertSpans::new(512, vec![212, 300]).unwrap();
+        assert_eq!(uneven.largest_rank(), 1);
+        // Ties pick the lowest rank.
+        assert_eq!(
+            EpExpertSpans::new(512, vec![100, 206, 206])
+                .unwrap()
+                .largest_rank(),
+            1
+        );
         assert_eq!(
             routed_expert_bytes_ranks(&manifest.weights, element_bytes, &uneven),
             Ok(experts / 512 * 300)
@@ -8584,8 +8591,8 @@ mod tests {
         assert_eq!(
             host_mapped_bytes_ranks(&manifest.weights, element_bytes, &uneven),
             Ok(vec![
-                (single - pad) / 512 * 300 + pad,
-                (single - pad) / 512 * 212 + pad
+                (single - pad) / 512 * 212 + pad,
+                (single - pad) / 512 * 300 + pad
             ])
         );
         // Spans that are not a cover of every expert by two or more ranks,

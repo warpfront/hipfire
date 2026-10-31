@@ -674,8 +674,9 @@ borrows its last two resident compact expert layers as alternating DMA stages,
 then restores their original bytes before the forward returns. Residency is
 unchanged; each host layer copies the rank's owned compact experts (637.5
 MiB/rank on EP2 and 318.75 MiB/rank on EP4). Two donor mirrors/rank, each
-charged at the largest rank's share, are charged for all ranks against one host's
-RAM/GTT budgets; an all-resident load needs no host-layer stage.
+sized to that rank's own sealed share, are charged as the sum of every rank's
+share against one host's RAM/GTT budgets; an all-resident load needs no
+host-layer stage.
 Decode and verify continue to use mapped experts and host-wait row exchange,
 independent of the staging launch stream. Staging stays outside capture/tapes.
 EP staging requires every trunk MoE in the forward to bind the compact
@@ -687,7 +688,8 @@ so all donors' restore waits have completed before peer reads.
 
 Stage tables preserve the bound runtime's non-owned entries: peer-mapped
 experts for the full-table route, zero dummy experts for owner-routed compact
-prefill. Owned expert `e` points at donor slot `e / ranks`. Internally
+prefill. Owned expert `e` points at the donor slot the seal assigns it
+(`Qwen4EpRankSeal::local_slots`; `e / ranks` under today's stride seal). Internally
 `Qwen4ExpertStage::prepare_runtime(gpu, layer, runtime)` prepares each full
 table once before binding; compact tables are built at load. The compact-route
 binder may call `tables_compact(layer)`; `tables(layer)` also selects the last
