@@ -1875,13 +1875,13 @@ pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
 }
 
 /// Draft depth of EP native-MTP lanes: the load's resolved K capped at
-/// `HIPFIRE_EP_MTP_LANE_K` (default 3: the measured sweet spot of the mesh
-/// step, whose window cost grows with every extra draft round).
+/// `HIPFIRE_EP_MTP_LANE_K` (default 2: with 3 MTP lanes it keeps 24 resident
+/// expert layers at 8 lanes where K=3 x 4 lanes keeps 23; measured).
 pub fn ep_lane_spec_k(resolved_k: usize) -> usize {
     let cap = hipfire_config::developer_var("HIPFIRE_EP_MTP_LANE_K")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(3);
+        .unwrap_or(2);
     resolved_k
         .min(cap)
         .min(crate::gpu_forward_lanes::LANE_MAX_ROWS - 1)

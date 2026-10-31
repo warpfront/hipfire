@@ -19,8 +19,9 @@
 //! AR-only lanes, so the reservation (and the resident-expert cost) is that
 //! of `max_active` MTP lanes, not of every lane.
 
-/// Default `max_active`: native windows up to 4 lanes in a step.
-pub const DEFAULT_MAX_ACTIVE: usize = 4;
+/// Default `max_active`: native windows up to 3 lanes in a step (3 MTP lanes
+/// at K=2 keep 24 resident expert layers at 8 lanes; measured).
+pub const DEFAULT_MAX_ACTIVE: usize = 3;
 
 /// `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` (developer; the name predates PP), else
 /// [`DEFAULT_MAX_ACTIVE`]. At least 1.

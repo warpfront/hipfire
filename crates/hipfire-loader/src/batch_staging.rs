@@ -1147,14 +1147,14 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         let (k, _) = ep_spec_lane_reservation(true, false, on, "gfx1201");
-        assert_eq!(k, Some(3));
-        // K is capped at the EP lane depth (`HIPFIRE_EP_MTP_LANE_K`, default 3).
+        assert_eq!(k, Some(2));
+        // K is capped at the EP lane depth (`HIPFIRE_EP_MTP_LANE_K`, default 2).
         let wide = SpecLoadCfg {
             mtp_k: Some(63),
             ..on
         };
         let (k, _) = ep_spec_lane_reservation(true, false, wide, "gfx1201");
-        assert_eq!(k, Some(3));
+        assert_eq!(k, Some(2));
         // `serve.batch_spec` off, MTP not explicit, sampled lanes: AR store.
         assert_eq!(
             ep_spec_lane_reservation(false, false, on, "gfx1201"),
