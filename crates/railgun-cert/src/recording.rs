@@ -2557,6 +2557,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-runtime/src/dflash.rs",
+        function: "admit",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
         function: "begin_draft_ffn_graph_capture",
         occurrences: 1,
         decisions: &["graph-capture-lifecycle"],
@@ -2565,6 +2571,12 @@ pub const SITES: &[Site] = &[
         file: "hipfire-runtime/src/dflash.rs",
         function: "draft_ffn_layer",
         occurrences: 3,
+        decisions: &["dflash-draft-graph-safe-body"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "draft_layer_post",
+        occurrences: 1,
         decisions: &["dflash-draft-graph-safe-body"],
     },
     Site {
