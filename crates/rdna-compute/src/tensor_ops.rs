@@ -37,6 +37,8 @@ pub(crate) const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
 pub(crate) const HYPER_READ_UP_FUSED_TWIN_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_fused_twin.gfx1151.hip");
+pub(crate) const HYPER_READ_UP_FUSED_TWIN_T1_SRC: &str =
+    include_str!("../../../kernels/src/hyper_read_up_fused_twin_t1.gfx1201.hip");
 pub(crate) const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1201.hip");
 pub(crate) const HYPER_READ_UP_WMMA_GFX1151_V2_SRC: &str =
@@ -2573,28 +2575,73 @@ fn qwen4_hc_up_twin_applies(enabled: bool, exact_gfx1151: bool, rows: usize) -> 
 // selector-receipt: receipts/selectors/qwen4_hc_up_twin_gfx1201_max_rows.json
 const QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS: usize = 8;
 
-/// The gfx1201 admission of the same twin (`HIPFIRE_QWEN4_HC_UP_TWIN` kill switch applies).
+/// The gfx1201 admission of the sx twin (`HIPFIRE_QWEN4_HC_UP_TWIN` kill switch applies).
 fn qwen4_hc_up_twin_gfx1201_applies(enabled: bool, exact_gfx1201: bool, rows: usize) -> bool {
     enabled && exact_gfx1201 && rows <= QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS
 }
 
-/// Same arguments, grid, block, dynamic LDS and kernarg blob for either entry:
-/// on exact gfx1151 with at least 16 rows, or exact gfx1201 with at most 8 rows (and
-/// `HIPFIRE_QWEN4_HC_UP_TWIN` not `0`) the launch is the bitwise twin
-/// `hyper_read_up_fused_f32_sx` (module `hyper_read_up_fused_twin`); otherwise it is
-/// `hyper_read_up_fused_f32`.
-pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
-    let twin = qwen4_hc_up_twin_applies(*QWEN4_HC_UP_TWIN, gpu.arch_caps.is_gfx1151(), p.rows)
-        || qwen4_hc_up_twin_gfx1201_applies(*QWEN4_HC_UP_TWIN, gpu.arch_caps.is_gfx1201(), p.rows);
-    hyper_read_up_fused_entry(gpu, p, twin)
+/// `HIPFIRE_QWEN4_HC_UP_T1` (developer, default on; `0` falls back from the one-token-per-wave
+/// entry to the `_sx` twin on the gfx1201 rows it admits). Read once.
+static QWEN4_HC_UP_T1: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_T1", true));
+
+/// Entry of the HC read tail `hyper_read_up_fused` (same arguments, block and dynamic LDS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HyperReadUpFusedEntry {
+    /// `hyper_read_up_fused_f32` (module `tensor_ops`): grid `[hidden/8, ceil(rows/128)]`.
+    Incumbent,
+    /// `hyper_read_up_fused_f32_sx` (module `hyper_read_up_fused_twin`): same grid, scalar X.
+    Twin,
+    /// `hyper_read_up_fused_f32_sx_t1` (module `hyper_read_up_fused_twin_t1`): one token per
+    /// wave, grid `[hidden/8, ceil(rows/8)]`.
+    TwinT1,
 }
 
-/// [`hyper_read_up_fused`] with the entry chosen by the caller (`twin` = the `_sx` twin): the
-/// byte-identity gates run both entries on one device through this.
+/// The entry [`hyper_read_up_fused`] launches. `twin_enabled` = `HIPFIRE_QWEN4_HC_UP_TWIN`,
+/// `t1_enabled` = `HIPFIRE_QWEN4_HC_UP_T1`. gfx1201 (exact, rows <= 8) takes `TwinT1`, or
+/// `Twin` with the T1 switch off; gfx1151 (exact, rows >= 16) takes `Twin`.
+fn hyper_read_up_fused_route(
+    twin_enabled: bool,
+    t1_enabled: bool,
+    exact_gfx1151: bool,
+    exact_gfx1201: bool,
+    rows: usize,
+) -> HyperReadUpFusedEntry {
+    if qwen4_hc_up_twin_gfx1201_applies(twin_enabled, exact_gfx1201, rows) {
+        if t1_enabled {
+            HyperReadUpFusedEntry::TwinT1
+        } else {
+            HyperReadUpFusedEntry::Twin
+        }
+    } else if qwen4_hc_up_twin_applies(twin_enabled, exact_gfx1151, rows) {
+        HyperReadUpFusedEntry::Twin
+    } else {
+        HyperReadUpFusedEntry::Incumbent
+    }
+}
+
+/// Same arguments, block and dynamic LDS for every entry: on exact gfx1151 with at least 16
+/// rows the launch is the bitwise twin `hyper_read_up_fused_f32_sx`; on exact gfx1201 with at
+/// most 8 rows it is the one-token-per-wave `hyper_read_up_fused_f32_sx_t1`
+/// (`HIPFIRE_QWEN4_HC_UP_T1=0`: the sx twin); `HIPFIRE_QWEN4_HC_UP_TWIN=0` forces the
+/// incumbent `hyper_read_up_fused_f32` everywhere.
+pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+    let entry = hyper_read_up_fused_route(
+        *QWEN4_HC_UP_TWIN,
+        *QWEN4_HC_UP_T1,
+        gpu.arch_caps.is_gfx1151(),
+        gpu.arch_caps.is_gfx1201(),
+        p.rows,
+    );
+    hyper_read_up_fused_entry(gpu, p, entry)
+}
+
+/// [`hyper_read_up_fused`] with the entry chosen by the caller: the byte-identity gates run
+/// every entry on one device through this.
 pub fn hyper_read_up_fused_entry(
     gpu: &mut Gpu,
     p: &HyperReadUpFused<'_>,
-    twin: bool,
+    entry: HyperReadUpFusedEntry,
 ) -> HipResult<()> {
     ensure_f32(p.low)?;
     ensure_f32(p.normalized)?;
@@ -2617,16 +2664,26 @@ pub fn hyper_read_up_fused_entry(
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
     let rows = checked_i32(p.rows, "HC read rows")?;
     let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
-    let row_grid = checked_u32(p.rows.div_ceil(128), "HC read row grid")?;
+    let tokens_per_row_group = match entry {
+        HyperReadUpFusedEntry::TwinT1 => 8,
+        HyperReadUpFusedEntry::Incumbent | HyperReadUpFusedEntry::Twin => 128,
+    };
+    let row_grid = checked_u32(p.rows.div_ceil(tokens_per_row_group), "HC read row grid")?;
     let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
-    let (module, source, kernel) = if twin {
-        (
+    let (module, source, kernel) = match entry {
+        HyperReadUpFusedEntry::Twin => (
             "hyper_read_up_fused_twin",
             HYPER_READ_UP_FUSED_TWIN_SRC,
             "hyper_read_up_fused_f32_sx",
-        )
-    } else {
-        ("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")
+        ),
+        HyperReadUpFusedEntry::TwinT1 => (
+            "hyper_read_up_fused_twin_t1",
+            HYPER_READ_UP_FUSED_TWIN_T1_SRC,
+            "hyper_read_up_fused_f32_sx_t1",
+        ),
+        HyperReadUpFusedEntry::Incumbent => {
+            ("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")
+        }
     };
     gpu.ensure_kernel_public(module, source, kernel)?;
     let mut args = KernargBlob::new();
@@ -20852,6 +20909,46 @@ mod hc_up_twin_route_tests {
                 qwen4_hc_up_twin_gfx1201_applies(enabled, exact, rows),
                 want,
                 "enabled={enabled} exact_gfx1201={exact} rows={rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyper_read_up_fused_route_table() {
+        use HyperReadUpFusedEntry::{Incumbent, Twin, TwinT1};
+        // (twin_enabled, t1_enabled, exact_gfx1151, exact_gfx1201, rows, expected)
+        let cases: [(bool, bool, bool, bool, usize, HyperReadUpFusedEntry); 20] = [
+            // gfx1201: T1 by default for rows <= 8.
+            (true, true, false, true, 1, TwinT1),
+            (true, true, false, true, 5, TwinT1),
+            (true, true, false, true, 8, TwinT1),
+            (true, true, false, true, 9, Incumbent),
+            (true, true, false, true, 16, Incumbent),
+            (true, true, false, true, 529, Incumbent),
+            // T1 switch off: the sx twin.
+            (true, false, false, true, 1, Twin),
+            (true, false, false, true, 8, Twin),
+            (true, false, false, true, 9, Incumbent),
+            // HIPFIRE_QWEN4_HC_UP_TWIN=0 forces the incumbent.
+            (false, true, false, true, 1, Incumbent),
+            (false, true, false, true, 8, Incumbent),
+            (false, false, false, true, 8, Incumbent),
+            // gfx1151: unchanged (sx twin at >= 16 rows, T1 never).
+            (true, true, true, false, 15, Incumbent),
+            (true, true, true, false, 16, Twin),
+            (true, true, true, false, 145, Twin),
+            (true, false, true, false, 145, Twin),
+            (false, true, true, false, 145, Incumbent),
+            (true, true, true, false, 1, Incumbent),
+            // Other architectures: incumbent.
+            (true, true, false, false, 1, Incumbent),
+            (true, true, false, false, 145, Incumbent),
+        ];
+        for (twin, t1, gfx1151, gfx1201, rows, want) in cases {
+            assert_eq!(
+                hyper_read_up_fused_route(twin, t1, gfx1151, gfx1201, rows),
+                want,
+                "twin={twin} t1={t1} gfx1151={gfx1151} gfx1201={gfx1201} rows={rows}"
             );
         }
     }

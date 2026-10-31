@@ -2726,6 +2726,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["hyper_read_up_fused_f32_sx"]
         );
         add!(
+            "hyper_read_up_fused_twin_t1",
+            crate::tensor_ops::HYPER_READ_UP_FUSED_TWIN_T1_SRC,
+            ["hyper_read_up_fused_f32_sx_t1"]
+        );
+        add!(
             "moe_down_combine_grouped_top10",
             kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC,
             [
