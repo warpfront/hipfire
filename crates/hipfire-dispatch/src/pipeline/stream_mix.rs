@@ -216,9 +216,10 @@ fn gamma<'a>(norm: Option<StreamNorm<'a>>) -> Option<StreamGamma<'a>> {
 /// weight at every `n`.
 ///
 /// Router-shaped calls (`m > SMALL_ROWS_SELECTOR_SHAPE_M`, F32 activation, `k` a
-/// multiple of 512) on an arch with the register-tiled kernels ([`small_rows_arch_ok`])
-/// run [`Gpu::gemm_bf16_small_rows`] at every row count, its profile picked by `n`
-/// ([`small_rows_profile`]); `HIPFIRE_BF16W_SMALL_ROWS=0` restores the routes below.
+/// multiple of 512) on an arch with the register-tiled kernels (gfx1201, gfx1100:
+/// [`small_rows_thresholds`]) run [`Gpu::gemm_bf16_small_rows`] at every row count, its
+/// profile picked by `n` and the arch's thresholds ([`small_rows_profile`]);
+/// `HIPFIRE_BF16W_SMALL_ROWS=0` restores the routes below.
 ///
 /// Otherwise `n < BF16_TILED_ROWS_MIN_N` (decode, speculative verify) and every arch
 /// but gfx1201 run `gemm_bf16_xf32_batched`. gfx1201 with `n >= BF16_TILED_ROWS_MIN_N`
@@ -261,51 +262,97 @@ pub(crate) fn rows_gemm(
 /// threshold: any other pairing keeps the batched/tiled routes.
 const SMALL_ROWS_SELECTOR_SHAPE_M: usize = 32;
 
+/// Row-count thresholds of the register-tiled small-rows profiles for one arch. The
+/// kernels are bit-identical in every profile, so a threshold only moves speed: each
+/// arch carries the crossovers measured on its own card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SmallRowsThresholds {
+    /// Router shape (F32 activation): rows from which the 4-rows-per-CTA profile runs.
+    f32_rows4: usize,
+    /// Router shape: rows from which the 8-rows-per-CTA profile runs.
+    f32_rows8: usize,
+    /// Selector shape (BF16 activation): rows from which the 4-rows-per-CTA profile runs.
+    bf16_rows4: usize,
+    /// Selector shape: rows from which the 8-rows-per-CTA profile runs.
+    bf16_rows8: usize,
+}
+
 // selector-receipt: receipts/selectors/small_rows_f32_rows4_min_rows.json
-/// Router-shaped (F32 activation) calls with `n` at least this many rows use the
+/// gfx1201 router-shaped (F32 activation) calls with `n` at least this many rows use the
 /// 4-rows-per-CTA small-rows profile; fewer rows (decode, speculative verify) the
 /// 1-row profile.
 pub(crate) const SMALL_ROWS_F32_ROWS4_MIN_ROWS: usize = 16;
 // selector-receipt: receipts/selectors/small_rows_f32_rows8_min_rows.json
-/// Router-shaped calls with `n` at least this many rows use the 8-rows-per-CTA profile.
+/// gfx1201 router-shaped calls with `n` at least this many rows use the 8-rows-per-CTA profile.
 pub(crate) const SMALL_ROWS_F32_ROWS8_MIN_ROWS: usize = 256;
 // selector-receipt: receipts/selectors/small_rows_bf16_rows4_min_rows.json
-/// Selector-shaped (BF16 activation) calls with `n` at least this many rows use the
+/// gfx1201 selector-shaped (BF16 activation) calls with `n` at least this many rows use the
 /// 4-rows-per-CTA profile; fewer rows the 1-row profile.
 pub(crate) const SMALL_ROWS_BF16_ROWS4_MIN_ROWS: usize = 80;
 // selector-receipt: receipts/selectors/small_rows_bf16_rows8_min_rows.json
-/// Selector-shaped calls with `n` at least this many rows use the 8-rows-per-CTA profile.
+/// gfx1201 selector-shaped calls with `n` at least this many rows use the 8-rows-per-CTA profile.
 pub(crate) const SMALL_ROWS_BF16_ROWS8_MIN_ROWS: usize = 512;
 
-/// Archs the register-tiled small-rows kernels are admitted on: gfx1201, measured in
-/// `receipts/selectors/evidence/small_rows_node_gfx1201.txt`. A new arch (gfx1100) needs
-/// its own node and end-to-end measurement before it is listed here.
-fn small_rows_arch_ok(arch: &str) -> bool {
-    matches!(arch, "gfx1201")
+// selector-receipt: receipts/selectors/small_rows_gfx1100_f32_rows4_min_rows.json
+/// gfx1100 router-shaped (F32 activation) calls with `n` at least this many rows use the
+/// 4-rows-per-CTA small-rows profile; fewer rows the 1-row profile (RX 7900 XTX: p1 wins to
+/// N = 22, p4 from N = 24).
+pub(crate) const SMALL_ROWS_GFX1100_F32_ROWS4_MIN_ROWS: usize = 24;
+// selector-receipt: receipts/selectors/small_rows_gfx1100_f32_rows8_min_rows.json
+/// gfx1100 router-shaped calls with `n` at least this many rows use the 8-rows-per-CTA profile.
+pub(crate) const SMALL_ROWS_GFX1100_F32_ROWS8_MIN_ROWS: usize = 384;
+// selector-receipt: receipts/selectors/small_rows_gfx1100_bf16_rows4_min_rows.json
+/// gfx1100 selector-shaped (BF16 activation) calls with `n` at least this many rows use the
+/// 4-rows-per-CTA profile; fewer rows the 1-row profile.
+pub(crate) const SMALL_ROWS_GFX1100_BF16_ROWS4_MIN_ROWS: usize = 160;
+// selector-receipt: receipts/selectors/small_rows_gfx1100_bf16_rows8_min_rows.json
+/// gfx1100 selector-shaped calls with `n` at least this many rows use the 8-rows-per-CTA profile.
+pub(crate) const SMALL_ROWS_GFX1100_BF16_ROWS8_MIN_ROWS: usize = 1024;
+
+/// Thresholds of the archs the register-tiled small-rows kernels are admitted on, each
+/// measured on its own card: gfx1201 in `receipts/selectors/evidence/small_rows_node_gfx1201.txt`
+/// (R9700), gfx1100 in `receipts/selectors/evidence/small_rows_node_gfx1100.txt` (RX 7900 XTX,
+/// bit-identical at every row count 1..4096). `None` for every other arch: a new arch needs
+/// its own node measurement before it is listed here.
+fn small_rows_thresholds(arch: &str) -> Option<SmallRowsThresholds> {
+    match arch {
+        "gfx1201" => Some(SmallRowsThresholds {
+            f32_rows4: SMALL_ROWS_F32_ROWS4_MIN_ROWS,
+            f32_rows8: SMALL_ROWS_F32_ROWS8_MIN_ROWS,
+            bf16_rows4: SMALL_ROWS_BF16_ROWS4_MIN_ROWS,
+            bf16_rows8: SMALL_ROWS_BF16_ROWS8_MIN_ROWS,
+        }),
+        "gfx1100" => Some(SmallRowsThresholds {
+            f32_rows4: SMALL_ROWS_GFX1100_F32_ROWS4_MIN_ROWS,
+            f32_rows8: SMALL_ROWS_GFX1100_F32_ROWS8_MIN_ROWS,
+            bf16_rows4: SMALL_ROWS_GFX1100_BF16_ROWS4_MIN_ROWS,
+            bf16_rows8: SMALL_ROWS_GFX1100_BF16_ROWS8_MIN_ROWS,
+        }),
+        _ => None,
+    }
 }
 
-/// Register-tiled small-rows profile for one call, by x dtype (router-shaped F32 /
-/// selector-shaped BF16, see [`SMALL_ROWS_SELECTOR_SHAPE_M`]) and row count; `None`
-/// when the shape is not one the kernel family is tuned for.
+/// Register-tiled small-rows profile for one call, by arch, x dtype (router-shaped F32 /
+/// selector-shaped BF16, see [`SMALL_ROWS_SELECTOR_SHAPE_M`]) and row count; `None` when
+/// the arch has no measured thresholds or the shape is not one the kernel family is tuned for.
 pub(crate) fn small_rows_profile(
+    arch: &str,
     x_bf16: bool,
     m: usize,
     n: usize,
 ) -> Option<rdna_compute::gemm::Bf16SmallRowsProfile> {
     use rdna_compute::gemm::Bf16SmallRowsProfile as P;
+    let t = small_rows_thresholds(arch)?;
     let (rows4, rows8) = if x_bf16 {
         if m > SMALL_ROWS_SELECTOR_SHAPE_M {
             return None;
         }
-        (
-            SMALL_ROWS_BF16_ROWS4_MIN_ROWS,
-            SMALL_ROWS_BF16_ROWS8_MIN_ROWS,
-        )
+        (t.bf16_rows4, t.bf16_rows8)
     } else {
         if m <= SMALL_ROWS_SELECTOR_SHAPE_M {
             return None;
         }
-        (SMALL_ROWS_F32_ROWS4_MIN_ROWS, SMALL_ROWS_F32_ROWS8_MIN_ROWS)
+        (t.f32_rows4, t.f32_rows8)
     };
     Some(if n >= rows8 {
         P::Rows8
@@ -316,7 +363,7 @@ pub(crate) fn small_rows_profile(
     })
 }
 
-/// [`small_rows_profile`] gated by arch, by K (the kernels need `k` a multiple of
+/// [`small_rows_profile`] gated by K (the kernels need `k` a multiple of
 /// [`rdna_compute::gemm::BF16_SMALL_ROWS_K_MULTIPLE`]) and by `HIPFIRE_BF16W_SMALL_ROWS`
 /// (developer flag, default ON: bit-identical to the batched/tiled routes; `0` restores them).
 fn small_rows_route(
@@ -326,13 +373,12 @@ fn small_rows_route(
     k: usize,
     n: usize,
 ) -> Option<rdna_compute::gemm::Bf16SmallRowsProfile> {
-    if !small_rows_arch_ok(arch)
-        || !k.is_multiple_of(rdna_compute::gemm::BF16_SMALL_ROWS_K_MULTIPLE)
+    if !k.is_multiple_of(rdna_compute::gemm::BF16_SMALL_ROWS_K_MULTIPLE)
         || !hipfire_config::developer_bool("HIPFIRE_BF16W_SMALL_ROWS", true)
     {
         return None;
     }
-    small_rows_profile(x_bf16, m, n)
+    small_rows_profile(arch, x_bf16, m, n)
 }
 
 /// Smallest row count that takes the tiled kernel: the measured prefill region
@@ -612,41 +658,104 @@ mod tests {
         assert_eq!(StreamMixOp::helmert_selector_rows(2), 5);
     }
 
+    /// Expected profile of `n` rows given the `[rows4, rows8)` floors: every n in 1..=16384 is
+    /// checked, so the floors are exact, not spot-checked.
+    fn assert_profile_thresholds(arch: &str, x_bf16: bool, m: usize, rows4: usize, rows8: usize) {
+        use rdna_compute::gemm::Bf16SmallRowsProfile as P;
+        for n in 1..=16384 {
+            let want = if n >= rows8 {
+                P::Rows8
+            } else if n >= rows4 {
+                P::Rows4
+            } else {
+                P::Rows1
+            };
+            assert_eq!(
+                small_rows_profile(arch, x_bf16, m, n),
+                Some(want),
+                "{arch} x_bf16 = {x_bf16} m = {m} n = {n}"
+            );
+        }
+    }
+
     #[test]
     fn small_rows_profile_follows_the_activation_dtype_and_row_count() {
         use rdna_compute::gemm::Bf16SmallRowsProfile as P;
-        // Router shape: F32 activation, M = 128.
-        for n in 1..=15 {
-            assert_eq!(small_rows_profile(false, 128, n), Some(P::Rows1), "n = {n}");
+        // gfx1201. Router shape: F32 activation, M = 128; selector shape: BF16 activation, M = 17.
+        assert_profile_thresholds("gfx1201", false, 128, 16, 256);
+        assert_profile_thresholds("gfx1201", true, 17, 80, 512);
+        for (n, want) in [
+            (15, P::Rows1),
+            (16, P::Rows4),
+            (255, P::Rows4),
+            (256, P::Rows8),
+        ] {
+            assert_eq!(small_rows_profile("gfx1201", false, 128, n), Some(want));
         }
-        for n in 16..=255 {
-            assert_eq!(small_rows_profile(false, 128, n), Some(P::Rows4), "n = {n}");
+        for (n, want) in [
+            (79, P::Rows1),
+            (80, P::Rows4),
+            (511, P::Rows4),
+            (512, P::Rows8),
+        ] {
+            assert_eq!(small_rows_profile("gfx1201", true, 17, n), Some(want));
         }
-        for n in [256, 257, 512, 4096, 16384] {
-            assert_eq!(small_rows_profile(false, 128, n), Some(P::Rows8), "n = {n}");
+        // gfx1100 (RX 7900 XTX): router 1..=23 Rows1, 24..=383 Rows4, 384+ Rows8; selector
+        // 1..=159 Rows1, 160..=1023 Rows4, 1024+ Rows8.
+        assert_profile_thresholds("gfx1100", false, 128, 24, 384);
+        assert_profile_thresholds("gfx1100", true, 17, 160, 1024);
+        for (n, want) in [
+            (1, P::Rows1),
+            (23, P::Rows1),
+            (24, P::Rows4),
+            (383, P::Rows4),
+            (384, P::Rows8),
+            (4096, P::Rows8),
+        ] {
+            assert_eq!(small_rows_profile("gfx1100", false, 128, n), Some(want));
         }
-        // Selector shape: BF16 activation, M = 17.
-        for n in 1..=79 {
-            assert_eq!(small_rows_profile(true, 17, n), Some(P::Rows1), "n = {n}");
+        for (n, want) in [
+            (1, P::Rows1),
+            (159, P::Rows1),
+            (160, P::Rows4),
+            (1023, P::Rows4),
+            (1024, P::Rows8),
+            (4096, P::Rows8),
+        ] {
+            assert_eq!(small_rows_profile("gfx1100", true, 17, n), Some(want));
         }
-        for n in 80..=511 {
-            assert_eq!(small_rows_profile(true, 17, n), Some(P::Rows4), "n = {n}");
+        // The thresholds are the shipped constants.
+        assert_eq!(
+            small_rows_thresholds("gfx1100"),
+            Some(SmallRowsThresholds {
+                f32_rows4: SMALL_ROWS_GFX1100_F32_ROWS4_MIN_ROWS,
+                f32_rows8: SMALL_ROWS_GFX1100_F32_ROWS8_MIN_ROWS,
+                bf16_rows4: SMALL_ROWS_GFX1100_BF16_ROWS4_MIN_ROWS,
+                bf16_rows8: SMALL_ROWS_GFX1100_BF16_ROWS8_MIN_ROWS,
+            })
+        );
+        // The other activation/M pairings keep the batched/tiled routes, on both archs.
+        for arch in ["gfx1201", "gfx1100"] {
+            for n in [1, 15, 16, 24, 255, 256, 384, 512, 1024, 4096] {
+                assert_eq!(
+                    small_rows_profile(arch, false, 17, n),
+                    None,
+                    "{arch} F32 x, M = 17, n = {n}"
+                );
+                assert_eq!(
+                    small_rows_profile(arch, true, 128, n),
+                    None,
+                    "{arch} BF16 x, M = 128, n = {n}"
+                );
+            }
         }
-        for n in [512, 513, 4096, 16384] {
-            assert_eq!(small_rows_profile(true, 17, n), Some(P::Rows8), "n = {n}");
-        }
-        // The other activation/M pairings keep the batched/tiled routes.
-        for n in [1, 15, 16, 255, 256, 512, 4096] {
-            assert_eq!(
-                small_rows_profile(false, 17, n),
-                None,
-                "F32 x, M = 17, n = {n}"
-            );
-            assert_eq!(
-                small_rows_profile(true, 128, n),
-                None,
-                "BF16 x, M = 128, n = {n}"
-            );
+        // An arch without a node measurement keeps the batched/tiled routes.
+        for arch in ["gfx1151", "gfx942", "gfx1030", ""] {
+            for n in [1, 16, 512, 4096] {
+                assert_eq!(small_rows_profile(arch, false, 128, n), None, "{arch}");
+                assert_eq!(small_rows_profile(arch, true, 17, n), None, "{arch}");
+                assert_eq!(small_rows_route(arch, false, 128, 2560, n), None, "{arch}");
+            }
         }
     }
 }
