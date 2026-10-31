@@ -10880,6 +10880,13 @@ pub const EP_GATHER_ROWS_BY_OWNER_SRC: &str =
 pub const EP_GATHER_ROWS_BY_SLOT_OWNER_SRC: &str =
     include_str!("../../../kernels/src/ep_gather_rows_by_slot_owner.hip");
 
+/// Flash-Next EP cross-device boundary (#863): one-thread publish-before-wait
+/// on per-rank monotonic epoch words (system release/acquire, bounded wait).
+pub const EP_BOUNDARY_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/ep_boundary.hip")
+);
+
 /// Certified builder (PeaceMaker) module of the Flash-Next expert-parallel
 /// balanced ownership (default on; `HIPFIRE_EP_BALANCED_OWNERS=0` disables), gfx1201 only
 /// (`peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201`, M7

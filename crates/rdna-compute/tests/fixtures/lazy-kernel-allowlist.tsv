@@ -200,6 +200,7 @@ module	embedding_q4k	codec-outside-core-rungs	Q4K route absent from admitted cor
 module	embedding_q8_buf_broadcast	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:3626
 module	embedding_scatter_ext_f32	config-opt-in	Non-default configuration: vision.mode / serve.multi_slot; forward_slots.rs:4161
 module	emu_validate	developer-opt-in	Non-default developer override: HIPFIRE_EMU; rdna-compute/src/emu_validate.rs:1202
+module	ep_boundary_signal_wait	developer-opt-in	Non-default developer override: HIPFIRE_EP_BOUNDARY=kernel (Flash-Next EP); rdna-compute/src/dispatch.rs:9345-9353
 module	fp8b128_moe_shared_activation_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/cdna/gfx942.rs:95-110
 module	fp8b128_moe_unscatter_silu_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/cdna/gfx942.rs:95-110
 module	fused_gate_up_hfq4g256_dot_prefetch_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM / HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH; rdna-compute/src/gemm.rs:125-145

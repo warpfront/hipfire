@@ -53,6 +53,7 @@ serve-fault-inject = []
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-registry = { path = "../hipfire-registry" }
+railgun = { path = "../railgun" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }

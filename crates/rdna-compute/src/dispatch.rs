@@ -9338,6 +9338,99 @@ impl Gpu {
         )
     }
 
+    /// Load the boundary kernel and allocate the wait block now, outside any
+    /// capture and before the first boundary: a rank that compiled the module
+    /// between two boundaries would hold every peer's bounded wait for that
+    /// long. (The gather copy kernels are registry modules, compiled at load.)
+    pub fn prepare_ep_boundary(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_device_wait_block()?;
+        self.ensure_kernel(
+            "ep_boundary_signal_wait",
+            crate::kernels::EP_BOUNDARY_SRC,
+            "ep_boundary_signal_wait",
+        )
+    }
+
+    /// One EP cross-device boundary (#863, `kernels/src/ep_boundary.hip`): on
+    /// this GPU's stream, increment this rank's epoch word `epochs[self_rank]`
+    /// with system-scope release, then wait with system-scope acquire until
+    /// every `epochs[0..n_ranks]` reached the new epoch. No host epoch: every
+    /// rank runs the same boundary sequence from zeroed words, so the launch
+    /// is identical each time and a retained body can replay it. The wait is
+    /// bounded ([`crate::device_wait`]); a timeout or a host poison is reported
+    /// by [`Self::take_device_wait_error`].
+    pub fn ep_boundary_signal_wait(
+        &mut self,
+        epochs: [usize; 8],
+        n_ranks: usize,
+        self_rank: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !(2..=8).contains(&n_ranks) || self_rank >= n_ranks || epochs[..n_ranks].contains(&0) {
+            return Err(HipError::new(
+                0,
+                "ep_boundary_signal_wait: n_ranks must be 2..=8, self_rank < n_ranks and every epoch word non-null",
+            ));
+        }
+        self.ensure_kernel(
+            "ep_boundary_signal_wait",
+            crate::kernels::EP_BOUNDARY_SRC,
+            "ep_boundary_signal_wait",
+        )?;
+        let wait_block = self.device_wait_block()?;
+        // Unused slots repeat this rank's own word: never read past `n_ranks`.
+        let words = epochs.map(|word| {
+            let word = if word == 0 { epochs[self_rank] } else { word };
+            word as *mut c_void
+        });
+        let own = words[self_rank];
+        let mut ranks_i32 = n_ranks as i32;
+        let mut params: [*mut c_void; 11] = [
+            &own as *const _ as *mut c_void,
+            &words[0] as *const _ as *mut c_void,
+            &words[1] as *const _ as *mut c_void,
+            &words[2] as *const _ as *mut c_void,
+            &words[3] as *const _ as *mut c_void,
+            &words[4] as *const _ as *mut c_void,
+            &words[5] as *const _ as *mut c_void,
+            &words[6] as *const _ as *mut c_void,
+            &words[7] as *const _ as *mut c_void,
+            &mut ranks_i32 as *mut _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "ep_boundary_signal_wait",
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(own);
+                for word in words {
+                    blob.push_ptr(word);
+                }
+                blob.push_i32(n_ranks as i32);
+                blob.push_ptr(wait_block);
+                blob
+            },
+        )
+    }
+
+    /// A handle that poisons this GPU's bounded waits from any host thread
+    /// (allocating the wait block if needed). It must not be used after this
+    /// `Gpu` is dropped.
+    pub fn device_wait_poison(&mut self) -> HipResult<crate::device_wait::DeviceWaitPoison> {
+        self.bind_thread()?;
+        self.ensure_device_wait_block()?;
+        Ok(self
+            .device_wait
+            .as_ref()
+            .expect("allocated above")
+            .poison_handle())
+    }
+
     /// [`Self::ep_gather_rows_by_owner`] with explicit owners (balanced EP
     /// ownership): row `s` is copied from `src[slot_owner[s]]` when
     /// `slot_owner[s]` is in `0..n_ranks` and not `self_rank`; slots with a

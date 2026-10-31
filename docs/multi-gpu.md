@@ -660,6 +660,50 @@ entered and crossed, how long ago it crossed and what its host thread is doing. 
 A rank failure aborts the row-gather, tile-exchange and trunk-split barriers together (`RankPool::set_abort`
 keeps every registered callback and runs all of them; it once kept only the first).
 
+### Flash-Next EP: kernel boundaries (#863, developer)
+
+`HIPFIRE_EP_BOUNDARY=kernel` makes every decode, verify and MTP-head row gather a device boundary instead of a
+producer event plus a host barrier: `ep_boundary_signal_wait` increments the rank's own epoch word (signal memory,
+zero at registration) with system-scope release, then waits, bounded at 500 ms, with system-scope acquire until
+every rank's word has reached that epoch; the unchanged copy kernel follows on the rank's own stream. The epoch is
+device-derived, so the launches are identical every step (what a retained body needs). Only the first gather of a
+fanned-out call meets the other ranks on the host (paired submission), so host skew between calls never reaches
+the bounded waits. Long prefill (the tile exchange) and the trunk split stay on the host barrier; the trunk split is
+refused with `kernel`.
+
+The contract is `railgun::mesh`: per rank a ledger of producer writes (all rows), boundaries (tag = kind, buffer,
+layer, rows, sequence), peer reads (rows the owner owns) and gather writes (rows other ranks own). After every
+fanned-out call `EpRowGather::check_step` requires the same boundaries in the same order on every rank (so no rank
+waits on an epoch nobody publishes) and no exchange buffer rewritten, read before it was produced, or retired in
+the epoch a peer reads it; a refusal poisons the mesh. A rank failure poisons every rank's bounded waits through
+its wait block (`EP boundary poisoned`), so peers stop at their next check instead of their deadline. Epoch words
+are transport state, never part of a model snapshot, and are freed only by `release` after every rank drained.
+
+**Retention census** (what still keeps a rank's EP decode step out of a retained Redline body; HIP API traces of
+emulated EP2 on gfx1151, every non-launch runtime call between two row gathers of one rank):
+
+- the row gather's host barrier and events: replaced by the kernel boundary above;
+- the refusals: `moe_program` owner assignment and row gather while recording, the Qwen4 retained-body predicate
+  `self.ep.is_none()`, `retained_redline_default` (`ep != 1`); unchanged;
+- PLE: a stream synchronize and a host-fetched row upload after layer 0 of every step;
+- QSA context arena growth inside a forward (VMM reserve/create/map, a device synchronize and a memset) when
+  the position crosses a mapped chunk;
+- first-use module binds inside the first forwards;
+- native MTP: blocking null-stream readbacks (draft top-k, verify picks), per-step allocations and frees and
+  device synchronizes;
+- gfx1151 itself: single-device Qwen4 decode is not retained there (linear AQL cannot rebind the position kernarg
+  of `gated_delta_conv_params_bf16_f32`, and GFX10/11 PM4 refuses `gemv_mq6g256v2_k2560_u2`, which uses scratch),
+  so retained per-rank rows need gfx1201.
+
+**Logical emulation limit.** The boundary spins on the device. Under `HIPFIRE_EMULATE_GPUS` every rank shares one
+device, so a device-wide runtime call one rank makes while another rank is parked on a boundary (a blocking
+null-stream copy, `hipDeviceSynchronize`, an allocation, a VMM map) waits for the parked rank, which waits for the
+caller: the wait stops at 500 ms and the step fails closed with `device wait timeout`. AR completes byte-identical
+to the single card in most runs (gfx1151, EP2 and EP4); native MTP always stops. EP4 also needs more ROCm
+hardware queues than the default (`GPU_MAX_HW_QUEUES=16`). On separate devices those calls are per device and do
+not couple ranks; that, peer-memory visibility and the launch/sync gain are not measured yet (no multi-GPU
+hardware in this work).
+
 ### Flash-Next EP: EP reserve decoupling (default on, `=0` kill switch)
 
 **Status: default for the admitted configuration; `HIPFIRE_EP_RESERVE_DECOUPLE=0` is the kill switch.** Measured on the C1

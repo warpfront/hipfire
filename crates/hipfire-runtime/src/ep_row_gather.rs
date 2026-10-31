@@ -39,8 +39,31 @@
 //! its wait. (Two buffers alternating, or a third dedicated one such as an MTP
 //! head, both satisfy the rule.)
 //!
-//! Eager only: events are created, recorded and waited on the host timeline; this
-//! transport is not usable inside a captured/retained-replay body.
+//! Host-barrier exchanges are eager only: events are created, recorded and
+//! waited on the host timeline, which a captured/retained-replay body cannot
+//! hold.
+//!
+//! # Kernel boundaries (#863)
+//!
+//! With [`EpRowGatherBuilder::kernel_boundaries`] an [`EpRowGather::exchange_layer`]
+//! is two kernels on the rank's stream and no host wait, except that a step's
+//! first crossing meets the other ranks on the host barrier once, so every
+//! rank submits the step together (the device waits are bounded at 500 ms and
+//! must not absorb host skew between calls): `ep_boundary_signal_wait`
+//! increments the rank's own epoch word with system-scope release and waits,
+//! bounded, with system-scope acquire until every rank's word reached that
+//! epoch; then the same copy kernel. The epoch is device-derived (every rank
+//! runs the same boundary sequence from zeroed words), so the launches are
+//! identical every step. The hazard argument above holds with "barrier" read
+//! as "boundary": a rank overwrites `buffer[b]` only after its next boundary,
+//! which every peer reaches only after its gather of `b`. The host keeps each
+//! rank's crossings in a ledger and [`EpRowGather::check_step`] proves the
+//! ranks crossed the same boundaries with no buffer rewritten while a peer
+//! reads it ([`railgun::mesh`]). A failure poisons every rank's waits
+//! ([`EpRowGather::abort`]); a waiter that stops (poison or the 500 ms
+//! deadline) leaves its code in the rank's wait block, which the rank's next
+//! download reports, failing the step. Epoch words are transport state: they
+//! are never part of a model snapshot, and they are freed only by `release`.
 //!
 //! # Band exchange (output-axis split, #862)
 //!
@@ -81,9 +104,11 @@
 //! `Drop` impl does not own.
 
 use hip_bridge::{
-    Event, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_EVENT_DISABLE_TIMING,
-    HIP_EVENT_RELEASE_TO_SYSTEM,
+    DeviceBuffer, Event, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
+    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
+use railgun::mesh;
+use rdna_compute::device_wait::DeviceWaitPoison;
 use rdna_compute::{Gpu, GpuTensor};
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -92,6 +117,10 @@ use std::time::{Duration, Instant};
 
 /// Default host-barrier timeout.
 pub const DEFAULT_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bytes of one rank's boundary epoch word allocation (the kernel uses the
+/// low u32; ROCm signal memory takes the proven 8-byte allocation).
+const EPOCH_BYTES: usize = 8;
 
 /// Largest supported rank count (the kernel takes eight source pointers).
 pub const MAX_RANKS: usize = 8;
@@ -449,6 +478,16 @@ struct RankReg {
     ptrs: Vec<usize>,
     sizes: Vec<usize>,
     events: Vec<Event>,
+    boundary: Option<RankBoundary>,
+}
+
+/// A rank's kernel-boundary resources (see [`EpRowGatherBuilder::kernel_boundaries`]).
+struct RankBoundary {
+    /// The rank's monotonic epoch word: signal memory on its device, zero at
+    /// registration, incremented only by its own boundary kernels.
+    epoch: DeviceBuffer,
+    /// Stops this rank's bounded waits when another rank fails.
+    poison: DeviceWaitPoison,
 }
 
 /// Collects one registration per rank, then builds the shared transport.
@@ -457,6 +496,7 @@ pub struct EpRowGatherBuilder {
     regs: Vec<Option<RankReg>>,
     barrier_timeout: Duration,
     device_waits: bool,
+    kernel_boundaries: bool,
 }
 
 impl EpRowGatherBuilder {
@@ -464,6 +504,17 @@ impl EpRowGatherBuilder {
     /// host waits, independent of streams installed by unrelated features.
     pub fn device_waits(mut self, enabled: bool) -> Self {
         self.device_waits = enabled;
+        self
+    }
+
+    /// Cross every [`EpRowGather::exchange_layer`] on a device boundary
+    /// instead of producer events and the host barrier (#863, see the module
+    /// docs): no host wait or host record is left inside the exchange, so the
+    /// rank's whole decode step is kernel launches. Must be set before the
+    /// first `register`, which then allocates the rank's epoch word and its
+    /// wait block and gives the rank its own stream.
+    pub fn kernel_boundaries(mut self, enabled: bool) -> Self {
+        self.kernel_boundaries = enabled;
         self
     }
 
@@ -522,6 +573,22 @@ impl EpRowGatherBuilder {
             sizes.push(buf.buf.size());
         }
         gpu.bind_thread()?;
+        let boundary = if self.kernel_boundaries {
+            // A spinning boundary kernel on the legacy null stream would block
+            // every other rank's null-stream work on a shared device (logical
+            // emulation), so each rank launches on its own stream.
+            gpu.ensure_capture_stream()?;
+            gpu.prepare_ep_boundary()?;
+            let poison = gpu.device_wait_poison()?;
+            let epoch = gpu.hip.malloc_signal(EPOCH_BYTES)?;
+            if let Err(e) = gpu.hip.memset(&epoch, 0, EPOCH_BYTES) {
+                let _ = gpu.hip.free(epoch);
+                return Err(e);
+            }
+            Some(RankBoundary { epoch, poison })
+        } else {
+            None
+        };
         let flags = HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM;
         let mut events = Vec::with_capacity(k);
         for _ in 0..k {
@@ -530,6 +597,9 @@ impl EpRowGatherBuilder {
                 Err(e) => {
                     for made in events {
                         let _ = gpu.hip.event_destroy(made);
+                    }
+                    if let Some(boundary) = boundary {
+                        let _ = gpu.hip.free(boundary.epoch);
                     }
                     return Err(e);
                 }
@@ -540,6 +610,7 @@ impl EpRowGatherBuilder {
             ptrs,
             sizes,
             events,
+            boundary,
         });
         Ok(())
     }
@@ -577,6 +648,7 @@ impl EpRowGatherBuilder {
                 )));
             }
         }
+        let kernel_boundaries = self.kernel_boundaries;
         let states = ranks
             .into_iter()
             .map(|r| RankState {
@@ -585,6 +657,9 @@ impl EpRowGatherBuilder {
                 ptrs: r.ptrs,
                 sizes: r.sizes,
                 events: r.events.into_iter().map(|e| Mutex::new(Some(e))).collect(),
+                epoch_ptr: r.boundary.as_ref().map_or(0, |b| b.epoch.as_ptr() as usize),
+                boundary: Mutex::new(r.boundary),
+                ledger: Mutex::new(Vec::new()),
                 peers_enabled: AtomicBool::new(false),
                 calls: AtomicU64::new(0),
                 entered: AtomicU64::new(0),
@@ -599,6 +674,7 @@ impl EpRowGatherBuilder {
             barrier: SpinBarrier::new(self.spec.ranks, self.barrier_timeout),
             ranks: states,
             device_waits: self.device_waits,
+            kernel_boundaries,
             started: Instant::now(),
         }))
     }
@@ -621,6 +697,13 @@ struct RankState {
     /// The `Mutex` makes the type `Sync` (`Event` is `Send` only); it is
     /// uncontended by protocol (record and wait of one index never overlap).
     events: Vec<Mutex<Option<Event>>>,
+    /// Device address of the rank's epoch word (kernel boundaries; else 0).
+    epoch_ptr: usize,
+    /// The rank's kernel-boundary resources; `None` without kernel boundaries
+    /// and after `release`.
+    boundary: Mutex<Option<RankBoundary>>,
+    /// The rank's boundary ledger since the last [`EpRowGather::check_step`].
+    ledger: Mutex<Vec<mesh::Event>>,
     peers_enabled: AtomicBool,
     /// Crossings this rank has entered (its next gather sequence number).
     calls: AtomicU64,
@@ -652,6 +735,7 @@ pub struct EpRowGather {
     ranks: Vec<RankState>,
     barrier: SpinBarrier,
     device_waits: bool,
+    kernel_boundaries: bool,
     /// Transport build time: the origin of `RankState::crossed_at_ms`.
     started: Instant,
 }
@@ -667,7 +751,14 @@ impl EpRowGather {
             regs: (0..spec.ranks.min(MAX_RANKS)).map(|_| None).collect(),
             barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
             device_waits: false,
+            kernel_boundaries: false,
         }
+    }
+
+    /// Whether exchanges cross on device boundaries (see
+    /// [`EpRowGatherBuilder::kernel_boundaries`]).
+    pub fn kernel_boundaries(&self) -> bool {
+        self.kernel_boundaries
     }
 
     pub fn ranks(&self) -> usize {
@@ -761,6 +852,19 @@ impl EpRowGather {
         self.check(gpu, rank, buffer)?;
         self.spec.check_call_slots(slots)?;
         self.wait_peers(gpu, rank, buffer)?;
+        self.copy_rows(gpu, rank, buffer, slot_owners, slots)
+    }
+
+    /// The gather's copy kernel alone (callers have ordered the peers'
+    /// producers before it).
+    fn copy_rows(
+        &self,
+        gpu: &mut Gpu,
+        rank: usize,
+        buffer: usize,
+        slot_owners: EpSlotOwners<'_>,
+        slots: usize,
+    ) -> HipResult<()> {
         self.ranks[rank].phase.store(PHASE_COPY, Ordering::Relaxed);
         let mut src = [0usize; MAX_RANKS];
         for (peer, state) in self.ranks.iter().enumerate() {
@@ -821,6 +925,13 @@ impl EpRowGather {
         slots: usize,
         layer: usize,
     ) -> HipResult<()> {
+        if self.kernel_boundaries {
+            let result = self.exchange_on_boundary(gpu, rank, buffer, slot_owners, slots, layer);
+            if result.is_err() {
+                self.abort();
+            }
+            return result;
+        }
         self.spec.check_call_slots(slots)?;
         if let Err(e) = self.check(gpu, rank, buffer) {
             self.abort();
@@ -837,6 +948,83 @@ impl EpRowGather {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// [`Self::exchange_layer`] on a device boundary: one boundary kernel
+    /// (publish this rank's epoch, wait every rank's) and the copy kernel, both
+    /// on the rank's stream, and the crossing appended to the rank's ledger.
+    /// Only a step's first crossing meets the other ranks on the host (paired
+    /// submission): the boundary wait is bounded at 500 ms, so ranks must start
+    /// submitting a step together rather than with whatever host skew the
+    /// previous call left. Later crossings never wait on the host;
+    /// [`Self::check_step`] compares the ledgers.
+    fn exchange_on_boundary(
+        &self,
+        gpu: &mut Gpu,
+        rank: usize,
+        buffer: usize,
+        slot_owners: EpSlotOwners<'_>,
+        slots: usize,
+        layer: usize,
+    ) -> HipResult<()> {
+        self.spec.check_call_slots(slots)?;
+        self.check(gpu, rank, buffer)?;
+        if !self.ranks[rank].peers_enabled.load(Ordering::Acquire) {
+            return Err(err(format!(
+                "ep_row_gather: gather on rank {rank} before enable_peers"
+            )));
+        }
+        if lock(&self.ranks[rank].boundary).is_none() {
+            return Err(err("ep_row_gather: boundary after release".into()));
+        }
+        if lock(&self.ranks[rank].ledger).is_empty() {
+            self.barrier.wait().map_err(|message| err(message.into()))?;
+        }
+        let tag = self.enter(rank, GatherKind::of(&slot_owners), buffer, layer, slots);
+        let mut epochs = [0usize; MAX_RANKS];
+        for (peer, state) in self.ranks.iter().enumerate() {
+            epochs[peer] = state.epoch_ptr;
+        }
+        gpu.ep_boundary_signal_wait(epochs, self.spec.ranks, rank)?;
+        self.copy_rows(gpu, rank, buffer, slot_owners, slots)?;
+        lock(&self.ranks[rank].ledger).extend([
+            mesh::Event::Write {
+                buffer,
+                region: mesh::Region::All,
+            },
+            mesh::Event::Boundary { tag: tag.0 },
+            mesh::Event::PeerRead { buffer },
+            mesh::Event::Write {
+                buffer,
+                region: mesh::Region::Unowned,
+            },
+        ]);
+        let state = &self.ranks[rank];
+        state
+            .crossed_at_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        state.crossed.store(tag.0, Ordering::Release);
+        Ok(())
+    }
+
+    /// Check and clear every rank's boundary ledger (kernel boundaries; a
+    /// no-op otherwise). Call on one thread once every rank's host work for
+    /// the step has returned: [`railgun::mesh::check`] must find the same
+    /// boundaries in the same order on every rank and no buffer rewritten in
+    /// the epoch a peer reads it. A refusal aborts the transport.
+    pub fn check_step(&self) -> HipResult<()> {
+        if !self.kernel_boundaries {
+            return Ok(());
+        }
+        let ledgers: Vec<Vec<mesh::Event>> = self
+            .ranks
+            .iter()
+            .map(|state| std::mem::take(&mut *lock(&state.ledger)))
+            .collect();
+        mesh::check(&ledgers).map(drop).map_err(|refusal| {
+            self.abort();
+            err(format!("ep_row_gather: {refusal}"))
+        })
     }
 
     /// Open this rank's next crossing: take its gather sequence number and
@@ -1063,9 +1251,20 @@ impl EpRowGather {
 
     /// Poison the barrier: every current/future waiter returns Err (a rank
     /// failed). Barrier waits time out (default 30 s) with Err rather than
-    /// hanging.
+    /// hanging. With kernel boundaries it also poisons every live rank's
+    /// bounded waits, so a rank spinning on a boundary the failed rank will
+    /// never reach stops within its next check instead of its 500 ms deadline,
+    /// and that rank's step check reports the poison.
     pub fn abort(&self) {
         self.barrier.abort();
+        for state in &self.ranks {
+            if let Some(boundary) = lock(&state.boundary).as_ref() {
+                // SAFETY: the handle lives in the rank's `boundary`, which
+                // `release` empties (under this lock) before the rank's `Gpu`
+                // and its wait block are dropped.
+                unsafe { boundary.poison.poison(0) };
+            }
+        }
     }
 
     /// Whether `abort` was called (or a barrier wait timed out).
@@ -1073,9 +1272,10 @@ impl EpRowGather {
         self.barrier.is_aborted()
     }
 
-    /// Destroy this rank's producer events. Call once per rank on that rank's
-    /// thread, after the rank's stream and every peer's stream that waits on
-    /// these events have drained. Later `publish`/`gather` return Err.
+    /// Destroy this rank's producer events and free its boundary epoch word.
+    /// Call once per rank on that rank's thread, after the rank's stream and
+    /// every peer's stream that waits on these events or reads the epoch word
+    /// have drained. Later `publish`/`gather` return Err.
     pub fn release(&self, rank: usize, gpu: &mut Gpu) -> HipResult<()> {
         self.check(gpu, rank, 0)?;
         gpu.bind_thread()?;
@@ -1086,6 +1286,12 @@ impl EpRowGather {
                 if first.is_ok() {
                     first = r;
                 }
+            }
+        }
+        if let Some(boundary) = lock(&self.ranks[rank].boundary).take() {
+            let r = gpu.hip.free(boundary.epoch);
+            if first.is_ok() {
+                first = r;
             }
         }
         first
@@ -1251,6 +1457,9 @@ pub(crate) mod tests {
                 sizes: Vec::new(),
                 tags: (0..MAX_BUFFERS).map(|_| AtomicU64::new(0)).collect(),
                 events: Vec::new(),
+                epoch_ptr: 0,
+                boundary: Mutex::new(None),
+                ledger: Mutex::new(Vec::new()),
                 peers_enabled: AtomicBool::new(true),
                 calls: AtomicU64::new(0),
                 entered: AtomicU64::new(0),
@@ -1265,6 +1474,7 @@ pub(crate) mod tests {
             ranks: states,
             barrier: SpinBarrier::new(ranks, timeout),
             device_waits: false,
+            kernel_boundaries: false,
             started: Instant::now(),
         })
     }
