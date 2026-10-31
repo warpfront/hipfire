@@ -11,6 +11,7 @@ pub mod carrier;
 pub mod census;
 pub mod config;
 pub mod forward;
+pub mod mesh;
 pub mod mhc;
 pub mod mla;
 pub mod moe;
@@ -37,6 +38,10 @@ pub use forward::{
     band_admit, band_body, forward_band, forward_rows, forward_rows_tapped,
     forward_rows_verify_tapped, forward_token, forward_token_tapped, readout_logits,
     validate_extract_layers, BandInput, DflashCapture, LayerTap, RaonWork, TapSite,
+};
+pub use mesh::{
+    raon_edge_capacity_bytes, raon_manifest, raon_rank_op_ids, raon_step_graph, RaonMeshBindings,
+    RaonMeshModel, RaonMeshOutput, RaonMeshProgram, RAON_STREAMS_RESOURCE,
 };
 pub use projection::{project, project_row, project_rows, round_bf16_rows, OutRound};
 pub use rollback::{RollbackMode, ROLLBACK_ENV};

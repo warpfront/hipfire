@@ -14,8 +14,9 @@ use rdna_compute::{Gpu, GpuTensor};
 use crate::band::{edge_view, RaonBand};
 use crate::config::RaonConfig;
 use crate::forward::{
-    admit_decode_context, decode_binding, decode_body, forward_band, forward_rows, forward_token,
-    require_whole_band, stage_decode_token, stage_decode_token_on_stream, BandInput, RaonWork,
+    admit_decode_context, band_admit, band_body, decode_binding, decode_body, forward_band,
+    forward_rows, forward_token, require_whole_band, stage_decode_token,
+    stage_decode_token_on_stream, BandInput, RaonWork,
 };
 use crate::session::session_stride;
 use crate::spec_impl::RaonSpecState;
@@ -449,7 +450,19 @@ impl RaonBundle {
 
     /// Attach the session cache: [`session_prefill`](Self::session_prefill)
     /// then restores and captures snapshots through it.
+    ///
+    /// A partial band (a mesh rank) never attaches one: its state is a slice of
+    /// the model and a snapshot of it is not restorable on its own
+    /// ([`SessionState::snapshot_scope`] reports `None` there, so the loader
+    /// does not offer a cache). The cache handed in is dropped.
     pub fn attach_session_cache(&mut self, cache: SessionCache) {
+        if !self.weights.band.is_whole() {
+            eprintln!(
+                "raon1_mini: session cache not attached on {}: snapshots need the whole model on one device",
+                self.weights.band.label()
+            );
+            return;
+        }
         self.session = Some(SessionDriver::new(cache));
     }
 
@@ -525,6 +538,7 @@ impl RaonBundle {
         prompt: &[u32],
         reused: usize,
     ) -> Result<(), String> {
+        require_whole_band(&self.weights, "session prefill")?;
         let len = prompt.len();
         if reused >= len {
             return Err(format!(
@@ -684,9 +698,33 @@ impl RaonBundle {
             gpu,
             end,
         )?;
+        self.decode_graph_enqueue(gpu, token, true)?;
+        // The recorded (or warm-up) step advanced the device `seq_len`; mirror it on the host.
+        self.state.note_host_tokens(1);
+        Ok(())
+    }
+
+    /// Device phase of one graph-route decode step (after
+    /// [`admit_decode_context`]): the warm-up step runs the body eagerly, every
+    /// later step stages the token id on the decode stream, records the graph
+    /// when the binding changed, then launches it. Only enqueues on the
+    /// device's active stream; the warm-up's id staging is the blocking one
+    /// when `blocking_warm_stage` (the single-device route) and the
+    /// stream-ordered one otherwise (the mesh epoch callback). The host
+    /// mirror advance is the caller's.
+    fn decode_graph_enqueue(
+        &mut self,
+        gpu: &mut Gpu,
+        token: Option<u32>,
+        blocking_warm_stage: bool,
+    ) -> Result<(), String> {
         if !self.graph.warmed {
             if let Some(token) = token {
-                stage_decode_token(&self.config, &self.scratch, gpu, token)?;
+                if blocking_warm_stage {
+                    stage_decode_token(&self.config, &self.scratch, gpu, token)?;
+                } else {
+                    stage_decode_token_on_stream(&self.config, &self.scratch, gpu, token)?;
+                }
             }
             decode_body(
                 &self.config,
@@ -697,7 +735,6 @@ impl RaonBundle {
                 gpu,
             )?;
             self.graph.warmed = true;
-            self.state.note_host_tokens(1);
             return Ok(());
         }
         if gpu.active_stream.is_none() {
@@ -730,9 +767,111 @@ impl RaonBundle {
             .graph_launch(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("raon1_mini: decode graph launch: {e:?}"))?;
         self.graph.launch_secs += t_launch.elapsed().as_secs_f64();
-        // The recorded step advanced the device `seq_len`; mirror it on the host.
-        self.state.note_host_tokens(1);
         Ok(())
+    }
+
+    /// Host phase of one mesh epoch of this band (see [`crate::mesh`]): validate
+    /// the input against the band and admit the context for `n_tokens + rows`
+    /// (map-ahead of the latent caches and expanded mirror, which may move the
+    /// decode binding). Eager rows also stage the first band's token ids; a
+    /// graph-route decode step stages its token on the stream inside
+    /// [`mesh_enqueue`](Self::mesh_enqueue). Outside any epoch submission.
+    /// Returns the rows of the call.
+    pub fn mesh_admit(
+        &mut self,
+        gpu: &mut Gpu,
+        input: BandInput<'_>,
+        graph_decode: bool,
+    ) -> Result<usize, String> {
+        if self.prefill_mode != PrefillMode::Batched {
+            return Err(format!(
+                "raon1_mini: {}: mesh bands run the batched route only",
+                self.weights.band.label()
+            ));
+        }
+        let rows = input.rows();
+        let start = self.state.n_tokens();
+        if start + rows > self.state.max_seq() {
+            return Err(format!(
+                "raon1_mini: {start} + {rows} rows exceed the reserved context of {} rows",
+                self.state.max_seq()
+            ));
+        }
+        if graph_decode {
+            if rows != 1 {
+                return Err(format!(
+                    "raon1_mini: graph decode takes one row, got {rows} on {}",
+                    self.weights.band.label()
+                ));
+            }
+            admit_decode_context(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                &self.scratch,
+                &self.work,
+                gpu,
+                start + 1,
+            )?;
+            return Ok(1);
+        }
+        band_admit(
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            &self.scratch,
+            &self.work,
+            gpu,
+            input,
+        )
+    }
+
+    /// Device phase of one mesh epoch of this band, after
+    /// [`mesh_admit`](Self::mesh_admit) with the same `graph_decode`: enqueue
+    /// the band's body over `rows` rows on the device's active stream with no
+    /// host wait (`token` is the first band's decode token on the graph route).
+    /// The last band's `want_logits` leaves the last row's logits in
+    /// [`logits`](Self::logits). The host mirror advance is
+    /// [`mesh_commit`](Self::mesh_commit).
+    pub fn mesh_enqueue(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: usize,
+        token: Option<u32>,
+        want_logits: bool,
+        graph_decode: bool,
+    ) -> Result<(), String> {
+        if want_logits && !self.weights.band.is_last() {
+            return Err(format!(
+                "raon1_mini: logits requested on {}: only the last band reads them out",
+                self.weights.band.label()
+            ));
+        }
+        if graph_decode {
+            if rows != 1 || want_logits != self.weights.band.is_last() {
+                return Err(format!(
+                    "raon1_mini: graph decode is one row with the last band's logits ({rows} rows on {})",
+                    self.weights.band.label()
+                ));
+            }
+            return self.decode_graph_enqueue(gpu, token, false);
+        }
+        band_body(
+            &self.config,
+            &self.weights,
+            &self.state,
+            &self.scratch,
+            &self.work,
+            gpu,
+            rows,
+            want_logits,
+        )
+    }
+
+    /// Advance the host mirror by the `rows` an enqueued epoch consumed (the
+    /// device `seq_len` advanced inside the body).
+    pub fn mesh_commit(&mut self, rows: usize) {
+        self.state.note_host_tokens(rows);
     }
 
     /// Record the decode body into the generic AR graph slot, replacing any
