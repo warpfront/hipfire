@@ -7,82 +7,119 @@
 // Q-tiled bidirectional attention for the vision encoder (flash-style
 // online softmax). Replaces the per-(head, query) `vit_attention_f32`,
 // whose blocks each re-read all of K and V from DRAM — ~220 GB of traffic
-// per tower layer at N=4624 (measured 1.02 s/layer on gfx1101, i.e. the
-// whole 25.5 s vision forward at 68x68 grid). Here QB queries of one head
-// share every K tile pulled through LDS: DRAM traffic drops by ~QB.
+// per tower layer at N=4624 (measured 1.02 s/layer on gfx1101). Here QB
+// queries of one head share every K/V tile pulled through LDS: DRAM
+// traffic drops by ~QB.
 //
-// V is NOT staged in LDS: in the P@V accumulation each (j, d) element is
-// read by exactly one lane (d = lane + a*LANES), so there is no intra-block
-// reuse to pay LDS for — lanes read V straight from global/L2, fully
-// coalesced. Keeping only K+Q+scores in LDS holds the footprint near
-// 30 KB, which lets two blocks share a CU.
+// Four rules keep the block fast, each learned from the sister
+// `attention_encoder_qtiled_f32` (same shape class, arch 17):
+//   1. K/Q/V row strides are padded by K_PAD floats. With stride == head_dim
+//      (64) the 16 lanes of a subgroup — reading the SAME `d` of DIFFERENT
+//      rows — land in one bank: a 16-way conflict on every score-pass read.
+//      Measured on gfx1101 at N=7564: 471.3 -> 170.5 ms per call.
+//   2. V is staged in LDS alongside K. The P@V pass reads each (j, d) once
+//      per lane, but straight from global that is a full-memory-latency
+//      load under every FMA; the encoder kernel measured 1.5% FMA issue and
+//      33 GB/s with global V. Staging V costs LDS, so K_TILE drops to 32.
+//   3. The dot product uses float4 LDS loads with four independent
+//      accumulator chains (a single accumulator exposes the FMA latency
+//      chain), and the running output lives in registers, not LDS.
+//   4. QB is a launch parameter, host-sized to the largest value whose LDS
+//      carve-up fits 64 KB (64 at head_dim<=64, 32 above). One K/V tile then
+//      serves up to 64 queries instead of 16. Measured N=7564/hd=64:
+//      170.5 -> 126.0 ms per call (3.7x the pre-padding kernel).
+//
+// head_dim is any value in 1..=128: per-lane accumulators are sized by
+// the rounded-up A, and every d the lane owns is guarded (`d < head_dim`)
+// in the P@V fold and the store, so head_dims that are not multiples of
+// 16 (the Qwen ViT's 72) keep the Q-tiled path as the non-WMMA fallback.
+// The float4 score pass is only taken when head_dim % 4 == 0, where the
+// padded row stride stays 16-byte aligned; other widths use a scalar dot.
+//
+// LDS (QB=64, K_TILE=32, hd=64): 51,968 B; 71 VGPR, no scratch, one
+// 1024-thread block per CU.
 //
 // Computes: out[qi, head] = softmax(Q[qi] @ K^T / sqrt(d)) @ V   (no mask)
 //
-// Grid:  [num_heads, ceil(N / QB)]
-// Block: [256]           — QB * LANES threads; each 16-lane subgroup owns
-//                        — one query for the whole tile.
-// LDS (QB=16, K_TILE=64, hd=64): k_tile 16 KB + q_tile 4 KB + s_tile 4 KB
-// + reductions ~1 KB + out_run 4 KB ≈ 29 KB.
+// Grid:  [num_heads, ceil(N / qpb)]
+// Block: [qpb * LANES]   — each 16-lane subgroup owns one query for the
+//                        — whole tile (256..1024 threads).
 
-#define QB 16      // queries per block (one 16-lane subgroup each)
 #define LANES 16   // threads per query subgroup
-#define K_TILE 64  // keys streamed through LDS per iteration
-#define A_MAX 8    // max head_dim/LANES (supports head_dim up to 128)
+#define K_TILE 32  // keys streamed through LDS per iteration
+#define A_MAX 8    // max ceil(head_dim/LANES) (supports head_dim up to 128)
+#define K_PAD 4    // row-stride padding (16 B: keeps float4 LDS alignment)
+#define S_PAD 1    // probability-tile stride padding across subgroups
 
-extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
+extern "C" __global__ __launch_bounds__(1024, 1) void vit_attention_qtiled_f32(
     const float* __restrict__ qkv,   // [N, 3*hidden] row-major, interleaved Q/K/V
     float* __restrict__ out,         // [N, hidden] row-major
-    int N, int hidden, int num_heads, int head_dim, float scale)
+    int N, int hidden, int num_heads, int head_dim, float scale, int qpb)
 {
     const int head = blockIdx.x;
-    const int q0 = blockIdx.y * QB;
+    const int nqb = qpb;              // queries per block, host-sized (16..64)
+    const int q0 = blockIdx.y * nqb;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     if (head >= num_heads || q0 >= N) return;
+    // The host sizes qpb so the LDS carve-up fits (vit_qtiled_launch, unit-
+    // tested against this carve-up). A block launched outside that contract
+    // computes nothing rather than reading past its LDS.
+    if (nqb < LANES || (nqb % LANES) != 0 || nqb * LANES > 1024) return;
 
     const int qid = tid / LANES;      // which query this subgroup owns
     const int lane = tid % LANES;
     const int qi = q0 + qid;
-    const int nq = min(QB, N - q0);   // queries live in this block
+    const int nq = min(nqb, N - q0);  // queries live in this block
     const bool alive = qid < nq;
 
     const int stride = 3 * hidden;
     const int q_off = head * head_dim;
     const int k_off = hidden + head * head_dim;
     const int v_off = 2 * hidden + head * head_dim;
-    const int A = (head_dim + LANES - 1) / LANES;   // out elements owned per lane; tail guarded by d < head_dim
+    // Out elements owned per lane; the tail above head_dim is skipped by
+    // the `d < head_dim` guards below.
+    const int A = (head_dim + LANES - 1) / LANES;
+
+    const int K_STRIDE = head_dim + K_PAD;
+    const int Q_STRIDE = head_dim + K_PAD;
+    const int S_STRIDE = K_TILE + S_PAD;
 
     extern __shared__ float smem[];
-    float* k_tile  = smem;                       // [K_TILE * head_dim]
-    float* q_tile  = k_tile + K_TILE * head_dim; // [QB * head_dim]
-    float* s_tile  = q_tile + QB * head_dim;     // [QB * K_TILE]
-    float* ws_max  = s_tile + QB * K_TILE;       // [QB * LANES]
-    float* ws_sum  = ws_max + QB * LANES;        // [QB * LANES]
-    float* m_l     = ws_sum + QB * LANES;        // [QB * 2] running (max, sum)
-    float* out_run = m_l + QB * 2;               // [QB * head_dim]
+    float* k_tile = smem;                             // [K_TILE * K_STRIDE]
+    float* v_tile = k_tile + K_TILE * K_STRIDE;       // [K_TILE * K_STRIDE]
+    float* q_tile = v_tile + K_TILE * K_STRIDE;       // [nqb * Q_STRIDE]
+    float* s_tile = q_tile + nqb * Q_STRIDE;          // [nqb * S_STRIDE]
+    float* ws_max = s_tile + nqb * S_STRIDE;          // [nqb * LANES]
+    float* ws_sum = ws_max + nqb * LANES;             // [nqb * LANES]
+    float* m_l    = ws_sum + nqb * LANES;             // [nqb * 2] running (max, sum)
 
     // Load this block's Q rows once.
     for (int i = tid; i < nq * head_dim; i += nthreads) {
         int q = i / head_dim, d = i % head_dim;
-        q_tile[q * head_dim + d] = qkv[(q0 + q) * stride + q_off + d];
+        q_tile[q * Q_STRIDE + d] = qkv[(q0 + q) * stride + q_off + d];
     }
     if (alive && lane == 0) {
         m_l[qid * 2 + 0] = -INFINITY;
         m_l[qid * 2 + 1] = 0.0f;
     }
-    for (int i = tid; i < nq * head_dim; i += nthreads) out_run[i] = 0.0f;
-    __syncthreads();
+    // Running output in registers: this lane owns up to `A` elements of its
+    // query (d = lane + a*LANES), so there is no cross-lane sharing to pay
+    // LDS for.
+    float out_reg[A_MAX];
+    for (int a = 0; a < A; a++) out_reg[a] = 0.0f;
 
     float s_reg[A_MAX];  // this lane's scores/p for the current tile
+    __syncthreads();
 
     for (int t0 = 0; t0 < N; t0 += K_TILE) {
         const int tlen = min(K_TILE, N - t0);
 
-        // Cooperative K tile load.
+        // Cooperative K+V tile load (coalesced over head_dim).
         for (int i = tid; i < tlen * head_dim; i += nthreads) {
             int j = i / head_dim, d = i % head_dim;
-            k_tile[j * head_dim + d] = qkv[(t0 + j) * stride + k_off + d];
+            k_tile[j * K_STRIDE + d] = qkv[(t0 + j) * stride + k_off + d];
+            v_tile[j * K_STRIDE + d] = qkv[(t0 + j) * stride + v_off + d];
         }
         __syncthreads();
 
@@ -92,10 +129,38 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
             for (int jj = 0; jj < K_TILE / LANES; jj++) {
                 int j = lane + jj * LANES;
                 if (j < tlen) {
-                    const float* qrow = q_tile + qid * head_dim;
-                    const float* krow = k_tile + j * head_dim;
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim; d++) dot += qrow[d] * krow[d];
+                    const float* qrow = q_tile + qid * Q_STRIDE;
+                    const float* krow = k_tile + j * K_STRIDE;
+                    float dot;
+                    if ((head_dim & 3) == 0) {
+                        // Four independent accumulator chains over float4 LDS
+                        // loads: a single accumulator exposes the full FMA
+                        // latency chain and was the measured bottleneck at
+                        // two warps/SIMD. 16-byte alignment holds because
+                        // head_dim % 4 == 0 keeps Q_STRIDE a float4 multiple.
+                        const float4* qv = (const float4*)qrow;
+                        const float4* kv4 = (const float4*)krow;
+                        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                        const int nq4 = head_dim >> 2;
+                        #pragma unroll 4
+                        for (int d4 = 0; d4 < nq4; d4++) {
+                            const float4 qa = qv[d4];
+                            const float4 ka = kv4[d4];
+                            a0 = fmaf(qa.x, ka.x, a0);
+                            a1 = fmaf(qa.y, ka.y, a1);
+                            a2 = fmaf(qa.z, ka.z, a2);
+                            a3 = fmaf(qa.w, ka.w, a3);
+                        }
+                        dot = (a0 + a1) + (a2 + a3);
+                    } else {
+                        // Widths that are not float4 multiples (e.g. 70) fall
+                        // back to one scalar chain; correctness over speed,
+                        // since no VisionTower contract ships such a head.
+                        float acc = 0.0f;
+                        for (int d = 0; d < head_dim; d++)
+                            acc = fmaf(qrow[d], krow[d], acc);
+                        dot = acc;
+                    }
                     float s = dot * scale;
                     s_reg[jj] = s;
                     smax = fmaxf(smax, s);
@@ -122,7 +187,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
                 int j = lane + jj * LANES;
                 float p = (j < tlen) ? expf(s_reg[jj] - m_new) : 0.0f;
                 s_reg[jj] = p;
-                s_tile[qid * K_TILE + j] = p;
+                s_tile[qid * S_STRIDE + j] = p;
                 psum += p;
             }
             ws_sum[qid * LANES + lane] = psum;
@@ -140,19 +205,36 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
             for (int l = 0; l < LANES; l++)
                 tsum += ws_sum[qid * LANES + l];
 
-            // Rescale the running output and fold in this tile's P@V.
-            // V comes straight from global: each (j, d) is touched by
-            // exactly one lane of this block.
-            const float* vrow_base = qkv + v_off;
-            for (int a = 0; a < A; a++) {
-                int d = lane + a * LANES;
-                if (d >= head_dim) continue;
-                float acc = out_run[qid * head_dim + d] * r;
-                const float* prow = s_tile + qid * K_TILE;
-                #pragma unroll 8
-                for (int j = 0; j < tlen; j++)
-                    acc += prow[j] * vrow_base[(t0 + j) * stride + d];
-                out_run[qid * head_dim + d] = acc;
+            // Rescale this lane's running output, then fold in P@V with `p`
+            // hoisted into a register and V read from LDS (reading `p` inside
+            // the `a` loop re-read it A times per key for one multiply).
+            // Exact widths (head_dim % LANES == 0, every shipped tower but
+            // the Qwen ViT's 72) take a guard-free loop: the per-element
+            // `d < head_dim` compare measured 122.0 -> 140.9 ms/call at
+            // N=7564 when it ran on every shape.
+            const float* prow = s_tile + qid * S_STRIDE;
+            const bool exact = (head_dim % LANES) == 0;
+            #pragma unroll
+            for (int a = 0; a < A; a++) out_reg[a] *= r;
+            if (exact) {
+                for (int j = 0; j < tlen; j++) {
+                    const float p = prow[j];
+                    const float* vrow = v_tile + j * K_STRIDE;
+                    #pragma unroll
+                    for (int a = 0; a < A; a++)
+                        out_reg[a] = fmaf(p, vrow[lane + a * LANES], out_reg[a]);
+                }
+            } else {
+                for (int j = 0; j < tlen; j++) {
+                    const float p = prow[j];
+                    const float* vrow = v_tile + j * K_STRIDE;
+                    #pragma unroll
+                    for (int a = 0; a < A; a++) {
+                        const int d = lane + a * LANES;
+                        if (d < head_dim)
+                            out_reg[a] = fmaf(p, vrow[d], out_reg[a]);
+                    }
+                }
             }
             if (lane == 0) {
                 m_l[qid * 2 + 0] = m_new;
@@ -165,11 +247,15 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
     // Normalize and write out.
     if (alive) {
         const float l = m_l[qid * 2 + 1];
-        for (int a = 0; a < A; a++) {
-            int d = lane + a * LANES;
-            if (d >= head_dim) continue;
-            out[qi * hidden + head * head_dim + d] =
-                out_run[qid * head_dim + d] / l;
+        const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+        float* orow = out + qi * hidden + head * head_dim;
+        if ((head_dim % LANES) == 0) {
+            for (int a = 0; a < A; a++) orow[lane + a * LANES] = out_reg[a] * inv;
+        } else {
+            for (int a = 0; a < A; a++) {
+                const int d = lane + a * LANES;
+                if (d < head_dim) orow[d] = out_reg[a] * inv;
+            }
         }
     }
 }

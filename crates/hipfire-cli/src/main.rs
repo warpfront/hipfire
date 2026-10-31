@@ -16945,6 +16945,7 @@ effort = "high"
                         allow_pull: false,
                         allow_paths: false,
                         operator_model: None,
+                        operator_path: None,
                     },
                     max_batch_tokens: 4096,
                 }),
@@ -16957,6 +16958,7 @@ effort = "high"
                 backoff_hook: Mutex::new(None),
                 stream_stall_timeout: None,
                 ui_enabled: false,
+                ocr_format: None,
                 api_key,
             });
 
