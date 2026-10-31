@@ -1106,12 +1106,20 @@ name = "head_batch_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "gdn_lanes_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_gdn_oracle"
 required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "lane_fa_oracle"
 required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "qsa_lanes_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "qwen4_mq4_x4_pm_oracle"

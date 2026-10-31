@@ -1324,12 +1324,23 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-gdn-core-lanes",
         predicates: &[IsRecording],
-        condition: "gated_delta_core_lanes (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive one-row GDN Core steps with Q8 states, HIPFIRE_QWEN4_GDN_LANES (exact gfx1151 default on, 0 kills) and `!is_recording()`",
+        condition: "gated_delta_core_lanes (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive one-row GDN Core steps with Q8 states, HIPFIRE_QWEN4_GDN_LANES (exact gfx1151 default on, exact gfx1201 opt-in `=1` and default off, 0 kills) and `!is_recording()`",
         effect: KernelSelection,
         switches: "eager lane step: gdn_lanes (gated_delta_conv_params_bf16_f32_lanes, gated_delta_step_gate_norm128_q8_lanes), one launch per kernel for every lane; recorded: the per-lane incumbent launches",
         kernels: &["gated_delta_conv_params_bf16_f32", "gated_delta_step_gate_norm128_q8"],
         verdict: ByteExact,
-        evidence: "fn_lane_oracle on gfx1151 (Flash-Next GPTQ3 MQ4): k = 1/2/8 lanes, every lane step and state checkpoint byte-identical to the singleton forward",
+        evidence: "gfx1151: fn_lane_oracle (Flash-Next GPTQ3 MQ4): k = 1/2/8 lanes, every lane step and state checkpoint byte-identical to the singleton forward. gfx1201 (opt-in, default off): the same device bodies in the same translation unit and compile recipe (the `gdn_lanes` module = `tensor_ops` + gdn_lanes.hip); kernel byte oracle rdna-compute examples/gdn_lanes_oracle (N = 1..8 lanes, ragged cursors and Q8 frames, carried state) is the gating receipt, not yet run on gfx1201 hardware at this commit",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-qsa-core-lanes",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "qsa_core_lanes_min (qsa_core_lanes.rs): 2..=QSA_CORE_LANES_MAX consecutive QSA Core steps (fp8 K/V, BF16 index keys, 1..=8 rows per lane, fused LDS-resident select below QSA_BF16_SPLIT_MIN_BLOCKS, per-head attention), HIPFIRE_QWEN4_QSA_LANES (exact gfx1201, default off) and `!is_recording() && !capture_mode`",
+        effect: KernelSelection,
+        switches: "eager lane step: qsa_lanes (indexed_attention_decode_prologue_fp8_lanes, indexed_attention_pool_rope_bf16_lanes, indexed_attention_select_bf16_lanes, indexed_attention_attention_fp8_lanes), one launch per kernel for every lane; recorded or captured: the per-lane incumbent launches",
+        kernels: &["indexed_attention_decode_prologue_fp8", "indexed_attention_pool_rope_bf16", "indexed_attention_select_bf16_batched", "indexed_attention_attention_fp8_batched"],
+        verdict: ByteExact,
+        evidence: "by construction: the lane kernels call the incumbent device templates (qsa_decode_prologue, qsa_pool_rope, qsa_select_batched, qsa_attention_row_parallel) on lane-derived pointers, positions and rows; the GPU byte oracle rdna-compute examples/qsa_lanes_oracle (per-lane singleton launches vs the grouped launches, N = 1..8 lanes, rows 1..8, cross-block-boundary and budget-saturating contexts, negative controls) is staged but has not run on a GPU yet",
         reaches: &[],
     },
     Decision {
@@ -3687,6 +3698,12 @@ pub const SITES: &[Site] = &[
         function: "gated_delta_core_lanes",
         occurrences: 1,
         decisions: &["qwen4-gdn-core-lanes"],
+    },
+    Site {
+        file: "rdna-compute/src/qsa_core_lanes.rs",
+        function: "qsa_core_lanes_min",
+        occurrences: 2,
+        decisions: &["qwen4-qsa-core-lanes"],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",
