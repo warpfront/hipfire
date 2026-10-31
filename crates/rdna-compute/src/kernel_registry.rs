@@ -11111,6 +11111,21 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // DFlash2 draft: few-row F16 `fc` GEMM and the block-parallel tie-row top-K recompute.
+        const DRAFT_SKINNY_TIE_ADDED_MODULES: [&str; 2] =
+            ["gemm_f16_skinny_xf32", "topk_values_tie_exact"];
+        for module in DRAFT_SKINNY_TIE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing DFlash2 draft module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // BF16-weight GEMMs (batched + x-stationary tiled) for the Raon mHC selector
         // and grouped-MoE router.
         const BF16_XF32_ROWS_ADDED_MODULES: [&str; 2] =
@@ -11216,7 +11231,8 @@ mod tests {
                 + BF16_XF32_ROWS_ADDED_MODULES.len()
                 + Q8_0_MMQ_ACT_ADDED_MODULES.len()
                 + FFN_ROTATE_I8_ADDED_MODULES.len()
-                + QSA_LANES_ADDED_MODULES.len(),
+                + QSA_LANES_ADDED_MODULES.len()
+                + DRAFT_SKINNY_TIE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
