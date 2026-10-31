@@ -32,12 +32,18 @@ pub const GATED_DELTA_VECTOR_HEAD_DIM: usize = 128;
 pub const CAUSAL_CONV_ROWS_KMAX: usize = 8;
 const CONV_ROWS_PER_CHUNK: usize = 64;
 
-fn refuse(msg: String) -> HipError {
+pub(crate) fn refuse(msg: String) -> HipError {
     HipError::new(0, &msg)
 }
 
 /// Check that `t` (F32) holds at least `(rows-1)*row_stride + extent` elements.
-fn need(t: &GpuTensor, what: &str, rows: usize, row_stride: usize, extent: usize) -> HipResult<()> {
+pub(crate) fn need(
+    t: &GpuTensor,
+    what: &str,
+    rows: usize,
+    row_stride: usize,
+    extent: usize,
+) -> HipResult<()> {
     if rows == 0 {
         return Ok(());
     }
@@ -54,7 +60,7 @@ fn need(t: &GpuTensor, what: &str, rows: usize, row_stride: usize, extent: usize
     Ok(())
 }
 
-fn i32_of(v: usize, what: &str) -> HipResult<i32> {
+pub(crate) fn i32_of(v: usize, what: &str) -> HipResult<i32> {
     i32::try_from(v).map_err(|_| refuse(format!("{what}: {v} exceeds i32")))
 }
 
