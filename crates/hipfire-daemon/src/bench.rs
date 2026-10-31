@@ -167,7 +167,7 @@ pub(crate) fn handle_bench_prefill(
             return;
         }
     }
-    if !bench_route.uses_carrier_hooks() {
+    if bench_route.is_mesh() {
         if let Err(reason) = hipfire_generate::bench_topology::quiesce_mesh(bench_route, m) {
             emit_uncorrelated_error(
                 stdout,
@@ -589,7 +589,7 @@ pub(crate) fn handle_bench_decode(
         gpu.replay.begin_replay_observation_window();
     }
     let replay_before = gpu.replay.replay_observation();
-    if !bench_route.uses_carrier_hooks() {
+    if bench_route.is_mesh() {
         if let Err(reason) = hipfire_generate::bench_topology::quiesce_mesh(bench_route, m) {
             emit_uncorrelated_error(
                 stdout,

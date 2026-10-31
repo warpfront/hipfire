@@ -14,6 +14,11 @@ pub mod decide;
 /// admission, byte extents, bpw census. Default-off (`HIPFIRE_GGUF_NATIVE=1`).
 pub mod gguf_native;
 mod qwen4_slab;
+pub mod topology_caps;
+pub use topology_caps::{
+    pp_degree_refusal, topology_axes_refusal, EpCaps, PpBenchRoute, PpCaps, PpExecutor,
+    TopologyCaps, TpCaps,
+};
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
@@ -23,6 +28,7 @@ pub mod spec_build;
 #[cfg(target_os = "linux")]
 pub use hipfire_arch_qwen4::npu_trunk::set_diagnostic_gpu_route;
 
+use crate::bench_topology::EpKind;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -79,22 +85,85 @@ pub trait Carrier: Send + Sync {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
     /// Read-only admission refusal for a topology/shape combination this
-    /// carrier cannot serve. Runs before any allocation or collective so a
-    /// refusal leaves no side effect (device-mesh G2 admission). Default:
-    /// pipeline-parallel (pp>1) is unsupported; HFQ and Dir get distinct
-    /// messages matching each carrier's load-time refusal. Qwen3.5 overrides —
-    /// it is the only carrier with a pp>1 path (`load_qwen35_pp`).
+    /// carrier cannot serve beyond what [`Carrier::topology_caps`] already
+    /// decided. Runs before any allocation or collective so a refusal leaves
+    /// no side effect (device-mesh G2 admission). The axis verdicts (an
+    /// undeclared `topology.pp` / `topology.ep` / `--tp N`, directory sources
+    /// on an HFQ-only axis, the declared pipeline degree bound) are the
+    /// admission front door's, keyed on the declaration; the default accepts.
     fn admit_topology(
         &self,
         _arch_id: u32,
-        is_dir: bool,
-        pp: usize,
+        _is_dir: bool,
+        _pp: usize,
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
-        if pp > 1 {
-            return Err(pp_unsupported_message(self.name(), is_dir, pp));
-        }
         Ok(())
+    }
+
+    /// The multi-GPU axes this carrier declares (`topology.pp`,
+    /// `topology.ep`, `--tp N`). Default: none, so every multi-card request
+    /// is refused at admission with the uniform topology sentence.
+    fn topology_caps(&self) -> TopologyCaps {
+        TopologyCaps::default()
+    }
+
+    /// Layer count the pipeline bands partition. Default: the generic source
+    /// metadata (`n_layers` of the HFQ metadata JSON / directory config).
+    fn pp_layer_count(&self, src: &ModelSource) -> Result<usize, String> {
+        admission::source_n_layers(src).ok_or_else(|| {
+            format!(
+                "{} pipeline admission: layer count unavailable",
+                self.name()
+            )
+        })
+    }
+
+    /// The mesh axis `--tp N` shards over for this source: [`DimKind::Ep`] for
+    /// a MoE model (experts sharded), [`DimKind::Tp`] for a dense one. May
+    /// refuse a degree the model cannot be sharded at. Only called for
+    /// carriers that declare `tp`.
+    fn tp_mesh_axis(&self, src: &ModelSource, tp: usize) -> Result<DimKind, String> {
+        Err(hipfire_runtime::loader_api::topology_refusal(
+            self.name(),
+            hipfire_runtime::loader_api::TopologyAxis::Tp,
+            tp,
+            src.is_dir(),
+        ))
+    }
+
+    /// Load an admitted `--tp N` source (expert/tensor parallel). Only called
+    /// for carriers that declare `tp`; the default is the uniform refusal.
+    fn load_tp(
+        &self,
+        _admission: admission::SourceAdmission,
+        args: TpLoadArgs<'_>,
+    ) -> Result<LoadedModel, String> {
+        Err(hipfire_runtime::loader_api::topology_refusal(
+            self.name(),
+            hipfire_runtime::loader_api::TopologyAxis::Tp,
+            args.tp,
+            false,
+        ))
+    }
+
+    /// `load_model_ep_with_compressor_cache`'s per-carrier route: an explicit
+    /// DeepSeek V4 compressor-cache policy. Only called for carriers that
+    /// declare `tp`; a carrier the setting does not apply to refuses it
+    /// with its own sentence.
+    fn load_tp_with_compressor_cache(
+        &self,
+        _path: &str,
+        _max_seq: usize,
+        tp: usize,
+        _compressor_cache: hipfire_config::Deepseek4CompressorCache,
+    ) -> Result<LoadedModel, String> {
+        Err(hipfire_runtime::loader_api::topology_refusal(
+            self.name(),
+            hipfire_runtime::loader_api::TopologyAxis::Tp,
+            tp,
+            false,
+        ))
     }
 
     /// Read-only, per-carrier request-option refusal before GPU allocation.
@@ -519,34 +588,52 @@ impl WireVerb {
     }
 }
 
-/// EP prompt construction route. DeepSeek4 (arch 9) uses the DSML prompt
-/// builder; all other EP arches (10 MiniMax, etc.) use Jinja.
+/// EP prompt construction route. DeepSeek4 uses the DSML prompt builder; every
+/// other EP server (MiniMax, Qwen3.5) uses Jinja.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpPromptRoute {
     Dsml,
     Jinja,
 }
-pub fn ep_prompt_route(arch_id: u32) -> EpPromptRoute {
-    match arch_id {
-        9 => EpPromptRoute::Dsml,
-        _ => EpPromptRoute::Jinja,
-    }
-}
 
-/// EP EOS token selection route. MiniMax (10) carries its own EOS; all others
-/// (including DeepSeek4) use `deepseek4_eos_tok`.
+/// EP EOS token selection route. MiniMax carries its own EOS; Qwen3.5 (MoE EP
+/// and dense TP) its own; DeepSeek4 uses `deepseek4_eos_tok`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpEosRoute {
     Deepseek4,
     Minimax,
     Qwen35,
 }
-pub fn ep_eos_route(arch_id: u32) -> EpEosRoute {
-    match arch_id {
-        10 => EpEosRoute::Minimax,
-        5 | 6 => EpEosRoute::Qwen35,
-        _ => EpEosRoute::Deepseek4,
+
+impl EpKind {
+    /// Prompt route of this server kind.
+    pub fn prompt_route(self) -> EpPromptRoute {
+        match self {
+            EpKind::Ds4 => EpPromptRoute::Dsml,
+            EpKind::Minimax | EpKind::Qwen35Moe | EpKind::Qwen35DenseTp => EpPromptRoute::Jinja,
+        }
     }
+
+    /// EOS route of this server kind.
+    pub fn eos_route(self) -> EpEosRoute {
+        match self {
+            EpKind::Ds4 => EpEosRoute::Deepseek4,
+            EpKind::Minimax => EpEosRoute::Minimax,
+            EpKind::Qwen35Moe | EpKind::Qwen35DenseTp => EpEosRoute::Qwen35,
+        }
+    }
+}
+
+/// Prompt route of the loaded EP server (`None`: no EP state, the Jinja
+/// default).
+pub fn ep_prompt_route(ep: Option<&EpArch>) -> EpPromptRoute {
+    ep.map_or(EpPromptRoute::Jinja, |ep| ep.kind().prompt_route())
+}
+
+/// EOS route of the loaded EP server (`None`: no EP state, the DeepSeek4
+/// default read).
+pub fn ep_eos_route(ep: Option<&EpArch>) -> EpEosRoute {
+    ep.map_or(EpEosRoute::Deepseek4, |ep| ep.kind().eos_route())
 }
 
 /// Early generation short-circuit route (Gemma4 eager, Glimmer eager).
@@ -1699,6 +1786,16 @@ pub enum EpArch {
 }
 
 impl EpArch {
+    /// Which expert-/tensor-sharded server this load is.
+    pub fn kind(&self) -> EpKind {
+        match self {
+            EpArch::Ds4 { .. } => EpKind::Ds4,
+            EpArch::Minimax { .. } => EpKind::Minimax,
+            EpArch::Qwen35 { .. } => EpKind::Qwen35Moe,
+            EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. } => EpKind::Qwen35DenseTp,
+        }
+    }
+
     /// Whether this EP load's serve loop applies a request's repeat, presence
     /// and frequency penalties to its logits. The Qwen3.5 loops (dense TP on
     /// either route, MoE EP) do, over rank 0's logits with the single-GPU host
@@ -4701,10 +4798,9 @@ pub fn qwen35_ep_moe_topology_refusal(
     None
 }
 
-/// Message constructor shared by [`ep_admission`], admission's `tp>1` branch and
-/// the per-entry match backstops so the refusal text cannot drift between them.
-/// The family is the carrier name for `arch_id` (`arch{id}` only where no
-/// carrier claims the id).
+/// Message constructor shared by [`ep_admission`] and the per-entry
+/// backstops so the refusal text cannot drift between them. The family is the
+/// carrier name for `arch_id` (`arch{id}` only where no carrier claims the id).
 pub(crate) fn ep_unsupported_arch_message(arch_id: u32, tp: usize) -> String {
     let family = carrier_for(arch_id)
         .map(|carrier| carrier.name().to_string())
@@ -4717,17 +4813,16 @@ pub(crate) fn ep_unsupported_arch_message(arch_id: u32, tp: usize) -> String {
     )
 }
 
-/// EP load admission by arch_id. Only archs with an `EpArch` variant may enter
-/// expert-parallel load (9/DeepSeek4, 10/MiniMax, 5|6/Qwen3.5); LFM2 (11),
-/// Cohere2 (12) and anything else must fail here — right after the host-side
-/// HFQ probe, before any device init — otherwise they would reach
+/// EP load admission by arch_id: the carrier that claims `arch_id` and
+/// declares `--tp N` ([`Carrier::topology_caps`]) may enter expert/tensor
+/// parallel load; anything else (LFM2, Cohere2, ...) fails here — right after
+/// the host-side HFQ probe, before any device init — otherwise it would reach
 /// `generate_ep` with no correct server. Pure so the contract is
 /// unit-testable; both `load_model_ep_*` entries call it before dispatching.
-pub fn ep_admission(arch_id: u32, tp: usize) -> Result<(), String> {
-    match arch_id {
-        5 | 6 | 9 | 10 => Ok(()),
-        id => Err(ep_unsupported_arch_message(id, tp)),
-    }
+pub fn ep_admission(arch_id: u32, tp: usize) -> Result<&'static dyn Carrier, String> {
+    carrier_for(arch_id)
+        .filter(|carrier| carrier.topology_caps().tp.is_some())
+        .ok_or_else(|| ep_unsupported_arch_message(arch_id, tp))
 }
 
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
@@ -4862,11 +4957,25 @@ pub fn load_model_ep_with_kv_mode(
     loaded
 }
 
-/// Dispatch an already-admitted expert-parallel source on its `arch_id` —
-/// admission's classification is not repeated. Unlike the single/pp route,
-/// the per-arch EP loaders still re-open `path` per rank, so the retained
-/// `SourceAdmission.source` is dropped here rather than consumed. Destructive
-/// (per-rank allocation + collectives) begins inside the per-arch loaders.
+/// Everything an admitted `--tp N` load needs beyond the admission record.
+/// The per-arch EP loaders re-open `path` per rank.
+pub struct TpLoadArgs<'a> {
+    pub path: &'a str,
+    pub tp: usize,
+    pub kv_mode: Option<&'a str>,
+    pub kv_k: Option<&'a str>,
+    pub kv_v: Option<&'a str>,
+    pub state_quant: Option<&'a str>,
+    pub mtp_path: Option<&'a Path>,
+    pub spec: hipfire_runtime::loader_api::SpecLoadCfg,
+}
+
+/// Dispatch an already-admitted expert-parallel source to the carrier that
+/// declares `--tp N` for it — admission's classification is not repeated.
+/// Unlike the single/pp route, the per-arch EP loaders still re-open `path`
+/// per rank, so the retained `SourceAdmission.source` is dropped by the
+/// carrier rather than consumed. Destructive (per-rank allocation +
+/// collectives) begins inside the per-arch loaders.
 pub fn load_model_ep_admitted(
     admission: crate::admission::SourceAdmission,
     path: &str,
@@ -4879,37 +4988,23 @@ pub fn load_model_ep_admitted(
     mtp_path: Option<&Path>,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
-    let kv_backend = admission.kv_backend;
-    let qwen_default_q8 = admission.qwen_default_q8;
-    let max_seq = admission.max_seq;
-    match admission.arch_id {
-        9 => load_model_ep_ds4(
+    // Backstop: `admit_source` already refused every carrier that does not
+    // declare `--tp N`; the shared constructor keeps this message from
+    // drifting from `ep_admission`'s.
+    let carrier = ep_admission(admission.arch_id, tp)?;
+    carrier.load_tp(
+        admission,
+        TpLoadArgs {
             path,
-            max_seq,
-            tp,
-            resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
-            kv_backend,
-        ),
-        10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 => load_model_ep_qwen35(
-            path,
-            max_seq,
             tp,
             kv_mode,
             kv_k,
             kv_v,
-            qwen_default_q8,
-            Some(kv_backend.as_str()),
             state_quant,
             mtp_path,
             spec,
-        ),
-        // Backstop: `admit_source` above already refused every other arch_id.
-        // Route through the shared constructor (not `unreachable!`) so the
-        // refusal survives a future edit that drops the early classification,
-        // and so this message never drifts from `ep_admission`'s.
-        id => Err(ep_unsupported_arch_message(id, tp)),
-    }
+        },
+    )
 }
 
 /// Expert-parallel load with an explicit DeepSeek V4 compressor-cache storage
@@ -4922,25 +5017,10 @@ pub fn load_model_ep_with_compressor_cache(
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    // Admission: refuse archs with no `EpArch` before any per-arch device init.
-    ep_admission(hfq.arch_id, tp)?;
-    match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, tp, compressor_cache, KvBackend::Vmm),
-        10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_minimax(path, max_seq, tp)
-        }
-        10 => Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to MiniMax models; remove it for this model".to_string()),
-        5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_with_kv_mode(path, max_seq, tp, None, None, None)
-        }
-        5 | 6 => {
-            Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to Qwen3.5 models; remove it for this model".to_string())
-        }
-        // Backstop: `ep_admission` above already refused these; route through the
-        // shared constructor (not `unreachable!`) so the refusal survives a
-        // future edit that drops the early call.
-        id => Err(ep_unsupported_arch_message(id, tp)),
-    }
+    // Admission: refuse carriers that do not declare `--tp N` before any
+    // per-arch device init.
+    let carrier = ep_admission(hfq.arch_id, tp)?;
+    carrier.load_tp_with_compressor_cache(path, max_seq, tp, compressor_cache)
 }
 
 fn load_model_ep_ds4(
@@ -6799,7 +6879,7 @@ mod ep_admission_tests {
         // LFM2 (11), Cohere2 (12) and anything else with no `EpArch` variant:
         for arch in [11u32, 12, 13, 0, 99] {
             let err = match ep_admission(arch, 2) {
-                Ok(()) => panic!("arch {arch} + EP must refuse"),
+                Ok(_) => panic!("arch {arch} + EP must refuse"),
                 Err(e) => e,
             };
             let family = super::carrier_for(arch)
@@ -7498,8 +7578,8 @@ mod registry_tests {
         use super::{
             bench_decode_route, continuous_batch_route, ep_eos_route, ep_prompt_route,
             generation_early_route, img_route, vision_route, BenchDecodeRoute,
-            ContinuousBatchRoute, EpEosRoute, EpPromptRoute, GenerationEarlyRoute, ImgRoute,
-            VisionRoute,
+            ContinuousBatchRoute, EpEosRoute, EpKind, EpPromptRoute, GenerationEarlyRoute,
+            ImgRoute, VisionRoute,
         };
         use saddle_core::caps::{ArchCaps, DflashKind, ReasoningContract};
 
@@ -7649,24 +7729,28 @@ mod registry_tests {
             assert_eq!(img_route(id), want, "img_route({id})");
         }
 
-        // ── ep_prompt_route: 9 -> Dsml, everything else Jinja ──
-        for id in 0u32..=14 {
-            let want = if id == 9 {
-                EpPromptRoute::Dsml
-            } else {
-                EpPromptRoute::Jinja
-            };
-            assert_eq!(ep_prompt_route(id), want, "ep_prompt_route({id})");
+        // ── EP prompt route: DeepSeek4 -> Dsml, every other server Jinja;
+        // no EP state keeps the Jinja default ──
+        assert_eq!(ep_prompt_route(None), EpPromptRoute::Jinja);
+        for (kind, want) in [
+            (EpKind::Ds4, EpPromptRoute::Dsml),
+            (EpKind::Minimax, EpPromptRoute::Jinja),
+            (EpKind::Qwen35Moe, EpPromptRoute::Jinja),
+            (EpKind::Qwen35DenseTp, EpPromptRoute::Jinja),
+        ] {
+            assert_eq!(kind.prompt_route(), want, "{kind:?}");
         }
 
-        // ── ep_eos_route: Qwen, MiniMax and DeepSeek carry distinct EOS ──
-        for id in 0u32..=14 {
-            let want = match id {
-                5 | 6 => EpEosRoute::Qwen35,
-                10 => EpEosRoute::Minimax,
-                _ => EpEosRoute::Deepseek4,
-            };
-            assert_eq!(ep_eos_route(id), want, "ep_eos_route({id})");
+        // ── EP EOS route: Qwen (MoE and dense TP), MiniMax and DeepSeek carry
+        // distinct EOS; no EP state keeps the DeepSeek4 default ──
+        assert_eq!(ep_eos_route(None), EpEosRoute::Deepseek4);
+        for (kind, want) in [
+            (EpKind::Ds4, EpEosRoute::Deepseek4),
+            (EpKind::Minimax, EpEosRoute::Minimax),
+            (EpKind::Qwen35Moe, EpEosRoute::Qwen35),
+            (EpKind::Qwen35DenseTp, EpEosRoute::Qwen35),
+        ] {
+            assert_eq!(kind.eos_route(), want, "{kind:?}");
         }
 
         // ── generation_early_route: 13 -> Gemma4, 14 -> MuseGlimmer; arch 22
