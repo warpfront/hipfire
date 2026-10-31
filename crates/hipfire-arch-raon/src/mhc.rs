@@ -40,6 +40,19 @@ pub const RAON_POST_FACTOR: f32 = 2.0;
 /// Weightless selector RMS epsilon (`raon_mhc_selector_eps`).
 pub const RAON_SELECTOR_EPS: f32 = 1e-5;
 
+/// Whether the mHC stream ping-pong planes are stored as BF16 bits (the values
+/// they carry are bf16-rounded at every write, so this is lossless and halves
+/// every four-stream pass). Default ON (bit-identical values); requires `HIPFIRE_RAON_MHC_FUSED` not `0` (the
+/// fused route+aggregate is the only reader besides the selector GEMM, postmix
+/// and mean) and `HIPFIRE_RAON_MHC_BF16_STREAMS=1`, and a geometry the fused
+/// kernel is instantiated for. `HIPFIRE_RAON_MHC_FUSED=0` kills both.
+pub fn bf16_streams_enabled(streams: usize, width: usize) -> bool {
+    Gpu::stream_mix_route_aggregate_supported(streams, width)
+        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", false)
+        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_BF16_STREAMS", false)
+        && crate::weights::mhc_selectors_all_bf16()
+}
+
 /// Geometry and numerics of every mHC site of one model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RaonMhcShape {
@@ -309,6 +322,38 @@ impl RaonMhcSite {
             rows,
             StreamMixStage::Aggregate {
                 streams,
+                controls: work.controls(),
+                norm: Some(norm),
+                out,
+            },
+        );
+        execute_stream_mix(gpu, &op).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::route`] then [`Self::aggregate`] as one stage (`pre/post/res` into
+    /// `work`, `out[rows, width]` the normed aggregate). Bit-identical to the two
+    /// calls; with `HIPFIRE_RAON_MHC_FUSED=1` the old streams are read once.
+    pub fn route_aggregate(
+        &self,
+        gpu: &mut Gpu,
+        rows: usize,
+        streams: &GpuTensor,
+        work: &RaonMhcWork,
+        norm: StreamNorm<'_>,
+        out: &GpuTensor,
+    ) -> Result<(), String> {
+        self.check_rows(rows, work)?;
+        let op = self.op(
+            rows,
+            StreamMixStage::RouteAggregate {
+                streams,
+                chart: StreamChart::HelmertBounded {
+                    selector: &self.selector,
+                    params: &self.params,
+                    post_factor: self.shape.post_factor,
+                    selector_eps: self.shape.selector_eps,
+                },
+                selector_out: &work.selector_out,
                 controls: work.controls(),
                 norm: Some(norm),
                 out,

@@ -246,8 +246,13 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
             if !cli.opts.contains_key("kld") {
                 require(&cli.opts, "tokens")?;
             }
-            if !cli.opts.contains_key("teacher") && !cli.opts.contains_key("kld") {
-                return Err("logits needs --teacher F or --kld REF.kldref.bin".into());
+            if !cli.opts.contains_key("teacher")
+                && !cli.opts.contains_key("kld")
+                && !cli.opts.contains_key("dump-layers")
+            {
+                return Err(
+                    "logits needs --teacher F, --dump-layers DIR or --kld REF.kldref.bin".into(),
+                );
             }
             run_fn = raon_oracle::logits::run;
             fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));

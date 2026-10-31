@@ -1091,6 +1091,15 @@ impl Pool {
 static ROWS_BF16_STORED: AtomicUsize = AtomicUsize::new(0);
 static ROWS_BF16_NARROWED: AtomicUsize = AtomicUsize::new(0);
 static ROWS_F32_KEPT: AtomicUsize = AtomicUsize::new(0);
+/// Set when a mHC selector stayed F32 (its values were not all BF16-exact): the
+/// BF16-activation selector GEMMs need a BF16 weight, so BF16 stream planes are
+/// vetoed ([`crate::mhc::bf16_streams_enabled`]).
+static MHC_SELECTOR_F32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// False once the last weight load kept any mHC selector F32.
+pub fn mhc_selectors_all_bf16() -> bool {
+    !MHC_SELECTOR_F32.load(Ordering::Relaxed)
+}
 /// Device bytes the router / selector tensors occupy, and what F32 copies would.
 static ROWS_BYTES_RESIDENT: AtomicUsize = AtomicUsize::new(0);
 static ROWS_BYTES_AS_F32: AtomicUsize = AtomicUsize::new(0);
@@ -1446,6 +1455,9 @@ fn load_mhc_site(
     params[MHC_PARAM_B_POST..MHC_PARAM_B_Z].copy_from_slice(&b_post);
     params[MHC_PARAM_B_Z..].copy_from_slice(&b_z);
     let selector = upload_rows_weight(gpu, &sel, MHC_CONTROLS, w, &format!("{p}.selector"))?;
+    if selector.buf.dtype != DType::BF16 {
+        MHC_SELECTOR_F32.store(true, Ordering::Relaxed);
+    }
     let params_t = match upload_f32_named(gpu, &params, &[MHC_PARAM_LEN], &format!("{p}.params")) {
         Ok(t) => t,
         Err(e) => {
@@ -2018,6 +2030,7 @@ pub fn load_raon_weights(
     ROWS_BF16_STORED.store(0, Ordering::Relaxed);
     ROWS_BF16_NARROWED.store(0, Ordering::Relaxed);
     ROWS_F32_KEPT.store(0, Ordering::Relaxed);
+    MHC_SELECTOR_F32.store(false, Ordering::Relaxed);
     ROWS_BYTES_RESIDENT.store(0, Ordering::Relaxed);
     ROWS_BYTES_AS_F32.store(0, Ordering::Relaxed);
     if index.iter().any(|e| e.quant_type == QT_MQ4V2) && !hfq.mq4v2_symmetric() {

@@ -271,7 +271,9 @@ pub enum TapSite {
 }
 
 /// Observer of the stream state (`[rows, streams, hidden]` F32 holding BF16
-/// values). Oracle only: a tap downloads and is not graph-capturable.
+/// values). Oracle only: a tap downloads and is not graph-capturable. With BF16
+/// stream planes (`HIPFIRE_RAON_MHC_BF16_STREAMS=1`) the forward widens them
+/// exactly into a temporary F32 tensor first, so a tap always sees F32.
 pub type LayerTap<'a> =
     &'a mut dyn FnMut(&mut Gpu, TapSite, &GpuTensor, usize) -> Result<(), String>;
 
@@ -281,11 +283,23 @@ fn fire(
     site: TapSite,
     streams: &GpuTensor,
     rows: usize,
+    width: usize,
 ) -> Result<(), String> {
-    if let Some(t) = tap.as_mut() {
-        (**t)(gpu, site, streams, rows)?;
+    let Some(t) = tap.as_mut() else {
+        return Ok(());
+    };
+    if streams.dtype != rdna_compute::DType::BF16 {
+        return (**t)(gpu, site, streams, rows);
     }
-    Ok(())
+    let wide = gpu
+        .alloc_tensor(&[rows, width], rdna_compute::DType::F32)
+        .map_err(|e| format!("raon1_mini: tap staging alloc: {e:?}"))?;
+    let r = gpu
+        .stream_mix_widen_rows(streams, &wide, rows, width, width, 0)
+        .map_err(|e| format!("raon1_mini: tap widen: {e:?}"))
+        .and_then(|()| (**t)(gpu, site, &wide, rows));
+    let _ = gpu.free_tensor(wide);
+    r
 }
 
 /// Fire a stage tap with the first `rows` rows of a `[cap_rows, width]` plane
@@ -557,6 +571,16 @@ fn capture_streams(
 ) -> Result<(), String> {
     let width = cfg.mhc_streams * cfg.hidden;
     let (dst_stride, dst_col) = capture_geometry(cap.layers.len(), width, cap.row0, k);
+    if streams.dtype == rdna_compute::DType::BF16 {
+        return gpu
+            .stream_mix_widen_rows(streams, cap.dst, rows, width, dst_stride, dst_col)
+            .map_err(|e| {
+                format!(
+                    "raon1_mini: DFlash capture of layer {}: {e:?}",
+                    cap.layers[k]
+                )
+            });
+    }
     gpu.copy_rows_strided_f32(
         streams, cap.dst, rows, width, width, dst_stride, dst_col, None,
     )
@@ -669,19 +693,24 @@ fn run_mix(gpu: &mut Gpu, op: &StreamMixOp<'_>) -> Result<(), String> {
 }
 
 /// Controls of one site from the OLD streams (selector/params are the loaded
-/// `[17, n*hidden]` F32 matrix and the F32 parameter vector of the site).
-fn mhc_route(
+/// `[17, n*hidden]` BF16 (or F32) matrix and the F32 parameter vector of the
+/// site) and its branch input `out = RMSNorm(round(sum_s pre_s X_s))`. One stage:
+/// with `HIPFIRE_RAON_MHC_FUSED=1` the old streams are read once for the weightless
+/// RMS and the aggregate; otherwise the stage launches route then aggregate.
+fn mhc_route_aggregate(
     gpu: &mut Gpu,
     work: &RaonWork,
     site: &MhcSiteWeights,
     rows: usize,
     streams: &GpuTensor,
+    norm: StreamNorm<'_>,
+    out: &GpuTensor,
 ) -> Result<(), String> {
     let shape = &work.mhc_shape;
     let op = mix_op(
         shape,
         rows,
-        StreamMixStage::Route {
+        StreamMixStage::RouteAggregate {
             streams,
             chart: StreamChart::HelmertBounded {
                 selector: &site.selector.buf,
@@ -690,25 +719,6 @@ fn mhc_route(
                 selector_eps: shape.selector_eps,
             },
             selector_out: work.mhc.selector_out(),
-            controls: work.mhc.controls(),
-        },
-    );
-    run_mix(gpu, &op)
-}
-
-fn mhc_aggregate(
-    gpu: &mut Gpu,
-    work: &RaonWork,
-    rows: usize,
-    streams: &GpuTensor,
-    norm: StreamNorm<'_>,
-    out: &GpuTensor,
-) -> Result<(), String> {
-    let op = mix_op(
-        &work.mhc_shape,
-        rows,
-        StreamMixStage::Aggregate {
-            streams,
             controls: work.mhc.controls(),
             norm: Some(norm),
             out,
@@ -1595,7 +1605,14 @@ fn forward_body(
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
     embed_staged(cfg, w, scratch, work, gpu, rows)?;
-    fire(tap, gpu, TapSite::Embedding, &scratch.stream_a, rows)?;
+    fire(
+        tap,
+        gpu,
+        TapSite::Embedding,
+        &scratch.stream_a,
+        rows,
+        cfg.mhc_streams * cfg.hidden,
+    )?;
 
     let mut ctx = DispatchCtx::new(gpu);
     ctx.batch_size = rows;
@@ -1613,11 +1630,10 @@ fn forward_body(
             } else {
                 (&scratch.stream_b, &scratch.stream_a)
             };
-            mhc_route(gpu, work, &layer.attn_mhc, rows, cur)?;
-            stage_route(tap, gpu, work, l, rows, "attn")?;
-            mhc_aggregate(
+            mhc_route_aggregate(
                 gpu,
                 work,
+                &layer.attn_mhc,
                 rows,
                 cur,
                 StreamNorm {
@@ -1626,6 +1642,9 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            // The fused stage still writes the selector and control planes, so the census taps
+            // them after it (one stage, same planes as the unfused route).
+            stage_route(tap, gpu, work, l, rows, "attn")?;
             fire_stage_scratch(
                 tap,
                 gpu,
@@ -1680,6 +1699,7 @@ fn forward_body(
                 &scratch.stream_b
             },
             rows,
+            cfg.mhc_streams * cfg.hidden,
         )?;
 
         // ── FFN site ──
@@ -1689,11 +1709,10 @@ fn forward_body(
             } else {
                 (&scratch.stream_b, &scratch.stream_a)
             };
-            mhc_route(gpu, work, &layer.ffn_mhc, rows, cur)?;
-            stage_route(tap, gpu, work, l, rows, "ffn")?;
-            mhc_aggregate(
+            mhc_route_aggregate(
                 gpu,
                 work,
+                &layer.ffn_mhc,
                 rows,
                 cur,
                 StreamNorm {
@@ -1702,6 +1721,7 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            stage_route(tap, gpu, work, l, rows, "ffn")?;
             // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`):
             // names this layer and its first row's position; a no-op when both are unset.
             hipfire_dispatch::pipeline::moe_capture::set_site(l, start);
@@ -1730,6 +1750,7 @@ fn forward_body(
                 &scratch.stream_b
             },
             rows,
+            cfg.mhc_streams * cfg.hidden,
         )?;
         if let Some(cap) = capture {
             if let Some(k) = cap.layers.iter().position(|&id| id == l) {
