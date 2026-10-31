@@ -1,0 +1,15 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "SMALL_ROWS_F32_ROWS8_MIN_ROWS",
+  "value": 256,
+  "covers": true,
+  "arch": "gfx1201",
+  "card": "R9700 (fabric j5919 + j5921, confounded=false)",
+  "summary": "Node bench (standalone hipcc harness, bit-identical to gemm_bf16_xf32_batched at every row count, odd M/K/N included): Router shape (M128 K2560, F32 x). 4 rows/CTA vs 8 rows/CTA, us per call at N=128/192/255/256/512/1024/4096: p4 14.2/19.5/25.0/25.1/44.9/88.1/342.5, p8 16.0/21.0/22.4/22.4/36.5/68.3/253.4: p8 wins from about N=224; 256 is a conservative floor (p4 stays up to 255, within 12% of p8 there). Previous route 172.4 us at N=256, 784.4 us at N=4096.",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/small_rows_node_gfx1201.txt",
+      "sha256": "3699da5ce5fc84fbe350440f8800e802a71bbd39b61df1042f3b91037de49df1"
+    }
+  ]
+}

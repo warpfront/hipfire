@@ -5400,6 +5400,20 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_BF16_XF32_TILED_ROWS_SRC,
             ["gemm_bf16_xf32_tiled_rows", "gemm_bf16_xf32_tiled_rows_mp4"]
         );
+        // Register-tiled exact-order small-M twins of the pair above (router F32
+        // activations `_r*`, mHC selector BF16 activations `_s*`), every row count.
+        add!(
+            "gemm_bf16_small_rows",
+            kernels::GEMM_BF16_SMALL_ROWS_SRC,
+            [
+                "gemm_bf16_xf32_small_rows_r1",
+                "gemm_bf16_xf32_small_rows_r4",
+                "gemm_bf16_xf32_small_rows_r8",
+                "gemm_bf16_xbf16_small_rows_s1",
+                "gemm_bf16_xbf16_small_rows_s4",
+                "gemm_bf16_xbf16_small_rows_s8"
+            ]
+        );
     }
     // lm_head rm2 muse tile (`gemm_hfq4g256_residual_muse_gfx1100_rm` rm=2):
     // gfx1151 at batch % 96 == 0 and (m/32)*(batch/96) >= 256 (default DFlash
@@ -11149,10 +11163,13 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // BF16-weight GEMMs (batched + x-stationary tiled) for the Raon mHC selector
-        // and grouped-MoE router.
-        const BF16_XF32_ROWS_ADDED_MODULES: [&str; 2] =
-            ["gemm_bf16_xf32_batched", "gemm_bf16_xf32_tiled_rows"];
+        // BF16-weight GEMMs (batched, x-stationary tiled, register-tiled small rows) for the
+        // Raon mHC selector and grouped-MoE router.
+        const BF16_XF32_ROWS_ADDED_MODULES: [&str; 3] = [
+            "gemm_bf16_xf32_batched",
+            "gemm_bf16_xf32_tiled_rows",
+            "gemm_bf16_small_rows",
+        ];
         for module in BF16_XF32_ROWS_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),

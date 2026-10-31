@@ -11380,6 +11380,12 @@ pub const GEMM_F32_REGISTER_TILED_SRC: &str =
 pub const GEMM_BF16_XF32_TILED_ROWS_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_xf32_tiled_rows.hip");
 
+/// Register-tiled exact-order BF16-weight small-M GEMMs (Raon MoE router with F32
+/// activations, mHC selector with BF16 activations): per-output arithmetic of
+/// `gemm_f32_batched` on the widened weight, NT rows per CTA kept in registers.
+pub const GEMM_BF16_SMALL_ROWS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_small_rows.hip");
+
 /// Atomic-free MQ2-Lloyd K4 MoE down kernel — writes [N × K_TOP × M]
 /// f32 with no atomicAdd contention. Pair with `moe_down_combine_k8_batched`
 /// to fold K_TOP outputs into x_residual deterministically. Required by
