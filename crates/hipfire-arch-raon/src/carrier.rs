@@ -357,7 +357,11 @@ fn admit_prefill_rows(
     let (available, cap) = state.mirror_available_with_input(gpu)?;
     let mut extra = |rows: usize| -> Result<usize, String> {
         Ok(RaonPrefillScratch::required_bytes(dims, rows)?
-            + RaonWork::required_bytes(config, rows)?)
+            + RaonWork::required_bytes(
+                config,
+                rows,
+                gpu.gated_delta_vector_chunked_arch_supported(),
+            )?)
     };
     let adm = select_prefill_rows(state.max_seq(), forced, available, &mut extra, &|usable| {
         state.projected_mirror_budget_rows(usable)

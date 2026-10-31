@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Chunked (C64) generic gated delta rule with per-key-channel diagonal log decay
-//! (`HIPFIRE_GATED_DELTA_VECTOR_CHUNKED`, developer, default OFF; `=0` kills).
+//! (`HIPFIRE_GATED_DELTA_VECTOR_CHUNKED`, developer, default ON on gfx1201; `=0` kills).
 //!
 //! [`Gpu::gated_delta_net_vector_chunked_f32`] takes the same [`GatedDeltaVectorLaunch`] as the
 //! serial [`Gpu::gated_delta_net_vector_serial_f32`] and produces the same outputs and final state
@@ -56,9 +56,9 @@ const SCAN_VTILES: u32 = 8;
 const PREP_WGS_PER_MP: u32 = 2;
 
 static FLAG: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GATED_DELTA_VECTOR_CHUNKED", false));
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GATED_DELTA_VECTOR_CHUNKED", true));
 
-/// `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` (default off; `0` kills).
+/// `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` (default on; `0` kills).
 pub fn chunked_enabled() -> bool {
     *FLAG
 }

@@ -129,7 +129,7 @@ pub struct RdaScratch {
     pub beta: GpuTensor,
     /// BF16-rounded recurrence output (`out = cast_model(y)`) `[N, P]`.
     pub y: GpuTensor,
-    /// Chunked-RDA workspace, allocated only with `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED=1` on a
+    /// Chunked-RDA workspace, allocated unless `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED=0`, on a
     /// device that has the chunked kernel; `None` keeps the serial recurrence.
     pub chunk: Option<GatedDeltaVectorChunkScratch>,
 }
@@ -174,15 +174,16 @@ impl RdaScratch {
     }
 
     /// Device bytes [`Self::new`] allocates for `max_rows` rows (pool allocations
-    /// are exact, minimum 256 B each).
-    pub fn required_bytes(geom: &RdaGeometry, max_rows: usize) -> usize {
+    /// are exact, minimum 256 B each). `chunked_arch`: the device has the chunked kernel
+    /// ([`Gpu::gated_delta_vector_chunked_arch_supported`]), so [`Self::new`] allocates its workspace.
+    pub fn required_bytes(geom: &RdaGeometry, max_rows: usize, chunked_arch: bool) -> usize {
         let p = geom.proj();
         // qconv, kconv, vconv, q, k, vprime, log_alpha, y: `[rows, P]`; beta: `[rows, heads]`.
         let mut elems = [max_rows * p; 8].to_vec();
         elems.push(max_rows * geom.n_heads);
         let planes: usize = elems.into_iter().map(|e| (e * 4).max(256)).sum();
-        // Charged whenever the flag is on (an arch without the kernel allocates none).
-        let chunk = if chunked_enabled() {
+        // Charged exactly when `new` allocates it: flag on and an arch with the kernel.
+        let chunk = if chunked_enabled() && chunked_arch {
             GatedDeltaVectorChunkScratch::required_bytes(chunk_scratch_rows(max_rows), geom.n_heads)
         } else {
             0

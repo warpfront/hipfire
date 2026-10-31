@@ -140,14 +140,19 @@ impl RaonWork {
 
     /// Device bytes of the work for `rows` rows once the bundle is assembled
     /// (every module buffer plus the packed absorbed MLA weights): what the
-    /// prefill chunk admission charges against free memory.
-    pub fn required_bytes(cfg: &RaonConfig, rows: usize) -> Result<usize, String> {
+    /// prefill chunk admission charges against free memory. `chunked_rda_arch`: the device has
+    /// the chunked RDA kernel ([`Gpu::gated_delta_vector_chunked_arch_supported`]).
+    pub fn required_bytes(
+        cfg: &RaonConfig,
+        rows: usize,
+        chunked_rda_arch: bool,
+    ) -> Result<usize, String> {
         if rows == 0 {
             return Err("raon work: rows == 0".into());
         }
         let (mhc_shape, rda_geom, moe_dims) = Self::shapes(cfg)?;
         Ok(RaonMhcWork::required_bytes(&mhc_shape, rows)
-            + RdaScratch::required_bytes(&rda_geom, rows)
+            + RdaScratch::required_bytes(&rda_geom, rows, chunked_rda_arch)
             + RaonMoeScratch::required_bytes(&moe_dims, rows)?
             + RaonDenseScratch::required_bytes(&moe_dims, rows)?
             + RaonMlaWork::required_bytes(cfg, rows)?)
