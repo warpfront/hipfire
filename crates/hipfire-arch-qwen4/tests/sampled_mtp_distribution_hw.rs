@@ -359,11 +359,28 @@
 //! evidence. The host-only logic and its CPU tests are `common/lane_suite.rs`
 //! (`cargo test ... --test sampled_mtp_distribution_hw lane_suite`).
 //!
-//! The sampled lane executor itself is an explicit interface boundary: until it
-//! lands (S3/S5 protocol, S4 lane Leviathan sampling) a lane arm validates its
-//! whole configuration, prints it, and fails with "not yet implemented by
-//! S3/S5"; it writes no ids, so no result can be merged from a run that did not
-//! happen.
+//! # EP2 lane arms (`lane_ep.rs`)
+//!
+//! Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2` a lane arm process (cards C,B under
+//! `HIPFIRE_TOPOLOGY_EP=2`, one fresh process per arm and shard) loads the
+//! artifact once through the product loader with the serve's `serve.vmm_batch`
+//! lane reservation, stages one lane store and runs its `START..END` trials
+//! through it, recycling the lanes. `lane_ar` is target-only AR lanes (lane
+//! executor AR rows, host draws from each lane's RNG: the reference);
+//! `lane_batched` and `lane_adaptive` are native-MTP mesh lanes
+//! (`Qwen4Bundle::ep_mesh_decode_step`, root Leviathan acceptance, every lane
+//! MTP, no copy lane) and `lane_copy` adds the copy lane (use a fixture the pool
+//! hits, `HIPFIRE_SAMPLED_MTP_PROMPT=repeat`, for every arm of that cohort). The
+//! MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so even the 8-lane arm runs
+//! native windows (the step switch would otherwise run AR windows above four
+//! lanes). Request seeds are the lane suite's `lane_request_seed` truncated to
+//! the lane RNG's 32 bits. Each shard writes `<arm>.<START>-<END>.ids.json`
+//! (`(END - START) * lanes` lane-minor rows), `.ids.config.json`,
+//! `.ids.receipt.json`, `.evidence.json` (window counters classified per window
+//! from the lanes' own counters and cross-checked against the mesh step facts)
+//! and `.text.txt`. The model artifact's identity needs a verified-artifact
+//! cache under `HIPFIRE_HOME` (the test never hashes artifacts). Single-card and
+//! PP2 lane arms validate their configuration and refuse explicitly.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::expert_residency as residency;
@@ -388,6 +405,8 @@ use std::process::{Command, Stdio};
 #[path = "common/hw_identity.rs"]
 mod hw_identity;
 use hw_identity::Counters;
+#[path = "common/lane_ep.rs"]
+mod lane_ep;
 #[path = "common/lane_run.rs"]
 mod lane_run;
 #[path = "common/lane_suite.rs"]

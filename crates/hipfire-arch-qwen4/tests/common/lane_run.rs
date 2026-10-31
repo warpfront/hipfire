@@ -17,12 +17,28 @@ use super::*;
 /// Fewest trials of a lane distribution verdict, per arm and lane.
 const LANE_MIN_TRIALS: usize = 2000;
 
-/// The explicit interface boundary of the lane arms: the sampled lane
-/// executor (EP2/PP2 speculative lane protocol and lane Leviathan sampling)
-/// is not in this build, so a lane arm validates its whole configuration and
-/// then refuses to run. It writes no ids, so nothing can be merged or judged
-/// from a run that did not happen.
-const LANE_EXECUTOR_PENDING: &str = "the sampled lane executor is not yet implemented by S3/S5 (EP2/PP2 lane speculative protocol) and S4 (lane Leviathan sampling); this arm validated its configuration and ran no trials";
+/// Harness-control variables of the lane suite: the shared [`CONTROL_ENV`] plus
+/// the fabric admission token, which names the job (a different value per
+/// shard job) and changes nothing the arm computes, so shards run in different
+/// fabric jobs share one identity.
+pub(super) const LANE_CONTROL_ENV: [&str; 5] = [
+    MODEL_ENV,
+    OUT_ENV,
+    ARM_ENV,
+    SHARD_ENV,
+    "HIPFIRE_FABRIC_ADMISSION",
+];
+
+/// Why a topology has no lane executor: only EP2 runs lane arms in this
+/// build. Single-card and PP2 lane arms validate their whole configuration
+/// and then refuse, writing no ids, so nothing can be merged or judged from a
+/// run that did not happen.
+fn lane_topology_unsupported(topology: lane_suite::Topology) -> String {
+    format!(
+        "the lane executor runs topology ep2 only ({} lane arms are not implemented in this build); this arm validated its configuration and ran no trials",
+        topology.as_str()
+    )
+}
 
 fn lane_state_format() -> Result<&'static str, String> {
     Ok(hw_identity::gdn_test_state_quant()?.0)
@@ -49,7 +65,8 @@ fn lane_arm_config(
 /// One lane arm process. Everything an arm would need is validated first (the
 /// environment contract, neutral penalties, the shard range, the config and any
 /// existing result's config), so a wrong invocation fails for its own reason;
-/// then the executor boundary refuses.
+/// then the EP2 executor ([`super::lane_ep`]) runs the shard, and the other
+/// topologies refuse explicitly.
 pub(super) fn run_lane_arm(
     arm: &str,
     model: &Path,
@@ -75,7 +92,7 @@ pub(super) fn run_lane_arm(
     let range = shard_range(arm, settings.trials)?;
     let config = lane_arm_config(
         arm,
-        &own_identity(model, dir, &CONTROL_ENV)?,
+        &own_identity(model, dir, &LANE_CONTROL_ENV)?,
         &settings,
         placement,
         range,
@@ -100,7 +117,12 @@ pub(super) fn run_lane_arm(
         placement.lanes
     );
     println!("ARM {arm} config {config}");
-    Err(LANE_EXECUTOR_PENDING.to_string())
+    match placement.topology {
+        lane_suite::Topology::Ep2 => super::lane_ep::run_ep_arm(
+            arm, model, dir, placement, &settings, range, &config, &stem,
+        ),
+        other => Err(lane_topology_unsupported(other)),
+    }
 }
 
 fn dir_file_names(dir: &Path) -> Result<Vec<String>, String> {
@@ -233,7 +255,7 @@ pub(super) fn lane_verdict(
         }
         let expected = lane_arm_config(
             arm,
-            &arm_identity(arm, "leviathan", &model_id, &CONTROL_ENV),
+            &arm_identity(arm, "leviathan", &model_id, &LANE_CONTROL_ENV),
             &settings,
             placement,
             (0, trials),

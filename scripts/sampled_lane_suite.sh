@@ -22,13 +22,24 @@
 #   TOPOLOGY  single | pp2 | ep2           (HIPFIRE_SAMPLED_MTP_TOPOLOGY)
 #   LANES     1 | 8                        (HIPFIRE_SAMPLED_MTP_LANES)
 # Optional: TRIALS (default 2000), PROMPT (default prose), CARGO_TARGET_DIR,
-#   DRY_RUN=1 (print the environment and command, run nothing).
+#   STATE_QUANT (GDN test state, default q8), DRY_RUN=1 (print the environment
+#   and command, run nothing), TEST_EXE (a staged test executable run instead
+#   of `cargo test`: the same executable MUST run every shard, the merge and
+#   the verdict, its hash is part of every config).
 #
 # ARM is one of lane_ar lane_batched lane_adaptive lane_copy. Cover 0..TRIALS
 # with disjoint shards for EACH arm, then `merge`, then `verdict`; `verdict`
-# never launches an arm. Until the sampled lane executor lands (S3/S5, S4) a
-# `shard` run validates its configuration and fails with "not yet
-# implemented by S3/S5"; `selftest` is the only runnable part.
+# never launches an arm. TOPOLOGY=ep2 (cards C,B; HIPFIRE_DEVICES from the
+# fabric job, a HIPFIRE_HOME whose cache/verified-artifacts.json holds the
+# model, its .ple-q4 and .expert-hotset hashes) runs the EP2 lane executor
+# (`lane_ep.rs`): one process per arm and shard, `START..END` of a few hundred
+# trials. HIPFIRE_TOPOLOGY_EP=2 is exported here, the native-MTP arms pin
+# HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 (the 8-lane arm would otherwise run AR
+# windows); give `merge` and `verdict` the same job environment as the shards
+# (the config identity compares every HIPFIRE_* variable). `lane_copy` needs a
+# fixture the copy pool hits: set PROMPT=repeat for the whole cohort. The single
+# and pp2 topologies validate their configuration and refuse ("ep2 only");
+# `selftest` is the host-only part.
 
 set -euo pipefail
 
@@ -37,6 +48,16 @@ TEST_ARGS=(-- --exact --ignored --nocapture --test-threads=1)
 ARMS="lane_ar lane_batched lane_adaptive lane_copy"
 
 die() { echo "sampled_lane_suite: $*" >&2; exit 2; }
+
+# The test command for test NAME: cargo test, or the staged executable.
+test_cmd() {
+  if [ -n "${TEST_EXE:-}" ]; then
+    [ -x "$TEST_EXE" ] || die "TEST_EXE=$TEST_EXE is not an executable"
+    run "$TEST_EXE" "$1" --exact --ignored --nocapture --test-threads=1
+  else
+    run "${TEST_BIN[@]}" "$1" "${TEST_ARGS[@]}"
+  fi
+}
 
 run() {
   if [ "${DRY_RUN:-0}" = 1 ]; then
@@ -55,8 +76,10 @@ common_env() {
   export HIPFIRE_SAMPLED_MTP_TOPOLOGY="$TOPOLOGY"
   export HIPFIRE_SAMPLED_MTP_TRIALS="${TRIALS:-2000}" HIPFIRE_SAMPLED_MTP_PROMPT="${PROMPT:-prose}"
   export HIPFIRE_MTP_SAMPLED=1 HIPFIRE_MTP_SAMPLED_MODE=leviathan
+  export HIPFIRE_GDN_TEST_STATE_QUANT="${STATE_QUANT:-q8}"
+  [ "$TOPOLOGY" = ep2 ] && export HIPFIRE_TOPOLOGY_EP=2
   unset HIPFIRE_MTP_TRACE HIPFIRE_MTP_PHASE_TIMING HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS
-  unset HIPFIRE_MTP_INCREMENTAL HIPFIRE_MTP_AR_FLOOR HIPFIRE_MTP_NGRAM_COPY
+  unset HIPFIRE_MTP_INCREMENTAL HIPFIRE_MTP_AR_FLOOR HIPFIRE_MTP_NGRAM_COPY HIPFIRE_EP_MTP_LANE_MAX_ACTIVE
   unset HIPFIRE_SAMPLED_MTP_ARM HIPFIRE_SAMPLED_MTP_SHARD
 }
 
@@ -75,21 +98,22 @@ case "${1:-}" in
     common_env
     export HIPFIRE_SAMPLED_MTP_ARM="$arm" HIPFIRE_SAMPLED_MTP_SHARD="$range"
     case "$arm" in
-      lane_batched) export HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_AR_FLOOR=0 ;;
-      lane_copy) export HIPFIRE_MTP_NGRAM_COPY=on ;;
+      lane_batched) export HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 ;;
+      lane_adaptive) export HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 ;;
+      lane_copy) export HIPFIRE_MTP_NGRAM_COPY=on HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 ;;
     esac
     show_env
-    run "${TEST_BIN[@]}" sampled_mtp_distribution_arm "${TEST_ARGS[@]}"
+    test_cmd sampled_mtp_distribution_arm
     ;;
   merge)
     common_env
     show_env
-    run "${TEST_BIN[@]}" sampled_mtp_merge_short_shards "${TEST_ARGS[@]}"
+    test_cmd sampled_mtp_merge_short_shards
     ;;
   verdict)
     common_env
     show_env
-    run "${TEST_BIN[@]}" sampled_mtp_matches_ar_distribution_on_flash_next "${TEST_ARGS[@]}"
+    test_cmd sampled_mtp_matches_ar_distribution_on_flash_next
     ;;
   selftest)
     # Host-only: GPUs hidden, no model. A zero-test filter is a failure.

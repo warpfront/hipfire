@@ -244,12 +244,25 @@ pub fn lane_route(arm: &str) -> Option<&'static str> {
     }
 }
 
+/// `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE`: the largest lane count of a step that
+/// still runs native windows (the mesh step switches to AR windows from
+/// `max + 2` lanes up).
+pub const MAX_ACTIVE_ENV: &str = "HIPFIRE_EP_MTP_LANE_MAX_ACTIVE";
+/// The value the native-MTP lane arms pin: at least the largest suite lane
+/// count ([`LANE_COUNTS`]), so the 8-lane arms really run native windows.
+pub const LANE_MAX_ACTIVE: &str = "8";
+
 /// Extra environment a lane arm pins (beyond the route/floor knobs the shared
 /// `arm_overrides` derives from the arm name): `lane_copy` always runs the copy
-/// lane.
+/// lane, and every native-MTP arm pins [`MAX_ACTIVE_ENV`] to [`LANE_MAX_ACTIVE`]
+/// (the AR reference store never switches windows, so it pins nothing).
 pub fn lane_env_overrides(arm: &str) -> Vec<(&'static str, Option<&'static str>)> {
     match arm {
-        "lane_copy" => vec![(NGRAM_COPY_ENV, Some("on"))],
+        "lane_copy" => vec![
+            (NGRAM_COPY_ENV, Some("on")),
+            (MAX_ACTIVE_ENV, Some(LANE_MAX_ACTIVE)),
+        ],
+        "lane_batched" | "lane_adaptive" => vec![(MAX_ACTIVE_ENV, Some(LANE_MAX_ACTIVE))],
         _ => Vec::new(),
     }
 }
@@ -1014,9 +1027,24 @@ mod tests {
         assert!(lane_salt("ar").is_err() && lane_route("interleaved").is_none());
         assert_eq!(
             lane_env_overrides("lane_copy"),
-            vec![(NGRAM_COPY_ENV, Some("on"))]
+            vec![
+                (NGRAM_COPY_ENV, Some("on")),
+                (MAX_ACTIVE_ENV, Some(LANE_MAX_ACTIVE))
+            ]
         );
-        assert!(lane_env_overrides("lane_batched").is_empty());
+        for arm in ["lane_batched", "lane_adaptive"] {
+            assert_eq!(
+                lane_env_overrides(arm),
+                vec![(MAX_ACTIVE_ENV, Some(LANE_MAX_ACTIVE))]
+            );
+        }
+        assert!(lane_env_overrides("lane_ar").is_empty());
+    }
+
+    #[test]
+    fn the_native_window_pin_covers_every_suite_lane_count() {
+        let pin: usize = LANE_MAX_ACTIVE.parse().unwrap();
+        assert!(LANE_COUNTS.iter().all(|&lanes| pin >= lanes));
     }
 
     #[test]
