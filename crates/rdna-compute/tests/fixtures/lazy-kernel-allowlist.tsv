@@ -989,8 +989,8 @@ module	gemv_q6k	codec-outside-core-rungs	Q6K route absent from admitted core art
 module	gemv_q8_0_moe_down_residual_scaled_k8_indexed	non-core-family	Non-core family route: Gemma, LFM2, MiniMax/Maple; sandwich.rs:1338
 module	gemv_q8_0_moe_down_top10_indexed_batched_expanded	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; moe.rs:2742-2754
 module	gemv_q8_0_moe_gate_up_k8_indexed	non-core-family	Non-core family route: Gemma, LFM2, MiniMax/Maple; hipfire-dispatch/src/pipeline/sandwich.rs:1324
-module	gemv_q8_0_rows_exact	no-caller	No production caller yet: the row-exact multi-row Q8_0 GEMV (K > 1536 arm) is reached only by tests and the not-yet-wired spec-verify consumer; rdna-compute/src/gemv.rs:20798
-module	gemv_q8_0_wide_rows_exact	no-caller	No production caller yet: the row-exact multi-row Q8_0 GEMV (K <= 1536 arm) is reached only by tests and the not-yet-wired spec-verify consumer; rdna-compute/src/gemv.rs:20789
+module	gemv_q8_0_rows_exact	config-opt-in	Non-default configuration: HIPFIRE_RAON_VERIFY_ROWEXACT row-exact multi-row Q8_0 GEMV (K > 1536 arm); rdna-compute/src/gemv.rs:20803
+module	gemv_q8_0_wide_rows_exact	config-opt-in	Non-default configuration: HIPFIRE_RAON_VERIFY_ROWEXACT row-exact multi-row Q8_0 GEMV (K <= 1536 arm); rdna-compute/src/gemv.rs:20794
 module	gemv_q8hfq	codec-outside-core-rungs	Q8HFQ route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:540
 module	gemv_q8hfq_wide	codec-outside-core-rungs	Q8HFQ route absent from admitted core artifact rungs; gemv.rs:18791-18832
 module	gemv_tq2g128	codec-outside-core-rungs	TQ2G128 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:534
@@ -1104,7 +1104,7 @@ module	kv_transcode_k_fwht4_to_fwht2	config-opt-in	Non-default configuration: at
 module	kv_transcode_k_fwht4_to_fwht3	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12421
 module	kv_transcode_v_lloyd_down	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12333
 module	kv_transcode_v_q8_to_lloyd4	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12286
-module	latent_attention_decode_rows	config-opt-in	Non-default configuration: opt-in MlaRowsRoute::DecodeExact / AttentionRoute::{TiledRows,AbsorbedRows} multi-row exact decode (default routes unchanged); rdna-compute/src/latent_attention_decode.rs:291
+module	latent_attention_decode_rows	config-opt-in	Non-default configuration: opt-in MlaRowsRoute::DecodeExact / AttentionRoute::{TiledRows,AbsorbedRows} multi-row exact decode (default routes unchanged); rdna-compute/src/latent_attention_decode.rs:301
 module	layernorm_f32	config-opt-in	Non-default configuration: vision.mode / vision.rs; qwen35_vl.rs:1329
 module	layernorm_modulate	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:1971
 module	logit_softcap_f32	non-core-family	Non-core family route: Muse Glimmer, Gemma, LFM2; forward.rs:507-3897

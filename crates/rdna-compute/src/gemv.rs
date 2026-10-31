@@ -290,7 +290,12 @@ pub fn q8_0_rows_exact_route(arch: &str, k: usize) -> Q8RowsExactRoute {
 /// shape the kernels refuse (`m == 0`, `k` not a positive multiple of 32,
 /// `rows` outside `1..`, or an extent past `u32`).
 fn q8_0_rows_exact_extents(m: usize, k: usize, rows: usize) -> Option<[usize; 3]> {
-    if m == 0 || m > i32::MAX as usize || k == 0 || k > i32::MAX as usize || k % 32 != 0 || rows == 0
+    if m == 0
+        || m > i32::MAX as usize
+        || k == 0
+        || k > i32::MAX as usize
+        || k % 32 != 0
+        || rows == 0
     {
         return None;
     }
@@ -20831,15 +20836,16 @@ impl Gpu {
             },
             bytes,
         );
-        let result = self.launch_maybe_blob(func, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(a_ptr);
-            b.push_ptr(x_ptr);
-            b.push_ptr(y_ptr);
-            b.push_i32(m_val);
-            b.push_i32(k_val);
-            b
-        });
+        let result =
+            self.launch_maybe_blob(func, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -26536,7 +26542,11 @@ mod rowtile_launch_tests {
         // have no verified recipe: per-row singleton launches.
         for arch in ["gfx1151", "gfx1150", "gfx942", "gfx906", "gfx1030"] {
             for k in [128, 320, 640, 2560, 5120] {
-                assert_eq!(q8_0_rows_exact_route(arch, k), PerRowSingleton, "{arch} K={k}");
+                assert_eq!(
+                    q8_0_rows_exact_route(arch, k),
+                    PerRowSingleton,
+                    "{arch} K={k}"
+                );
             }
         }
         // Drift guard: the singleton launcher still cuts wide/narrow at

@@ -32,8 +32,9 @@ pub use carrier::load_raon_bundle;
 pub use census::{CensusReport, CensusStage};
 pub use config::{FfnKind, GenerationDefaults, LayerKind, RaonConfig};
 pub use forward::{
-    forward_rows, forward_rows_tapped, forward_rows_verify_tapped, forward_token, forward_token_tapped, readout_logits,
-    validate_extract_layers, DflashCapture, LayerTap, RaonWork, TapSite,
+    forward_rows, forward_rows_tapped, forward_rows_verify_tapped, forward_token,
+    forward_token_tapped, readout_logits, validate_extract_layers, DflashCapture, LayerTap,
+    RaonWork, TapSite,
 };
 pub use projection::{project, project_row, project_rows, round_bf16_rows, OutRound};
 pub use rollback::{RollbackMode, ROLLBACK_ENV};

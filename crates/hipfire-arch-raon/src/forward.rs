@@ -54,8 +54,8 @@ use crate::config::{LayerKind, RaonConfig};
 use crate::mhc::{broadcast_embedding, final_mean_norm, RaonMhcShape, RaonMhcWork};
 use crate::mla::{raon_mla_scale, MlaRoute, RaonMlaWork, RAON_MLA_EPS};
 use crate::moe::{
-    forward_dense, forward_dense_rows_exact, forward_moe, forward_moe_rows_exact, RaonDenseRefs, RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs,
-    RaonMoeScratch,
+    forward_dense, forward_dense_rows_exact, forward_moe, forward_moe_rows_exact, RaonDenseRefs,
+    RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs, RaonMoeScratch,
 };
 use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
 use crate::projection::{project, OutRound};
@@ -335,9 +335,19 @@ fn stage_route(
         return Ok(());
     }
     let names: [&'static str; 4] = if prefix == "attn" {
-        ["attn.route.sel", "attn.route.pre", "attn.route.post", "attn.route.res"]
+        [
+            "attn.route.sel",
+            "attn.route.pre",
+            "attn.route.post",
+            "attn.route.res",
+        ]
     } else {
-        ["ffn.route.sel", "ffn.route.pre", "ffn.route.post", "ffn.route.res"]
+        [
+            "ffn.route.sel",
+            "ffn.route.pre",
+            "ffn.route.post",
+            "ffn.route.res",
+        ]
     };
     let c = work.mhc.controls();
     let planes = [work.mhc.selector_out(), c.pre, c.post, c.res];
@@ -1088,8 +1098,8 @@ fn ffn_block(
         RaonFfn::Moe(m) => {
             // Row-exact verify blocks run every row as the decode step does,
             // shared expert included: its single-row weights.
-            let rows_exact =
-                (2..=crate::projection::ROWS_EXACT_MAX).contains(&rows) && crate::projection::rows_exact();
+            let rows_exact = (2..=crate::projection::ROWS_EXACT_MAX).contains(&rows)
+                && crate::projection::rows_exact();
             let (shared_gate, shared_up, shared_down) =
                 m.shared.projections(if rows_exact { 1 } else { rows });
             let refs = RaonMoeLayerRefs::from_parts(
@@ -1104,7 +1114,11 @@ fn ffn_block(
                 m.expert_down_awq_ptrs.as_ref(),
             )
             .with_iu4_symmetric(m.iu4_symmetric, m.shared.iu4_symmetric);
-            let run = if rows_exact { forward_moe_rows_exact } else { forward_moe };
+            let run = if rows_exact {
+                forward_moe_rows_exact
+            } else {
+                forward_moe
+            };
             run(
                 gpu,
                 ctx,
@@ -1612,7 +1626,15 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
-            fire_stage_scratch(tap, gpu, l, "attn.agg", &scratch.branch_in, rows, scratch.rows)?;
+            fire_stage_scratch(
+                tap,
+                gpu,
+                l,
+                "attn.agg",
+                &scratch.branch_in,
+                rows,
+                scratch.rows,
+            )?;
             match (kind, &layer.mixer) {
                 (LayerKind::Rda, RaonMixer::Rda(rw)) => {
                     let ri = cfg
@@ -1636,7 +1658,15 @@ fn forward_body(
                     ))
                 }
             }
-            fire_stage_scratch(tap, gpu, l, "attn.out", &scratch.branch_out, rows, scratch.rows)?;
+            fire_stage_scratch(
+                tap,
+                gpu,
+                l,
+                "attn.out",
+                &scratch.branch_out,
+                rows,
+                scratch.rows,
+            )?;
             mhc_postmix(gpu, work, rows, cur, &scratch.branch_out, oth)?;
         }
         cur_is_a = !cur_is_a;
@@ -1675,7 +1705,15 @@ fn forward_body(
             // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`):
             // names this layer and its first row's position; a no-op when both are unset.
             hipfire_dispatch::pipeline::moe_capture::set_site(l, start);
-            fire_stage_scratch(tap, gpu, l, "ffn.agg", &scratch.branch_in, rows, scratch.rows)?;
+            fire_stage_scratch(
+                tap,
+                gpu,
+                l,
+                "ffn.agg",
+                &scratch.branch_in,
+                rows,
+                scratch.rows,
+            )?;
             ffn_block(gpu, &ctx, work, layer, scratch, rows)
                 .map_err(|e| format!("raon1_mini L{l} ffn: {e}"))?;
             fire_stage_scratch(tap, gpu, l, "ffn.out", &scratch.ffn_out, rows, scratch.rows)?;
@@ -1866,7 +1904,18 @@ pub fn forward_rows_verify(
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
     forward_rows_verify_tapped(
-        cfg, w, s, scratch, work, gpu, tokens, start_pos, want_logits, capture, ring, None,
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        tokens,
+        start_pos,
+        want_logits,
+        capture,
+        ring,
+        None,
     )
 }
 

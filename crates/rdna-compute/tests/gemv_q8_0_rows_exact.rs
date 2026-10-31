@@ -150,7 +150,11 @@ fn gemv_q8_0_rows_exact_is_bit_identical_to_the_decode_singleton() {
         let route = q8_0_rows_exact_route(&arch, k);
         println!(
             "== shape m={m} k={k}: singleton {} / rows_exact route {route:?}",
-            if k <= 1536 { "gemv_q8_0_wide" } else { "gemv_q8_0" }
+            if k <= 1536 {
+                "gemv_q8_0_wide"
+            } else {
+                "gemv_q8_0"
+            }
         );
         for rows in (1..=16usize).chain(extra.iter().copied()) {
             let x = gpu
@@ -176,7 +180,9 @@ fn gemv_q8_0_rows_exact_is_bit_identical_to_the_decode_singleton() {
                 if holes == 0 { "" } else { ", singleton left holes" },
             );
             if !pass {
-                failures.push(format!("m={m} k={k} rows={rows} bad={bad} guard_ok={guard_ok}"));
+                failures.push(format!(
+                    "m={m} k={k} rows={rows} bad={bad} guard_ok={guard_ok}"
+                ));
             }
         }
         weights.push((m, k, w));

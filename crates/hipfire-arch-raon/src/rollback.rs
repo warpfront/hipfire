@@ -247,7 +247,9 @@ impl RaonBundle {
                 false,
                 capture.as_ref(),
                 ring.as_ref(),
-                census.as_mut().map(|t| &mut **t as crate::forward::LayerTap<'_>),
+                census
+                    .as_mut()
+                    .map(|t| &mut **t as crate::forward::LayerTap<'_>),
             )
         };
         self.spec.census_tap = census;

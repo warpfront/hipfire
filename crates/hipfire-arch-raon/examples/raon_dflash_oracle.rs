@@ -889,7 +889,6 @@ fn run_rowexact(
     Ok(all_exact)
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // rowexact --census
 // ─────────────────────────────────────────────────────────────────────────────
@@ -935,9 +934,7 @@ fn run_census(
                         .all(|(a, b)| a.to_bits() == b.to_bits())
             })
             .collect();
-        println!(
-            "  eager decode logits == graph decode logits per row: {eager_eq_graph:?}"
-        );
+        println!("  eager decode logits == graph decode logits per row: {eager_eq_graph:?}");
         let mut layers: Vec<usize> = rep.stages.iter().map(|s| s.layer).collect();
         layers.dedup();
         let mut json_layers = Vec::new();
@@ -956,7 +953,11 @@ fn run_census(
                 "  {tag}: {}/{} stages bit-equal on every row{}",
                 stages.len() - bad.len(),
                 stages.len(),
-                if bad.is_empty() { "" } else { " — DIVERGENT:" }
+                if bad.is_empty() {
+                    ""
+                } else {
+                    " — DIVERGENT:"
+                }
             );
             for s in &bad {
                 let rows: Vec<String> = s
@@ -989,7 +990,10 @@ fn run_census(
         for r in 0..k {
             match rep.first_divergent(r) {
                 Some(s) => {
-                    println!("  row {r}: FIRST DIVERGENT stage = (layer {}, {})", s.layer, s.name);
+                    println!(
+                        "  row {r}: FIRST DIVERGENT stage = (layer {}, {})",
+                        s.layer, s.name
+                    );
                     firsts.push(json!({"row": r, "layer": s.layer, "stage": s.name}));
                 }
                 None => {
@@ -1013,10 +1017,17 @@ fn run_census(
     println!(
         "{} rowexact census: every tapped stage and logits row {}",
         if all_exact { "PASS" } else { "FAIL" },
-        if all_exact { "bit-equal" } else { "NOT all bit-equal" }
+        if all_exact {
+            "bit-equal"
+        } else {
+            "NOT all bit-equal"
+        }
     );
     if let Some(dir) = out {
-        write_json(&dir.join("census.json"), &json!({"pass": all_exact, "ks": json_ks}))?;
+        write_json(
+            &dir.join("census.json"),
+            &json!({"pass": all_exact, "ks": json_ks}),
+        )?;
     }
     Ok(all_exact)
 }

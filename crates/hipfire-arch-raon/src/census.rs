@@ -93,13 +93,16 @@ impl CensusReport {
 
     /// Stages with at least one differing row.
     pub fn divergent_stages(&self) -> impl Iterator<Item = &CensusStage> {
-        self.stages.iter().filter(|s| s.row_equal.iter().any(|e| !e))
+        self.stages
+            .iter()
+            .filter(|s| s.row_equal.iter().any(|e| !e))
     }
 }
 
 fn compare_rows(k: usize, verify: &CensusRecord, decode: &[&CensusRecord]) -> Option<CensusStage> {
     let width = verify.data.len() / k;
-    if width == 0 || verify.data.len() != width * k || decode.iter().any(|d| d.data.len() != width) {
+    if width == 0 || verify.data.len() != width * k || decode.iter().any(|d| d.data.len() != width)
+    {
         return None;
     }
     let mut row_equal = Vec::with_capacity(k);
@@ -166,7 +169,11 @@ impl RaonBundle {
                                    _rows: usize|
                      -> Result<(), String> {
                         let (layer, name) = site_key(site);
-                        records.push(CensusRecord { layer, name, data: download(gpu, t)? });
+                        records.push(CensusRecord {
+                            layer,
+                            name,
+                            data: download(gpu, t)?,
+                        });
                         Ok(())
                     };
                     forward_token_tapped(
@@ -207,7 +214,11 @@ impl RaonBundle {
         let sink_tap = Arc::clone(&sink);
         self.spec.census_tap = Some(Box::new(move |gpu, site, t, _rows| {
             let (layer, name) = site_key(site);
-            sink_tap.lock().expect("census sink").push(CensusRecord { layer, name, data: download(gpu, t)? });
+            sink_tap.lock().expect("census sink").push(CensusRecord {
+                layer,
+                name,
+                data: download(gpu, t)?,
+            });
             Ok(())
         }));
         let verified = SpecTarget::verify_block_logits(self, gpu, chain, position, spec, None);
@@ -227,7 +238,10 @@ impl RaonBundle {
 
         let vocab = self.config.vocab;
         if logits.len() != k * vocab {
-            return Err(format!("census: verify returned {} logits for K={k}", logits.len()));
+            return Err(format!(
+                "census: verify returned {} logits for K={k}",
+                logits.len()
+            ));
         }
         let mut logits_equal = Vec::with_capacity(k);
         let mut logits_max_abs = Vec::with_capacity(k);
@@ -247,14 +261,23 @@ impl RaonBundle {
         for rec in verify.iter() {
             let rows: Option<Vec<&CensusRecord>> = decode
                 .iter()
-                .map(|step| step.iter().find(|d| d.layer == rec.layer && d.name == rec.name))
+                .map(|step| {
+                    step.iter()
+                        .find(|d| d.layer == rec.layer && d.name == rec.name)
+                })
                 .collect();
             let Some(rows) = rows else { continue };
             if let Some(stage) = compare_rows(k, rec, &rows) {
                 stages.push(stage);
             }
         }
-        Ok(CensusReport { k, stages, logits_equal, logits_max_abs, decode_logits })
+        Ok(CensusReport {
+            k,
+            stages,
+            logits_equal,
+            logits_max_abs,
+            decode_logits,
+        })
     }
 }
 
@@ -263,7 +286,11 @@ mod tests {
     use super::*;
 
     fn rec(name: &str, data: Vec<f32>) -> CensusRecord {
-        CensusRecord { layer: 3, name: name.to_string(), data }
+        CensusRecord {
+            layer: 3,
+            name: name.to_string(),
+            data,
+        }
     }
 
     #[test]
@@ -294,6 +321,9 @@ mod tests {
         assert_eq!(site_key(TapSite::Embedding), (0, "embed".to_string()));
         assert_eq!(site_key(TapSite::Attn(4)), (4, "attn.streams".to_string()));
         assert_eq!(site_key(TapSite::Ffn(4)), (4, "ffn.streams".to_string()));
-        assert_eq!(site_key(TapSite::Stage(7, "rda.q")), (7, "rda.q".to_string()));
+        assert_eq!(
+            site_key(TapSite::Stage(7, "rda.q")),
+            (7, "rda.q".to_string())
+        );
     }
 }
