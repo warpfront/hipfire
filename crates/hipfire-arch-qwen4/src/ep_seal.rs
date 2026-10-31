@@ -414,14 +414,14 @@ impl Qwen4Bundle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hipfire_runtime::model_source::{SourceFileIdentity, SourceFormat, SourceRangeIdentity};
     use rdna_compute::DType;
 
     /// The Flash-Next manifest's own tensor index: every entry encoded as its
     /// declared dtype.
-    fn source_of(manifest: &Qwen4Manifest, mtime_secs: i64) -> SourceIdentity {
+    pub(crate) fn source_of(manifest: &Qwen4Manifest, mtime_secs: i64) -> SourceIdentity {
         let ranges = manifest
             .weights
             .iter()
@@ -641,5 +641,71 @@ mod tests {
         assert_eq!(qwen4_source_generation(&hfq, &model).unwrap(), base);
         drop(hfq);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn seal_with(experts: usize, ranks: usize) -> Qwen4EpSeal {
+        let mut manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        for entry in &mut manifest.weights {
+            if [GATE_UP, DOWN, ROUTER]
+                .iter()
+                .any(|s| entry.name.ends_with(s))
+            {
+                entry.logical_shape[0] = experts;
+            }
+        }
+        let devices: Vec<i32> = (0..ranks as i32).collect();
+        Qwen4EpSeal::seal(
+            &manifest,
+            48,
+            ranks,
+            &devices,
+            &source_of(&manifest, 10),
+            "g",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn expert_spans_refuses_groups_that_disagree() {
+        let a = seal_with(512, 3);
+        let b = seal_with(510, 3);
+        let two = seal_with(512, 2);
+        let spans = |seal: &Qwen4EpSeal| -> Vec<Option<usize>> {
+            let s = seal.expert_spans().unwrap();
+            (0..seal.ranks()).map(|r| s.local(r)).collect()
+        };
+        assert_eq!(spans(&a), [Some(171), Some(171), Some(170)]);
+        assert_eq!(spans(&b), [Some(170), Some(170), Some(170)]);
+        for plans in [
+            vec![a.plans[0].clone(), b.plans[1].clone()],
+            vec![b.plans[0].clone(), a.plans[1].clone()],
+        ] {
+            let mixed = Qwen4EpSeal {
+                mesh: a.mesh.clone(),
+                plans,
+            };
+            assert!(mixed
+                .expert_spans()
+                .unwrap_err()
+                .contains("other expert counts"));
+        }
+        // A 2-rank plan inside a 3-rank mesh leaves rank 2 empty.
+        let empty = Qwen4EpSeal {
+            mesh: a.mesh.clone(),
+            plans: vec![two.plans[0].clone()],
+        };
+        assert!(empty.expert_spans().is_err());
+        let mixed = Qwen4EpSeal {
+            mesh: a.mesh.clone(),
+            plans: vec![a.plans[0].clone(), two.plans[1].clone()],
+        };
+        assert!(mixed.expert_spans().is_err());
+        let bound = Qwen4EpRankSeal {
+            seal: Arc::new(b),
+            rank: 2,
+        };
+        let slots = bound.local_slots(5).unwrap();
+        assert_eq!(slots.len(), 510);
+        assert!((0..510).all(|e| slots[e] == (e % 3 == 2).then(|| e / 3)));
     }
 }
