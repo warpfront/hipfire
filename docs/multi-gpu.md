@@ -949,8 +949,11 @@ operator's `HIPFIRE_PP_LAYERS` (comma list summing to 25). Edges are host-mapped
 no peer access is needed.
 
 **The cut tensor.** The only value live across a layer boundary is the mHC
-stream tensor: `[mhc_streams = 4, hidden = 2560]` F32 per row, 40 KiB per token
-(160 MiB for a 4096-row prefill chunk, the edge size the loader provisions). A
+stream tensor: `[mhc_streams = 4, hidden = 2560]` per row in the stream plane's
+own dtype: F32 is 40 KiB per token, and the BF16 stream planes of the fused mHC
+route (default on) halve it to 20 KiB; every edge size and view derives from that
+dtype. The loader provisions the F32 upper bound (160 MiB for a 4096-row prefill
+chunk). A
 cut between any two layers is therefore one transfer of that tensor and every
 band runs the same kernels on the same bits as the whole model: any split is
 **exact**, not just a tolerated one (`raon_band_oracle` and `raon_mesh_oracle`
