@@ -1333,6 +1333,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-qsa-core-lanes",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "qsa_core_lanes_min (qsa_core_lanes.rs): 2..=QSA_CORE_LANES_MAX consecutive QSA Core steps (fp8 K/V, BF16 index keys, 1..=8 rows per lane, fused LDS-resident select below QSA_BF16_SPLIT_MIN_BLOCKS, per-head attention), HIPFIRE_QWEN4_QSA_LANES (exact gfx1201, default off) and `!is_recording() && !capture_mode`",
+        effect: KernelSelection,
+        switches: "eager lane step: qsa_lanes (indexed_attention_decode_prologue_fp8_lanes, indexed_attention_pool_rope_bf16_lanes, indexed_attention_select_bf16_lanes, indexed_attention_attention_fp8_lanes), one launch per kernel for every lane; recorded or captured: the per-lane incumbent launches",
+        kernels: &["indexed_attention_decode_prologue_fp8", "indexed_attention_pool_rope_bf16", "indexed_attention_select_bf16_batched", "indexed_attention_attention_fp8_batched"],
+        verdict: ByteExact,
+        evidence: "by construction: the lane kernels call the incumbent device templates (qsa_decode_prologue, qsa_pool_rope, qsa_select_batched, qsa_attention_row_parallel) on lane-derived pointers, positions and rows; the GPU byte oracle rdna-compute examples/qsa_lanes_oracle (per-lane singleton launches vs the grouped launches, N = 1..8 lanes, rows 1..8, cross-block-boundary and budget-saturating contexts, negative controls) is staged but has not run on a GPU yet",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-moe-down-r4",
         predicates: &[IsRecording, CaptureMode],
         condition: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded (moe.rs): K = 640, HIPFIRE_QWEN4_MOE_DOWN_R4 (exact gfx1151 default on, 0 kills) and `!is_recording() && !capture_mode`",
@@ -3687,6 +3698,12 @@ pub const SITES: &[Site] = &[
         function: "gated_delta_core_lanes",
         occurrences: 1,
         decisions: &["qwen4-gdn-core-lanes"],
+    },
+    Site {
+        file: "rdna-compute/src/qsa_core_lanes.rs",
+        function: "qsa_core_lanes_min",
+        occurrences: 2,
+        decisions: &["qwen4-qsa-core-lanes"],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",
