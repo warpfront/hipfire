@@ -182,6 +182,53 @@ impl Rope {
     }
 }
 
+/// Llama-3 `rope_type: "llama3"` frequency remap (HF
+/// `_compute_llama3_parameters`) as kernel scalars for `rope_f32` /
+/// `rope_batched_f32`: with `s = clamp(inv_freq * smooth_mul + smooth_add, 0, 1)`,
+/// `inv_freq' = inv_freq * (s + (1 - s) * inv_factor)`. `s` is linear in
+/// `inv_freq`, so the clamp reproduces HF's three wavelength bands exactly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeLlama3 {
+    pub inv_factor: f32,
+    pub smooth_mul: f32,
+    pub smooth_add: f32,
+}
+
+impl RopeLlama3 {
+    /// Plain RoPE: the kernels leave `inv_freq` untouched.
+    pub const OFF: Self = Self {
+        inv_factor: 1.0,
+        smooth_mul: 0.0,
+        smooth_add: 1.0,
+    };
+
+    /// Requires `factor >= 1` and `high_freq_factor > low_freq_factor`.
+    pub fn new(
+        factor: f64,
+        low_freq_factor: f64,
+        high_freq_factor: f64,
+        original_max_position_embeddings: usize,
+    ) -> Self {
+        assert!(factor.is_finite() && factor >= 1.0 && high_freq_factor > low_freq_factor);
+        let span = high_freq_factor - low_freq_factor;
+        Self {
+            inv_factor: (1.0 / factor) as f32,
+            smooth_mul: (original_max_position_embeddings as f64
+                / (2.0 * std::f64::consts::PI * span)) as f32,
+            smooth_add: (-low_freq_factor / span) as f32,
+        }
+    }
+
+    /// Host twin of the kernel remap.
+    pub fn scale(&self, inv_freq: f32) -> f32 {
+        if self.inv_factor == 1.0 {
+            return inv_freq;
+        }
+        let s = (inv_freq * self.smooth_mul + self.smooth_add).clamp(0.0, 1.0);
+        inv_freq * (s + (1.0 - s) * self.inv_factor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +279,26 @@ mod tests {
         assert_eq!(y.attention_factor, 1.0);
         let y = Yarn::new(4.0, 4096, None, None, Some(1.5), None);
         assert_eq!(y.attention_factor, 1.5);
+    }
+
+    #[test]
+    fn llama3_remap_matches_hf_bands() {
+        // Llama-3.2-1B: theta 5e5, head_dim 64, factor 32, low 1, high 4, original 8192.
+        let l3 = RopeLlama3::new(32.0, 1.0, 4.0, 8192);
+        for i in 0..32 {
+            let inv = 500_000f64.powf(-((2 * i) as f64) / 64.0);
+            let wavelen = 2.0 * std::f64::consts::PI / inv;
+            let hf = if wavelen < 8192.0 / 4.0 {
+                inv
+            } else if wavelen > 8192.0 {
+                inv / 32.0
+            } else {
+                let s = (8192.0 / wavelen - 1.0) / 3.0;
+                (1.0 - s) * inv / 32.0 + s * inv
+            };
+            let got = l3.scale(inv as f32) as f64;
+            assert!((got - hf).abs() <= hf * 1e-5, "pair {i}: {got} vs {hf}");
+        }
+        assert_eq!(RopeLlama3::OFF.scale(0.25), 0.25);
     }
 }

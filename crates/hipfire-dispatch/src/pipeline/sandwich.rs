@@ -667,6 +667,8 @@ pub(super) fn rms_norm(
 pub enum RopeKind {
     /// Every channel pair of the head rotates.
     RotateHalf,
+    /// [`Self::RotateHalf`] with the Llama-3 inverse-frequency remap.
+    RotateHalfLlama3(rdna_compute::rope::RopeLlama3),
     /// The first `rot_pairs` pairs of each half rotate; the rest pass through.
     PartialHalved { rot_pairs: usize },
     /// Rotate-half over the first `rot_dim` channels of each head (pair
@@ -687,7 +689,7 @@ impl Rope {
     /// pairing is a prefix of the head.
     fn halved_pairs(&self, head_dim: usize) -> Option<usize> {
         match self.kind {
-            RopeKind::RotateHalf => Some(head_dim / 2),
+            RopeKind::RotateHalf | RopeKind::RotateHalfLlama3(_) => Some(head_dim / 2),
             RopeKind::PartialHalved { rot_pairs } => Some(rot_pairs),
             RopeKind::PrefixHalfSplit { .. } => None,
             RopeKind::NoPe => Some(0),
@@ -712,6 +714,9 @@ impl Rope {
             RopeKind::NoPe => Ok(()),
             RopeKind::RotateHalf => {
                 gpu.rope_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta)
+            }
+            RopeKind::RotateHalfLlama3(l3) => {
+                gpu.rope_scaled_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta, l3)
             }
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32(
                 q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_pairs, theta,
@@ -764,6 +769,9 @@ impl Rope {
             RopeKind::RotateHalf => {
                 gpu.rope_batched_f32(q, k, positions, n_heads, n_kv_heads, head_dim, theta, rows)
             }
+            RopeKind::RotateHalfLlama3(l3) => gpu.rope_batched_scaled_f32(
+                q, k, positions, n_heads, n_kv_heads, head_dim, theta, rows, l3,
+            ),
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
                 q, k, positions, n_heads, n_kv_heads, head_dim, rot_pairs, theta, rows,
             ),

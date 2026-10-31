@@ -37,6 +37,8 @@ pub struct LlamaConfig {
     pub norm_eps: f32,
     pub max_seq_len: usize,
     pub rope_freq_base: f32,
+    /// `rope_type: "llama3"` remap; `RopeLlama3::OFF` for plain RoPE.
+    pub rope_llama3: rdna_compute::rope::RopeLlama3,
     pub bos_token: u32,
     pub eos_token: u32,
     pub has_qk_norm: bool, // Qwen3 feature
@@ -98,6 +100,8 @@ impl LlamaConfig {
             norm_eps,
             max_seq_len,
             rope_freq_base,
+            // ponytail: GGUF llama3 ships a `rope_freqs` tensor we do not read; plain RoPE.
+            rope_llama3: rdna_compute::rope::RopeLlama3::OFF,
             bos_token,
             eos_token,
             has_qk_norm,
@@ -1924,7 +1928,7 @@ pub fn prefill_forward(
         }
 
         // Batched RoPE: all positions in one kernel launch
-        gpu.rope_batched_f32(
+        gpu.rope_batched_scaled_f32(
             &q_batch,
             &k_batch,
             &pos_array,
@@ -1933,6 +1937,7 @@ pub fn prefill_forward(
             head_dim,
             config.rope_freq_base,
             batch,
+            config.rope_llama3,
         )?;
 
         // Batched KV cache write: all positions in 2 kernel launches (K + V)
@@ -3070,7 +3075,7 @@ fn forward_prefill_chunk(
             Some(tm) => tm.rope_positions,
             None => &pbs.positions,
         };
-        gpu.rope_batched_f32(
+        gpu.rope_batched_scaled_f32(
             &pbs.fa_q_batch,
             &pbs.fa_k_batch,
             rope_pos,
@@ -3079,6 +3084,7 @@ fn forward_prefill_chunk(
             config.head_dim,
             config.rope_freq_base,
             n,
+            config.rope_llama3,
         )?;
 
         // Batched KV write.
@@ -4475,7 +4481,12 @@ fn forward_scratch_compute_lowered(
     let knobs = crate::arch_spec::DenseKnobs {
         attn_bias: false,
         qk_norm: config.has_qk_norm,
-        rope_theta: config.rope_freq_base,
+        rope: hipfire_dispatch::pipeline::sandwich::Rope {
+            kind: hipfire_dispatch::pipeline::sandwich::RopeKind::RotateHalfLlama3(
+                config.rope_llama3,
+            ),
+            theta: config.rope_freq_base,
+        },
         norm_eps: config.norm_eps,
         n_heads: config.n_heads,
         n_kv_heads: config.n_kv_heads,
@@ -4743,7 +4754,7 @@ pub fn forward_scratch_layers(
             }
         }
 
-        gpu.rope_f32(
+        gpu.rope_scaled_f32(
             &scratch.q,
             &scratch.k,
             &scratch.pos_buf,
@@ -4751,6 +4762,7 @@ pub fn forward_scratch_layers(
             n_kv_heads,
             head_dim,
             config.rope_freq_base,
+            config.rope_llama3,
         )?;
 
         if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
@@ -5095,7 +5107,7 @@ pub fn forward_early_exit(
             }
         }
 
-        gpu.rope_f32(
+        gpu.rope_scaled_f32(
             &scratch.q,
             &scratch.k,
             &scratch.pos_buf,
@@ -5103,6 +5115,7 @@ pub fn forward_early_exit(
             n_kv_heads,
             head_dim,
             config.rope_freq_base,
+            config.rope_llama3,
         )?;
 
         // KV write + attention (use same dispatch as forward_scratch_layers)
@@ -5339,7 +5352,7 @@ pub fn forward_scratch_compute_capture(
             }
         }
 
-        gpu.rope_f32(
+        gpu.rope_scaled_f32(
             &scratch.q,
             &scratch.k,
             &scratch.pos_buf,
@@ -5347,6 +5360,7 @@ pub fn forward_scratch_compute_capture(
             n_kv_heads,
             head_dim,
             config.rope_freq_base,
+            config.rope_llama3,
         )?;
 
         if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
@@ -5710,7 +5724,7 @@ pub fn forward(
         }
 
         // RoPE — GPU-side, reads pos from GPU buffer
-        gpu.rope_f32(
+        gpu.rope_scaled_f32(
             &q,
             &k,
             &pos_buf,
@@ -5718,6 +5732,7 @@ pub fn forward(
             n_kv_heads,
             head_dim,
             config.rope_freq_base,
+            config.rope_llama3,
         )?;
 
         // Store K, V in GPU cache + attention
@@ -5901,7 +5916,7 @@ fn forward_logits_gpu(
             }
         }
 
-        gpu.rope_f32(
+        gpu.rope_scaled_f32(
             &q,
             &k,
             &pos_buf,
@@ -5909,6 +5924,7 @@ fn forward_logits_gpu(
             n_kv_heads,
             head_dim,
             config.rope_freq_base,
+            config.rope_llama3,
         )?;
 
         gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;

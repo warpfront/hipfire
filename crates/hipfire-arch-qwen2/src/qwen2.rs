@@ -1960,7 +1960,10 @@ fn forward_step_after_x_lowered(
     let knobs = DenseKnobs {
         attn_bias: true,
         qk_norm: false,
-        rope_theta: cfg.rope_theta,
+        rope: hipfire_dispatch::pipeline::sandwich::Rope {
+            kind: hipfire_dispatch::pipeline::sandwich::RopeKind::RotateHalf,
+            theta: cfg.rope_theta,
+        },
         norm_eps: cfg.rms_norm_eps,
         n_heads: cfg.num_attention_heads,
         n_kv_heads: cfg.num_key_value_heads,
