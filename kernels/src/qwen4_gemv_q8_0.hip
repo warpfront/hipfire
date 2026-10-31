@@ -349,7 +349,7 @@ static __device__ __forceinline__ void gemv_q8_0_row_multi(
             sum[r] += __shfl_down(sum[r], offset);
 }
 
-// gemv_q8_0 (gemv_q8_0.hip) over `rows` (1..=8) activation rows at
+// gemv_q8_0 (gemv_q8_0.hip) over `rows` (2..=8) activation rows at
 // K % 64 == 0 (x row stride K, y row stride M), Q8_ROWS_W weight rows per
 // wave. Each 8-block (272 B) chunk of the wave's rows is copied into LDS
 // with dword loads (the next chunk's loads in flight while the current one
@@ -465,7 +465,7 @@ extern "C" __global__ void gemv_q8_0_rows(
     case R:                                                                            \
         gemv_q8_0_rows_tile<R>(A_q8, x, y, M, K, row0, lane, staged);                  \
         return;
-    Q8_ROWS(1) Q8_ROWS(2) Q8_ROWS(3) Q8_ROWS(4) Q8_ROWS(5) Q8_ROWS(6) Q8_ROWS(7) Q8_ROWS(8)
+    Q8_ROWS(2) Q8_ROWS(3) Q8_ROWS(4) Q8_ROWS(5) Q8_ROWS(6) Q8_ROWS(7) Q8_ROWS(8)
 #undef Q8_ROWS
     }
 }
