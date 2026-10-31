@@ -17,6 +17,17 @@ use crate::{DType, Gpu, GpuTensor};
 pub(crate) mod npu_arena;
 pub use npu_arena::*;
 
+// Multi-lane QSA decode core (fn-lanes, exact gfx1201): a child module so it
+// shares the singleton launchers' private validators and route predicates.
+#[path = "qsa_core_lanes.rs"]
+mod qsa_core_lanes;
+pub(crate) use qsa_core_lanes::QSA_LANES_SRC;
+pub use qsa_core_lanes::{
+    qsa_core_lanes, qsa_core_lanes_min, QsaCoreLane, QsaCoreLanesPlan, QSA_CORE_LANES_MAX,
+    QSA_CORE_LANE_ROWS, QSA_LANES_ATTENTION_SYMBOL, QSA_LANES_MODULE, QSA_LANES_POOL_SYMBOL,
+    QSA_LANES_PROLOGUE_SYMBOL, QSA_LANES_SELECT_SYMBOL,
+};
+
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/rope_yarn.h"),

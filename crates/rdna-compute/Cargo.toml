@@ -1114,6 +1114,10 @@ name = "lane_fa_oracle"
 required-features = ["lab", "deltanet"]
 
 [[example]]
+name = "qsa_lanes_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_mq4_x4_pm_oracle"
 required-features = ["lab"]
 
