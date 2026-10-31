@@ -163,6 +163,7 @@ module	embedding_q4k	codec-outside-core-rungs	Q4K route absent from admitted cor
 module	embedding_q8_buf_broadcast	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:3626
 module	embedding_scatter_ext_f32	config-opt-in	Non-default configuration: vision.mode / serve.multi_slot; forward_slots.rs:4161
 module	emu_validate	developer-opt-in	Non-default developer override: HIPFIRE_EMU; rdna-compute/src/emu_validate.rs:1202
+module	ep_boundary_signal_wait	developer-opt-in	Non-default developer override: HIPFIRE_EP_BOUNDARY=kernel (Flash-Next EP); rdna-compute/src/dispatch.rs:9345-9353
 module	ffn_grouped_activation_pad	non-core-family	Generic GroupedMoeOp lowering is built only by Raon MoE (Qwen3.5/qwen4 do not construct GroupedMoeOp); hipfire-arch-raon/src/moe.rs:507
 module	ffn_moe_combine_policy	non-core-family	Generic GroupedMoeOp combine/bf16-round stage; only Raon builds GroupedMoeOp; hipfire-arch-raon/src/moe.rs:507
 module	ffn_moe_combine_policy_w2	non-core-family	Generic GroupedMoeOp combine stage; only Raon builds GroupedMoeOp; hipfire-arch-raon/src/moe.rs:507
