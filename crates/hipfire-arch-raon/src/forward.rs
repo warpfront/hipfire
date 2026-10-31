@@ -54,7 +54,7 @@ use crate::config::{LayerKind, RaonConfig};
 use crate::mhc::{broadcast_embedding, final_mean_norm, RaonMhcShape, RaonMhcWork};
 use crate::mla::{raon_mla_scale, MlaRoute, RaonMlaWork, RAON_MLA_EPS};
 use crate::moe::{
-    forward_dense, forward_moe, RaonDenseRefs, RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs,
+    forward_dense, forward_moe, forward_moe_rows_exact, RaonDenseRefs, RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs,
     RaonMoeScratch,
 };
 use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
@@ -847,7 +847,7 @@ fn mla_mixer(
             y: &scratch.mla_attn,
             rows,
             scale: raon_mla_scale(&geometry),
-            route: work.mla.attention_route(route, mi)?,
+            route: work.mla.attention_route(route, mi, rows)?,
         },
     )?;
     run_latent(
@@ -897,7 +897,12 @@ fn ffn_block(
             )
         }
         RaonFfn::Moe(m) => {
-            let (shared_gate, shared_up, shared_down) = m.shared.projections(rows);
+            // Row-exact verify blocks run every row as the decode step does,
+            // shared expert included: its single-row weights.
+            let rows_exact =
+                (2..=crate::projection::ROWS_EXACT_MAX).contains(&rows) && crate::projection::rows_exact();
+            let (shared_gate, shared_up, shared_down) =
+                m.shared.projections(if rows_exact { 1 } else { rows });
             let refs = RaonMoeLayerRefs::from_parts(
                 &m.router,
                 &m.e_bias,
@@ -910,7 +915,8 @@ fn ffn_block(
                 m.expert_down_awq_ptrs.as_ref(),
             )
             .with_iu4_symmetric(m.iu4_symmetric, m.shared.iu4_symmetric);
-            forward_moe(
+            let run = if rows_exact { forward_moe_rows_exact } else { forward_moe };
+            run(
                 gpu,
                 ctx,
                 &work.moe_dims,

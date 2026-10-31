@@ -23,7 +23,7 @@
 
 use hipfire_dispatch::pipeline::latent_attention::{
     execute_latent_attention, AbsorbOperands, AttentionRoute, ExpandedMirror, KvExpansion,
-    LatentAttentionOp, LatentCache, LatentGeometry, RowRange,
+    LatentAttentionOp, LatentCache, LatentGeometry, MlaRowsRoute, RowRange,
 };
 use hipfire_dispatch::types::DispatchError;
 use rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems;
@@ -258,7 +258,14 @@ impl RaonMlaWork {
         } else {
             cfg.v_head
         };
-        let ws = latent_attention_decode_workspace_elems(cfg.n_heads, v_width);
+        // Row-exact verify blocks run up to ROWS_EXACT_MAX decode problems in
+        // one launch, one workspace plane each.
+        let planes = if crate::projection::rows_exact() {
+            crate::projection::ROWS_EXACT_MAX
+        } else {
+            1
+        };
+        let ws = latent_attention_decode_workspace_elems(cfg.n_heads, v_width) * planes;
         let split_ws = gpu.zeros(&[ws], DType::F32).map_err(hip)?;
         let absorb = if policy.absorb {
             let q = gpu
@@ -380,28 +387,46 @@ impl RaonMlaWork {
         }
     }
 
-    /// Attention route operands for MLA layer ordinal `mi` under `route`.
+    /// Attention route operands for MLA layer ordinal `mi` under `route`, for
+    /// a call of `rows` rows. A row-exact verify block
+    /// ([`crate::projection::rows_exact`], `2..=ROWS_EXACT_MAX` rows) runs every
+    /// row as its own decode problem ([`MlaRowsRoute::DecodeExact`]).
     pub fn attention_route(
         &self,
         route: MlaRoute,
         mi: usize,
+        rows: usize,
     ) -> Result<AttentionRoute<'_>, String> {
         let policy = self.policy;
         let ws = Some(&self.split_ws);
+        let rows_route = ((2..=crate::projection::ROWS_EXACT_MAX).contains(&rows)
+            && crate::projection::rows_exact())
+        .then_some(MlaRowsRoute::DecodeExact);
         match (route, policy.tiled) {
             (MlaRoute::Decompressed, false) => Ok(AttentionRoute::Reference),
-            (MlaRoute::Decompressed, true) => Ok(AttentionRoute::Tiled { workspace: ws }),
+            (MlaRoute::Decompressed, true) => Ok(match rows_route {
+                Some(rows_route) => AttentionRoute::TiledRows {
+                    workspace: ws,
+                    rows_route,
+                },
+                None => AttentionRoute::Tiled { workspace: ws },
+            }),
             (MlaRoute::Absorbed, _) => {
                 let ab = self.absorb.as_ref().filter(|a| mi < a.packed.len()).ok_or(
                     "raon mla: absorbed route selected but its packed weights are not built",
                 )?;
-                Ok(AttentionRoute::Absorbed {
-                    ops: AbsorbOperands {
-                        packed: &ab.packed[mi],
-                        q_abs: &ab.q_abs,
-                        z: &ab.z,
+                let ops = AbsorbOperands {
+                    packed: &ab.packed[mi],
+                    q_abs: &ab.q_abs,
+                    z: &ab.z,
+                };
+                Ok(match rows_route {
+                    Some(rows_route) => AttentionRoute::AbsorbedRows {
+                        ops,
+                        workspace: ws,
+                        rows_route,
                     },
-                    workspace: ws,
+                    None => AttentionRoute::Absorbed { ops, workspace: ws },
                 })
             }
         }

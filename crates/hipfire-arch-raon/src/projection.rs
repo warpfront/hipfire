@@ -117,6 +117,9 @@ pub fn project_rows(
     }
     match w.gpu_dtype {
         DType::MQ4G256V2 => weight_gemm(gpu, w, x, y, rows).map_err(|e| format!("{e:?}")),
+        DType::Q8_0 if rows <= ROWS_EXACT_MAX && rows_exact() => gpu
+            .gemv_q8_0_rows_exact(&w.buf, x, y, w.m, w.k, rows)
+            .map_err(|e| e.to_string()),
         DType::Q8_0 => q8_0_prefill_gemm(gpu, tier, &w.buf, x, y, w.m, w.k, rows)
             .map(|_| ())
             .map_err(|e| e.to_string()),
@@ -130,6 +133,18 @@ pub fn project_rows(
         round_bf16_rows(gpu, y, rows, w.m)?;
     }
     Ok(())
+}
+
+/// Widest block the row-exact verify route takes (a DFlash2 window).
+pub const ROWS_EXACT_MAX: usize = 16;
+
+/// `HIPFIRE_RAON_VERIFY_ROWEXACT=1` (lab, default off pending its gates):
+/// blocks of `2..=ROWS_EXACT_MAX` rows run the row-exact multi-row kernels,
+/// every row bit-identical to the decode route's single row (Q8_0:
+/// `gemv_q8_0_rows_exact`); other dtypes keep the batched GEMM.
+pub fn rows_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| hipfire_config::developer_bool("HIPFIRE_RAON_VERIFY_ROWEXACT", false))
 }
 
 /// Dispatch to [`project_row`] / [`project_rows`] by row count.
