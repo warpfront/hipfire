@@ -30,6 +30,8 @@
 
 /// CPU log-mel-spectrogram front-end (no GPU needed). Always compiled.
 pub mod mel;
+/// Minimal PCM WAV decoder (no GPU needed). Always compiled.
+pub mod wav;
 
 #[cfg(feature = "deltanet")]
 pub mod arch;

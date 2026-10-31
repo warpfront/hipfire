@@ -58,6 +58,22 @@ impl MelConfig {
     }
     /// 8 spectrogram frames → 1 encoder token (LFM3-Audio `encoder_stride`).
     pub const ENCODER_STRIDE: usize = 8;
+
+    /// Right-pad length for a clip of `num_samples` (HF `pad_length`): pad so
+    /// the last STFT window is full (aligned to `hop_length`), minimum `n_fft`.
+    pub fn pad_length(&self, num_samples: usize) -> usize {
+        if num_samples < self.n_fft {
+            self.n_fft
+        } else {
+            let rem = (num_samples - self.n_fft) % self.hop_length;
+            num_samples + ((self.hop_length - rem) % self.hop_length)
+        }
+    }
+    /// Number of STFT frames for a clip of `num_samples` (after padding).
+    pub fn num_frames(&self, num_samples: usize) -> usize {
+        let padded = self.pad_length(num_samples);
+        1 + (padded.saturating_sub(self.n_fft)) / self.hop_length
+    }
 }
 
 /// ln(6.4) — used by the Slaney mel scale (std doesn't expose this constant).
@@ -222,6 +238,19 @@ pub fn log_mel_spectrogram(waveform: &[f32], cfg: &MelConfig) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Compute the log-mel spectrogram of a raw mono waveform (right-padded to a
+/// full final STFT window first, matching the HF `Lfm3AudioFeatureExtractor`).
+///
+/// Returns `(mel, num_frames)` where `mel` is row-major `[n_mels, num_frames]`
+/// F32 and `num_frames` is the padded frame count (the caller divides by 8 for
+/// the encoder token count).
+pub fn log_mel_from_waveform(waveform: &[f32], cfg: &MelConfig) -> Vec<f32> {
+    let padded = cfg.pad_length(waveform.len());
+    let mut buf = vec![0.0f32; padded];
+    buf[..waveform.len()].copy_from_slice(waveform);
+    log_mel_spectrogram(&buf, cfg)
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_lfm3 as lfm3;
+use hipfire_arch_lfm3_audio::{lfm3_audio, mel as lfm3_mel, wav as lfm3_wav};
 use hipfire_arch_lfm3_vl::lfm3_vl;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
@@ -5653,6 +5654,7 @@ fn main() {
                             );
                         }
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some() || m.lfm3_vision_config.is_some();
+                        let audio = m.lfm3_audio_config.is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
@@ -5758,8 +5760,8 @@ fn main() {
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let _ = writeln!(
                             stdout,
-                            r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{}}}"#,
-                            arch, dim, layers, vocab, vl, cache_capable, retry_reset_eligible
+                            r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"audio":{},"cache_capable":{},"retry_reset_eligible":{}}}"#,
+                            arch, dim, layers, vocab, vl, audio, cache_capable, retry_reset_eligible
                         );
 
                         // ── PFlash drafter load (Phase 4.0) ──────────────
@@ -5967,6 +5969,8 @@ fn main() {
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
+                let audio = msg.get("audio").and_then(|v| v.as_str());
+                let audio_base64 = msg.get("audio_base64").and_then(|v| v.as_str());
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -6288,11 +6292,46 @@ fn main() {
                 };
 
                 let has_image = image_base64.is_some() || image.is_some();
+                let has_audio = audio_base64.is_some() || audio.is_some();
                 let is_dots_ocr = m.arch_id == 8;
                 let is_lfm3_vl = m.lfm3_vision_config.is_some();
+                let is_lfm3_audio = m.lfm3_audio_config.is_some();
                 let has_vl = m.vision_config.is_some() || is_dots_ocr || is_lfm3_vl;
 
-                if has_image && !has_vl {
+                if has_audio && !is_lfm3_audio {
+                    write_error(&mut stdout, id, "model has no audio encoder");
+                } else if has_audio && is_lfm3_audio {
+                    // LFM3-Audio ASR path: decode audio → mel → encoder →
+                    // projector → splice audio tokens into the LM context.
+                    if audio_base64.is_some() && audio.is_some() {
+                        eprintln!(
+                            "[daemon/audio] both audio and audio_base64 provided — using audio_base64"
+                        );
+                    }
+                    let audio_bytes: Vec<u8> = if let Some(b64) = audio_base64 {
+                        use base64::Engine as _;
+                        match base64::engine::general_purpose::STANDARD.decode(
+                            b64.strip_prefix("data:").and_then(|r| r.split_once(',').map(|(_, a)| a)).unwrap_or(b64),
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                write_error(&mut stdout, id, &format!("failed to decode base64 audio: {e}"));
+                                continue;
+                            }
+                        }
+                    } else {
+                        match std::fs::read(audio.unwrap()) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                write_error(&mut stdout, id, &format!("failed to read audio file: {e}"));
+                                continue;
+                            }
+                        }
+                    };
+                    generate_lfm3_audio(
+                        m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, &audio_bytes,
+                    );
+                } else if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
                 } else if has_image && has_vl {
                     // DEFENSIVE: VL is single-image, single-turn only. The
@@ -19270,6 +19309,294 @@ fn generate_lfm3_vl(
             Ok(logits) => last_logits = logits,
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("lfm3-vl decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.lfm3().unwrap().state.n_tokens;
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_ms": prefill_ms,
+        "total_ms": total_ms,
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {}
+    }
+}
+
+/// LFM3-Audio ASR path (Phase 3). Mirrors `generate_lfm3_vl`'s shape (render
+/// chat template → splice placeholder tokens → prefill with
+/// `decode_step_with_embed` at placeholder positions → host-side decode loop),
+/// but the multimodal input is audio: decode WAV → log-mel → conv2d downsampler
+/// → 17-layer LFM2 encoder → projector → `[n_audio, text_hidden]` audio tokens,
+/// spliced at `<|audio|>` (id 125031) positions. One `<|audio|>` per encoder
+/// token (one per 8 mel frames), matching the HF processor's
+/// `replace_audio_token` expansion.
+fn generate_lfm3_audio(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    audio_bytes: &[u8],
+) {
+    use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
+
+    if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_audio_weights.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "lfm3-audio: tokenizer / lfm3 bundle / audio weights missing",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    let audio_config = m.lfm3_audio_config.as_ref().unwrap();
+    let sr = audio_config.mel.sample_rate;
+
+    // ── Audio decode (WAV → mono F32 @ 16 kHz) ──
+    let waveform = match lfm3_wav::decode_wav(audio_bytes, sr) {
+        Ok(w) => w,
+        Err(e) => {
+            write_error(stdout, id, &format!("lfm3-audio: WAV decode failed: {e}"));
+            return;
+        }
+    };
+    eprintln!(
+        "[lfm3-audio] decoded {} samples ({:.1}s @ {}Hz)",
+        waveform.samples.len(),
+        waveform.samples.len() as f64 / sr as f64,
+        sr
+    );
+
+    // ── Mel + encoder + projector → projected audio tokens ──
+    let mel = lfm3_mel::log_mel_from_waveform(&waveform.samples, &audio_config.mel);
+    let num_frames = mel.len() / audio_config.mel.n_mels;
+    let audio_tokens = {
+        let aw = m.lfm3_audio_weights.as_ref().unwrap();
+        match lfm3_audio::audio_forward(gpu, aw, audio_config, &mel, num_frames) {
+            Ok(v) => v,
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm3-audio: audio_forward failed: {e:?}"));
+                return;
+            }
+        }
+    };
+    let text_hidden = m.lfm3().unwrap().config.hidden_size;
+    let n_audio_tokens = audio_tokens.len() / text_hidden;
+    eprintln!(
+        "[lfm3-audio] encoder produced {n_audio_tokens} audio tokens x {text_hidden} dims (from {num_frames} mel frames)"
+    );
+
+    // ── Resolve the <|audio|> placeholder token id (default 125031). ──
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let audio_pad_id = {
+        let ids = tokenizer.encode("<|audio|>");
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            125_031
+        }
+    };
+
+    // ── Prompt build: render the LFM3 chat template, then splice n_audio
+    //    <|audio|> tokens before the user content (mirrors the VL vision
+    //    splice; the HF processor expands <|audio|> once per encoder token). ──
+    let q_tokens = tokenizer.encode(prompt);
+    let mut audio_seq: Vec<u32> = Vec::with_capacity(n_audio_tokens + 1);
+    audio_seq.extend(std::iter::repeat(audio_pad_id).take(n_audio_tokens));
+
+    let prompt_tokens: Vec<u32> = if let Some(template) = m.chat_template.as_ref() {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: true,
+            bos_token: None,
+        };
+        match frame.render() {
+            Ok(rendered) => {
+                let mut toks = tokenizer.encode(&rendered);
+                if !q_tokens.is_empty() {
+                    if let Some(pos) = toks.windows(q_tokens.len()).position(|w| w == q_tokens) {
+                        toks.splice(pos..pos, audio_seq.clone());
+                    } else {
+                        eprintln!("[lfm3-audio] warning: could not locate user content for audio splice");
+                    }
+                }
+                toks
+            }
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed in lfm3-audio path ({e}) — falling back to ChatFrame");
+                let mut body = audio_seq.clone();
+                body.extend_from_slice(&q_tokens);
+                ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: "",
+                    assistant_prefix: AssistantPrefix::OpenThink,
+                    raw: false,
+                }
+                .build_with_user_tokens(&body)
+            }
+        }
+    } else {
+        let mut body = audio_seq.clone();
+        body.extend_from_slice(&q_tokens);
+        ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: "",
+            assistant_prefix: AssistantPrefix::OpenThink,
+            raw: false,
+        }
+        .build_with_user_tokens(&body)
+    };
+
+    if prompt_tokens.is_empty() {
+        write_error(stdout, id, "lfm3-audio: empty prompt after tokenize");
+        return;
+    }
+
+    let eos_tok = m.lfm3().unwrap().eos_tok;
+    let stop_toks: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut v = vec![eos_tok];
+        for s in ["", "</s>", "<|im_end|>"] {
+            let ids = tk.encode(s);
+            if ids.len() == 1 && !v.contains(&ids[0]) {
+                v.push(ids[0]);
+            }
+        }
+        v
+    };
+
+    // Cross-conversation reset (LFM3 hybrid conv+GQA state can't rewind).
+    let _ = m.lfm3_mut().unwrap().state.reset(gpu);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    let cap = m.lfm3().unwrap().state.max_seq;
+    if prompt_tokens.len().saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "lfm3-audio: prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={}",
+                prompt_tokens.len(),
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: per-token decode_step, splicing audio embeddings at
+    //    audio_pad positions via decode_step_with_embed. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    let mut audio_idx = 0usize;
+    {
+        let b = m.lfm3_mut().unwrap();
+        let cfg = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_tokens {
+            let res = if tok == audio_pad_id && audio_idx < n_audio_tokens {
+                let emb = &audio_tokens[audio_idx * text_hidden..(audio_idx + 1) * text_hidden];
+                audio_idx += 1;
+                lfm3::forward::decode_step_with_embed(cfg, weights, state, gpu, emb, position)
+            } else {
+                lfm3::forward::decode_step(cfg, weights, state, gpu, tok, position)
+            };
+            match res {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("lfm3-audio prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_tokens {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── Decode loop (host-side sampling, same as generate_lfm3_vl). ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_toks.contains(&next_tok) {
+            break;
+        }
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        if matches!(frag.trim(), "</s>" | "<|im_end|>") {
+            break;
+        }
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+            "attempt_id": active_attempt_id(),
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        let step = {
+            let b = m.lfm3_mut().unwrap();
+            let cfg = &b.config;
+            let weights = &b.weights;
+            let state = &mut b.state;
+            let position = state.n_tokens as u32;
+            lfm3::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("lfm3-audio decode failed: {e:?}"));
                 return;
             }
         }
