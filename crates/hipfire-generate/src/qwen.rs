@@ -4345,15 +4345,21 @@ fn spec_retire_done_fields(done: &mut serde_json::Value, run: &SpecRun) {
     }
 }
 
-/// Break-even line of the spec → AR retirement policy from `HIPFIRE_SPEC_RETIRE`
-/// (see [`hipfire_runtime::spec_retire::parse_break_even`]). A malformed value
-/// turns retirement off and says so, rather than guessing a line.
-fn spec_retire_break_even() -> Option<hipfire_runtime::spec_retire::BreakEven> {
+/// Break-even line of the spec → AR retirement policy: `HIPFIRE_SPEC_RETIRE`
+/// when set (see [`hipfire_runtime::spec_retire::parse_break_even`]), else the
+/// drafter's measured line (`drafter`), else the shared default. A malformed
+/// value turns retirement off and says so, rather than guessing a line.
+fn spec_retire_break_even(
+    drafter: Option<hipfire_runtime::spec_retire::BreakEven>,
+) -> Option<hipfire_runtime::spec_retire::BreakEven> {
     let raw = hipfire_config::developer_var("HIPFIRE_SPEC_RETIRE").ok();
-    hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()).unwrap_or_else(|e| {
-        eprintln!("[spec-retire] {e}; retirement off");
-        None
-    })
+    match hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()) {
+        Ok(parsed) => hipfire_runtime::spec_retire::resolve_break_even(parsed, drafter),
+        Err(e) => {
+            eprintln!("[spec-retire] {e}; retirement off");
+            None
+        }
+    }
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -5088,11 +5094,13 @@ pub fn generate_spec(
     // first sampled token was already a terminator (see the guard above).
     let mut terminal_cache_invalidated = false;
     // Spec → AR retirement (`hipfire_runtime::spec_retire`) for greedy requests
-    // on a speculator with an AR step. It reads token counts only, so a greedy
-    // request retires at the same cycle on every run.
+    // on a speculator with an AR step, and sampled ones when that AR step
+    // samples with the request's law. It reads token and verified-row counts
+    // only, so a request retires at the same cycle on every run with the same
+    // draws.
     let mut retire = hipfire_runtime::spec_retire::SpecRetire::new(
-        (temp <= 1e-6 && spec.supports_ar_step())
-            .then(spec_retire_break_even)
+        ((temp <= 1e-6 || spec.supports_sampled_ar_step()) && spec.supports_ar_step())
+            .then(|| spec_retire_break_even(spec.retire_break_even()))
             .flatten(),
     );
     let mut ar_steps = 0usize;
@@ -5552,7 +5560,8 @@ pub fn generate_spec(
         } else {
             host.seed_token
         };
-        if !ar_step && retire.observe(committed_tail.len(), position) {
+        // A window verifies its seed row plus the drafts it proposed.
+        if !ar_step && retire.observe(committed_tail.len(), step.proposed + 1, position) {
             eprintln!(
                 "[spec-retire] id={id} drafter={} retired to AR at position {position} (generated {generated}, {spec_cycles} cycles, tau {:.2})",
                 spec.name(),

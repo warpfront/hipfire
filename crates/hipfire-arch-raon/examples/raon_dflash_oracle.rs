@@ -12,7 +12,7 @@
 //! raon_dflash_oracle rollback  --model M.hfq [--draft D.hfq] --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
 //! raon_dflash_oracle verifygraph --model M.hfq --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
 //! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--out DIR]
-//! raon_dflash_oracle costs    --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--reps R] [--max-rows K] [--block B] [--out DIR]
+//! raon_dflash_oracle costs    --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
 //! ```
 //!
 //! Common options: `--chat on|off` (default off: the prompt file is tokenized as
@@ -99,7 +99,11 @@
 //! * `costs` (spec-retire policy): device-synced median/mean ms of AR `decode_step`,
 //!   `verify_block` / `verify_block_logits` per row count 1..=`--max-rows` (9), partial
 //!   `commit_prefix` (k = 2 and k = max-rows), the draft sequence and its head, over
-//!   `--reps` (20); prints `window_units[k] = (draft + verify[k]) / decode`. Writes `costs.json`.
+//!   `--reps` (20); prints `window_units[k] = (draft + verify[k]) / decode`, the
+//!   AR step of a retired request (`commit_row`) and the production cycles: the
+//!   speculator's own greedy windows over `--tokens` (64) tokens, each priced in
+//!   decode steps by its verified rows, with their least-squares break-even line
+//!   (the `spec_retire` line a target states). Writes `costs.json`.
 //!
 //! Exit status: 0 pass, 1 verdict failed, 2 usage / runtime error.
 
@@ -118,13 +122,15 @@ use hipfire_runtime::dflash::{
     draft_forward_based, propose_candidates_device, DflashConfig, DflashScratch, DflashWeights,
     DFLASH_BLOCK_MAX,
 };
-use hipfire_runtime::dflash2_spec::build_dflash2_speculator;
+use hipfire_runtime::dflash2_spec::{build_dflash2_speculator, new_draft_scratch};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::sample_top_k_p_with_state;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::prompt_frame::JinjaChatFrame;
-use hipfire_runtime::spec::{SpecAdvance, SpecRequestConfig, SpecScratch, SpecTarget, Speculator};
+use hipfire_runtime::spec::{
+    RowPick, SpecAdvance, SpecRequestConfig, SpecScratch, SpecTarget, Speculator,
+};
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{Gpu, GpuTensor};
@@ -138,7 +144,7 @@ const USAGE: &str = "usage:
   raon_dflash_oracle rollback --model M [--draft D] --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle verifygraph --model M --prompt-file P [--out DIR] [--chat on] [--max-seq N]
   raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--out DIR]
-  raon_dflash_oracle costs    --model M --draft D --prompt-file P [--chat on] [--reps R] [--max-rows K] [--block B] [--out DIR]
+  raon_dflash_oracle costs    --model M --draft D --prompt-file P [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
 common: [--chat on|off] [--think on|off]   (raw text tokens by default)";
 
 type Opts = BTreeMap<String, String>;
@@ -1249,6 +1255,35 @@ impl SpecTarget for TimedTarget<'_> {
         Ok(logits)
     }
 
+    fn commit_row(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        want_logits: bool,
+    ) -> Result<RowPick, String> {
+        {
+            let mut p = self.prof.borrow_mut();
+            *p.verify_rows.entry(1).or_default() += 1;
+            p.verifies.push((position, vec![token]));
+        }
+        let r: Result<RowPick, String> = timed!(
+            self,
+            gpu,
+            "commit_row",
+            self.inner
+                .commit_row(gpu, token, position, scratch, hidden_out, want_logits)
+        );
+        let pick = r?;
+        let law = self.prof.borrow().row_law;
+        if let (Some(spec), RowPick::Logits(logits)) = (law, &pick) {
+            self.prof.borrow_mut().last_laws = vec![row_law(logits, spec)?];
+        }
+        Ok(pick)
+    }
+
     fn commit_prefix(
         &mut self,
         gpu: &mut Gpu,
@@ -1326,6 +1361,14 @@ impl SpecTarget for TimedTarget<'_> {
 
     fn set_dflash_feature_window(&mut self, rows: usize) {
         self.inner.set_dflash_feature_window(rows)
+    }
+
+    fn dflash_retire_break_even(
+        &self,
+        gpu: &Gpu,
+        draft_quantized: bool,
+    ) -> Option<hipfire_runtime::spec_retire::BreakEven> {
+        self.inner.dflash_retire_break_even(gpu, draft_quantized)
     }
 
     fn embed_row(&mut self, gpu: &mut Gpu, token_id: u32) -> Result<Vec<f32>, String> {
@@ -3101,6 +3144,7 @@ fn run_costs(
     let reps = opt_usize(opts, "reps", 20)?;
     let max_rows = opt_usize(opts, "max-rows", 9)?;
     let block = opt_usize(opts, "block", 8)?;
+    let cycle_tokens = opt_usize(opts, "tokens", 64)?;
     if reps == 0 {
         return Err("--reps must be >= 1".into());
     }
@@ -3123,19 +3167,28 @@ fn run_costs(
             max_rows.max(block)
         ));
     }
-    let mut spec: Box<dyn Speculator> =
-        build_dflash2_speculator(gpu, draft_path, bundle, ctx_capacity, block)?;
+    let mut spec: Option<Box<dyn Speculator>> = Some(build_dflash2_speculator(
+        gpu,
+        draft_path,
+        bundle,
+        ctx_capacity,
+        block,
+    )?);
     let mut scratch: Box<dyn SpecScratch> =
         match SpecTarget::new_spec_scratch(bundle, gpu, max_rows.max(block)) {
             Ok(s) => s,
             Err(e) => {
-                spec.free(gpu);
+                if let Some(spec) = spec.take() {
+                    spec.free(gpu);
+                }
                 return Err(e);
             }
         };
     let r = (|| -> Result<Value, String> {
         // 1 + 2. Cold spec prefill, then AR decode.
         let first = spec
+            .as_mut()
+            .expect("speculator lives until the draft cost")
             .prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
             .into_first_token()?;
         let mut chain = vec![first];
@@ -3151,6 +3204,8 @@ fn run_costs(
         let (dec_med, dec_mean) = median_mean(&decode);
         println!("decode_step: median {dec_med:.3} ms, mean {dec_mean:.3} ms");
         let first = spec
+            .as_mut()
+            .expect("speculator lives until the draft cost")
             .prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
             .into_first_token()?;
         if bundle.n_tokens() != position {
@@ -3229,7 +3284,9 @@ fn run_costs(
             let blk = block_for(k);
             let mut ms_v = Vec::with_capacity(pc_reps);
             for _ in 0..pc_reps {
-                spec.prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
+                spec.as_mut()
+                    .expect("speculator lives until the draft cost")
+                    .prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
                     .into_first_token()?;
                 SpecTarget::verify_block(bundle, gpu, &blk, position, scratch.as_mut(), None)?;
                 let (_, ms) = timed_ms(gpu, |gpu| {
@@ -3245,7 +3302,102 @@ fn run_costs(
             partial.insert(k, (med, mean));
         }
 
-        // 4. Draft cost.
+        // The AR step of a retired request: `commit_row` along the greedy
+        // chain (no rollback snapshot), feature row captured.
+        let mut tok = spec
+            .as_mut()
+            .expect("speculator lives until the draft cost")
+            .prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
+            .into_first_token()?;
+        let mut ar_ms = Vec::with_capacity(reps);
+        for i in 0..reps + 2 {
+            let mut rows: Vec<f32> = Vec::new();
+            let (pick, ms) = timed_ms(gpu, |gpu| {
+                SpecTarget::commit_row(
+                    bundle,
+                    gpu,
+                    tok,
+                    position + i,
+                    scratch.as_mut(),
+                    Some(&mut rows),
+                    false,
+                )
+            })?;
+            tok = match pick {
+                RowPick::Argmax(t) => t,
+                RowPick::Logits(_) => return Err("commit_row returned logits".into()),
+            };
+            if i >= 2 {
+                ar_ms.push(ms);
+            }
+        }
+        let (ar_med, ar_mean) = median_mean(&ar_ms);
+        println!("commit_row (AR step): median {ar_med:.3} ms, mean {ar_mean:.3} ms");
+
+        // Production cycles: the speculator's own greedy windows (draft,
+        // selector, verify, commit, feature append and every host round trip
+        // in between) over `--tokens` generated tokens, each device-synced
+        // and priced in decode steps by its verified rows. The first two uses
+        // of a row count run the eager verify and record its graph: skipped.
+        let s = spec
+            .as_mut()
+            .expect("speculator lives until the draft cost");
+        let mut seed = s
+            .prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
+            .into_first_token()?;
+        let mut pos = position;
+        let mut emitted: Vec<u32> = Vec::new();
+        let mut seen: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut cycles: Vec<(usize, usize, f64)> = Vec::new();
+        while pos - position < cycle_tokens && pos + block + 1 < ctx_capacity {
+            let max_emit = (cycle_tokens - (pos - position)).min(block);
+            let (step, ms) = timed_ms(gpu, |gpu| {
+                s.step(gpu, bundle, pos, seed, &emitted, None, 0.0, max_emit)
+            })?;
+            let rows = step.proposed + 1;
+            let uses = seen.entry(rows).or_default();
+            *uses += 1;
+            if *uses > 2 {
+                cycles.push((rows, step.emit.len(), ms / dec_med));
+            }
+            pos += step.emit.len();
+            seed = step.next_seed;
+            emitted.extend(step.emit.iter().copied());
+        }
+        let cycle_line = (cycles.len() >= 2).then(|| {
+            let n = cycles.len() as f64;
+            let (sx, sy) = cycles
+                .iter()
+                .fold((0.0, 0.0), |(a, b), &(r, _, u)| (a + r as f64, b + u));
+            let (mx, my) = (sx / n, sy / n);
+            let sxx: f64 = cycles
+                .iter()
+                .map(|&(r, _, _)| (r as f64 - mx).powi(2))
+                .sum();
+            let sxy: f64 = cycles
+                .iter()
+                .map(|&(r, _, u)| (r as f64 - mx) * (u - my))
+                .sum();
+            // One row count only (every cycle verified the same rows): a flat line.
+            let per_row = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+            (my - per_row * mx, per_row, my)
+        });
+        let emit_mean =
+            cycles.iter().map(|&(_, e, _)| e as f64).sum::<f64>() / cycles.len().max(1) as f64;
+        match cycle_line {
+            Some((base, per_row, units)) => println!(
+                "production cycles: {} timed, {emit_mean:.2} tokens and {units:.3} decode steps per cycle; line base {base:.3} per_row {per_row:.4}",
+                cycles.len()
+            ),
+            None => println!("production cycles: too few timed cycles ({})", cycles.len()),
+        }
+
+        // 4. Draft cost, on the production draft scratch
+        // (`new_draft_scratch`). The speculator's draft copy goes first: two
+        // resident drafts do not fit next to the target on a 24 GB card.
+        if let Some(spec) = spec.take() {
+            spec.free(gpu);
+        }
         let (draft_hfq, cfg) = draft_config(draft_path)?;
         check_streams(bundle, &cfg)?;
         let weights = DflashWeights::load(gpu, &draft_hfq, &cfg).map_err(|e| format!("{e}"))?;
@@ -3253,17 +3405,12 @@ fn run_costs(
             weights.free_gpu(gpu);
             return Err("DFlash2 draft: candidate selector tensors are missing".into());
         }
-        let dscratch = match cfg.declared_window {
-            Some(w) => {
-                DflashScratch::new_windowed(gpu, &cfg, block, w, w, ctx_capacity, weights.has_mq)
-            }
-            None => DflashScratch::new_with_mq(gpu, &cfg, block, ctx_capacity, weights.has_mq),
-        };
+        let dscratch = new_draft_scratch(gpu, &cfg, block, ctx_capacity, weights.has_mq);
         let mut dscratch = match dscratch {
             Ok(s) => s,
             Err(e) => {
                 weights.free_gpu(gpu);
-                return Err(format!("{e}"));
+                return Err(e);
             }
         };
         let d = draft_cost(
@@ -3293,6 +3440,34 @@ fn run_costs(
             println!("{k:>3}  {u:.3}");
             units.push(u);
         }
+        // The spec-retire break-even line (`hipfire_runtime::spec_retire::
+        // BreakEven`, AR steps per cycle): least squares over the windows a
+        // spec cycle runs (k >= 2 verified rows), each charged a partial
+        // commit (the common case where the line matters).
+        let commit = partial.get(&2).map_or(0.0, |&(med, _)| med);
+        let pts: Vec<(f64, f64)> = verify
+            .iter()
+            .filter(|&&(k, _, _)| k >= 2)
+            .map(|&(k, vm, _)| (k as f64, (draft_med + vm + commit) / dec_med))
+            .collect();
+        let line = (pts.len() >= 2).then(|| {
+            let n = pts.len() as f64;
+            let (sx, sy) = pts
+                .iter()
+                .fold((0.0, 0.0), |(a, b), &(x, y)| (a + x, b + y));
+            let (mx, my) = (sx / n, sy / n);
+            let sxx: f64 = pts.iter().map(|&(x, _)| (x - mx) * (x - mx)).sum();
+            let sxy: f64 = pts.iter().map(|&(x, y)| (x - mx) * (y - my)).sum();
+            let per_row = sxy / sxx;
+            (my - per_row * mx, per_row)
+        });
+        if let Some((base, per_row)) = line {
+            println!(
+                "break-even line (k >= 2, partial commit {commit:.3} ms): base {base:.3} per_row {per_row:.4}"
+            );
+        }
+        let ar_step_units = ar_med / dec_med;
+        println!("ar step (commit_row) / decode: {ar_step_units:.4}");
         let by_k = |v: &[(usize, f64, f64)]| -> Value {
             Value::Object(
                 v.iter()
@@ -3311,10 +3486,16 @@ fn run_costs(
             "draft_lm_head_ms": {"median": head_med, "mean": head_mean},
             "window_units": Value::Object(units.iter().enumerate()
                 .map(|(i, u)| ((i + 1).to_string(), json!(u))).collect()),
+            "break_even": line.map(|(base, per_row)| json!({"base": base, "per_row": per_row})),
+            "ar_step_units": ar_step_units,
+            "production_cycles": cycle_line.map(|(base, per_row, units)| json!({"timed": cycles.len(), "emit_mean": emit_mean, "units_mean": units, "base": base, "per_row": per_row})),
+            "commit_row_ms": {"median": ar_med, "mean": ar_mean},
         }))
     })();
     scratch.free(gpu);
-    spec.free(gpu);
+    if let Some(spec) = spec {
+        spec.free(gpu);
+    }
     let mut v = r?;
     if let Some(dir) = out {
         let o = v.as_object_mut().expect("costs result is an object");

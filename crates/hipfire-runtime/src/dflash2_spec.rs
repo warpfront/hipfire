@@ -36,8 +36,8 @@ use crate::dflash::{draft_forward_based, propose_candidates_device, DflashConfig
 use crate::dflash::{DflashWeights, DFLASH_BLOCK_MAX};
 use crate::hfq::HfqFile;
 use crate::spec::{
-    accept_greedy_prefix, terminal_prefix_replay, PrefillOutcome, SpecAdvance, SpecGrammar,
-    SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
+    accept_greedy_prefix, terminal_prefix_replay, PrefillOutcome, RowPick, SpecAdvance,
+    SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use crate::spec_sampling::{accept_sampled_prefix, SampleSpec, SparseDist, SpecRng};
 use rdna_compute::Gpu;
@@ -69,6 +69,9 @@ pub struct Dflash2Speculator {
     mask_row: Vec<f32>,
     request: SpecRequestConfig,
     rng: SpecRng,
+    /// The target's measured break-even line for this draft
+    /// ([`SpecTarget::dflash_retire_break_even`]); `Some` arms the AR step.
+    retire: Option<crate::spec_retire::BreakEven>,
 }
 
 impl Dflash2Speculator {
@@ -201,7 +204,9 @@ impl Dflash2Speculator {
         }
     }
 
-    /// Verify `[seed]` alone: one target token, no draft.
+    /// One target token, no draft: the committed row `[seed]`
+    /// ([`SpecTarget::commit_row`], no rollback snapshot needed) with its
+    /// feature capture, then the greedy or sampled pick.
     fn step_one_token(
         &mut self,
         gpu: &mut Gpu,
@@ -209,20 +214,15 @@ impl Dflash2Speculator {
         position: usize,
         seed: u32,
     ) -> Result<SpecStep, String> {
-        let block = [seed];
         let mut rows = Vec::with_capacity(self.row_elems());
-        let token = if self.sampled() {
-            let mut vs = self.verify_scratch.take().ok_or("verify scratch freed")?;
-            let logits =
-                target.verify_block_logits(gpu, &block, position, vs.as_mut(), Some(&mut rows));
-            self.verify_scratch = Some(vs);
-            self.sample_row(&logits?)?
-        } else {
-            let vs = self.verify_scratch()?;
-            target.verify_block(gpu, &block, position, vs.as_mut(), Some(&mut rows))?[0]
+        let sampled = self.sampled();
+        let vs = self.verify_scratch()?;
+        let pick = target.commit_row(gpu, seed, position, vs.as_mut(), Some(&mut rows), sampled)?;
+        let token = match pick {
+            RowPick::Logits(logits) => self.sample_row(&logits)?,
+            RowPick::Argmax(token) => token,
         };
-        target.commit_prefix(gpu, &block, 0, position, self.verify_scratch()?.as_mut())?;
-        self.append_rows(&rows, &block)?;
+        self.append_rows(&rows, &[seed])?;
         Ok(SpecStep::new(std::iter::once(token), token, 0, 0).cap_emit(1))
     }
 
@@ -428,6 +428,37 @@ impl Speculator for Dflash2Speculator {
             self.check_host_rows(start_pos + tokens.len())?;
         }
         Ok(true)
+    }
+
+    fn supports_ar_step(&self) -> bool {
+        self.retire.is_some()
+    }
+
+    /// A one-row window: the target's verify of `[seed]` (its recorded
+    /// one-row graph after the first use) with the feature capture, the
+    /// greedy or sampled pick of [`Self::step_one_token`], and the committed
+    /// row appended to the draft context, which therefore stays whole.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        if self.retire.is_none() {
+            return Err("Dflash2Speculator: this target has no AR step".into());
+        }
+        self.check_host_rows(position)?;
+        let result = self.step_one_token(gpu, target, position, seed);
+        self.settle(gpu, target, result).map(|step| step.next_seed)
+    }
+
+    fn supports_sampled_ar_step(&self) -> bool {
+        true
+    }
+
+    fn retire_break_even(&self) -> Option<crate::spec_retire::BreakEven> {
+        self.retire
     }
 
     fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
@@ -668,6 +699,37 @@ fn verify_depth(confidence: &[f32]) -> usize {
     confident.max(1).min(confidence.len())
 }
 
+/// The draft scratch [`build_dflash2_speculator`] runs on: an all-sliding
+/// draft was trained over its declared window, so it reads its context
+/// through the projected rows only and stages the raw feature rows from the
+/// host ([`DflashScratch::new_windowed_staged`]) instead of keeping a
+/// window-high raw ring on the device; a split draft keeps the raw window
+/// (its full layer reads it); an unwindowed draft keeps every row. Running
+/// the draft over any other span than its declared window is a
+/// train/inference mask mismatch.
+pub fn new_draft_scratch(
+    gpu: &mut Gpu,
+    config: &DflashConfig,
+    block: usize,
+    ctx_capacity: usize,
+    has_mq: bool,
+) -> Result<DflashScratch, String> {
+    match config.declared_window {
+        Some(w) if config.all_layers_sliding => DflashScratch::new_windowed_staged(
+            gpu,
+            config,
+            block,
+            w,
+            ctx_capacity,
+            has_mq,
+            FEATURE_STAGE_ROWS,
+        ),
+        Some(w) => DflashScratch::new_windowed(gpu, config, block, w, w, ctx_capacity, has_mq),
+        None => DflashScratch::new_with_mq(gpu, config, block, ctx_capacity, has_mq),
+    }
+    .map_err(|e| format!("{e}"))
+}
+
 /// Build a DFlash2 speculator for `target` from a converted draft HFQ
 /// (`dflash_convert`, F16 or MQ). `block` is the runtime proposal width
 /// (seed included), `2..=DFLASH_BLOCK_MAX`; the caller bounds it by the
@@ -707,31 +769,12 @@ pub fn build_dflash2_speculator(
         weights.free_gpu(gpu);
         return Err("DFlash2 draft: candidate selector tensors are missing".into());
     }
-    // The draft was trained over its declared sliding window; running it
-    // over any other span is a train/inference mask mismatch. An all-sliding
-    // draft reads its context through the projected rows only, and the raw
-    // feature rows come from `target_hidden_host`: stage them instead of
-    // keeping a window-high raw ring on the device.
-    let scratch = match config.declared_window {
-        Some(w) if config.all_layers_sliding => DflashScratch::new_windowed_staged(
-            gpu,
-            &config,
-            block,
-            w,
-            ctx_capacity,
-            weights.has_mq,
-            FEATURE_STAGE_ROWS,
-        ),
-        Some(w) => {
-            DflashScratch::new_windowed(gpu, &config, block, w, w, ctx_capacity, weights.has_mq)
-        }
-        None => DflashScratch::new_with_mq(gpu, &config, block, ctx_capacity, weights.has_mq),
-    };
+    let scratch = new_draft_scratch(gpu, &config, block, ctx_capacity, weights.has_mq);
     let scratch = match scratch {
         Ok(scratch) => scratch,
         Err(e) => {
             weights.free_gpu(gpu);
-            return Err(format!("{e}"));
+            return Err(e);
         }
     };
     // An all-sliding draft reads only its last `W` context rows: the host and
@@ -741,6 +784,7 @@ pub fn build_dflash2_speculator(
     if let Some(window) = feature_window {
         target.set_dflash_feature_window(window);
     }
+    let retire = target.dflash_retire_break_even(gpu, weights.has_mq);
     let verify_scratch = match target.new_spec_scratch(gpu, block) {
         Ok(vs) => vs,
         Err(e) => {
@@ -764,6 +808,7 @@ pub fn build_dflash2_speculator(
         mask_row: Vec::new(),
         request: SpecRequestConfig::default(),
         rng: SpecRng::new(0),
+        retire,
     }))
 }
 
