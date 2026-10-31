@@ -1011,3 +1011,55 @@ fn mesh_lane_ep_sampled_lane_without_the_head_read_aborts_the_step() {
     let error = sampled_run(7, false).expect_err("a Leviathan proposal needs its read");
     assert!(matches!(error, ProtocolError::Aborted(_)), "{error}");
 }
+
+#[test]
+fn a_full_row_read_round_with_several_ops_is_sequential() {
+    // Only a read of a head without re-scoring (the whole shared row) over more
+    // than one op needs the one-op-at-a-time schedule.
+    assert_eq!(draft_read_plan(true, false, 3), DraftReadPlan::Sequential);
+    assert_eq!(draft_read_plan(true, false, 2), DraftReadPlan::Sequential);
+    // One op, a re-scoring head (host-resident candidates) and a round with
+    // no distribution read keep the one batched download.
+    assert_eq!(draft_read_plan(true, false, 1), DraftReadPlan::Batched);
+    assert_eq!(draft_read_plan(true, true, 4), DraftReadPlan::Batched);
+    assert_eq!(draft_read_plan(false, false, 4), DraftReadPlan::Batched);
+    assert_eq!(draft_read_plan(false, true, 4), DraftReadPlan::Batched);
+    assert_eq!(draft_read_plan(true, false, 0), DraftReadPlan::Batched);
+}
+
+#[test]
+fn the_read_schedule_covers_every_op_once_in_order() {
+    assert_eq!(DraftReadPlan::Batched.chunks(3), vec![0..3]);
+    assert_eq!(DraftReadPlan::Sequential.chunks(3), vec![0..1, 1..2, 2..3]);
+    assert!(DraftReadPlan::Sequential.chunks(0).is_empty());
+}
+
+/// A fake head: every enqueued op overwrites one shared "logit row" with its
+/// own marker (the real draft head's single `logits` tensor); a FullRow read
+/// copies that row at read time.
+fn run_round_on_shared_row(plan: DraftReadPlan, ops: usize) -> Vec<u32> {
+    let mut shared_row = u32::MAX;
+    let mut reads = Vec::new();
+    for chunk in plan.chunks(ops) {
+        for op in chunk.clone() {
+            shared_row = 100 + op as u32; // enqueue: the op's step writes the row
+        }
+        for _ in chunk {
+            reads.push(shared_row); // finish + read right after the chunk's enqueues
+        }
+    }
+    reads
+}
+
+#[test]
+fn full_row_reads_of_two_ops_are_distinct_only_when_sequential() {
+    // The hazard the plan removes: batched, every op reads the last op's row.
+    assert_eq!(
+        run_round_on_shared_row(DraftReadPlan::Batched, 3),
+        vec![102, 102, 102]
+    );
+    // Sequential: each op reads the row its own step wrote.
+    let plan = draft_read_plan(true, false, 3);
+    assert_eq!(plan, DraftReadPlan::Sequential);
+    assert_eq!(run_round_on_shared_row(plan, 3), vec![100, 101, 102]);
+}

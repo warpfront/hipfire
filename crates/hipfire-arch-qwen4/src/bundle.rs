@@ -3344,6 +3344,15 @@ impl Qwen4Bundle {
         .map_err(BundleError::Forward)
     }
 
+    /// Whether the draft head re-scores its candidates (its reads are the 8
+    /// host-resident candidates); `false`: a read is the whole shared draft
+    /// logit row. `false` without MTP resources.
+    pub(crate) fn mtp_draft_rescored(&self) -> bool {
+        self.mtp
+            .as_ref()
+            .is_some_and(|mtp| mtp.draft.rescored_candidates().is_some())
+    }
+
     /// The last MTP prediction's raw draft material, copied out of the head's
     /// shared buffers: the 8 re-scored candidates' exact logits (host-resident,
     /// no device traffic), or the whole draft logit row when the head does not
