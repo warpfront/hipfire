@@ -3024,6 +3024,11 @@ pub struct GdnCoreLanesPlan<'a, 'l> {
     step: [i32; 4],
 }
 
+/// Whether no two entries of `keys` are equal.
+fn pairwise_distinct(keys: &[usize]) -> bool {
+    (1..keys.len()).all(|i| !keys[..i].contains(&keys[i]))
+}
+
 /// Admission of the per-lane [`gated_delta_conv_params`] + unrotated
 /// [`gated_delta_step_gated`] calls of 2..=[`GDN_CORE_LANES_MAX`] lanes as two
 /// launches (see [`GdnCoreLanesPlan::launch`]). Lanes share the weights and
@@ -3047,6 +3052,9 @@ pub fn gated_delta_core_lanes<'a, 'l>(
         || lanes.len() > GDN_CORE_LANES_MAX
         || gpu.replay.is_recording()
         || !gpu.flags.qwen4_gdn_lanes_enabled()
+        // The singleton's fused step + gated norm (the body the lane kernel
+        // inlines) is the gfx11+ SIMT 128x128 route.
+        || !gpu.arch_caps.has_gfx11_plus_simt()
     {
         return Ok(None);
     }
@@ -3080,6 +3088,26 @@ pub fn gated_delta_core_lanes<'a, 'l>(
             && g.norm.buf.as_ptr() == g0.norm.buf.as_ptr();
         let lane_shape = ([channels, history_rows, kernel_size], step_args);
         if !fits || *shape.get_or_insert(lane_shape) != lane_shape {
+            return Ok(None);
+        }
+    }
+    // Lanes run concurrently: two lanes naming one state, ring or output
+    // buffer would race, so every written buffer must be pairwise distinct.
+    type LaneKey = fn(&GdnCoreLane<'_>) -> usize;
+    let written: [LaneKey; 6] = [
+        |l| l.step.state.buf.as_ptr() as usize,
+        |l| l.conv.history.buf.as_ptr() as usize,
+        |l| l.conv.output.buf.as_ptr() as usize,
+        |l| l.params.gate.buf.as_ptr() as usize,
+        |l| l.params.beta.buf.as_ptr() as usize,
+        |l| l.gate.output.buf.as_ptr() as usize,
+    ];
+    for key in written {
+        let mut keys = [0usize; GDN_CORE_LANES_MAX];
+        for (slot, lane) in keys.iter_mut().zip(lanes) {
+            *slot = key(lane);
+        }
+        if !pairwise_distinct(&keys[..lanes.len()]) {
             return Ok(None);
         }
     }
@@ -21564,5 +21592,98 @@ mod gdn_q8ef_tests {
         for (count, grid) in [(1usize, 1u32), (256, 1), (257, 2), (48 * 128 * 128, 3072)] {
             assert_eq!(blocks(count).unwrap(), grid, "count {count}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gdn_core_lanes_tests {
+    use super::*;
+
+    #[test]
+    fn lane_buffers_must_be_pairwise_distinct() {
+        assert!(pairwise_distinct(&[]));
+        assert!(pairwise_distinct(&[0x10]));
+        assert!(pairwise_distinct(&[0x10, 0x20, 0x30, 0x40]));
+        assert!(!pairwise_distinct(&[0x10, 0x10]));
+        assert!(!pairwise_distinct(&[0x10, 0x20, 0x30, 0x20]));
+        assert!(!pairwise_distinct(&[
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x10
+        ]));
+    }
+
+    /// A lane whose every argument is the one tensor `t`: enough for the
+    /// refusals that precede any shape or pointer validation.
+    fn lane(t: &GpuTensor) -> GdnCoreLane<'_> {
+        GdnCoreLane {
+            conv: GatedDeltaConv {
+                input: t,
+                kernel: t,
+                history: t,
+                output: t,
+                next_history: t,
+                channels: 1,
+                history_rows: 3,
+                kernel_size: 4,
+                cursor: 0,
+                row_index: 0,
+            },
+            params: GatedDeltaParams {
+                a: t,
+                b: t,
+                a_log: t,
+                dt_bias: t,
+                gate: t,
+                beta: t,
+            },
+            step: GatedDeltaStep {
+                q: t,
+                k: t,
+                v: t,
+                gate: t,
+                beta: t,
+                state: t,
+                format: GdnStateFormat::Q8,
+                residual: None,
+                output: t,
+                key_heads: 16,
+                value_heads: 48,
+                key_dim: 128,
+                value_dim: 128,
+                position: 0,
+            },
+            gate: GatedDeltaGate {
+                recurrent_output: t,
+                z: t,
+                norm: t,
+                output: t,
+                value_heads: 48,
+                value_dim: 128,
+            },
+        }
+    }
+
+    /// The count and flag refusals return `Ok(None)` (run the lanes one by one)
+    /// before anything is validated or launched. Needs a GPU for the tensor
+    /// handles only; skipped without one.
+    #[test]
+    fn admission_refuses_bad_counts_and_a_killed_flag() {
+        let Some(mut gpu) = crate::gpu_test::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let t = gpu.zeros(&[16], DType::F32).expect("tensor");
+        let lanes: Vec<GdnCoreLane<'_>> = (0..GDN_CORE_LANES_MAX + 1).map(|_| lane(&t)).collect();
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes = true;
+        assert!(gated_delta_core_lanes(&gpu, &[], 48).unwrap().is_none());
+        assert!(gated_delta_core_lanes(&gpu, &lanes[..1], 48)
+            .unwrap()
+            .is_none());
+        assert!(gated_delta_core_lanes(&gpu, &lanes, 48).unwrap().is_none());
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes = false;
+        assert!(gated_delta_core_lanes(&gpu, &lanes[..2], 48)
+            .unwrap()
+            .is_none());
+        drop(lanes);
+        gpu.free_tensor(t).expect("free");
     }
 }
