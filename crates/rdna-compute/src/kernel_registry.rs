@@ -1215,7 +1215,24 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemv_q8_0_fast",
             kernels::GEMV_Q8_0_FAST_SRC,
-            ["gemv_q8_0_fast_r1"]
+            [
+                "gemv_q8_0_fast_r1",
+                "gemv_q8_0_fast_r2",
+                "gemv_q8_0_fast_r3",
+                "gemv_q8_0_fast_r4",
+                "gemv_q8_0_fast_r5",
+                "gemv_q8_0_fast_r6",
+                "gemv_q8_0_fast_r7",
+                "gemv_q8_0_fast_r8",
+                "gemv_q8_0_fast_r9",
+                "gemv_q8_0_fast_r10",
+                "gemv_q8_0_fast_r11",
+                "gemv_q8_0_fast_r12",
+                "gemv_q8_0_fast_r13",
+                "gemv_q8_0_fast_r14",
+                "gemv_q8_0_fast_r15",
+                "gemv_q8_0_fast_r16",
+            ]
         );
     }
     if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {

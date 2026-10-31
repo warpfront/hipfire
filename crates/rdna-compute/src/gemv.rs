@@ -334,8 +334,25 @@ pub fn q8_0_fast_admits(arch: &str, k: usize, a_addr: usize, x_addr: usize) -> b
         && x_addr.is_multiple_of(16)
 }
 
-/// `gemv_q8_0_fast_r1` .. (index `rows - 1`).
-const Q8_0_FAST_SYMBOLS: [&str; 1] = ["gemv_q8_0_fast_r1"];
+/// `gemv_q8_0_fast_r1` ..= `_r16` (index `rows - 1`; `_r1` is the decode kernel).
+const Q8_0_FAST_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS] = [
+    "gemv_q8_0_fast_r1",
+    "gemv_q8_0_fast_r2",
+    "gemv_q8_0_fast_r3",
+    "gemv_q8_0_fast_r4",
+    "gemv_q8_0_fast_r5",
+    "gemv_q8_0_fast_r6",
+    "gemv_q8_0_fast_r7",
+    "gemv_q8_0_fast_r8",
+    "gemv_q8_0_fast_r9",
+    "gemv_q8_0_fast_r10",
+    "gemv_q8_0_fast_r11",
+    "gemv_q8_0_fast_r12",
+    "gemv_q8_0_fast_r13",
+    "gemv_q8_0_fast_r14",
+    "gemv_q8_0_fast_r15",
+    "gemv_q8_0_fast_r16",
+];
 
 fn q8_0_fast_symbol(rows: usize) -> Option<&'static str> {
     rows.checked_sub(1)
@@ -20842,7 +20859,19 @@ impl Gpu {
             let n = (rows - first).min(Q8_0_ROWS_EXACT_KERNELS);
             let x_group = x.sub_offset(first * k, n * k);
             let y_group = y.sub_offset(first * m, n * m);
-            self.launch_q8_0_rows_exact_group(route, a_raw, &x_group, &y_group, m, k, n)?;
+            if route == Q8RowsExactRoute::Narrow
+                && self.q8_0_fast_narrow_ok(
+                    k,
+                    a_raw.buf.as_ptr() as usize,
+                    x_group.buf.as_ptr() as usize,
+                )
+            {
+                // The decode arm's fast kernel over `n` rows: row r is `gemv_q8_0_fast_r1`
+                // on x row r (same per-lane chain), hence the decode launch's bits.
+                self.launch_q8_0_fast(n, a_raw, &x_group, &y_group, m, k)?;
+            } else {
+                self.launch_q8_0_rows_exact_group(route, a_raw, &x_group, &y_group, m, k, n)?;
+            }
             first += n;
         }
         Ok(())
