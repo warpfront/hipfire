@@ -56,8 +56,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::bundle::RaonBundle;
 use crate::forward::{
-    embed_lookup, forward_rows_tapped, readout_logits, stage_decode_token, validate_extract_layers,
-    DflashCapture, TapSite,
+    embed_lookup, forward_rows_tapped, readout_logits, require_whole_band, stage_decode_token,
+    validate_extract_layers, DflashCapture, TapSite,
 };
 use crate::projection::{project_rows_batched, OutRound};
 use crate::rollback::{RdaRingBuf, RollbackMode};
@@ -604,6 +604,7 @@ impl SpecTarget for RaonBundle {
         gpu: &mut Gpu,
         block_size: usize,
     ) -> Result<Box<dyn SpecScratch>, String> {
+        require_whole_band(&self.weights, "speculative decoding")?;
         let block_size = block_size.max(2);
         let cap = self.scratch.rows.min(self.work.rows());
         if block_size > cap {
@@ -924,7 +925,7 @@ impl SpecTarget for RaonBundle {
         // Draft rows are never decode rows: the batched head, row-exact or not.
         project_rows_batched(
             gpu,
-            &self.weights.lm_head,
+            self.weights.lm_head_weight()?,
             &hidden_rows.sub_offset(0, n * hidden),
             &logits,
             n,

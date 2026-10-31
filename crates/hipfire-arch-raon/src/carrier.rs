@@ -13,11 +13,13 @@ use hipfire_runtime::loader_api::{
 use hipfire_runtime::spec::Speculator;
 use rdna_compute::Gpu;
 
+use crate::band::RaonBand;
 use crate::bundle::{RaonBundle, PREFILL_SCRATCH_ROWS};
 use crate::config::RaonConfig;
 use crate::forward::RaonWork;
 use crate::state::{RaonPrefillScratch, RaonState, RaonStateDims};
-use crate::weights::load_raon_weights;
+use crate::weights::load_raon_weights_band;
+use hipfire_runtime::hfq::HfqFile;
 
 /// The DFlash2 draft a load asks for, or `None` for plain AR.
 ///
@@ -169,38 +171,92 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
     }
     // Resolved before any device allocation so a malformed value fails fast.
     let forced_rows = forced_chunk_rows()?;
-    let weights = load_raon_weights(&hfq, ctx.gpu, &config)?;
-    let dims = config.state_dims();
-    let state = match RaonState::new(ctx.gpu, &dims, ctx.max_seq) {
+    let band = RaonBand::whole(&config);
+    assemble_raon_bundle(ctx.gpu, &hfq, &config, &band, ctx.max_seq, forced_rows)
+}
+
+/// Build the Raon bundle of one layer band ([`RaonBand`]) on `gpu`: the same
+/// load as [`load_raon_bundle`] (inventory, weights, state, chunk admission,
+/// scratch, work) scoped to the band's layers. The whole band is
+/// [`load_raon_bundle`]'s bundle. `chunk_rows` forces the prefill chunk
+/// (`512`, `1024`, `2048` or `4096`; `None` = `HIPFIRE_RAON_PREFILL_CHUNK_ROWS`
+/// or the widest rung that fits), which bands driven together must agree on.
+pub fn load_raon_band_bundle(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    max_seq: usize,
+    band: &RaonBand,
+    chunk_rows: Option<usize>,
+) -> Result<RaonBundle, String> {
+    if hfq.arch_id != crate::ARCH_ID {
+        return Err(format!(
+            "raon1_mini: HFQ arch_id {} is not {}",
+            hfq.arch_id,
+            crate::ARCH_ID
+        ));
+    }
+    let config = RaonConfig::from_hfq(hfq)?;
+    if max_seq == 0 || max_seq > config.max_position {
+        return Err(format!(
+            "raon1_mini: max_seq {max_seq} outside 1..={}",
+            config.max_position
+        ));
+    }
+    let forced_rows = match chunk_rows {
+        Some(n) if PREFILL_CHUNK_LADDER.contains(&n) => Some(n),
+        Some(n) => {
+            return Err(format!(
+                "raon1_mini: prefill chunk rows {n}: expected 512, 1024, 2048 or 4096"
+            ))
+        }
+        None => forced_chunk_rows()?,
+    };
+    assemble_raon_bundle(gpu, hfq, &config, band, max_seq, forced_rows)
+}
+
+/// Load, state, chunk admission, scratch and work of `band` of the model
+/// `config` describes (the whole model's configuration; the bundle carries
+/// its band view).
+fn assemble_raon_bundle(
+    gpu: &mut Gpu,
+    hfq: &HfqFile,
+    config: &RaonConfig,
+    band: &RaonBand,
+    max_seq: usize,
+    forced_rows: Option<usize>,
+) -> Result<RaonBundle, String> {
+    let view = config.band_view(band)?;
+    let weights = load_raon_weights_band(hfq, gpu, config, band)?;
+    let dims = view.state_dims();
+    let state = match RaonState::new(gpu, &dims, max_seq) {
         Ok(s) => s,
         Err(e) => {
-            weights.free_gpu(ctx.gpu);
+            weights.free_gpu(gpu);
             return Err(format!("raon1_mini: RaonState::new failed: {e}"));
         }
     };
-    let rows = match admit_prefill_rows(ctx.gpu, &config, &dims, &state, forced_rows) {
+    let rows = match admit_prefill_rows(gpu, &view, &dims, &state, forced_rows) {
         Ok(rows) => rows,
         Err(e) => {
-            if let Err(fe) = state.free_gpu(ctx.gpu) {
+            if let Err(fe) = state.free_gpu(gpu) {
                 eprintln!("raon1_mini: state free after chunk admission failure: {fe}");
             }
-            weights.free_gpu(ctx.gpu);
+            weights.free_gpu(gpu);
             return Err(e);
         }
     };
-    let (scratch, rows) =
-        match alloc_scratch_descending(ctx.gpu, &config, &dims, rows, state.max_seq()) {
-            Ok(s) => s,
-            Err(e) => {
-                if let Err(fe) = state.free_gpu(ctx.gpu) {
-                    eprintln!("raon1_mini: state free after scratch failure: {fe}");
-                }
-                weights.free_gpu(ctx.gpu);
-                return Err(format!("raon1_mini: RaonPrefillScratch::new failed: {e}"));
+    let (scratch, rows) = match alloc_scratch_descending(gpu, config, &dims, rows, state.max_seq()) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Err(fe) = state.free_gpu(gpu) {
+                eprintln!("raon1_mini: state free after scratch failure: {fe}");
             }
-        };
+            weights.free_gpu(gpu);
+            return Err(format!("raon1_mini: RaonPrefillScratch::new failed: {e}"));
+        }
+    };
     let _ = rows;
-    RaonBundle::new(ctx.gpu, config, weights, state, scratch)
+    RaonBundle::new(gpu, view, weights, state, scratch)
 }
 
 /// Verify the admitted rung by really allocating it; step down the ladder

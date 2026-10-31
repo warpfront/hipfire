@@ -1286,12 +1286,13 @@ pub(crate) fn embed_lookup(
     rows: usize,
     out: &GpuTensor,
 ) -> Result<(), String> {
+    let embed = w.embed_table()?;
     let res = match w.embed_format {
         EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8_batched(&w.embed, out, &scratch.token_ids, rows, cfg.hidden)
+            gpu.embedding_lookup_q8_batched(embed, out, &scratch.token_ids, rows, cfg.hidden)
         }
         EmbeddingFormat::F32 => {
-            gpu.embedding_lookup_f32_batched(&w.embed, out, &scratch.token_ids, rows, cfg.hidden)
+            gpu.embedding_lookup_f32_batched(embed, out, &scratch.token_ids, rows, cfg.hidden)
         }
         other => {
             return Err(format!(
@@ -1346,13 +1347,13 @@ pub fn readout_logits(
     let width = cfg.mhc_streams * cfg.hidden;
     let view = scratch.stream_a.sub_offset(row0 * width, count * width);
     let norm = StreamNorm {
-        gamma: &w.final_norm,
+        gamma: w.final_norm_weight()?,
         eps: cfg.rms_eps,
     };
     final_mean_norm(gpu, &work.mhc_shape, count, &view, norm, &scratch.branch_in)?;
     project(
         gpu,
-        &w.lm_head,
+        w.lm_head_weight()?,
         &scratch.branch_in,
         out,
         count,
@@ -1378,6 +1379,7 @@ fn forward_impl(
     capture: Option<&DflashCapture<'_>>,
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
+    require_whole_band(w, "token/row forward")?;
     let rows = tokens.len();
     if rows == 0 || rows > scratch.rows || rows > work.rows {
         return Err(format!(
@@ -1504,7 +1506,7 @@ pub fn decode_body(
         gpu,
         1,
         s.n_tokens(),
-        true,
+        w.band.is_last(),
         &mut None,
         None,
         None,
@@ -1529,6 +1531,7 @@ pub(crate) fn verify_body(
     capture: Option<&DflashCapture<'_>>,
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
+    require_whole_band(w, "verify forward")?;
     if let Some(cap) = capture {
         cap.check(cfg, rows)?;
     }
@@ -1579,8 +1582,8 @@ pub(crate) fn rows_binding(
 ) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x100_0000_01b3);
-    mix(w.embed.buf.as_ptr() as u64);
-    mix(w.lm_head.buf.buf.as_ptr() as u64);
+    mix(w.embed.as_ref().map_or(0, |t| t.buf.as_ptr() as u64));
+    mix(w.lm_head.as_ref().map_or(0, |t| t.buf.buf.as_ptr() as u64));
     mix(s.seq_len.buf.as_ptr() as u64);
     for t in s
         .rda
@@ -1632,15 +1635,19 @@ fn forward_body(
     capture: Option<&DflashCapture<'_>>,
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
-    embed_staged(cfg, w, scratch, work, gpu, rows)?;
-    fire(
-        tap,
-        gpu,
-        TapSite::Embedding,
-        &scratch.stream_a,
-        rows,
-        cfg.mhc_streams * cfg.hidden,
-    )?;
+    // A band past the first receives its streams in `scratch.stream_a` (rows
+    // `[0, rows)`) from the previous band instead of embedding.
+    if w.band.is_first() {
+        embed_staged(cfg, w, scratch, work, gpu, rows)?;
+        fire(
+            tap,
+            gpu,
+            TapSite::Embedding,
+            &scratch.stream_a,
+            rows,
+            cfg.mhc_streams * cfg.hidden,
+        )?;
+    }
 
     let mut ctx = DispatchCtx::new(gpu);
     ctx.batch_size = rows;
@@ -1806,13 +1813,13 @@ fn forward_body(
         let width = cfg.mhc_streams * cfg.hidden;
         let view = scratch.stream_a.sub_offset(last * width, width);
         let norm = StreamNorm {
-            gamma: &w.final_norm,
+            gamma: w.final_norm_weight()?,
             eps,
         };
         final_mean_norm(gpu, &work.mhc_shape, 1, &view, norm, &scratch.final_norm)?;
         project(
             gpu,
-            &w.lm_head,
+            w.lm_head_weight()?,
             &scratch.final_norm,
             &scratch.logits,
             1,
@@ -1999,6 +2006,173 @@ pub fn forward_rows_verify_tapped(
         capture,
         ring,
     )
+}
+
+// ───────────────────────── band forward ─────────────────────────
+//
+// A band ([`crate::band::RaonBand`]) runs its layers only: the first band
+// embeds staged token ids into `scratch.stream_a`, every other band expects the
+// previous band's streams already in `scratch.stream_a` rows `[0, rows)` (the
+// edge, [`crate::band::edge_view`]); the last band reads the logits out. Each
+// band keeps its own `seq_len` / `n_tokens` and advances them once per call.
+//
+// The host work (context admission / map-ahead, token staging) is split from
+// the device-only body so a mesh executor can run the body per rank with no
+// host wait in it.
+
+/// `Err` unless `w` covers the whole model: whole-model logits, speculation
+/// (DFlash capture, verify, rollback) and session snapshots are not defined
+/// under a partial band.
+pub(crate) fn require_whole_band(w: &RaonWeights, what: &str) -> Result<(), String> {
+    if w.band.is_whole() {
+        Ok(())
+    } else {
+        Err(format!(
+            "raon1_mini: {what} is not supported on a partial band ({}): the whole-model \
+             forward, DFlash/speculation, rollback and session snapshots need the whole model \
+             on one device; drive the band with the band forward",
+            w.band.label()
+        ))
+    }
+}
+
+/// What one band call consumes.
+#[derive(Clone, Copy, Debug)]
+pub enum BandInput<'a> {
+    /// The first band: token ids to embed (`1..=scratch rows`).
+    Tokens(&'a [u32]),
+    /// A later band: `rows` stream rows already in `scratch.stream_a`.
+    Streams { rows: usize },
+}
+
+impl BandInput<'_> {
+    /// Rows of the call.
+    pub fn rows(&self) -> usize {
+        match self {
+            BandInput::Tokens(t) => t.len(),
+            BandInput::Streams { rows } => *rows,
+        }
+    }
+}
+
+/// Host phase of a band call: validate the input against the band, admit the
+/// context (map-ahead of the band's latent caches and expanded mirror) for
+/// `n_tokens + rows`, and stage the token ids on the first band. Returns the
+/// rows of the call. Outside capture only.
+#[allow(clippy::too_many_arguments)]
+pub fn band_admit(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    input: BandInput<'_>,
+) -> Result<usize, String> {
+    let rows = input.rows();
+    if rows == 0 || rows > scratch.rows || rows > work.rows {
+        return Err(format!(
+            "raon1_mini: {rows} rows outside 1..={} (scratch rows {}, work rows {})",
+            scratch.rows.min(work.rows),
+            scratch.rows,
+            work.rows
+        ));
+    }
+    if w.layers.len() != cfg.n_layers || w.layers.len() != w.band.len() {
+        return Err(format!(
+            "raon1_mini: weights hold {} layers, config view {}, {}",
+            w.layers.len(),
+            cfg.n_layers,
+            w.band.label()
+        ));
+    }
+    match input {
+        BandInput::Tokens(_) if !w.band.is_first() => {
+            return Err(format!(
+                "raon1_mini: token input on {}: only the first band embeds",
+                w.band.label()
+            ))
+        }
+        BandInput::Streams { .. } if w.band.is_first() => {
+            return Err(format!(
+                "raon1_mini: stream input on {}: the first band takes tokens",
+                w.band.label()
+            ))
+        }
+        _ => {}
+    }
+    ensure_context(cfg, w, s, scratch, work, gpu, s.n_tokens() + rows)?;
+    if let BandInput::Tokens(tokens) = input {
+        stage_tokens(cfg, scratch, gpu, tokens)?;
+    }
+    Ok(rows)
+}
+
+/// Device-only body of a band call over `rows` rows from the slot's current
+/// position: (first band) embedding of the staged ids, the band's layers,
+/// (last band, `want_logits`) final norm + `lm_head` of the last row into
+/// `scratch.logits`, then a device-side `seq_len += rows`. Issues launches over
+/// stable device buffers only (no host wait), so it is recordable into a
+/// hipGraph at `rows == 1` exactly like [`decode_body`]. The host mirror
+/// ([`RaonState::note_host_tokens`]) is the caller's.
+#[allow(clippy::too_many_arguments)]
+pub fn band_body(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    rows: usize,
+    want_logits: bool,
+) -> Result<(), String> {
+    if want_logits && !w.band.is_last() {
+        return Err(format!(
+            "raon1_mini: logits requested on {}: only the last band reads them out",
+            w.band.label()
+        ));
+    }
+    forward_body(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        rows,
+        s.n_tokens(),
+        want_logits,
+        &mut None,
+        None,
+        None,
+    )?;
+    gpu.device_counter_add_i32(&s.seq_len, rows as i32)
+        .map_err(|e| format!("raon1_mini: device seq_len advance: {e:?}"))
+}
+
+/// One band call: [`band_admit`], [`band_body`], then the host mirror advance.
+/// The slot advances by the call's rows exactly once.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_band(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &mut RaonPrefillScratch,
+    work: &mut RaonWork,
+    gpu: &mut Gpu,
+    input: BandInput<'_>,
+    want_logits: bool,
+) -> Result<(), String> {
+    if want_logits && !w.band.is_last() {
+        return Err(format!(
+            "raon1_mini: logits requested on {}: only the last band reads them out",
+            w.band.label()
+        ));
+    }
+    let rows = band_admit(cfg, w, s, scratch, work, gpu, input)?;
+    band_body(cfg, w, s, scratch, work, gpu, rows, want_logits)?;
+    s.note_host_tokens(rows);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -53,6 +53,7 @@ use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, EmbeddingFormat, WeightTens
 use hipfire_runtime::weight_backend::{dequant_weight_raw, load_embedding, MemoryTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+use crate::band::RaonBand;
 use crate::config::{FfnKind, LayerKind, RaonConfig, MHC_STREAMS, QT44_GROUP};
 
 // ───────────────────────── quant-type constants ─────────────────────────
@@ -234,16 +235,60 @@ pub struct RaonLayerWeights {
     pub ffn: RaonFfn,
 }
 
-/// Immutable device weights of one Raon-1-mini model.
+/// Immutable device weights of one Raon-1-mini model, or of one band of it
+/// ([`RaonBand`]): `layers` holds only the band's layers (band-local index,
+/// see [`RaonWeights::layer`]), `embed` exists on the first band only,
+/// `final_norm` and `lm_head` on the last band only. The whole band holds all.
 pub struct RaonWeights {
-    /// `model.embed_tokens.weight` in its on-device format (see `embed_format`).
-    pub embed: GpuTensor,
+    /// The layers these weights cover.
+    pub band: RaonBand,
+    /// `model.embed_tokens.weight` in its on-device format (see `embed_format`);
+    /// `None` off the first band.
+    pub embed: Option<GpuTensor>,
     pub embed_format: EmbeddingFormat,
-    /// `model.norm.weight`, F32 `[2560]`.
-    pub final_norm: GpuTensor,
-    /// Untied `lm_head.weight` `[vocab, 2560]`.
-    pub lm_head: WeightTensor,
+    /// `model.norm.weight`, F32 `[2560]`; `None` off the last band.
+    pub final_norm: Option<GpuTensor>,
+    /// Untied `lm_head.weight` `[vocab, 2560]`; `None` off the last band.
+    pub lm_head: Option<WeightTensor>,
+    /// The band's layers, band-local order (`layers[l - band.layers.start]`).
     pub layers: Vec<RaonLayerWeights>,
+}
+
+impl RaonWeights {
+    /// Weights of global layer `layer` (must belong to the band).
+    pub fn layer(&self, layer: usize) -> Option<&RaonLayerWeights> {
+        self.band.local(layer).and_then(|l| self.layers.get(l))
+    }
+
+    /// The embedding table (first band only).
+    pub fn embed_table(&self) -> Result<&GpuTensor, String> {
+        self.embed.as_ref().ok_or_else(|| {
+            format!(
+                "raon1_mini: the embedding lives on the first band, not on {}",
+                self.band.label()
+            )
+        })
+    }
+
+    /// `model.norm.weight` (last band only).
+    pub fn final_norm_weight(&self) -> Result<&GpuTensor, String> {
+        self.final_norm.as_ref().ok_or_else(|| {
+            format!(
+                "raon1_mini: the final norm lives on the last band, not on {}",
+                self.band.label()
+            )
+        })
+    }
+
+    /// `lm_head.weight` (last band only).
+    pub fn lm_head_weight(&self) -> Result<&WeightTensor, String> {
+        self.lm_head.as_ref().ok_or_else(|| {
+            format!(
+                "raon1_mini: lm_head lives on the last band, not on {}",
+                self.band.label()
+            )
+        })
+    }
 }
 
 // ───────────────────────── free ─────────────────────────
@@ -394,9 +439,15 @@ impl RaonWeights {
         for layer in self.layers {
             layer.free_gpu(gpu);
         }
-        self.lm_head.free_all(gpu);
-        free_t(gpu, self.final_norm);
-        free_t(gpu, self.embed);
+        if let Some(lm_head) = self.lm_head {
+            lm_head.free_all(gpu);
+        }
+        if let Some(final_norm) = self.final_norm {
+            free_t(gpu, final_norm);
+        }
+        if let Some(embed) = self.embed {
+            free_t(gpu, embed);
+        }
     }
 }
 
@@ -729,6 +780,30 @@ pub fn tensor_inventory(cfg: &RaonConfig) -> Vec<TensorSpec> {
         }
     }
     v
+}
+
+/// [`tensor_inventory`] restricted to what `band` loads: its layers' tensors,
+/// the embedding on the first band, `model.norm` and `lm_head` on the last.
+/// The whole band's inventory is the full one.
+pub fn tensor_inventory_band(cfg: &RaonConfig, band: &RaonBand) -> Vec<TensorSpec> {
+    let mut specs = tensor_inventory(cfg);
+    if !band.is_whole() {
+        specs.retain(|s| band.owns_tensor(&s.name));
+    }
+    specs
+}
+
+/// The part of an artifact index a band answers for ([`RaonBand::owns_tensor`]):
+/// another band's tensors are not "unconsumed" by this band's pre-flight, but
+/// a name nobody declares still is. The whole band sees the whole index.
+pub fn index_for_band(index: Vec<IndexEntry>, band: &RaonBand) -> Vec<IndexEntry> {
+    if band.is_whole() {
+        return index;
+    }
+    index
+        .into_iter()
+        .filter(|e| band.owns_tensor(&e.name))
+        .collect()
 }
 
 // ───────────────────────── pre-flight ─────────────────────────
@@ -2020,9 +2095,32 @@ pub fn load_raon_weights(
     gpu: &mut Gpu,
     cfg: &RaonConfig,
 ) -> Result<RaonWeights, String> {
+    load_raon_weights_band(hfq, gpu, cfg, &RaonBand::whole(cfg))
+}
+
+/// [`load_raon_weights`] for one band: the inventory check, the upload and the
+/// assembly cover only the band's layers' tensors, the embedding on the first
+/// band and `model.norm` / `lm_head` on the last. `cfg` is the whole model's
+/// configuration (tensor names use global layer numbers); the result's
+/// `layers` are band-local. The whole band is [`load_raon_weights`].
+pub fn load_raon_weights_band(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    cfg: &RaonConfig,
+    band: &RaonBand,
+) -> Result<RaonWeights, String> {
     cfg.validate()?;
-    let specs = tensor_inventory(cfg);
-    let index: Vec<IndexEntry> = hfq.tensors().iter().map(IndexEntry::from_info).collect();
+    if band.total != cfg.n_layers {
+        return Err(format!(
+            "raon1_mini weights: band of a {}-layer model applied to a {}-layer config",
+            band.total, cfg.n_layers
+        ));
+    }
+    let specs = tensor_inventory_band(cfg, band);
+    let index: Vec<IndexEntry> = index_for_band(
+        hfq.tensors().iter().map(IndexEntry::from_info).collect(),
+        band,
+    );
     check_inventory(&specs, &index)?;
     BF16_FFN_TENSORS.store(0, Ordering::Relaxed);
     BF16_FFN_VALUES.store(0, Ordering::Relaxed);
@@ -2076,8 +2174,8 @@ pub fn load_raon_weights(
             ));
         }
     }
-    let mut layers: Vec<RaonLayerWeights> = Vec::with_capacity(cfg.n_layers);
-    for l in 0..cfg.n_layers {
+    let mut layers: Vec<RaonLayerWeights> = Vec::with_capacity(band.len());
+    for l in band.layers.clone() {
         match build_layer(hfq, gpu, cfg, &mut pool, l) {
             Ok(layer) => layers.push(layer),
             Err(e) => {
@@ -2105,12 +2203,22 @@ pub fn load_raon_weights(
             ));
         }
     }
-    let (embed, embed_format) = match pool.items.remove("model.embed_tokens.weight") {
-        Some(Loaded::Embed(t, f)) => (t, f),
-        _ => unreachable!("embedding verified"),
+    let (embed, embed_format) = if band.is_first() {
+        match pool.items.remove("model.embed_tokens.weight") {
+            Some(Loaded::Embed(t, f)) => (Some(t), f),
+            _ => unreachable!("embedding verified"),
+        }
+    } else {
+        (None, EmbeddingFormat::F32)
     };
-    let final_norm = pool.take_vec("model.norm.weight");
-    let lm_head = pool.take_mat("lm_head.weight");
+    let (final_norm, lm_head) = if band.is_last() {
+        (
+            Some(pool.take_vec("model.norm.weight")),
+            Some(pool.take_mat("lm_head.weight")),
+        )
+    } else {
+        (None, None)
+    };
     debug_assert!(
         pool.items.is_empty() || pool.items.keys().all(|k| !pool.has("") || k.is_empty())
     );
@@ -2118,6 +2226,7 @@ pub fn load_raon_weights(
     if !leftover.is_empty() {
         // Every declared non-expert tensor must have been consumed by assembly.
         let w = RaonWeights {
+            band: band.clone(),
             embed,
             embed_format,
             final_norm,
@@ -2156,6 +2265,7 @@ pub fn load_raon_weights(
         as_f32.saturating_sub(resident)
     );
     Ok(RaonWeights {
+        band: band.clone(),
         embed,
         embed_format,
         final_norm,
@@ -2279,6 +2389,104 @@ mod tests {
     fn well_formed_artifact_passes() {
         let specs = tensor_inventory(&released());
         check_inventory(&specs, &good_index(&specs)).unwrap();
+    }
+
+    fn names(specs: &[TensorSpec]) -> HashSet<&str> {
+        specs.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[test]
+    fn whole_band_inventory_is_the_full_inventory() {
+        let cfg = released();
+        let full = tensor_inventory(&cfg);
+        let whole = tensor_inventory_band(&cfg, &RaonBand::whole(&cfg));
+        assert_eq!(full, whole);
+        let idx = good_index(&full);
+        let n = idx.len();
+        assert_eq!(index_for_band(idx, &RaonBand::whole(&cfg)).len(), n);
+    }
+
+    #[test]
+    fn band_inventories_partition_the_model_inventory() {
+        let cfg = released();
+        let full = tensor_inventory(&cfg);
+        let bands = RaonBand::from_cuts(25, &[1, 12]).unwrap();
+        let parts: Vec<Vec<TensorSpec>> = bands
+            .iter()
+            .map(|b| tensor_inventory_band(&cfg, b))
+            .collect();
+        // Disjoint and exhaustive.
+        assert_eq!(parts.iter().map(Vec::len).sum::<usize>(), full.len());
+        let mut seen = HashSet::new();
+        for p in &parts {
+            for s in p {
+                assert!(seen.insert(s.name.clone()), "{} in two bands", s.name);
+            }
+        }
+        assert_eq!(seen.len(), full.len());
+        // The embedding is the first band's only; norm + lm_head the last's only.
+        assert!(names(&parts[0]).contains("model.embed_tokens.weight"));
+        assert!(!names(&parts[1]).contains("model.embed_tokens.weight"));
+        assert!(!names(&parts[2]).contains("model.embed_tokens.weight"));
+        for (i, p) in parts.iter().enumerate() {
+            let n = names(p);
+            let last = i == 2;
+            assert_eq!(n.contains("lm_head.weight"), last);
+            assert_eq!(n.contains("model.norm.weight"), last);
+        }
+        // Layers land where the cut says: layer 0 (dense) alone on band 0.
+        assert!(names(&parts[0]).contains("model.layers.0.mlp.gate_proj.weight"));
+        assert!(!names(&parts[0]).contains("model.layers.1.input_layernorm.weight"));
+        assert!(names(&parts[1]).contains("model.layers.11.moe.gate.weight"));
+        assert!(names(&parts[2]).contains("model.layers.12.moe.gate.weight"));
+        assert!(names(&parts[2]).contains("model.layers.24.self_attn.q_b_proj.weight"));
+    }
+
+    #[test]
+    fn band_preflight_checks_only_the_bands_tensors() {
+        let cfg = released();
+        let full = tensor_inventory(&cfg);
+        let index = good_index(&full);
+        for band in RaonBand::from_cuts(25, &[1, 12]).unwrap() {
+            let specs = tensor_inventory_band(&cfg, &band);
+            // The whole artifact index passes a band's pre-flight once scoped...
+            check_inventory(&specs, &index_for_band(index.clone(), &band))
+                .unwrap_or_else(|e| panic!("{}: {e}", band.label()));
+            // ...but not unscoped: the other bands' tensors are unconsumed.
+            let err = check_inventory(&specs, &index).unwrap_err();
+            assert!(err.contains("unconsumed"), "{err}");
+        }
+    }
+
+    #[test]
+    fn band_preflight_ignores_other_bands_defects_and_reports_its_own() {
+        let cfg = released();
+        let full = tensor_inventory(&cfg);
+        let band0 = RaonBand::new(0..1, 25).unwrap();
+        let band2 = RaonBand::new(12..25, 25).unwrap();
+        let specs0 = tensor_inventory_band(&cfg, &band0);
+        let specs2 = tensor_inventory_band(&cfg, &band2);
+        // A tensor of layer 19 (MLA) missing from the artifact: band 0 does not care.
+        let mut idx = good_index(&full);
+        idx.retain(|e| e.name != "model.layers.19.self_attn.kv_b_proj.weight");
+        check_inventory(&specs0, &index_for_band(idx.clone(), &band0)).unwrap();
+        let err = check_inventory(&specs2, &index_for_band(idx, &band2)).unwrap_err();
+        assert!(
+            err.contains("missing 1 tensor(s)") && err.contains("layers.19.self_attn.kv_b_proj"),
+            "{err}"
+        );
+        // A name nobody declares is unconsumed by every band.
+        let mut idx = good_index(&full);
+        idx.push(IndexEntry {
+            name: "mtp.layers.0.weight".into(),
+            quant_type: QT_F16,
+            shape: vec![2560],
+            data_size: 5120,
+        });
+        for (b, specs) in [(&band0, &specs0), (&band2, &specs2)] {
+            let err = check_inventory(specs, &index_for_band(idx.clone(), b)).unwrap_err();
+            assert!(err.contains("mtp.layers.0.weight"), "{err}");
+        }
     }
 
     #[test]

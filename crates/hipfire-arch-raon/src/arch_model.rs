@@ -18,7 +18,7 @@ impl ArchModel for RaonBundle {
     }
 
     fn n_layers(&self) -> usize {
-        self.config.n_layers
+        self.weights.band.total
     }
 
     fn vocab_size(&self) -> usize {

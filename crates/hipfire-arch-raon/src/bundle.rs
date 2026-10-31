@@ -11,10 +11,11 @@
 use crate::precision::{RaonPrecisionPlan, RaonPrecisionPolicy, SiteWeights};
 use rdna_compute::{Gpu, GpuTensor};
 
+use crate::band::{edge_view, RaonBand};
 use crate::config::RaonConfig;
 use crate::forward::{
-    admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
-    stage_decode_token, stage_decode_token_on_stream, RaonWork,
+    admit_decode_context, decode_binding, decode_body, forward_band, forward_rows, forward_token,
+    require_whole_band, stage_decode_token, stage_decode_token_on_stream, BandInput, RaonWork,
 };
 use crate::session::session_stride;
 use crate::spec_impl::RaonSpecState;
@@ -175,6 +176,14 @@ impl RaonBundle {
             .and_then(|m| RaonPrecisionPolicy::from_env(&arch).map(|p| (m, p)))
             .and_then(|(m, policy)| {
                 pin_flag_quant_routes_off(gpu);
+                if config.n_layers != weights.layers.len() {
+                    return Err(format!(
+                        "raon1_mini: config view of {} layers does not match {} ({} layers loaded)",
+                        config.n_layers,
+                        weights.band.label(),
+                        weights.layers.len()
+                    ));
+                }
                 let precision = policy.resolve(&arch, &SiteWeights::collect(&weights));
                 eprintln!("{}", precision.coverage_line());
                 let mut work = RaonWork::new(gpu, &config, scratch.rows)?;
@@ -249,6 +258,64 @@ impl RaonBundle {
     /// the reserved context is shorter).
     pub fn prefill_chunk_rows(&self) -> usize {
         self.scratch.rows.min(self.work.rows())
+    }
+
+    /// The layers this bundle covers (the whole model for a regular load).
+    /// `config` is the band's view ([`RaonConfig::band_view`]); `n_layers` of
+    /// the whole model is `band().total`.
+    pub fn band(&self) -> &RaonBand {
+        &self.weights.band
+    }
+
+    /// The edge view of `rows` stream rows (`scratch.stream_a`, from row 0): a
+    /// band exports its result from it at band end and imports its input into
+    /// it at band start. A view: never free it.
+    pub fn edge_view(&self, rows: usize) -> Result<GpuTensor, String> {
+        if rows == 0 || rows > self.prefill_chunk_rows() {
+            return Err(format!(
+                "raon1_mini: edge of {rows} rows outside 1..={}",
+                self.prefill_chunk_rows()
+            ));
+        }
+        Ok(edge_view(&self.config, &self.scratch, rows))
+    }
+
+    /// One batched prefill call of this band over one chunk: the first band
+    /// takes `BandInput::Tokens(piece)`, a later band `BandInput::Streams`
+    /// with the previous band's rows already imported into its
+    /// [`edge_view`](Self::edge_view). The slot advances by the rows. The last
+    /// band's `want_logits` leaves the last row's logits in
+    /// [`logits`](Self::logits). The whole band keeps [`prefill`](Self::prefill).
+    pub fn prefill_band_chunk(
+        &mut self,
+        gpu: &mut Gpu,
+        input: BandInput<'_>,
+        want_logits: bool,
+    ) -> Result<(), String> {
+        if self.prefill_mode != PrefillMode::Batched {
+            return Err(format!(
+                "raon1_mini: {}: band prefill is the batched route only",
+                self.weights.band.label()
+            ));
+        }
+        let start = self.state.n_tokens();
+        if start + input.rows() > self.state.max_seq() {
+            return Err(format!(
+                "raon1_mini: {start} + {} rows exceed the reserved context of {} rows",
+                input.rows(),
+                self.state.max_seq()
+            ));
+        }
+        forward_band(
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            &mut self.scratch,
+            &mut self.work,
+            gpu,
+            input,
+            want_logits,
+        )
     }
 
     /// Override the load-time route (oracle/control use).
@@ -360,6 +427,7 @@ impl RaonBundle {
     /// [`logits`](Self::logits). A failure leaves the slot partially advanced:
     /// the caller resets it.
     pub fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
+        require_whole_band(&self.weights, "prefill")?;
         if tokens.is_empty() {
             return Err("raon1_mini: prefill of zero tokens".into());
         }
@@ -519,6 +587,32 @@ impl RaonBundle {
     /// graph replay per token (recorded on first use per admitted context
     /// bucket) or per-launch eager dispatch. Both advance the slot exactly once.
     pub fn decode_step(&mut self, gpu: &mut Gpu, token: u32) -> Result<(), String> {
+        if !self.weights.band.is_first() {
+            return Err(format!(
+                "raon1_mini: decode_step takes a token on {}: only the first band embeds \
+                 (later bands: decode_step_from_edge)",
+                self.weights.band.label()
+            ));
+        }
+        self.decode_step_in(gpu, Some(token))
+    }
+
+    /// One decode step of a band past the first: consume the one stream row the
+    /// previous band left in [`edge_view`](Self::edge_view) (`scratch.stream_a`
+    /// row 0) and advance this band's slot by one. On the last band the logits
+    /// are left in [`logits`](Self::logits). Same routes as
+    /// [`decode_step`](Self::decode_step).
+    pub fn decode_step_from_edge(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if self.weights.band.is_first() {
+            return Err(format!(
+                "raon1_mini: decode_step_from_edge on {}: the first band takes a token",
+                self.weights.band.label()
+            ));
+        }
+        self.decode_step_in(gpu, None)
+    }
+
+    fn decode_step_in(&mut self, gpu: &mut Gpu, token: Option<u32>) -> Result<(), String> {
         let pos = self.state.n_tokens();
         if pos + 1 > self.state.max_seq() {
             return Err(format!(
@@ -526,8 +620,8 @@ impl RaonBundle {
                 self.state.max_seq()
             ));
         }
-        match self.decode_mode {
-            DecodeMode::Eager => forward_token(
+        match (self.decode_mode, token) {
+            (DecodeMode::Eager, Some(token)) if self.weights.band.is_whole() => forward_token(
                 &self.config,
                 &self.weights,
                 &mut self.state,
@@ -538,7 +632,24 @@ impl RaonBundle {
                 pos as u32,
                 true,
             ),
-            DecodeMode::Graph => self.decode_step_graph(gpu, token, pos),
+            (DecodeMode::Eager, token) => {
+                let ids = [token.unwrap_or(0)];
+                let input = match token {
+                    Some(_) => BandInput::Tokens(&ids),
+                    None => BandInput::Streams { rows: 1 },
+                };
+                forward_band(
+                    &self.config,
+                    &self.weights,
+                    &mut self.state,
+                    &mut self.scratch,
+                    &mut self.work,
+                    gpu,
+                    input,
+                    self.weights.band.is_last(),
+                )
+            }
+            (DecodeMode::Graph, token) => self.decode_step_graph(gpu, token, pos),
         }
     }
 
@@ -557,7 +668,12 @@ impl RaonBundle {
     /// exactly once; no snapshot/restore is needed. The very first decode step
     /// of the bundle runs the same body eagerly instead, so every kernel module
     /// is loaded before a capture.
-    fn decode_step_graph(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
+    fn decode_step_graph(
+        &mut self,
+        gpu: &mut Gpu,
+        token: Option<u32>,
+        pos: usize,
+    ) -> Result<(), String> {
         let end = pos + 1;
         admit_decode_context(
             &self.config,
@@ -569,7 +685,9 @@ impl RaonBundle {
             end,
         )?;
         if !self.graph.warmed {
-            stage_decode_token(&self.config, &self.scratch, gpu, token)?;
+            if let Some(token) = token {
+                stage_decode_token(&self.config, &self.scratch, gpu, token)?;
+            }
             decode_body(
                 &self.config,
                 &self.weights,
@@ -590,7 +708,9 @@ impl RaonBundle {
             gpu.active_stream = Some(stream);
         }
         // The token id rides the decode stream (one queue, no null-stream hop).
-        stage_decode_token_on_stream(&self.config, &self.scratch, gpu, token)?;
+        if let Some(token) = token {
+            stage_decode_token_on_stream(&self.config, &self.scratch, gpu, token)?;
+        }
         let binding = decode_binding(&self.weights, &self.state, &self.scratch, &self.work);
         let recorded = gpu.graphs.graph_exec.is_some()
             && self.graph.binding == binding
