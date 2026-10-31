@@ -4850,19 +4850,21 @@ pub fn generate_spec(
             return None;
         }
     };
-    // Native Qwen4 MTP commits a whole window before the emitter observes it,
-    // so an emitter intervention (think-budget force-close or think-cap stop)
-    // that lands strictly inside a window would leave committed state past the
-    // intervention. Inside a think span (or over a queued close) the loop
-    // clamps each window to the emitter's `window_cap()` for this speculator
-    // so the intervention only ever falls on a window's last token — no
-    // Realign re-prefill, no window repair. Outside a span the cap is `None`
-    // (thinking off is `max_think_tokens == 1`, so capping there would stop
+    // Native Qwen4 MTP and Qwen4 DFlash2 commit a whole window before the
+    // emitter observes it, so an emitter intervention (think-budget
+    // force-close or think-cap stop) that lands strictly inside a window would
+    // leave committed state past the intervention. Inside a think span (or
+    // over a queued close) the loop clamps each window to the emitter's
+    // `window_cap()` for these speculators so the intervention only ever falls
+    // on a window's last token — no Realign re-prefill (whose numerics differ
+    // from AR), no window repair. Outside a span the cap is `None` (thinking
+    // off is `max_think_tokens == 1`, so capping there would stop
     // speculation): a span opened and tripped inside one window takes the
     // window repair below. Other speculators keep their own handling.
-    let native_qwen4_mtp = spec
-        .drafter_any_mut()
-        .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+    let qwen4_window_capped = spec.name() == "dflash2"
+        || spec
+            .drafter_any_mut()
+            .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
     // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
@@ -5373,7 +5375,7 @@ pub fn generate_spec(
         // borrow ends when `step` returns, before the per-token `emit.observe`.
         let max_emit = spec_window_emit_budget(
             max_tokens.saturating_sub(generated),
-            native_qwen4_mtp,
+            qwen4_window_capped,
             emit.window_cap(),
         );
         let window_seed = seed_token;
@@ -5580,7 +5582,7 @@ pub fn generate_spec(
         let keep = consumed.min(committed_tail.len());
         let mut strict_prefix_action =
             spec_strict_prefix_action(keep, committed_tail.len(), hit_eos || think_cap_hit);
-        if spec_window_repair_attempt(strict_prefix_action, native_qwen4_mtp, ar_step) {
+        if spec_window_repair_attempt(strict_prefix_action, qwen4_window_capped, ar_step) {
             // Must run right after the window is observed and before any
             // further step / forced advance / prefill / reset on the
             // speculator: the retained pre-window snapshot is only valid until
