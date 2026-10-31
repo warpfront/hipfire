@@ -781,6 +781,8 @@ pub(crate) fn decode_raw_codec(
             | DType::HFQ2G128
             | DType::HFQ3G128
             | DType::Q4F16G64
+            | DType::Q4K
+            | DType::Q8_0
     ) {
         // Same per-row extent the weight_store manifest paths enforce: older
         // quantizers packed ragged-K matrices across rows, which the per-row

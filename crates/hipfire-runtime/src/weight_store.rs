@@ -1293,9 +1293,10 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
         // support no ragged tail, so a `[rows, K]` matrix needs K aligned.
         // Older quantizers packed ragged-K matrices flat across rows. A conv1d
         // `[C, 1, W]` is packed flat.
-        DType::HFQ6G256 | DType::HFQ4G256 if shape.len() == 2 => 256,
+        DType::HFQ6G256 | DType::HFQ4G256 | DType::Q4K if shape.len() == 2 => 256,
         DType::HFQ2G128 | DType::HFQ3G128 if shape.len() == 2 => 128,
         DType::Q4F16G64 if shape.len() == 2 => 64,
+        DType::Q8_0 if shape.len() == 2 => 32,
         // qt=55 is expert-blocked, not row-strided: `[E, R, K]` (or `[R, K]`)
         // is E blocks of `b128_block_stride(R, K)` bytes.
         DType::FP8E4M3B128 => {
@@ -1337,7 +1338,7 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
     let row_bytes = match dtype {
         // `DType::row_bytes` has no HFQ4G128 arm; ParoQ4G128 is its layout.
         DType::HFQ4G128 => DType::ParoQ4G128.row_bytes(k),
-        DType::HFQ2G128 | DType::HFQ3G128 | DType::Q4F16G64 => {
+        DType::HFQ2G128 | DType::HFQ3G128 | DType::Q4F16G64 | DType::Q4K | DType::Q8_0 => {
             (k / k_alignment).checked_mul(quant_block_bytes(dtype))
         }
         _ => dtype.row_bytes(k),
