@@ -1819,7 +1819,10 @@ pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
 /// Device bytes one rank's lane store commits, for `lanes` lanes at
 /// `row_budget` rows (`spec_k` = native-MTP lanes; EP stages AR lanes only).
 /// `max_seq`, `chunk_rows` and `granularity` are the context commit the QSA
-/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). The single
+/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). An AR
+/// store's lane states hold no snapshot mirror
+/// ([`Qwen4LaneStore::state_mirror`]): the figure excludes it, exactly as
+/// `stage_lanes` allocates. The single
 /// source of the byte count: the loader's EP load reservation and
 /// `stage_rank_lanes` (and the single-device staging check) all call it, so
 /// planned and staged bytes cannot differ. `None` on overflow.
@@ -2640,6 +2643,86 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The AR lane store a rank stages carries no snapshot mirror: the one
+    /// byte source the loader reserves and `stage_rank_lanes` checks shrinks
+    /// by exactly the mirror bytes of every lane, and an MTP store (never
+    /// staged by EP, but sized by the same call) keeps them.
+    #[test]
+    fn ep_lane_store_bytes_exclude_the_snapshot_mirror_of_ar_lanes() {
+        use crate::state::{Qwen4State, StateMirror};
+        use crate::weights::Qwen4BandScope;
+        use crate::{Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let (max_seq, chunk, granularity) = (16384usize, 256usize, 2usize << 20);
+        let context = crate::kv_backend::Qwen4ContextCommit::new(
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        assert_eq!(Qwen4LaneStore::state_mirror(None), StateMirror::Absent);
+        for gdn in [
+            crate::GdnStateFormat::F32,
+            crate::GdnStateFormat::Q8,
+            crate::GdnStateFormat::Q8Ef,
+        ] {
+            let format = Qwen4StateFormat {
+                qsa: crate::QsaKvFormat::Fp8,
+                gdn,
+                qsa_f16_arena: false,
+                qsa_pooled_bf16: false,
+            };
+            let with = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &context,
+                &single,
+                StateMirror::Snapshot,
+            )
+            .unwrap() as u64;
+            let without = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &context,
+                &single,
+                StateMirror::Absent,
+            )
+            .unwrap() as u64;
+            let mirror = with - without;
+            assert!(mirror > 0, "{gdn:?}");
+            let mut previous = 0u64;
+            for lanes in [1usize, 2, 4, 8] {
+                let budget = ep_lane_row_budget(4096, lanes);
+                let planned = ep_lane_store_device_bytes(
+                    &config,
+                    format,
+                    Qwen4KvBackend::Vmm,
+                    max_seq,
+                    chunk,
+                    granularity,
+                    lanes,
+                    budget,
+                    None,
+                )
+                .unwrap();
+                // Every lane charges its live state alone; the step buffers
+                // are the store's only other bytes.
+                let rows = 2 * lanes as u64;
+                let step = rows * (config.vocab_size as u64 * 4 + 4);
+                assert_eq!(planned, lanes as u64 * without + step, "{gdn:?} {lanes}");
+                // Lane by lane the saving over a snapshot-capable state.
+                assert_eq!(
+                    lanes as u64 * with + step - planned,
+                    lanes as u64 * mirror,
+                    "{gdn:?} {lanes}"
+                );
+                assert!(planned > previous);
+                previous = planned;
+            }
+        }
     }
 }
 

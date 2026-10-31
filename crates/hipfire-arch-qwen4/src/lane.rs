@@ -40,6 +40,14 @@
 //! lanes and never part of the capture ring or any snapshot. Lane forwards
 //! pass each lane's own residual and the state's actual `gdn_format()` to
 //! the GDN step.
+//!
+//! Snapshot mirror: a lane state of an AR store is only ever stepped and reset
+//! (its window is one committed row; no ticket is taken, `Verify` rows need an
+//! MTP window), so it is built without the snapshot arena's device copy of
+//! its in-place state ([`StateMirror::Absent`]) and the store's byte census
+//! charges none. An MTP store keeps the mirror on every lane (including a PP
+//! band that holds target rings alone): its verify windows snapshot and roll
+//! the lane state back. See [`Qwen4LaneStore::state_mirror`].
 
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config};
@@ -58,7 +66,7 @@ use crate::mtp_spec::{
     mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture,
     Qwen4PromotionParts,
 };
-use crate::state::{Qwen4State, Qwen4StateFormat};
+use crate::state::{Qwen4State, Qwen4StateFormat, StateMirror};
 use crate::weights::{
     HyperConnectionWeights, MoeWeights, Qwen4BandScope, Qwen4FfnWeights, Qwen4LayerWeights,
     Qwen4TierRecipe, Qwen4Weights, TensorRef,
@@ -1048,7 +1056,8 @@ impl LaneSpec {
     }
 }
 
-/// A fresh slot's payload: a lane trunk state with its `ring_rows`-row GDN
+/// A fresh slot's payload: a lane trunk state (with the snapshot `mirror` of
+/// its store, [`Qwen4LaneStore::state_mirror`]) with its `ring_rows`-row GDN
 /// capture ring (every band that owns target layers; `0`: AR lanes arm no
 /// ring) and, with `spec_cfg`, its MTP head state (a failure frees what was
 /// allocated).
@@ -1056,11 +1065,12 @@ fn new_payload(
     gpu: &mut Gpu,
     bundle: &Qwen4Bundle,
     slot: usize,
+    mirror: StateMirror,
     ring_rows: usize,
     spec_cfg: Option<(LaneSpecConfig, usize, Qwen4KvBackend)>,
 ) -> Result<(Qwen4State, Option<LaneSpec>), String> {
     let mut state = bundle
-        .new_lane_state(gpu)
+        .new_lane_state(gpu, mirror)
         .map_err(|e| format!("admit: allocate lane {slot}: {e}"))?;
     if ring_rows > 0 {
         if let Err(error) =
@@ -1579,6 +1589,8 @@ pub struct Qwen4LaneStore {
     table: LaneTable<Qwen4LaneState>,
     row_budget: usize,
     ring_rows: usize,
+    /// Snapshot mirror of every lane state ([`Self::state_mirror`]).
+    mirror: StateMirror,
     format: Qwen4StateFormat,
     backend: Qwen4KvBackend,
     policy: LaneStagePolicy,
@@ -1748,6 +1760,7 @@ impl Qwen4LaneStore {
             table: LaneTable::new(max_lanes),
             row_budget: row_budget.min(max_lanes),
             ring_rows: spec.map_or(0, |spec| spec.k + 1),
+            mirror: Self::state_mirror(spec),
             format: bundle.state_format(),
             backend: bundle.state.qsa_backend(),
             policy,
@@ -1771,8 +1784,24 @@ impl Qwen4LaneStore {
         })
     }
 
+    /// The snapshot mirror every lane state of a store staged with `spec`
+    /// holds: an MTP store keeps it ([`census::SPEC_LANE_MIRROR`]: a verify
+    /// window snapshots the lane state and rolls it back, on every band that
+    /// owns target layers), an AR store has none ([`census::AR_LANE_MIRROR`]:
+    /// its lanes are only stepped and reset). The same constants the byte
+    /// census charges ([`census::ar_lane_census`] /
+    /// [`census::lane_spec_census`]), so planned and staged bytes agree.
+    pub(crate) fn state_mirror(spec: Option<LaneSpecConfig>) -> StateMirror {
+        match spec {
+            Some(_) => census::SPEC_LANE_MIRROR,
+            None => census::AR_LANE_MIRROR,
+        }
+    }
+
     /// Device bytes the store commits at load: `max_lanes` lane states
-    /// ([`Qwen4State::device_bytes`]) plus the step logits and top-1
+    /// ([`Qwen4State::device_bytes_with_mirror`] under
+    /// [`Self::state_mirror`]: with the snapshot mirror only when `spec_k`
+    /// names MTP lanes) plus the step logits and top-1
     /// buffers; with `spec_k` each lane also holds its MTP head state, its
     /// `k + 1`-row GDN ring and pending hidden, and the store the wide-hidden
     /// capture, the draft top-1 slots and the prompt-fill append scratch
@@ -1805,11 +1834,13 @@ impl Qwen4LaneStore {
     /// census of [`census::ar_lane_census`] / [`census::lane_spec_census`]
     /// under the legacy budget ([`census::LaneSpecBudget::legacy`]: copy not
     /// armed, a `k + 1`-row ring). The lane states and rings cover only the
-    /// band's layers; the step logits/top-1 buffers exist only on a band
-    /// that runs the LM head (`scope.output`) and every MTP head charge only
-    /// on the head owner (the output band). A non-output band with `spec_k`
-    /// holds its lanes' target rings alone. `None` on overflow or a `spec_k`
-    /// outside the lane budget, which [`Self::new`] refuses.
+    /// band's layers, the states with the snapshot mirror only under
+    /// `spec_k` ([`Self::state_mirror`]); the step logits/top-1 buffers exist
+    /// only on a band that runs the LM head (`scope.output`) and every MTP
+    /// head charge only on the head owner (the output band). A non-output
+    /// band with `spec_k` holds its lanes' target rings alone. `None` on
+    /// overflow or a `spec_k` outside the lane budget, which [`Self::new`]
+    /// refuses.
     pub fn device_bytes_scoped(
         config: &Qwen4Config,
         format: Qwen4StateFormat,
@@ -1854,7 +1885,7 @@ impl Qwen4LaneStore {
         epoch: RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, String> {
-        let ring_rows = self.ring_rows;
+        let (ring_rows, mirror) = (self.ring_rows, self.mirror);
         let spec_cfg = self
             .spec
             .as_ref()
@@ -1879,7 +1910,7 @@ impl Qwen4LaneStore {
                     }
                     Ok(None)
                 }
-                None => new_payload(gpu, bundle, slot, ring_rows, spec_cfg).map(Some),
+                None => new_payload(gpu, bundle, slot, mirror, ring_rows, spec_cfg).map(Some),
             })
     }
 
@@ -1904,7 +1935,7 @@ impl Qwen4LaneStore {
         if self.phase != LanePhase::Idle {
             return Err("admit_promoted: a step is in flight".to_string());
         }
-        let ring_rows = self.ring_rows;
+        let (ring_rows, mirror) = (self.ring_rows, self.mirror);
         let spec_cfg = self
             .spec
             .as_ref()
@@ -1944,7 +1975,7 @@ impl Qwen4LaneStore {
                     }
                     None => {
                         let (state, mut spec) =
-                            new_payload(gpu, bundle, slot, ring_rows, spec_cfg)?;
+                            new_payload(gpu, bundle, slot, mirror, ring_rows, spec_cfg)?;
                         let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
                             (Some((config, _, _)), Some(spec), Some(parts)) => {
                                 spec.promote(gpu, config.k, parts)
@@ -3392,23 +3423,25 @@ mod band_accounting_tests {
                     })
                     .collect();
                 // The step logits and top-1 are charged once, on the output
-                // band; every lane's state is split with no duplication.
+                // band; every lane's state (an AR lane: no snapshot mirror)
+                // is split with no duplication.
                 assert_eq!(bands.iter().sum::<u64>(), whole, "{counts:?} lanes={lanes}");
                 let head = (2 * lanes * (config.vocab_size * 4 + 4)) as u64;
                 let output = scopes.iter().position(|scope| scope.output).unwrap();
-                let states: u64 = scopes
-                    .iter()
-                    .map(|scope| {
-                        lanes as u64
-                            * Qwen4State::device_bytes_scoped(&config, format, &context, scope)
-                                .unwrap() as u64
-                    })
-                    .sum();
+                let state = |scope: &Qwen4BandScope| {
+                    Qwen4State::device_bytes_with_mirror(
+                        &config,
+                        format,
+                        &context,
+                        scope,
+                        Qwen4LaneStore::state_mirror(None),
+                    )
+                    .unwrap() as u64
+                };
+                let states: u64 = scopes.iter().map(|scope| lanes as u64 * state(scope)).sum();
                 assert_eq!(states + head, whole);
                 for (index, (&bytes, scope)) in bands.iter().zip(&scopes).enumerate() {
-                    let own = lanes as u64
-                        * Qwen4State::device_bytes_scoped(&config, format, &context, scope).unwrap()
-                            as u64;
+                    let own = lanes as u64 * state(scope);
                     assert_eq!(bytes, own + if index == output { head } else { 0 });
                 }
             }
@@ -3437,13 +3470,30 @@ mod band_accounting_tests {
                 .unwrap()
         };
         // The non-output band holds its lanes' capture rings and no head,
-        // logits or wide hidden: exactly the AR store plus the rings.
+        // logits or wide hidden: exactly the AR store plus the rings and the
+        // snapshot mirror of each MTP lane state (the AR lanes have none).
         let (gdn_layers, _) = scope_layer_counts(&config, &scopes[0]);
         let ring =
             Qwen4State::row_capture_bytes_scoped(&config, format.gdn, 4, gdn_layers).unwrap();
+        let state = |scope: &Qwen4BandScope, spec| {
+            Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &context,
+                scope,
+                Qwen4LaneStore::state_mirror(spec),
+            )
+            .unwrap() as u64
+        };
+        let spec = Some(LaneSpecConfig {
+            k: 3,
+            end_of_turn: None,
+        });
+        let mirror = state(&scopes[0], spec) - state(&scopes[0], None);
+        assert!(mirror > 0);
         assert_eq!(
             bytes(Some(3), &scopes[0]),
-            bytes(None, &scopes[0]) + 2 * ring as u64
+            bytes(None, &scopes[0]) + 2 * (ring as u64 + mirror)
         );
         // The MTP head, ring and wide buffers add more on the output band.
         assert!(bytes(Some(3), &scopes[1]) > bytes(None, &scopes[1]));

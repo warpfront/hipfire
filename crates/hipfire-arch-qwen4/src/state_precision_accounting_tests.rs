@@ -432,16 +432,17 @@ fn gdn_precision_owner_accounting_pp_and_lane_counts() {
         Qwen4State::device_bytes_scoped(&config, f32, &context, &single),
         Qwen4State::device_bytes(&config, f32, &context)
     );
-    // Lanes multiply the owners: per lane a state (live + mirror) and, with
-    // MTP, a (k + 1)-row ring.
+    // Lanes multiply the owners: per AR lane a live state (no snapshot
+    // mirror), per MTP lane a live state + mirror and a (k + 1)-row ring.
     for k in [None, Some(3usize)] {
         let store = |format, lanes| {
             crate::lane::Qwen4LaneStore::device_bytes(&config, format, &context, lanes, 0, k)
                 .unwrap()
         };
         let one = store(f32, 1) - store(q8, 1);
-        let per_lane =
-            2 * GDN_LAYERS * slot_delta + k.map_or(0, |k| GDN_LAYERS * 2 * (k + 1) * slot_delta);
+        let recurrent_sets = if k.is_some() { 2 } else { 1 };
+        let per_lane = recurrent_sets * GDN_LAYERS * slot_delta
+            + k.map_or(0, |k| GDN_LAYERS * 2 * (k + 1) * slot_delta);
         assert_eq!(one, per_lane as u64, "{k:?}");
         for lanes in [2usize, 4, 8] {
             assert_eq!(
@@ -449,6 +450,74 @@ fn gdn_precision_owner_accounting_pp_and_lane_counts() {
                 one * lanes as u64,
                 "{k:?} lanes={lanes}"
             );
+        }
+    }
+}
+
+/// An AR lane has no snapshot mirror, so a lane of the store costs exactly the
+/// mirror less than a snapshot-capable state (the resident state, an MTP
+/// lane). Per state, Flash-Next (36 GDN + 12 QSA layers, QSA fp8/q8 index
+/// dtype BF16): every GDN layer's recurrent slot and conv history, per QSA
+/// layer the partial K (2048 B), partial V (8192 B), the 2051-entry selection
+/// and the 4 x 128 BF16 raw-index circular block, and the PLE conv history
+/// (9 x 4 x 2560 F32) plus hyper feedback. Context independent; the figures
+/// are storage arithmetic from the owners, not measured.
+#[test]
+fn gdn_precision_owner_accounting_ar_lane_has_no_snapshot_mirror() {
+    let config = compact_test_config();
+    let single = Qwen4BandScope::single(&config);
+    let conv = StateGeometry::new(
+        &config,
+        &format_of(QsaKvFormat::Q8, GdnStateFormat::Q8),
+        1024,
+    )
+    .expect("geometry")
+    .conv_len
+        * std::mem::size_of::<f32>();
+    assert_eq!(conv, 122_880);
+    let qsa = 2_048 + 8_192 + 2_051 * 4 + 4 * 128 * 2;
+    assert_eq!(qsa, 19_468);
+    let per_request = 9 * 2560 * 4 * 4 + 4 * 2560 * 4;
+    assert_eq!(per_request, 409_600);
+    let contexts = [
+        Qwen4ContextCommit::legacy(1024),
+        Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 16384, 4096, 2 << 20),
+    ];
+    for (gdn, mirror, eight_lanes) in [
+        (GdnStateFormat::Q8, 34_263_184usize, 274_105_472usize),
+        (GdnStateFormat::F32, 118_313_104, 946_504_832),
+    ] {
+        assert_eq!(
+            GDN_LAYERS * (slot_of(gdn) + conv) + config.n_full_layers() * qsa + per_request,
+            mirror,
+            "{gdn:?}"
+        );
+        assert_eq!(8 * mirror, eight_lanes, "{gdn:?}");
+        let format = format_of(QsaKvFormat::Q8, gdn);
+        for context in &contexts {
+            let state = |mirror| {
+                Qwen4State::device_bytes_with_mirror(&config, format, context, &single, mirror)
+                    .unwrap()
+            };
+            assert_eq!(
+                state(StateMirror::Snapshot) - state(StateMirror::Absent),
+                mirror,
+                "{gdn:?} {context:?}"
+            );
+            // The store of AR lanes charges the live state per lane, the MTP
+            // store the mirror too; the step buffers are the same.
+            for lanes in [1usize, 2, 8] {
+                let step = (2 * lanes * (config.vocab_size * 4 + 4)) as u64;
+                let ar = crate::lane::Qwen4LaneStore::device_bytes(
+                    &config, format, context, lanes, 0, None,
+                )
+                .unwrap();
+                assert_eq!(
+                    ar,
+                    lanes as u64 * state(StateMirror::Absent) as u64 + step,
+                    "{gdn:?} {context:?} lanes={lanes}"
+                );
+            }
         }
     }
 }
