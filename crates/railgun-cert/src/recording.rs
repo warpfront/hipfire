@@ -1324,12 +1324,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-gdn-core-lanes",
         predicates: &[IsRecording],
-        condition: "gated_delta_core_lanes (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive one-row GDN Core steps with Q8 states, HIPFIRE_QWEN4_GDN_LANES (exact gfx1151 default on, 0 kills) and `!is_recording()`",
+        condition: "gated_delta_core_lanes (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive one-row GDN Core steps with Q8 states, HIPFIRE_QWEN4_GDN_LANES (exact gfx1151 default on, exact gfx1201 opt-in `=1` and default off, 0 kills) and `!is_recording()`",
         effect: KernelSelection,
         switches: "eager lane step: gdn_lanes (gated_delta_conv_params_bf16_f32_lanes, gated_delta_step_gate_norm128_q8_lanes), one launch per kernel for every lane; recorded: the per-lane incumbent launches",
         kernels: &["gated_delta_conv_params_bf16_f32", "gated_delta_step_gate_norm128_q8"],
         verdict: ByteExact,
-        evidence: "fn_lane_oracle on gfx1151 (Flash-Next GPTQ3 MQ4): k = 1/2/8 lanes, every lane step and state checkpoint byte-identical to the singleton forward",
+        evidence: "gfx1151: fn_lane_oracle (Flash-Next GPTQ3 MQ4): k = 1/2/8 lanes, every lane step and state checkpoint byte-identical to the singleton forward. gfx1201 (opt-in, default off): the same device bodies in the same translation unit and compile recipe (the `gdn_lanes` module = `tensor_ops` + gdn_lanes.hip); kernel byte oracle rdna-compute examples/gdn_lanes_oracle (N = 1..8 lanes, ragged cursors and Q8 frames, carried state) is the gating receipt, not yet run on gfx1201 hardware at this commit",
         reaches: &[],
     },
     Decision {
