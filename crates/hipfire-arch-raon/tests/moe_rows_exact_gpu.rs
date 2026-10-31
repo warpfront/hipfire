@@ -213,11 +213,11 @@ fn rows_exact_is_bit_identical_to_single_row_decode_for_k_1_to_16() {
         down_ptrs: &down_ptrs,
         gate_up_awq: None,
         down_awq_ptrs: None,
-        shared: GroupedMoeShared {
-            gate: qt44_ref(&sh_gate, mi, c),
-            up: qt44_ref(&sh_up, mi, c),
-            down: qt44_ref(&sh_down, c, down_k),
-        },
+        shared: GroupedMoeShared::new(
+            qt44_ref(&sh_gate, mi, c),
+            qt44_ref(&sh_up, mi, c),
+            qt44_ref(&sh_down, c, down_k),
+        ),
         iu4_symmetric: false,
     };
 
