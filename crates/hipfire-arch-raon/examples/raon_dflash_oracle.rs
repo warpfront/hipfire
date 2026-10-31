@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 //! Raon DFlash2 oracle CLI: capture | emit | rowexact | greedy | rollback | verifygraph |
-//! sampled | costs. Lab-gated
+//! sampled | costs | draftgraph. Lab-gated
 //! (`--features lab`), GPU required. PLAN `raon/dflash2/PLAN.md` §4 gates 1-4.
 //!
 //! ```text
@@ -13,6 +13,7 @@
 //! raon_dflash_oracle verifygraph --model M.hfq --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
 //! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--out DIR]
 //! raon_dflash_oracle costs    --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
+//! raon_dflash_oracle draftgraph --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--block B] [--tokens N] [--out DIR] [--max-seq N]
 //! ```
 //!
 //! Common options: `--chat on|off` (default off: the prompt file is tokenized as
@@ -105,6 +106,17 @@
 //!   decode steps by its verified rows, with their least-squares break-even line
 //!   (the `spec_retire` line a target states). Writes `costs.json`.
 //!
+//! * `draftgraph` (draft-graph gate): the same DFlash2 greedy run twice from a fresh target
+//!   state, once with the draft window eager and once with the graph-captured draft window
+//!   (`HIPFIRE_DFLASH_DRAFT_GRAPH` forced off / on for the speculator built per arm;
+//!   `--block` default 16, `--tokens` default 128). Every window is traced after the draft
+//!   forward and the selector: the drafted tokens, the bit patterns of the selector
+//!   confidences and a hash of the draft's final hidden rows. Exit 0 iff the emitted
+//!   streams, the window counts and every traced window are bit-identical between the arms
+//!   and the graph arm recorded and replayed segment graphs without refusing. Prints the
+//!   median / mean device-synced draft-forward and selector ms of both arms (the graph
+//!   arm's warm-up windows excluded from the steady-state figure) and the graph counters.
+//!
 //! Exit status: 0 pass, 1 verdict failed, 2 usage / runtime error.
 
 use std::cell::RefCell;
@@ -122,7 +134,10 @@ use hipfire_runtime::dflash::{
     draft_forward_based, propose_candidates_device, DflashConfig, DflashScratch, DflashWeights,
     DFLASH_BLOCK_MAX,
 };
-use hipfire_runtime::dflash2_spec::{build_dflash2_speculator, new_draft_scratch};
+use hipfire_runtime::dflash2_spec::{
+    build_dflash2_speculator, last_draft_graph_stats, new_draft_scratch, set_draft_graph_override,
+    trace_windows_begin, trace_windows_take, DraftWindowTrace,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::sample_top_k_p_with_state;
@@ -145,6 +160,7 @@ const USAGE: &str = "usage:
   raon_dflash_oracle verifygraph --model M --prompt-file P [--out DIR] [--chat on] [--max-seq N]
   raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--out DIR]
   raon_dflash_oracle costs    --model M --draft D --prompt-file P [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
+  raon_dflash_oracle draftgraph --model M --draft D --prompt-file P [--chat on] [--block B] [--tokens N] [--fc-compare on|off] [--out DIR] [--max-seq N]
 common: [--chat on|off] [--think on|off]   (raw text tokens by default)";
 
 type Opts = BTreeMap<String, String>;
@@ -162,6 +178,7 @@ fn parse_cli() -> Result<(String, Opts), String> {
             | "verifygraph"
             | "sampled"
             | "costs"
+            | "draftgraph"
     ) {
         return Err(format!("unknown mode `{mode}`"));
     }
@@ -1987,6 +2004,236 @@ fn run_greedy(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// draftgraph
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Windows the graph arm spends warming up per block size: the first runs eagerly, the
+/// second records (capture + launch). Steady state starts after them.
+const DRAFTGRAPH_WARM_WINDOWS: usize = 2;
+
+struct DraftArm {
+    stream: Vec<u32>,
+    windows: Vec<DraftWindowTrace>,
+    stats: hipfire_runtime::dflash::DraftGraphStats,
+}
+
+fn draftgraph_arm(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    prompt: &[u32],
+    draft_path: &str,
+    block: usize,
+    n: usize,
+    graph: bool,
+) -> Result<DraftArm, String> {
+    bundle.reset(gpu)?;
+    let ctx_capacity = bundle.max_seq();
+    let eos: Vec<u32> = bundle.eos.clone();
+    let prof: SharedProf = Rc::new(RefCell::new(Prof::default()));
+    set_draft_graph_override(Some(graph));
+    trace_windows_begin();
+    let run = {
+        let mut wrapped = TimedTarget {
+            inner: &mut *bundle,
+            prof: Rc::clone(&prof),
+            timed: false,
+        };
+        dflash_arm(
+            gpu,
+            &mut wrapped,
+            prompt,
+            draft_path,
+            block,
+            n,
+            ctx_capacity,
+            &eos,
+            &prof,
+            false,
+        )
+    };
+    let windows = trace_windows_take();
+    set_draft_graph_override(None);
+    let run = run?;
+    let stats = last_draft_graph_stats().ok_or("no draft graph counters (speculator not freed)")?;
+    Ok(DraftArm {
+        stream: run.stream,
+        windows,
+        stats,
+    })
+}
+
+fn median_of(v: &mut [f64]) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
+}
+
+fn mean_of(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        f64::NAN
+    } else {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+}
+
+fn run_draftgraph(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    prompt: &[u32],
+    opts: &Opts,
+    out: Option<&Path>,
+) -> Result<bool, String> {
+    let block = opt_usize(opts, "block", 16)?;
+    let n = opt_usize(opts, "tokens", 128)?;
+    let draft_path = require(opts, "draft")?;
+    if n < 2 {
+        return Err("--tokens must be >= 2".into());
+    }
+    let eager = draftgraph_arm(gpu, bundle, prompt, draft_path, block, n, false)?;
+    let graph = draftgraph_arm(gpu, bundle, prompt, draft_path, block, n, true)?;
+
+    let mut failures: Vec<String> = Vec::new();
+    if eager.stream != graph.stream {
+        let at = (0..eager.stream.len().min(graph.stream.len()))
+            .find(|&i| eager.stream[i] != graph.stream[i])
+            .unwrap_or(eager.stream.len().min(graph.stream.len()));
+        failures.push(format!(
+            "emitted streams differ (eager {} tokens, graph {}), first at index {at}",
+            eager.stream.len(),
+            graph.stream.len()
+        ));
+    }
+    if eager.windows.len() != graph.windows.len() {
+        failures.push(format!(
+            "window counts differ (eager {}, graph {})",
+            eager.windows.len(),
+            graph.windows.len()
+        ));
+    }
+    let mut differing = 0usize;
+    let mut first_diff: Option<(usize, String)> = None;
+    for (i, (e, g)) in eager.windows.iter().zip(&graph.windows).enumerate() {
+        let mut what = Vec::new();
+        if (e.position, e.seed, e.block) != (g.position, g.seed, g.block) {
+            what.push("window identity");
+        }
+        if e.tokens != g.tokens {
+            what.push("draft tokens");
+        }
+        if e.confidence_bits != g.confidence_bits {
+            what.push("selector confidences");
+        }
+        if e.hidden_fnv != g.hidden_fnv {
+            what.push("draft hidden rows");
+        }
+        if !what.is_empty() {
+            differing += 1;
+            first_diff.get_or_insert((i, what.join(", ")));
+        }
+    }
+    if let Some((i, what)) = &first_diff {
+        failures.push(format!(
+            "{differing} of {} windows differ; first is window {i} (position {}): {what}",
+            eager.windows.len().min(graph.windows.len()),
+            eager.windows[*i].position
+        ));
+    }
+    if let Some(why) = &graph.stats.refused {
+        failures.push(format!("the graph arm refused its capture: {why}"));
+    } else if graph.stats.captures == 0 || graph.stats.replays == 0 {
+        failures.push(format!(
+            "the graph arm did not record and replay segment graphs (captures {}, replays {}): \
+             too few windows (--tokens) or the route is off",
+            graph.stats.captures, graph.stats.replays
+        ));
+    }
+    if eager.stats.captures != 0 || eager.stats.replays != 0 {
+        failures.push("the eager arm recorded segment graphs".into());
+    }
+
+    let draft = |a: &DraftArm, from: usize| -> Vec<f64> {
+        a.windows.iter().skip(from).map(|w| w.draft_ms).collect()
+    };
+    let selector = |a: &DraftArm, from: usize| -> Vec<f64> {
+        a.windows.iter().skip(from).map(|w| w.selector_ms).collect()
+    };
+    let steady = DRAFTGRAPH_WARM_WINDOWS;
+    println!(
+        "draftgraph: prompt {} tokens, block {block}, {} windows, {} tokens emitted",
+        prompt.len(),
+        eager.windows.len(),
+        eager.stream.len()
+    );
+    let (mut e_all, mut g_all) = (draft(&eager, 0), draft(&graph, 0));
+    let (mut e_ss, mut g_ss) = (draft(&eager, steady), draft(&graph, steady));
+    println!(
+        "  draft forward ms (device-synced)   eager median {:.3} mean {:.3} | graph median {:.3} mean {:.3} (all windows)",
+        median_of(&mut e_all),
+        mean_of(&e_all),
+        median_of(&mut g_all),
+        mean_of(&g_all)
+    );
+    println!(
+        "  draft forward ms, windows >= {steady}  eager median {:.3} mean {:.3} | graph median {:.3} mean {:.3}",
+        median_of(&mut e_ss),
+        mean_of(&e_ss),
+        median_of(&mut g_ss),
+        mean_of(&g_ss)
+    );
+    let (mut e_sel, mut g_sel) = (selector(&eager, steady), selector(&graph, steady));
+    println!(
+        "  target head + selector ms, windows >= {steady}  eager median {:.3} | graph median {:.3}",
+        median_of(&mut e_sel),
+        median_of(&mut g_sel)
+    );
+    println!(
+        "  graph counters: captures {}, replays {}, segments {}, host launch {:.3} ms total, refused {:?}",
+        graph.stats.captures,
+        graph.stats.replays,
+        graph.stats.segments,
+        graph.stats.launch_secs * 1e3,
+        graph.stats.refused
+    );
+    let pass = failures.is_empty();
+    for f in &failures {
+        println!("  FAIL: {f}");
+    }
+    println!(
+        "{} draftgraph{}",
+        if pass { "PASS" } else { "FAIL" },
+        if pass {
+            " (every window's draft tokens, selector confidences and draft hidden rows are bit-identical)"
+        } else {
+            ""
+        }
+    );
+    if let Some(dir) = out {
+        let arm = |a: &DraftArm| {
+            json!({
+                "windows": a.windows.len(),
+                "stream_md5": md5_hex_u32(&a.stream),
+                "draft_ms": a.windows.iter().map(|w| w.draft_ms).collect::<Vec<_>>(),
+                "selector_ms": a.windows.iter().map(|w| w.selector_ms).collect::<Vec<_>>(),
+                "captures": a.stats.captures,
+                "replays": a.stats.replays,
+                "segments": a.stats.segments,
+                "refused": a.stats.refused,
+            })
+        };
+        write_json(
+            &dir.join("draftgraph.json"),
+            &json!({
+                "pass": pass, "block": block, "prompt_tokens": prompt.len(),
+                "failures": failures, "eager": arm(&eager), "graph": arm(&graph),
+            }),
+        )?;
+    }
+    Ok(pass)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // rollback
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3552,6 +3799,7 @@ fn run() -> Result<bool, String> {
             "verifygraph" => run_verifygraph(&mut gpu, &mut bundle, &prompt, out.as_deref()),
             "sampled" => run_sampled(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
             "costs" => run_costs(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
+            "draftgraph" => run_draftgraph(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
             _ => unreachable!("mode validated by parse_cli"),
         }
     })();

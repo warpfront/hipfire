@@ -43,6 +43,76 @@ use crate::spec_sampling::{accept_sampled_prefix, SampleSpec, SparseDist, SpecRn
 use rdna_compute::Gpu;
 use std::path::Path;
 
+/// One draft window as the oracle sees it: what the draft forward and the
+/// selector produced before any verify ([`trace_windows_begin`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftWindowTrace {
+    pub position: usize,
+    pub seed: u32,
+    pub block: usize,
+    /// The selector's drafted tokens (`block - 1`).
+    pub tokens: Vec<u32>,
+    /// Bit patterns of the selector's per-row confidences.
+    pub confidence_bits: Vec<u32>,
+    /// FNV-1a over the bit patterns of the draft's final hidden rows `1..block`.
+    pub hidden_fnv: u64,
+    /// Device-synced ms of the draft forward alone.
+    pub draft_ms: f64,
+    /// Device-synced ms of the target head + selector over the draft rows.
+    pub selector_ms: f64,
+}
+
+static WINDOW_TRACE: std::sync::Mutex<Option<Vec<DraftWindowTrace>>> = std::sync::Mutex::new(None);
+/// 0 = follow `HIPFIRE_DFLASH_DRAFT_GRAPH`, 1 = force off, 2 = force on.
+static DRAFT_GRAPH_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Developer oracle hook: from now on every speculator window records a
+/// [`DraftWindowTrace`] (and device-syncs around the draft forward to time
+/// it). Process-wide; [`trace_windows_take`] ends it.
+pub fn trace_windows_begin() {
+    *WINDOW_TRACE.lock().unwrap() = Some(Vec::new());
+}
+
+/// The windows traced since [`trace_windows_begin`]; tracing stops.
+pub fn trace_windows_take() -> Vec<DraftWindowTrace> {
+    WINDOW_TRACE.lock().unwrap().take().unwrap_or_default()
+}
+
+fn tracing_windows() -> bool {
+    WINDOW_TRACE.lock().unwrap().is_some()
+}
+
+/// Developer oracle hook: force the graph-captured draft window on (`Some(true)`),
+/// off (`Some(false)`), or back to `HIPFIRE_DFLASH_DRAFT_GRAPH` (`None`) for every
+/// speculator built after this call.
+pub fn set_draft_graph_override(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    DRAFT_GRAPH_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fnv1a_f32_bits(v: &[f32]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for x in v {
+        for byte in x.to_bits().to_le_bytes() {
+            h = (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Graph counters of the most recently freed speculator's scratch (oracle read-out).
+static LAST_GRAPH_STATS: std::sync::Mutex<Option<crate::dflash::DraftGraphStats>> =
+    std::sync::Mutex::new(None);
+
+/// Draft-graph counters of the last speculator freed (see [`Speculator::free`]).
+pub fn last_draft_graph_stats() -> Option<crate::dflash::DraftGraphStats> {
+    LAST_GRAPH_STATS.lock().unwrap().clone()
+}
+
 /// Target-generic DFlash2 chain speculator. Owns the draft, its scratch, the
 /// cumulative committed feature rows (`[rows × feature_width]` F32,
 /// the draft's context) and the target-minted verify scratch.
@@ -352,6 +422,11 @@ impl Speculator for Dflash2Speculator {
         // Context rows sit at their absolute positions, the block after them.
         let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
         let positions_k: Vec<i32> = (0..(position + b) as i32).collect();
+        let traced = tracing_windows();
+        let t_draft = traced.then(|| {
+            let _ = gpu.hip.device_synchronize();
+            std::time::Instant::now()
+        });
         draft_forward_based(
             gpu,
             &self.weights,
@@ -367,6 +442,11 @@ impl Speculator for Dflash2Speculator {
             false,
         )
         .map_err(|e| format!("Dflash2Speculator draft_forward: {e}"))?;
+        let draft_ms = t_draft.map(|t| {
+            let _ = gpu.hip.device_synchronize();
+            t.elapsed().as_secs_f64() * 1e3
+        });
+        let t_selector = traced.then(std::time::Instant::now);
 
         // Selector over the target head's logits of the draft rows 1..b.
         let hidden_rows = self.scratch.x.sub_offset(h, drafts_n * h);
@@ -389,6 +469,25 @@ impl Speculator for Dflash2Speculator {
             sampled.then_some(uniforms.as_slice()),
         )
         .map_err(|e| format!("Dflash2Speculator selector: {e}"))?;
+        if let (Some(draft_ms), Some(t_selector)) = (draft_ms, t_selector) {
+            let selector_ms = t_selector.elapsed().as_secs_f64() * 1e3;
+            let hidden = gpu
+                .download_f32(&hidden_rows)
+                .map_err(|e| format!("Dflash2Speculator trace download: {e}"))?;
+            let trace = DraftWindowTrace {
+                position,
+                seed,
+                block: b,
+                tokens: proposal.tokens.clone(),
+                confidence_bits: proposal.confidence.iter().map(|c| c.to_bits()).collect(),
+                hidden_fnv: fnv1a_f32_bits(&hidden[..drafts_n * h]),
+                draft_ms,
+                selector_ms,
+            };
+            if let Some(log) = WINDOW_TRACE.lock().unwrap().as_mut() {
+                log.push(trace);
+            }
+        }
         // Verify only the confident prefix of the drafts: an unconfident draft
         // rarely survives the verify but still costs its target row. The cut is
         // draft-side only, so greedy output stays AR's and sampled acceptance
@@ -555,6 +654,7 @@ impl Speculator for Dflash2Speculator {
             ..
         } = *self;
         weights.free_gpu(gpu);
+        *LAST_GRAPH_STATS.lock().unwrap() = Some(scratch.draft_graph_stats());
         scratch.free_gpu(gpu);
         if let Some(vs) = verify_scratch {
             vs.free(gpu);
@@ -770,13 +870,18 @@ pub fn build_dflash2_speculator(
         return Err("DFlash2 draft: candidate selector tensors are missing".into());
     }
     let scratch = new_draft_scratch(gpu, &config, block, ctx_capacity, weights.has_mq);
-    let scratch = match scratch {
+    let mut scratch = match scratch {
         Ok(scratch) => scratch,
         Err(e) => {
             weights.free_gpu(gpu);
             return Err(e);
         }
     };
+    match DRAFT_GRAPH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => scratch.set_draft_graph(false),
+        2 => scratch.set_draft_graph(true),
+        _ => {}
+    }
     // An all-sliding draft reads only its last `W` context rows: the host and
     // the target keep just those (a split draft's full layer reads them all).
     let feature_window = config.declared_window.filter(|_| config.all_layers_sliding);
