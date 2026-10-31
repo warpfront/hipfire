@@ -4764,6 +4764,19 @@ pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip
 /// Grid=[n_heads, N]. Each block computes one (head, query_pos) output row.
 pub const VIT_ATTENTION_SRC: &str = include_str!("../../../kernels/src/vit_attention.hip");
 
+/// Bidirectional GQA ViT attention for the LFM3-VL vision tower: separate
+/// Q/K/V buffers with distinct head counts (16 Q / 8 KV). Grid=[n_heads, N].
+pub const VIT_ATTENTION_GQA_SRC: &str =
+    include_str!("../../../kernels/src/vit_attention_gqa_f32.hip");
+
+/// Exact (erf) GELU: 0.5 * x * (1 + erf(x/sqrt(2))). LFM3-VL projector uses
+/// nn.GELU(approximate="none") — distinct from `GELU_TANH_SRC`.
+pub const GELU_ERF_SRC: &str = include_str!("../../../kernels/src/gelu_erf_f32.hip");
+
+/// LFM3-VL vision conv layer: double-gated depthwise 2D convolution over the
+/// merge-grouped patch grid. Grid=[N, hidden]. See `conv2d_gated_f32.hip`.
+pub const CONV2D_GATED_SRC: &str = include_str!("../../../kernels/src/conv2d_gated_f32.hip");
+
 /// 2D rotary positional embedding for the Qwen3.5-VL vision tower. Rotates Q
 /// and K halves of the packed QKV buffer in-place using per-token cos/sin of
 /// size `head_dim/2`. See `kernels/src/apply_rope_2d_vision.hip`.

@@ -6325,6 +6325,63 @@ impl Gpu {
         }
     }
 
+    /// Bidirectional GQA ViT attention for the LFM3-VL vision tower. Separate
+    /// Q/K/V buffers with distinct head counts (e.g. 16 Q / 8 KV). Every query
+    /// patch attends to every key patch in the same frame (no causal mask).
+    pub fn vit_attention_gqa_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "vit_attention_gqa_f32",
+            kernels::VIT_ATTENTION_GQA_SRC,
+            "vit_attention_gqa_f32",
+        )?;
+        let func = &self.functions["vit_attention_gqa_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut nh = n_heads as i32;
+        let mut nk = n_kv as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = std::cmp::min(256, std::cmp::max(n, head_dim)) as u32;
+        let block_size = block_size.next_power_of_two();
+        let shared_mem = ((n + block_size as usize) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, n as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Apply 2D rotary positional embedding to the Q and K halves of a packed
     /// QKV buffer for the Qwen3.5-VL vision tower (V is left untouched).
     ///

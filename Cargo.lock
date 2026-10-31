@@ -819,6 +819,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-lfm3-vl"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-llama"
 version = "0.3.0"
 dependencies = [

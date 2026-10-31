@@ -4010,6 +4010,87 @@ impl Gpu {
         }
     }
 
+    /// Exact (erf) GELU: 0.5 * x * (1 + erf(x/sqrt(2))). In-place capable.
+    /// Used by the LFM3-VL multi-modal projector (nn.GELU, approximate="none").
+    pub fn gelu_erf_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gelu_erf_f32", kernels::GELU_ERF_SRC, "gelu_erf_f32")?;
+        let func = &self.functions["gelu_erf_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let blocks = ((n + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// LFM3-VL vision conv layer: double-gated depthwise 2D convolution.
+    /// `bcx` is `[N, 3*hidden]` (B|C|x), `weight` is `[hidden, 3, 3]` flattened
+    /// (`[hidden*9]`), `out` is `[N, hidden]` = C * depthwise_conv(B*x). Patches
+    /// are in `(gy,gx,sy,sx)` merge-grouped order; the conv runs over the full
+    /// `(grid_h, grid_w)` raster grid with zero padding.
+    pub fn conv2d_gated_f32(
+        &mut self,
+        bcx: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        hidden: usize,
+        grid_h: usize,
+        grid_w: usize,
+        sms: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("conv2d_gated_f32", kernels::CONV2D_GATED_SRC, "conv2d_gated_f32")?;
+        let func = &self.functions["conv2d_gated_f32"];
+        let mut bp = bcx.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut hi = hidden as i32;
+        let mut gh = grid_h as i32;
+        let mut gw = grid_w as i32;
+        let mut sm = sms as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut bp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut gh as *mut _ as *mut c_void,
+            &mut gw as *mut _ as *mut c_void,
+            &mut sm as *mut _ as *mut c_void,
+        ];
+        // 16x16 thread block → grid [ceil(N/16), ceil(hidden/16)].
+        let bx = 16u32;
+        let by = 16u32;
+        let gx = ((n as u32) + bx - 1) / bx;
+        let gy = ((hidden as u32) + by - 1) / by;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [gx, gy, 1],
+                [bx, by, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)
     pub fn bias_add_f32(
         &mut self,
