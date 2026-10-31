@@ -17,7 +17,7 @@
 //! silent per-token loop.
 
 use hipfire_dispatch::pipeline::{q8_0_prefill_gemm, PrefillActTier};
-use hipfire_runtime::llama::{weight_gemm, weight_gemv, WeightTensor};
+use hipfire_runtime::llama::{weight_gemm, weight_gemv, weight_gemv_rows_exact, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Output rounding applied after the projection.
@@ -123,9 +123,7 @@ pub fn project_rows(
         // reduction order (WMMA F16 x for qt44, a 32-lane tree for F32 vs the 256-thread
         // `gemv_f32`), so each row runs the decode projection itself.
         DType::MQ4G256V2 | DType::F32 => per_row_decode(gpu, w, x, y, rows),
-        DType::Q8_0 => gpu
-            .gemv_q8_0_rows_exact(&w.buf, x, y, w.m, w.k, rows)
-            .map_err(|e| e.to_string()),
+        DType::Q8_0 => weight_gemv_rows_exact(gpu, w, x, y, rows).map_err(|e| e.to_string()),
         other => unreachable!("dtype {other:?} rejected by check()"),
     }
     .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;

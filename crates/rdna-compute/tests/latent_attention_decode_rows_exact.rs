@@ -34,7 +34,7 @@
 //!   cargo test -p rdna-compute --release --test latent_attention_decode_rows_exact -- --ignored --nocapture
 
 use rdna_compute::latent_attention_decode::{
-    latent_attention_decode_workspace_elems, LATENT_DECODE_ROWS_MAX,
+    latent_attention_decode_workspace_elems, LATENT_DECODE_ROWS_CAP,
 };
 use rdna_compute::latent_attention_tiled::{q8_plane_row_bytes, LatentRows, TiledAttention};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -326,7 +326,7 @@ fn latent_attention_decode_rows_are_bit_identical_to_the_decode_singleton() {
     let mut rng = Rng(0x0a7a_0004);
     println!("arch {}", gpu.arch);
     let lmax = *LENGTHS.last().unwrap();
-    let cap = lmax + LATENT_DECODE_ROWS_MAX;
+    let cap = lmax + LATENT_DECODE_ROWS_CAP;
     let geos = [
         Geo::build(&mut gpu, &mut rng, "absorbed", Kind::Absorbed, 32, cap),
         Geo::build(&mut gpu, &mut rng, "bf16_mirror", Kind::Bf16Mirror, 16, cap),
@@ -340,17 +340,17 @@ fn latent_attention_decode_rows_are_bit_identical_to_the_decode_singleton() {
         let (dq, dv, heads) = (geo.dq(), geo.dv(), geo.heads);
         let q_all = gpu
             .upload_f32(
-                &(0..LATENT_DECODE_ROWS_MAX * heads * dq)
+                &(0..LATENT_DECODE_ROWS_CAP * heads * dq)
                     .map(|_| rng.unit())
                     .collect::<Vec<_>>(),
-                &[LATENT_DECODE_ROWS_MAX * heads * dq],
+                &[LATENT_DECODE_ROWS_CAP * heads * dq],
             )
             .expect("upload q");
         let ws_one = latent_attention_decode_workspace_elems(heads, dv);
         let ws_rows = gpu
             .upload_f32(
-                &vec![f32::NAN; ws_one * LATENT_DECODE_ROWS_MAX],
-                &[ws_one * LATENT_DECODE_ROWS_MAX],
+                &vec![f32::NAN; ws_one * LATENT_DECODE_ROWS_CAP],
+                &[ws_one * LATENT_DECODE_ROWS_CAP],
             )
             .expect("ws rows");
         let ws_single = gpu
@@ -361,7 +361,7 @@ fn latent_attention_decode_rows_are_bit_identical_to_the_decode_singleton() {
         let mut scenarios: Vec<(usize, usize)> = LENGTHS.iter().map(|&l| (l, cap)).collect();
         scenarios.push((511, 520));
         for (l, max_rows) in scenarios {
-            for k in 1..=LATENT_DECODE_ROWS_MAX {
+            for k in 1..=LATENT_DECODE_ROWS_CAP {
                 let rounds: &[bool] = if [1, 5, 16].contains(&k) {
                     &[true, false]
                 } else {
@@ -424,17 +424,17 @@ fn latent_attention_decode_rows_are_bit_identical_to_the_decode_singleton() {
         let ws_one = latent_attention_decode_workspace_elems(heads, dv);
         let ws_rows = gpu
             .upload_f32(
-                &vec![0.0; ws_one * LATENT_DECODE_ROWS_MAX],
-                &[ws_one * LATENT_DECODE_ROWS_MAX],
+                &vec![0.0; ws_one * LATENT_DECODE_ROWS_CAP],
+                &[ws_one * LATENT_DECODE_ROWS_CAP],
             )
             .expect("ws");
         let ws_single = gpu.upload_f32(&vec![0.0; ws_one], &[ws_one]).expect("ws");
         let q_all = gpu
             .upload_f32(
-                &(0..LATENT_DECODE_ROWS_MAX * heads * dq)
+                &(0..LATENT_DECODE_ROWS_CAP * heads * dq)
                     .map(|_| rng.unit())
                     .collect::<Vec<_>>(),
-                &[LATENT_DECODE_ROWS_MAX * heads * dq],
+                &[LATENT_DECODE_ROWS_CAP * heads * dq],
             )
             .expect("q");
         for l in [2048usize, 8000] {

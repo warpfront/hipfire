@@ -65,7 +65,7 @@ const PARTIAL_ROWS_KERNEL: &str = "latent_attention_decode_partial_rows";
 const MERGE_ROWS_KERNEL: &str = "latent_attention_decode_merge_rows";
 const PARTIAL_Q8_ROWS_KERNEL: &str = "latent_attention_decode_partial_q8_rows";
 /// Most query rows one [`Gpu::latent_attention_decode_split_rows`] launch serves.
-pub const LATENT_DECODE_ROWS_MAX: usize = 16;
+pub const LATENT_DECODE_ROWS_CAP: usize = 16;
 
 /// Number of key splits (grid `x` of the partials kernel). Fixed: the merge
 /// order, and therefore the output bytes for a given `len`, depend on it.
@@ -152,7 +152,7 @@ impl Gpu {
     }
 
     /// Row-exact multi-row split-KV decode: `a.n_rows = K` in
-    /// `1..=`[`LATENT_DECODE_ROWS_MAX`] query rows in ONE launch pair (grid `z` =
+    /// `1..=`[`LATENT_DECODE_ROWS_CAP`] query rows in ONE launch pair (grid `z` =
     /// row), where row `r` sees keys `j < min(*pos + pos_offset + r + 1, max_rows)`
     /// (the K new rows are already in the cache) and its partials and merge are
     /// bit-identical to the rows == 1 call [`Self::latent_attention_decode_split`]
@@ -192,9 +192,9 @@ impl Gpu {
                 a.n_rows
             )));
         }
-        if rows_mode && !(1..=LATENT_DECODE_ROWS_MAX).contains(&a.n_rows) {
+        if rows_mode && !(1..=LATENT_DECODE_ROWS_CAP).contains(&a.n_rows) {
             return Err(err(format!(
-                "latent_attention decode: multi-row decode supports 1..={LATENT_DECODE_ROWS_MAX} \
+                "latent_attention decode: multi-row decode supports 1..={LATENT_DECODE_ROWS_CAP} \
                  query rows, got n_rows = {}",
                 a.n_rows
             )));
@@ -426,7 +426,7 @@ mod tests {
                 macro_suffix(module_symbol)
             )));
         }
-        assert!(LATENT_DECODE_ROWS_MAX >= 16);
+        assert!(LATENT_DECODE_ROWS_CAP >= 16);
     }
 
     fn macro_suffix(symbol: &str) -> &'static str {

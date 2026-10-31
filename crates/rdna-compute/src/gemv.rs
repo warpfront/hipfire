@@ -204,7 +204,7 @@ static BF16_ROWS_WIDE_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(
 /// Most activation rows one `gemv_q8_0_*_rows_exact_r<R>` launch serves;
 /// [`Gpu::gemv_q8_0_rows_exact`] splits larger row counts into groups of this
 /// many (every group exact: rows never interact).
-pub const Q8_0_ROWS_EXACT_MAX_ROWS: usize = 16;
+pub const Q8_0_ROWS_EXACT_KERNELS: usize = 16;
 
 /// The rows == 1 decode GEMV for a Q8_0 weight reads the wide kernel up to
 /// this K and the narrow kernel above it (`Gpu::gemv_q8_0`: `if k <= 1536`).
@@ -311,7 +311,7 @@ fn q8_0_rows_exact_extents(m: usize, k: usize, rows: usize) -> Option<[usize; 3]
 }
 
 /// `gemv_q8_0_wide_rows_exact_r1` ..= `_r16` (index `rows - 1`).
-const Q8_0_WIDE_ROWS_EXACT_SYMBOLS: [&str; Q8_0_ROWS_EXACT_MAX_ROWS] = [
+const Q8_0_WIDE_ROWS_EXACT_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS] = [
     "gemv_q8_0_wide_rows_exact_r1",
     "gemv_q8_0_wide_rows_exact_r2",
     "gemv_q8_0_wide_rows_exact_r3",
@@ -331,7 +331,7 @@ const Q8_0_WIDE_ROWS_EXACT_SYMBOLS: [&str; Q8_0_ROWS_EXACT_MAX_ROWS] = [
 ];
 
 /// `gemv_q8_0_rows_exact_r1` ..= `_r16` (index `rows - 1`).
-const Q8_0_NARROW_ROWS_EXACT_SYMBOLS: [&str; Q8_0_ROWS_EXACT_MAX_ROWS] = [
+const Q8_0_NARROW_ROWS_EXACT_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS] = [
     "gemv_q8_0_rows_exact_r1",
     "gemv_q8_0_rows_exact_r2",
     "gemv_q8_0_rows_exact_r3",
@@ -20716,7 +20716,7 @@ impl Gpu {
     /// code with an inner per-row loop (same thread-to-output map, per-lane
     /// accumulation order, accumulator chains, dequant and reduction tree; the
     /// weights are loaded once per block and shared by up to
-    /// [`Q8_0_ROWS_EXACT_MAX_ROWS`] rows, more rows run in groups of that many).
+    /// [`Q8_0_ROWS_EXACT_KERNELS`] rows, more rows run in groups of that many).
     /// Any other architecture runs [`Gpu::gemv_q8_0`] once per row (exact by
     /// construction, weights re-read per row).
     ///
@@ -20764,7 +20764,7 @@ impl Gpu {
         }
         let mut first = 0;
         while first < rows {
-            let n = (rows - first).min(Q8_0_ROWS_EXACT_MAX_ROWS);
+            let n = (rows - first).min(Q8_0_ROWS_EXACT_KERNELS);
             let x_group = x.sub_offset(first * k, n * k);
             let y_group = y.sub_offset(first * m, n * m);
             self.launch_q8_0_rows_exact_group(route, a_raw, &x_group, &y_group, m, k, n)?;
@@ -20774,7 +20774,7 @@ impl Gpu {
     }
 
     /// One kernel launch of [`Gpu::gemv_q8_0_rows_exact`]: `n` in
-    /// `1..=`[`Q8_0_ROWS_EXACT_MAX_ROWS`] rows on a hipcc route.
+    /// `1..=`[`Q8_0_ROWS_EXACT_KERNELS`] rows on a hipcc route.
     #[allow(clippy::too_many_arguments)]
     fn launch_q8_0_rows_exact_group(
         &mut self,
@@ -20786,7 +20786,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
-        assert!((1..=Q8_0_ROWS_EXACT_MAX_ROWS).contains(&n));
+        assert!((1..=Q8_0_ROWS_EXACT_KERNELS).contains(&n));
         self.bind_thread()?;
         let (func, grid, block) = match route {
             Q8RowsExactRoute::Wide => {
@@ -26570,7 +26570,7 @@ mod rowtile_launch_tests {
 
     #[test]
     fn q8_rows_exact_symbols_exist_in_their_kernel_sources() {
-        for rows in 1..=Q8_0_ROWS_EXACT_MAX_ROWS {
+        for rows in 1..=Q8_0_ROWS_EXACT_KERNELS {
             assert_eq!(
                 Q8_0_WIDE_ROWS_EXACT_SYMBOLS[rows - 1],
                 format!("gemv_q8_0_wide_rows_exact_r{rows}")

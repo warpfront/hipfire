@@ -138,7 +138,7 @@ pub enum MlaRowsRoute {
     /// not bit-equal to the decode call of the same row).
     #[default]
     Flash,
-    /// One multi-row split-KV decode launch (`rows <= LATENT_DECODE_ROWS_MAX`,
+    /// One multi-row split-KV decode launch (`rows <= LATENT_DECODE_ROWS_CAP`,
     /// needs the split-KV `workspace` sized for `rows`): row `r` is bit-identical
     /// to the rows == 1 decode call at length `*pos + r + 1`, so a verify row
     /// equals the autoregressive decode row bit for bit. The `rows` new cache
