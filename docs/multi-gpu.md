@@ -490,6 +490,17 @@ forward. Singleton forward bytes and numerics are unchanged.
   stages. The flag is planner capacity only: the oracle's
   singleton-versus-lanes comparison and its `--ks`, `--row-budget` and
   `--policies` are unchanged. The report records `reserve_lanes`.
+- **Speculative-lane schema.** `fn_mesh_lane_oracle` also parses `--spec ar|mtp`
+  (default `ar`: everything above, unchanged), `--k` (1..=7, default 3) and
+  `--routes floor|cycle|batched` (default `cycle`) for `--spec mtp`, plus
+  `--soak-seconds S [--soak-seed N]` and
+  `--fault-point before-draft|head-round|target-edge|repair|before-publish`
+  (`mtp` only; a soak and a fault point are exclusive). Every run writes
+  `manifest.json` (expanded command, SHA-256 of each `--prompt-file` and of the
+  binary, model hash, recorded environment). `--spec mtp` is parsed and
+  recorded but refuses with "not yet implemented by S3/S5" until the EP/PP
+  speculative lane protocol lands; the refusal is an interface boundary, not a
+  pass.
 
 This section records behavior only; it carries no measurement and no exactness
 evidence. The changed placement is not covered by the EP2/EP4 evidence above.
@@ -1265,8 +1276,10 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   the experts. The stage line reports `spec=mtp K=.. executor=ep-mesh
   copy=on|off`; a store that does not fit is a labeled refusal and AR lanes
   (`spec=off (...)`), never a narrower MTP store. `HIPFIRE_EP_MTP_LANES=0` is
-  the kill switch (EP lanes are AR lanes, as before) and `serve.batch_sampled`
-  keeps EP on AR lanes until the lane sampled oracle (>= 2000 trials) passes.
+  the kill switch (EP lanes are AR lanes, as before). Sampled requests
+  (`serve.batch_sampled`, neutral penalties) run on the same lanes: rank 0
+  reads the head's exact candidates and its target logits rows, and the root
+  alone draws every proposal and every Leviathan accept/residual/bonus.
   A lone request keeps the singleton MTP route; the floor retires a lane to AR
   windows when native drafts do not pay (high concurrency). The daemon logs
   each lane drive's route mix by step concurrency (`[fn-lane-mesh-mix]`).

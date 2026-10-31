@@ -47,16 +47,29 @@
 //! # Not covered here
 //!
 //! Copy proposals, forced advances and head-lag lanes are refused at
-//! preflight (the root keeps them off a window by not offering them); EP
-//! sampled acceptance arrives from the root's `AcceptRule`.
+//! preflight (the root keeps them off a window by not offering them).
+//!
+//! # Sampled lanes
+//!
+//! A sampled lane (`SamplingMode::Leviathan`) is served by the root's
+//! [`LaneSampler`] ([`EpMeshLanes::step_sampled`]). Rank 0 (the sampler owner)
+//! copies the head's exact rescored candidates into every native
+//! [`DraftProposal::read`] right after the draft finish of each op, before another
+//! lane's op can overwrite them, and returns a [`RowHandle`] over its resident
+//! verify logits in [`SamplerOutput::rows`]; the root draws every proposal
+//! and every accept/residual/bonus on the lane's staged RNG. The ranks only
+//! replay the committed tokens, exactly as for greedy lanes. The handle is
+//! valid from the verify until the step's prepare (or abort).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::ep::{gather_tally, GatherTally};
 use crate::gpu_forward_lanes::{
     forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, StageName, StageShare,
 };
+use crate::lane::download_lane_rows;
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
 use crate::lane_exec::pick_at;
+use crate::mesh_lane_protocol::SamplingMode;
 use crate::mesh_lane_protocol::{
     AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DraftProposal, DraftRound,
     EvidenceError, HeadState, LaneAdmission, LaneAdmit, LaneKind, LaneMeshExecutor, LanePlan,
@@ -75,9 +88,13 @@ use crate::mtp_lanes::lane_call;
 use crate::mtp_spec::{
     draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH,
 };
+use crate::sampled_lane::{DraftRead, LaneSampler, RowHandle, TargetRowSource};
 use hipfire_runtime::slot_batch::RequestEpoch;
+use hipfire_runtime::spec::SpecRequestConfig;
 use rdna_compute::{Gpu, GpuTensor};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 type R<T> = Result<T, String>;
@@ -177,6 +194,8 @@ pub struct RankExec {
     /// construction; this records the impossible case).
     fatal: Option<String>,
     abort_reason: Option<String>,
+    /// Validity flag of the row source the last verify handed out.
+    rows_valid: Option<Arc<AtomicBool>>,
 }
 
 impl RankExec {
@@ -194,6 +213,7 @@ impl RankExec {
             },
             fatal: None,
             abort_reason: None,
+            rows_valid: None,
         }
     }
 
@@ -204,6 +224,14 @@ impl RankExec {
     /// Why this rank was aborted (idempotent), if it was.
     pub fn abort_reason(&self) -> Option<&str> {
         self.abort_reason.as_deref()
+    }
+
+    /// Invalidate the row source of the last verify: its rows are only
+    /// readable from the verify until the step's prepare (or abort).
+    fn drop_rows(&mut self) {
+        if let Some(valid) = self.rows_valid.take() {
+            valid.store(false, Ordering::Release);
+        }
     }
 
     fn take_fatal(&mut self) -> Option<String> {
@@ -286,9 +314,84 @@ struct OpRead {
     /// The confirmation probe abandoned its head step (a hit, or a miss with
     /// no native route).
     abandoned: bool,
+    /// The head's rescored candidates (rank 0, native Leviathan lane only).
+    read: Option<DraftRead>,
+}
+
+/// The sampler owner's resident verify logits, read one row at a time by the
+/// root's sampled rule ([`TargetRowSource`]). It reads rank 0's device from
+/// the root's thread (rank 0 runs on the caller's thread) between the verify
+/// and the prepare phase of one step.
+struct EpRowSource {
+    /// SAFETY: the rank's `Gpu` outlives every use of the handle: the handle
+    /// is only readable while `valid` is set, and `valid` is cleared at the
+    /// start of this rank's next verify, prepare, publish and abort, all of
+    /// which run inside the `EpMeshLanes::step` call that borrows the `Gpu`.
+    gpu: *const Gpu,
+    /// A view of the step's `n_dec * vocab` logits rows.
+    logits: GpuTensor,
+    vocab: usize,
+    /// `(window key, first row, rows)` per lane in plan order.
+    lanes: Vec<(LaneWindowKey, usize, usize)>,
+    valid: Arc<AtomicBool>,
+}
+
+// SAFETY: the raw `Gpu` pointer and the device view are only dereferenced on
+// the root's thread (the thread that runs rank 0), while the step is in
+// flight (see `gpu`).
+unsafe impl Send for EpRowSource {}
+
+impl TargetRowSource for EpRowSource {
+    fn row_logits(
+        &mut self,
+        key: &LaneWindowKey,
+        row: usize,
+        host: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        if !self.valid.load(Ordering::Acquire) {
+            return Err("the step's target rows are no longer readable".to_string());
+        }
+        let &(_, first, rows) = self
+            .lanes
+            .iter()
+            .find(|(k, _, _)| k == key)
+            .ok_or_else(|| format!("no verify rows for lane window {key:?}"))?;
+        if row >= rows {
+            return Err(format!("verify row {row} of a {rows}-row window"));
+        }
+        if host.len() != self.vocab {
+            host.resize(self.vocab, 0.0);
+        }
+        // SAFETY: see `gpu`.
+        let gpu = unsafe { &*self.gpu };
+        download_lane_rows(gpu, &self.logits, first + row, 1, self.vocab, host)
+    }
 }
 
 impl RankLane<'_> {
+    /// The root's lazy access to this rank's resident verify logits.
+    fn rows_handle(&mut self, plan: &VerifyPlan, logits: GpuTensor) -> RowHandle {
+        let valid = Arc::new(AtomicBool::new(true));
+        self.exec.rows_valid = Some(valid.clone());
+        let mut first = 0usize;
+        let lanes = plan
+            .lanes
+            .iter()
+            .map(|l| {
+                let entry = (l.key, first, l.rows.len());
+                first += l.rows.len();
+                entry
+            })
+            .collect();
+        RowHandle::new(EpRowSource {
+            gpu: &*self.gpu as *const Gpu,
+            logits,
+            vocab: self.bundle.lane_vocab(),
+            lanes,
+            valid,
+        })
+    }
+
     fn rank(&self) -> usize {
         self.exec.rank
     }
@@ -400,7 +503,7 @@ impl RankLane<'_> {
     /// Draft op), then every op's deferred head step in the root's order, one
     /// download for all of them and the head's own parse of each. Returns the
     /// catch-up rows appended and the reads per op.
-    fn draft_round_device(&mut self, round: &DraftRound) -> R<(usize, Vec<OpRead>)> {
+    fn draft_round_device(&mut self, round: &DraftRound, sampler: bool) -> R<(usize, Vec<OpRead>)> {
         let Self {
             exec, bundle, gpu, ..
         } = self;
@@ -491,7 +594,10 @@ impl RankLane<'_> {
             for (slot, op) in round.ops.iter().enumerate() {
                 let top = &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
                 let plan = plan_of(&op.key)?;
-                let (token, margin) = {
+                let want_read = sampler
+                    && plan.sampling == SamplingMode::Leviathan
+                    && plan.source == ProposalSource::Native;
+                let (token, margin, read) = {
                     let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
                     let spec = spec
                         .as_mut()
@@ -499,7 +605,12 @@ impl RankLane<'_> {
                     let LaneSpec { head, draft, .. } = spec;
                     lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
                         let token = b.mtp_draft_finish(top)?;
-                        Ok::<_, BundleError>((token, b.mtp_draft_margin()))
+                        let read = if want_read {
+                            Some(b.mtp_draft_read(gpu)?)
+                        } else {
+                            None
+                        };
+                        Ok::<_, BundleError>((token, b.mtp_draft_margin(), read))
                     }))
                     .map_err(|e| format!("draft finish: {e}"))?
                 };
@@ -531,6 +642,7 @@ impl RankLane<'_> {
                     margin,
                     j,
                     abandoned,
+                    read: if abandoned { None } else { read },
                 });
             }
             Ok((catch_rows, reads))
@@ -540,7 +652,7 @@ impl RankLane<'_> {
     /// The one trunk forward over every lane's sealed rows (arming the ring and
     /// taking the target ticket of every multi-row lane first); the picks per
     /// lane and each lane's resulting target position.
-    fn verify_device(&mut self, plan: &VerifyPlan) -> R<(Vec<Vec<u32>>, Vec<usize>)> {
+    fn verify_device(&mut self, plan: &VerifyPlan) -> R<(Vec<Vec<u32>>, Vec<usize>, GpuTensor)> {
         let Self { bundle, gpu, .. } = self;
         let vocab = bundle.lane_vocab();
         let epochs: Vec<RequestEpoch> = plan.lanes.iter().map(|l| l.key.request_epoch).collect();
@@ -617,7 +729,9 @@ impl RankLane<'_> {
                 first += v.rows.len();
             }
             let ends = lanes.iter().map(|lane| lane.state.position).collect();
-            Ok((picks, ends))
+            // A view of the step's decode logits rows (the root's sampled rule
+            // reads single rows from it before the prepare phase).
+            Ok((picks, ends, logits.sub_offset(0, n_dec * vocab)))
         })
     }
 
@@ -795,7 +909,7 @@ impl LaneMeshExecutor for RankLane<'_> {
         let before = gather_tally();
         let t0 = Instant::now();
         let (catch_rows, reads) = self
-            .draft_round_device(round)
+            .draft_round_device(round, sampler)
             .map_err(|e| rank_err(rank, e))?;
         let tally = gather_tally().since(before);
         if catch_rows != result.catch_up_rows {
@@ -854,7 +968,7 @@ impl LaneMeshExecutor for RankLane<'_> {
                 drop_last,
                 // Greedy lanes propose the head's argmax; a sampled lane's
                 // distribution read (S4) is the sampler owner's alone.
-                read: None,
+                read: read.read,
             });
         }
         if sampler {
@@ -869,7 +983,8 @@ impl LaneMeshExecutor for RankLane<'_> {
         let mut result = self.exec.session.on_verify(plan)?;
         let before = gather_tally();
         let t0 = Instant::now();
-        let (picks, ends) = self.verify_device(plan).map_err(|e| rank_err(rank, e))?;
+        self.exec.drop_rows();
+        let (picks, ends, logits) = self.verify_device(plan).map_err(|e| rank_err(rank, e))?;
         let tally = gather_tally().since(before);
         let row_counts: Vec<usize> = plan.lanes.iter().map(|l| l.rows.len()).collect();
         let Some(step) = self.exec.step.as_mut() else {
@@ -910,13 +1025,22 @@ impl LaneMeshExecutor for RankLane<'_> {
             head_draft_calls: plan.ledger.head_draft_calls,
         };
         if sampler {
-            result.sampler = Some(SamplerOutput::picks_only(
+            let mut out = SamplerOutput::picks_only(
                 plan.lanes
                     .iter()
                     .zip(picks)
                     .map(|(l, p)| (l.key, p))
                     .collect(),
-            ));
+            );
+            let sampled = self.exec.step.as_ref().is_some_and(|s| {
+                s.lanes
+                    .iter()
+                    .any(|w| w.plan.sampling != SamplingMode::Greedy)
+            });
+            if sampled {
+                out.rows = Some(self.rows_handle(plan, logits));
+            }
+            result.sampler = Some(out);
         }
         Ok(result)
     }
@@ -924,6 +1048,7 @@ impl LaneMeshExecutor for RankLane<'_> {
     fn prepare_commit(&mut self, decision: &CommitDecision) -> Result<PreparedReceipt, RankError> {
         let rank = self.rank();
         let receipt = self.exec.session.on_prepare(decision)?;
+        self.exec.drop_rows();
         let t0 = Instant::now();
         let head_rows = self
             .prepare_device(decision)
@@ -975,6 +1100,7 @@ impl LaneMeshExecutor for RankLane<'_> {
     }
 
     fn publish_commit(&mut self, decision: &CommitDecision) {
+        self.exec.drop_rows();
         let rank = self.rank();
         let Some(step) = self.exec.step.take() else {
             return;
@@ -1060,6 +1186,7 @@ impl LaneMeshExecutor for RankLane<'_> {
     }
 
     fn abort_step(&mut self, _key: &MeshStepKey, _phase: StepPhase, reason: &str) {
+        self.exec.drop_rows();
         if self.exec.abort_reason.is_none() {
             self.exec.abort_reason = Some(reason.to_string());
         }
@@ -1198,7 +1325,7 @@ pub(crate) fn drive_step<F: MeshFanout>(
                 ))
             }
         };
-        if let Err(error) = root.collect_draft(&round, &results) {
+        if let Err(error) = root.collect_draft_with(&round, &results, rule) {
             return Err(abort_after(root, fan, &key, error));
         }
     }
@@ -1239,6 +1366,7 @@ pub(crate) fn drive_step<F: MeshFanout>(
         return Err(abort_after(root, fan, &key, error));
     }
     let output = root.publish_commit()?;
+    rule.on_publish(&output);
     let fatal: Vec<String> = fan.publish(&decision).into_iter().flatten().collect();
     if !fatal.is_empty() {
         // The step is already published at the root (no step is in flight):
@@ -1486,6 +1614,7 @@ pub struct EpMeshLanes {
     prefill_ran: bool,
     last_merged: Option<MergedCostEvidence>,
     steps: u64,
+    sampler: Option<LaneSampler>,
 }
 
 /// What [`EpMeshLanes::step`] reports besides the output.
@@ -1593,6 +1722,7 @@ impl EpMeshLanes {
             prefill_ran: false,
             last_merged: None,
             steps: 0,
+            sampler: Some(LaneSampler::new(bundle.lane_vocab())),
         })
     }
 
@@ -1693,6 +1823,9 @@ impl EpMeshLanes {
         gpu: &mut Gpu,
         epoch: RequestEpoch,
     ) -> Result<(), String> {
+        if let Some(sampler) = self.sampler.as_mut() {
+            sampler.release(&epoch);
+        }
         self.root.release_lane(epoch).map_err(|e| e.to_string())?;
         let (mut fan, _) = self.fan(bundle, gpu);
         fan.release(&epoch)
@@ -1760,6 +1893,9 @@ impl EpMeshLanes {
     /// EOS/stop/length, the root never does and drafts through an EOS draft.
     pub fn set_driver_terminates(&mut self, on: bool) {
         self.root.set_driver_terminates(on);
+        if let Some(sampler) = self.sampler.as_mut() {
+            sampler.set_driver_terminates(on);
+        }
     }
 
     /// Whether the root holds `epoch`'s lane.
@@ -1785,6 +1921,9 @@ impl EpMeshLanes {
         bundle: &mut Qwen4Bundle,
         epoch: RequestEpoch,
     ) -> Result<(), String> {
+        if let Some(sampler) = self.sampler.as_mut() {
+            sampler.release(&epoch);
+        }
         let root = self.root.release_lane(epoch).map_err(|e| e.to_string());
         let Some(mesh) = bundle.ep.take() else {
             return Err("qwen4 EP mesh is not attached".to_string());
@@ -1814,6 +1953,54 @@ impl EpMeshLanes {
         }
         root?;
         ranks.map(|_| ())
+    }
+}
+
+impl EpMeshLanes {
+    /// [`Self::admit_lane`] for a sampled request: the root's [`LaneSampler`]
+    /// registers the request's sampler (temperature/top-p/top-k/min-p and
+    /// penalty history over the prompt) before the lane enters the root; the
+    /// request's RNG stream is `admission.rng_seed`. Registration is undone
+    /// when the lane is not admitted.
+    pub fn admit_lane_sampled(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        admission: MeshLaneAdmission,
+        cfg: &SpecRequestConfig,
+    ) -> Result<(), String> {
+        let epoch = admission.epoch;
+        self.sampler
+            .as_mut()
+            .ok_or_else(|| "the mesh lane sampler is in use".to_string())?
+            .admit(epoch, cfg, &admission.prompt, admission.seed)?;
+        let admitted = self.admit_lane(bundle, gpu, admission);
+        if admitted.is_err() {
+            if let Some(sampler) = self.sampler.as_mut() {
+                sampler.release(&epoch);
+            }
+        }
+        admitted
+    }
+
+    /// [`Self::step`] with the root's [`LaneSampler`] as the acceptance rule:
+    /// the lanes' [`LaneRequest::sampling`] selects greedy, naive or
+    /// Leviathan acceptance per lane.
+    pub fn step_sampled(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        requests: &[LaneRequest],
+        budgets: &WindowBudgets,
+    ) -> Result<MeshStepReport, MeshStepError> {
+        let mut sampler = self.sampler.take().ok_or_else(|| {
+            MeshStepError::Protocol(ProtocolError::Config(
+                "the mesh lane sampler is in use".to_string(),
+            ))
+        })?;
+        let report = self.step(bundle, gpu, requests, budgets, &mut sampler);
+        self.sampler = Some(sampler);
+        report
     }
 }
 

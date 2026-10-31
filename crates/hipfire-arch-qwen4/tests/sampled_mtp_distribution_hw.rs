@@ -330,6 +330,62 @@
 //! `ALPHA`, coverage failures are reported separately). Run unsharded
 //! (`HIPFIRE_SAMPLED_MTP_SHARD` unset) and the parent test alone spawns the
 //! four arms in fresh processes.
+//!
+//! # Lane suite (`HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes`)
+//!
+//! Compares the continuous-batching lane executor with AR lanes in
+//! distribution. `HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes` (default `singleton`)
+//! selects it; `HIPFIRE_SAMPLED_MTP_LANES=1|8` (required, refused under
+//! `singleton`) is the concurrent request count of a trial;
+//! `HIPFIRE_SAMPLED_MTP_TOPOLOGY` takes `single`, `pp2` or `ep2` (`ep2` only
+//! under the lane executor; the singleton arms stay `single`/`pp2`). The
+//! declared arm set is `lane_ar` (the reference), `lane_batched`
+//! (`HIPFIRE_MTP_INCREMENTAL=0`, `HIPFIRE_MTP_AR_FLOOR=0`), `lane_adaptive`
+//! (floor on, no route knob) and `lane_copy` (copy lane, `HIPFIRE_MTP_NGRAM_COPY=on`,
+//! one-hot copy proposals); there is no `lane_interleaved`. Arms run through the
+//! same exact `sampled_mtp_distribution_arm` test and `START..END` shards, in a
+//! **separate** `HIPFIRE_SAMPLED_MTP_OUT` directory per executor: a lane shard
+//! holds `(END - START) * lanes` rows, lane-minor, and a request's seed depends
+//! on the global trial and lane, never on the slot it ran in.
+//!
+//! `sampled_mtp_merge_short_shards` under `lanes` merges the lane arm set only,
+//! and refuses (writing nothing) a shard set that is mixed or incomplete: it keys
+//! every shard on executor, topology, model artifact hash, lane count, route,
+//! sampling/cohort settings, GDN state format and trial range, requires one key
+//! per arm and one cross-arm key, ranges that tile `0..trials` exactly once, and
+//! every arm of its topology's cohort (all four, or the three `ep2` arms). `sampled_mtp_matches_ar_distribution_on_flash_next` under
+//! `lanes` never launches an arm: it judges the merged files (>= 2000 trials)
+//! pooled and per lane against `lane_ar`, plus route coverage from each arm's
+//! evidence. The host-only logic and its CPU tests are `common/lane_suite.rs`
+//! (`cargo test ... --test sampled_mtp_distribution_hw lane_suite`).
+//!
+//! # EP2 lane arms (`lane_ep.rs`)
+//!
+//! Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2` the cohort is `lane_ar`,
+//! `lane_batched` and `lane_adaptive` (`lane_suite::EP2_ARMS`: the copy lane is
+//! off by default on EP serve, so `lane_copy` is refused under `ep2` and its
+//! shards are foreign to an `ep2` merge). A lane arm process (cards C,B under
+//! `HIPFIRE_TOPOLOGY_EP=2`, one fresh process per arm and shard) loads the
+//! artifact once through the product loader with the serve's `serve.vmm_batch`
+//! lane reservation, stages one lane store and runs its `START..END` trials
+//! through it, recycling the lanes. `lane_ar` is target-only AR lanes (lane
+//! executor AR rows, host draws from each lane's RNG: the reference);
+//! `lane_batched` and `lane_adaptive` are native-MTP mesh lanes
+//! (`Qwen4Bundle::ep_mesh_decode_step`, root Leviathan acceptance, every lane
+//! MTP, no copy lane). The MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so
+//! even the 8-lane arm runs native windows (the step switch would otherwise run
+//! AR windows above four lanes). The mesh router calibrates inline, so the
+//! `ep2` adaptive coverage needs native windows and a floor-on route class
+//! (`adaptive-floor` in its recorded config), not a zero-draft first window.
+//! Request seeds are the lane suite's `lane_request_seed` truncated to the lane
+//! RNG's 32 bits. Each shard writes `<arm>.<START>-<END>.ids.json`
+//! (`(END - START) * lanes` lane-minor rows), `.ids.config.json`,
+//! `.ids.receipt.json`, `.evidence.json` (window counters classified per window
+//! from the lanes' own counters and cross-checked against the mesh step facts)
+//! and `.text.txt`. The model artifact's identity needs a verified-artifact
+//! cache under `HIPFIRE_HOME` (the test never hashes artifacts) and
+//! `HIPFIRE_FABRIC_ADMISSION` is excluded from the compared identity. Single-card
+//! and PP2 lane arms validate their configuration and refuse explicitly.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::expert_residency as residency;
@@ -354,6 +410,13 @@ use std::process::{Command, Stdio};
 #[path = "common/hw_identity.rs"]
 mod hw_identity;
 use hw_identity::Counters;
+#[path = "common/lane_ep.rs"]
+mod lane_ep;
+#[path = "common/lane_run.rs"]
+mod lane_run;
+#[path = "common/lane_suite.rs"]
+mod lane_suite;
+use lane_suite::Topology;
 
 const MODEL_ENV: &str = "HIPFIRE_MTP_IDENTITY_MODEL";
 const OUT_ENV: &str = "HIPFIRE_SAMPLED_MTP_OUT";
@@ -372,10 +435,10 @@ const PROMPT_ENV: &str = "HIPFIRE_SAMPLED_MTP_PROMPT";
 const INCREMENTAL_ENV: &str = "HIPFIRE_MTP_INCREMENTAL";
 const SAMPLED_MODE_ENV: &str = "HIPFIRE_MTP_SAMPLED_MODE";
 const FLOOR_ENV: &str = "HIPFIRE_MTP_AR_FLOOR";
-const SHARD_ENV: &str = "HIPFIRE_SAMPLED_MTP_SHARD";
+const SHARD_ENV: &str = lane_suite::SHARD_ENV;
 const LATE_TOKENS_ENV: &str = "HIPFIRE_SAMPLED_MTP_LATE_TOKENS";
 const LATE_ARM_TEST: &str = "sampled_mtp_late_arm";
-const TOPOLOGY_ENV: &str = "HIPFIRE_SAMPLED_MTP_TOPOLOGY";
+const TOPOLOGY_ENV: &str = lane_suite::TOPOLOGY_ENV;
 /// Harness-control variables: they differ between a parent and each child
 /// without changing what the arm computes, so identities exclude them.
 const CONTROL_ENV: [&str; 4] = [MODEL_ENV, OUT_ENV, ARM_ENV, SHARD_ENV];
@@ -870,6 +933,11 @@ fn homogeneity<K: std::hash::Hash + Eq + Clone>(a: &[K], b: &[K]) -> (f64, usize
 fn sampled_mtp_matches_ar_distribution_on_flash_next() {
     let model = model_path();
     let dir = out_dir();
+    let placement = lane_suite::Placement::from_env().unwrap_or_else(|e| panic!("{e}"));
+    if placement.executor == lane_suite::Executor::Lanes {
+        lane_run::lane_verdict(&model, &dir, placement).unwrap_or_else(|e| panic!("{e}"));
+        return;
+    }
     let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
     let mut samples: Vec<Vec<Vec<u32>>> = Vec::new();
     let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
@@ -1416,7 +1484,11 @@ fn new_drafter_with_max_seq(
 
 fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     require_arm_env(arm, "leviathan")?;
-    if topology_from_env()? == Topology::Pp2 {
+    let placement = lane_suite::Placement::from_env()?;
+    if placement.executor == lane_suite::Executor::Lanes {
+        return lane_run::run_lane_arm(arm, model, dir, placement);
+    }
+    if placement.topology == Topology::Pp2 {
         return run_arm_pp(arm, model, dir);
     }
     let DistSettings {
@@ -1555,27 +1627,8 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
 // PP2 topology arms (`HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2`)
 // ---------------------------------------------------------------------------
 
-/// Where the short arms run. `Single` is the historical one-card load of
-/// [`load`]; `Pp2` is a two-card pipeline mesh loaded through the product
-/// loader (`HIPFIRE_PP_LAYERS` picks the band split).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Topology {
-    Single,
-    Pp2,
-}
-
-/// The pipeline degree of [`Topology::Pp2`].
+/// The pipeline degree of [`Topology::Pp2`] (topologies: [`lane_suite::Topology`]).
 const PP_DEGREE: usize = 2;
-
-fn topology_from_env() -> Result<Topology, String> {
-    match std::env::var(TOPOLOGY_ENV).as_deref() {
-        Err(_) | Ok("") | Ok("single") => Ok(Topology::Single),
-        Ok("pp2") => Ok(Topology::Pp2),
-        Ok(other) => Err(format!(
-            "{TOPOLOGY_ENV}={other:?}: expected `single` or `pp2`"
-        )),
-    }
-}
 
 /// `text` as one user message, thinking as given, rendered as `hipfire serve`
 /// renders it.
@@ -1979,6 +2032,11 @@ fn run_arm_pp(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
 fn sampled_mtp_merge_short_shards() {
     let dir = out_dir();
     let trials: usize = env_or(TRIALS_ENV, 2000);
+    let placement = lane_suite::Placement::from_env().unwrap_or_else(|e| panic!("{e}"));
+    if placement.executor == lane_suite::Executor::Lanes {
+        lane_run::merge_lane_suite(&dir, trials, placement).unwrap_or_else(|e| panic!("{e}"));
+        return;
+    }
     for arm in ARMS {
         let shards = late_shards(&dir, arm).unwrap_or_else(|e| panic!("{e}"));
         assert!(!shards.is_empty(), "{arm}: no shards in {}", dir.display());
@@ -2351,6 +2409,7 @@ fn arm_overrides(arm: &str, mode: &'static str) -> Vec<(&'static str, Option<&'s
             overrides.push((FLOOR_ENV, None));
         }
     }
+    overrides.extend(lane_suite::lane_env_overrides(arm));
     let (state_request, _) = hw_identity::gdn_test_state_quant().unwrap_or_else(|e| panic!("{e}"));
     overrides.push((hw_identity::GDN_TEST_STATE_QUANT_ENV, Some(state_request)));
     overrides
@@ -2363,13 +2422,11 @@ fn require_arm_env(arm: &str, mode: &'static str) -> Result<(), String> {
     // An unknown test mode (or q8_ef) is refused before the overrides below
     // resolve it.
     hw_identity::gdn_test_state_quant()?;
-    // The topology switch is read by the four short leviathan arms only; every
-    // other arm loads one card, so a stale pp2 setting would mislabel it.
-    if (!ARMS.contains(&arm) || mode != "leviathan") && topology_from_env()? != Topology::Single {
-        return Err(format!(
-            "{TOPOLOGY_ENV} is set but arm {arm} (mode {mode}) runs on one card only: only the {ARMS:?} leviathan arms take a PP2 topology; unset {TOPOLOGY_ENV}"
-        ));
-    }
+    // Executor / topology / lane count: lane arms need the lane executor and the
+    // singleton arms refuse it; a mesh topology is read by the four short
+    // leviathan arms (pp2) or the lane arms only, so a stale setting cannot
+    // mislabel a one-card arm.
+    lane_suite::validate_arm(arm, mode, lane_suite::Placement::from_env()?, &ARMS)?;
     for (name, want) in arm_overrides(arm, mode) {
         let have = std::env::var(name).ok();
         if have.as_deref() != want {
@@ -4059,21 +4116,7 @@ fn shard_range(arm: &str, trials: usize) -> Result<(usize, usize), String> {
     let Ok(value) = std::env::var(SHARD_ENV) else {
         return Ok((0, total));
     };
-    let (start, end) = value
-        .split_once("..")
-        .ok_or_else(|| format!("{SHARD_ENV}={value}: expected START..END"))?;
-    let parse = |text: &str| {
-        text.trim()
-            .parse::<usize>()
-            .map_err(|e| format!("{SHARD_ENV}={value}: {e}"))
-    };
-    let (start, end) = (parse(start)?, parse(end)?);
-    if start >= end || end > total {
-        return Err(format!(
-            "{SHARD_ENV}={value}: the range must be non-empty and within 0..{total}"
-        ));
-    }
-    Ok((start, end))
+    lane_suite::parse_shard(SHARD_ENV, &value, total)
 }
 
 fn late_config(
@@ -4106,7 +4149,6 @@ fn late_config(
 
 /// Sorted `(start, end)` of every `<arm>.<start>-<end>.ids.json` in `dir`.
 fn late_shards(dir: &Path, arm: &str) -> Result<Vec<(usize, usize)>, String> {
-    let prefix = format!("{arm}.");
     let mut found = Vec::new();
     for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
         let name = entry
@@ -4114,17 +4156,8 @@ fn late_shards(dir: &Path, arm: &str) -> Result<Vec<(usize, usize)>, String> {
             .file_name()
             .to_string_lossy()
             .into_owned();
-        let Some(rest) = name
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(".ids.json"))
-        else {
-            continue;
-        };
-        let Some((start, end)) = rest.split_once('-') else {
-            continue;
-        };
-        if let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) {
-            found.push((start, end));
+        if let Some(range) = lane_suite::shard_of_file(arm, &name) {
+            found.push(range);
         }
     }
     found.sort_unstable();
@@ -4135,26 +4168,7 @@ fn late_shards(dir: &Path, arm: &str) -> Result<Vec<(usize, usize)>, String> {
 /// a seed twice and a shard beyond `total` is not part of this cohort: both
 /// are errors, not something to patch around.
 fn shard_gaps(shards: &[(usize, usize)], total: usize) -> Result<Vec<(usize, usize)>, String> {
-    let mut gaps = Vec::new();
-    let mut next = 0;
-    for &(start, end) in shards {
-        if start >= end || end > total {
-            return Err(format!("shard {start}-{end} lies outside 0..{total}"));
-        }
-        if start < next {
-            return Err(format!(
-                "shard {start}-{end} overlaps an earlier shard ending at {next}: a seed would be counted twice"
-            ));
-        }
-        if start > next {
-            gaps.push((next, start));
-        }
-        next = end;
-    }
-    if next < total {
-        gaps.push((next, total));
-    }
-    Ok(gaps)
+    lane_suite::shard_gaps(shards, total)
 }
 
 /// Every shard of `arm` covering exactly `0..total`, each verified against
