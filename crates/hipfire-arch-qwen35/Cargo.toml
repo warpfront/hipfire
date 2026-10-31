@@ -25,6 +25,8 @@ rdna-compute = { path = "../rdna-compute" }
 railgun = { path = "../railgun" }
 hipfire-reap = { path = "../hipfire-reap", default-features = false }
 saddle-core = { path = "../saddle-core" }
+peacemaker-npu = { path = "../peacemaker-npu" }
+rayon.workspace = true
 sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

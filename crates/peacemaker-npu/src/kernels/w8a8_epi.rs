@@ -34,6 +34,24 @@ pub fn grid15_up(v: f32) -> (u16, i16) {
     (m as u16, e as i16)
 }
 
+/// Quantize one decoded weight row for the direct-BF16 contract: the grid15-up row scale
+/// `ws >= absmax / 127` (NaN-ignoring absmax), then `w8 = clamp(rne(w / ws), -127, 127)` with an
+/// `f32` division; a zero row gives zero codes. Returns `ws` and its `(Sm, Se)` decomposition.
+pub fn w8_direct_row(w: &[f32], out: &mut [i8]) -> (f32, (u16, i16)) {
+    let absmax = w.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+    let grid = grid15_up(((absmax as f64) / 127.0) as f32);
+    let ws = (f64::from(grid.0) * 2f64.powi(i32::from(grid.1))) as f32;
+    if ws == 0.0 {
+        out.fill(0);
+    } else {
+        for (o, &x) in out.iter_mut().zip(w) {
+            // Saturating, NaN-to-zero float→int like the device conversion, then clamp.
+            *o = ((x / ws).round_ties_even() as i32).clamp(-127, 127) as i8;
+        }
+    }
+    (ws, grid)
+}
+
 /// Exact `i * sm * dm * 2^(se+de)`, rounded once to IEEE BF16.
 /// Includes gradual underflow, signed nonzero underflow, carries and infinity.
 /// A zero integer product always returns positive zero.
