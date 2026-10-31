@@ -3584,11 +3584,7 @@ fn forced_commit_admission_uses_tx_commit_len_not_forced_count() {
 
 #[test]
 fn dflash_client_commit_preserves_release_and_store() {
-    let e = hipfire_generate::qwen::qwen_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        true,
-        true,
-    );
+    let e = ClientTerminalDecision::Commit.commit_effects(true, true);
     assert!(e.release_tool_calls && e.store_cache && e.emit_done);
     // Successful Done classify → intended flags gate release/store.
     let tc = ToolCall {
@@ -3611,8 +3607,7 @@ fn dflash_client_commit_preserves_release_and_store() {
             wire_tool_calls,
             ..
         } => {
-            let effects = hipfire_generate::qwen::qwen_client_commit_effects(
-                ClientTerminalDecision::Commit,
+            let effects = ClientTerminalDecision::Commit.commit_effects(
                 *release_tool_calls && !wire_tool_calls.is_empty(),
                 *store_cache,
             );
@@ -3653,8 +3648,7 @@ fn dflash_client_abort_suppresses_release_store_done() {
     else {
         panic!("expected Done");
     };
-    let effects = hipfire_generate::qwen::qwen_client_commit_effects(
-        ClientTerminalDecision::Abort,
+    let effects = ClientTerminalDecision::Abort.commit_effects(
         *release_tool_calls && !wire_tool_calls.is_empty(),
         *store_cache,
     );
