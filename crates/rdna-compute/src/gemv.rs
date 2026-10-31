@@ -315,9 +315,9 @@ pub const Q8_0_FAST_ROWS_PER_BLOCK: usize = 8;
 /// Threads per block of `gemv_q8_0_fast_r*`.
 pub const Q8_0_FAST_THREADS: usize = Q8_0_FAST_ROWS_PER_BLOCK * 32;
 
-/// `HIPFIRE_Q8_GEMV_FAST` (developer, read once, default on): `0` keeps the legacy
-/// one-wave-per-row narrow kernel everywhere. The two are bit-identical; the switch is a
-/// kill switch / A-B handle only.
+/// `HIPFIRE_Q8_GEMV_FAST` (developer, read once, default on): `0` keeps the one-wave-per-row
+/// narrow kernel for the row-exact multi-row route too. The two are bit-identical; the switch
+/// is a kill switch / A-B handle only (the decode `gemv_q8_0` never takes the fast kernel).
 static Q8_0_GEMV_FAST: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_Q8_GEMV_FAST", true));
 
@@ -334,9 +334,9 @@ pub fn q8_0_fast_admits(arch: &str, k: usize, a_addr: usize, x_addr: usize) -> b
         && x_addr.is_multiple_of(16)
 }
 
-/// `gemv_q8_0_fast_r1` ..= `_r16` (index `rows - 1`; `_r1` is the decode kernel).
-const Q8_0_FAST_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS] = [
-    "gemv_q8_0_fast_r1",
+/// `gemv_q8_0_fast_r2` ..= `_r16` (index `rows - 2`). One row is the decode kernel
+/// (`launch_q8_0_narrow`): the fast kernel measured slower than it at n == 1.
+const Q8_0_FAST_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS - 1] = [
     "gemv_q8_0_fast_r2",
     "gemv_q8_0_fast_r3",
     "gemv_q8_0_fast_r4",
@@ -355,7 +355,7 @@ const Q8_0_FAST_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS] = [
 ];
 
 fn q8_0_fast_symbol(rows: usize) -> Option<&'static str> {
-    rows.checked_sub(1)
+    rows.checked_sub(2)
         .and_then(|i| Q8_0_FAST_SYMBOLS.get(i))
         .copied()
 }
@@ -20720,19 +20720,15 @@ impl Gpu {
                 },
             );
         }
-        // gfx1100/gfx1201 narrow arm (K > 1536, K % 64 == 0): the high-occupancy kernel,
-        // bit-identical to the legacy one below (see `kernels/src/gemv_q8_0_fast.hip`).
-        if self.q8_0_fast_narrow_ok(k, a_ptr as usize, x_ptr as usize) {
-            return self.launch_q8_0_fast(1, a_raw, x, y, m, k);
-        }
-        self.gemv_q8_0_narrow_legacy(a_raw, x, y, m, k)
+        // Narrow arm (K > 1536). The multi-row `gemv_q8_0_fast_r*` kernels are bit-identical
+        // to this one but measured slower at n == 1 (R9700, 0.61-0.79x), so decode stays here.
+        self.launch_q8_0_narrow(a_raw, x, y, m, k)
     }
 
-    /// The pre-`gemv_q8_0_fast` narrow-arm launch of [`Gpu::gemv_q8_0`] (one 32-thread
-    /// block per output row, single ascending chain per lane + shuffle tree). Kept as the
-    /// fallback for shapes/pointers the fast kernel does not admit, and as the
-    /// bit-exactness reference of `tests/gemv_q8_0_fast_parity.rs`.
-    pub fn gemv_q8_0_narrow_legacy(
+    /// The narrow-arm launch of [`Gpu::gemv_q8_0`] (K > 1536): one 32-thread block per
+    /// output row, single ascending chain per lane + shuffle tree. Also the `rows == 1`
+    /// group of [`Gpu::gemv_q8_0_rows_exact`].
+    fn launch_q8_0_narrow(
         &mut self,
         a_raw: &GpuTensor,
         x: &GpuTensor,
@@ -20859,15 +20855,18 @@ impl Gpu {
             let n = (rows - first).min(Q8_0_ROWS_EXACT_KERNELS);
             let x_group = x.sub_offset(first * k, n * k);
             let y_group = y.sub_offset(first * m, n * m);
-            if route == Q8RowsExactRoute::Narrow
+            if route == Q8RowsExactRoute::Narrow && n == 1 {
+                // One row is the decode launch itself.
+                self.launch_q8_0_narrow(a_raw, &x_group, &y_group, m, k)?;
+            } else if route == Q8RowsExactRoute::Narrow
                 && self.q8_0_fast_narrow_ok(
                     k,
                     a_raw.buf.as_ptr() as usize,
                     x_group.buf.as_ptr() as usize,
                 )
             {
-                // The decode arm's fast kernel over `n` rows: row r is `gemv_q8_0_fast_r1`
-                // on x row r (same per-lane chain), hence the decode launch's bits.
+                // `gemv_q8_0_fast_r<n>`: row r is the decode kernel's single-row chain on x row
+                // r (same per-lane order, same tree), hence the decode launch's bits.
                 self.launch_q8_0_fast(n, a_raw, &x_group, &y_group, m, k)?;
             } else {
                 self.launch_q8_0_rows_exact_group(route, a_raw, &x_group, &y_group, m, k, n)?;
@@ -20956,15 +20955,15 @@ impl Gpu {
         result
     }
 
-    /// Whether the narrow-arm Q8_0 GEMV (K > 1536) runs `gemv_q8_0_fast_r*` here:
-    /// exact gfx1100 / gfx1201 (wave32), `HIPFIRE_Q8_GEMV_FAST` not `0`, and
-    /// [`q8_0_fast_admits`] for the shape and operand alignment.
+    /// Whether the narrow-arm row-exact multi-row group (K > 1536, `rows >= 2`) runs
+    /// `gemv_q8_0_fast_r*` here: exact gfx1100 / gfx1201 (wave32), `HIPFIRE_Q8_GEMV_FAST`
+    /// not `0`, and [`q8_0_fast_admits`] for the shape and operand alignment.
     pub(crate) fn q8_0_fast_narrow_ok(&self, k: usize, a_addr: usize, x_addr: usize) -> bool {
         *Q8_0_GEMV_FAST && q8_0_fast_admits(&self.arch, k, a_addr, x_addr)
     }
 
-    /// One `gemv_q8_0_fast_r<rows>` launch (`rows` in `1..=Q8_0_ROWS_EXACT_KERNELS`;
-    /// `rows == 1` is the decode kernel): y `[rows, m]` = A x `[rows, k]`, 8 weight rows
+    /// One `gemv_q8_0_fast_r<rows>` launch (`rows` in `2..=Q8_0_ROWS_EXACT_KERNELS`):
+    /// y `[rows, m]` = A x `[rows, k]`, 8 weight rows
     /// per 256-thread block. The caller checked [`Gpu::q8_0_fast_narrow_ok`].
     fn launch_q8_0_fast(
         &mut self,
@@ -26742,21 +26741,23 @@ mod rowtile_launch_tests {
             .unwrap();
         assert!(singleton.contains("if k <= 1536 {"));
         let wide = singleton.find("\"gemv_q8_0_wide\"").unwrap();
-        // The narrow arm: the fast kernel where admitted, else the legacy launch (the
-        // two are bit-identical; `tests/gemv_q8_0_fast_parity.rs`), after the wide arm.
-        let fast = singleton.find("self.q8_0_fast_narrow_ok(").unwrap();
-        let legacy = singleton.find("self.gemv_q8_0_narrow_legacy(").unwrap();
-        assert!(wide < fast && fast < legacy);
+        // The narrow arm is the one-wave-per-row kernel, after the wide arm; the fast
+        // multi-row kernels are not on the decode path (measured slower at n == 1).
+        let narrow = singleton.find("self.launch_q8_0_narrow(").unwrap();
+        assert!(wide < narrow);
+        assert!(
+            !singleton.contains("q8_0_fast_narrow_ok(") && !singleton.contains("launch_q8_0_fast(")
+        );
         assert!(singleton.contains("kernels::GEMV_Q8_0_WIDE_SRC"));
-        let legacy_fn = source
-            .split("    pub fn gemv_q8_0_narrow_legacy(")
+        let narrow_fn = source
+            .split("    fn launch_q8_0_narrow(")
             .nth(1)
             .unwrap()
             .split("\n    pub fn ")
             .next()
             .unwrap();
-        assert!(legacy_fn.contains("kernels::GEMV_Q8_0_SRC"));
-        assert!(legacy_fn.contains("\"gemv_q8_0\""));
+        assert!(narrow_fn.contains("kernels::GEMV_Q8_0_SRC"));
+        assert!(narrow_fn.contains("\"gemv_q8_0\""));
     }
 
     #[test]
@@ -26803,9 +26804,11 @@ mod rowtile_launch_tests {
         for arch in ["gfx1151", "gfx1150", "gfx942", "gfx906", "gfx1030"] {
             assert!(!q8_0_fast_admits(arch, 2560, 256, 256), "{arch}");
         }
-        assert_eq!(q8_0_fast_symbol(1), Some("gemv_q8_0_fast_r1"));
+        // One row is the decode kernel, not a fast kernel.
+        assert_eq!(q8_0_fast_symbol(1), None);
         assert_eq!(q8_0_fast_symbol(0), None);
-        for rows in 1..=Q8_0_FAST_SYMBOLS.len() {
+        assert_eq!(q8_0_fast_symbol(17), None);
+        for rows in 2..=Q8_0_ROWS_EXACT_KERNELS {
             let want = format!("gemv_q8_0_fast_r{rows}");
             assert_eq!(q8_0_fast_symbol(rows), Some(want.as_str()));
             assert!(kernels::GEMV_Q8_0_FAST_SRC.contains(&format!("GEMV_Q8_0_FAST({rows})\n")));

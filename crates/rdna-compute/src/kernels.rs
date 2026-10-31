@@ -7870,9 +7870,9 @@ pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip
 /// bit-identical to the singleton's output for x row r:
 /// [`GEMV_Q8_0_ROWS_EXACT_SRC`] mirrors `gemv_q8_0` (K > 1536),
 /// [`GEMV_Q8_0_WIDE_ROWS_EXACT_SRC`] mirrors `gemv_q8_0_wide` (K <= 1536).
-/// High-occupancy narrow-arm Q8_0 GEMV (module `gemv_q8_0_fast`, K > 1536 on
-/// gfx1100/gfx1201): bit-identical to [`GEMV_Q8_0_SRC`]'s `gemv_q8_0`;
-/// `gemv_q8_0_fast_r1` is the decode kernel, `_r2` .. `_r16` the row-exact verify kernels.
+/// High-occupancy multi-row narrow-arm Q8_0 GEMV (module `gemv_q8_0_fast`, K > 1536 on
+/// gfx1100/gfx1201): `gemv_q8_0_fast_r2` .. `_r16`, each output row bit-identical to
+/// [`GEMV_Q8_0_SRC`]'s `gemv_q8_0` on that x row (the row-exact verify kernels).
 pub const GEMV_Q8_0_FAST_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0_fast.hip");
 pub const GEMV_Q8_0_ROWS_EXACT_SRC: &str =
     include_str!("../../../kernels/src/gemv_q8_0_rows_exact.hip");

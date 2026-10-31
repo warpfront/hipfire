@@ -4,7 +4,8 @@
 
 #include <hip/hip_runtime.h>
 
-// High-occupancy Q8_0 GEMV for K > 1536 (`gemv_q8_0.hip`'s arm), BIT-IDENTICAL to it.
+// High-occupancy multi-row Q8_0 GEMV for K > 1536 (`gemv_q8_0.hip`'s arm), every output row
+// BIT-IDENTICAL to that kernel's output for the same x row.
 //
 // Per output the arithmetic is the narrow kernel's, instruction for instruction:
 //   * one lane per element of a 32-wide Q8_0 block (lane l owns element l of every
@@ -31,8 +32,10 @@
 //   chunk 4-byte aligned), A 4-byte aligned, x 16-byte aligned, wave32 (gfx11/gfx12),
 //   grid ceil(M / 8), block 256. y is [R, M] row-major, x is [R, K].
 //
-// `gemv_q8_0_fast_r1` is the decode kernel; `_r2` .. `_r16` are the row-exact
-// verify kernels (one per row count so a small R does not carry R = 16's registers).
+// `gemv_q8_0_fast_r2` .. `_r16` are the row-exact verify kernels (one per row count so a
+// small R does not carry R = 16's registers). There is no R = 1 instance: a single row
+// is the decode kernel itself, which measured faster than this body at n == 1 (the staging
+// pays off only once a weight chunk is applied to several rows).
 
 #define Q8F_WAVES 8
 #define Q8F_THREADS (Q8F_WAVES * 32)
@@ -164,7 +167,6 @@ static __device__ __forceinline__ void gemv_q8_0_fast_body(
         gemv_q8_0_fast_body<R>(A_q8, x, y, M, K);                             \
     }
 
-GEMV_Q8_0_FAST(1)
 GEMV_Q8_0_FAST(2)
 GEMV_Q8_0_FAST(3)
 GEMV_Q8_0_FAST(4)

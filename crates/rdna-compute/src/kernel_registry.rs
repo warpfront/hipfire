@@ -1216,7 +1216,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_q8_0_fast",
             kernels::GEMV_Q8_0_FAST_SRC,
             [
-                "gemv_q8_0_fast_r1",
                 "gemv_q8_0_fast_r2",
                 "gemv_q8_0_fast_r3",
                 "gemv_q8_0_fast_r4",

@@ -2,28 +2,22 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! `gemv_q8_0_fast_r*` (the high-occupancy narrow-arm Q8_0 GEMV, K > 1536) must be
-//! BIT-IDENTICAL (`f32::to_bits`) to the legacy one-wave-per-row kernel:
-//!
-//! 1. the decode launcher `Gpu::gemv_q8_0` (which runs the fast kernel where admitted)
-//!    against `Gpu::gemv_q8_0_narrow_legacy` (the previous kernel, launched directly),
-//!    on Raon-shaped weights: (m, k) = (2560, 5120), (5120, 2560), (10240, 2560),
-//!    (7680, 2560), the 259,840-row lm_head (2560 in), ragged m, and K tails: 1568 / 2592
-//!    / 2656 (odd block count: legacy fallback) and 2624 / 2688 / 3200 / 1600 / 10240
-//!    (even block count with a ragged last chunk);
-//! 2. `Gpu::gemv_q8_0_rows_exact` rows 1..=16 (and 17, 32: groups of 16) against the
-//!    per-row new decode and per-row legacy decode, row by row.
+//! `Gpu::gemv_q8_0_rows_exact` over K > 1536 weights (the multi-row `gemv_q8_0_fast_r2..r16`
+//! kernels on gfx1100 / gfx1201) must be BIT-IDENTICAL (`f32::to_bits`) to the decode
+//! launcher `Gpu::gemv_q8_0` (the one-wave-per-row narrow kernel) run per row, rows 1..=16
+//! and 17, 32 (groups of 16), on Raon-shaped weights: (m, k) = (2560, 5120), (5120, 2560),
+//! (10240, 2560), (7680, 2560), the 259,840-row lm_head (2560 in), ragged m, and K tails:
+//! 1568 / 2592 / 2656 (odd block count: legacy rows kernels) and 1600 / 2624 / 2688 / 3200
+//! / 10240 (even block count with a ragged last chunk).
 //!
 //! Deterministic data (fixed seed), NaN-sentinel output with a guard row past the end.
-//! Prints per-case PASS/FAIL with mismatching words and max abs diff, then a timing
-//! table (median of launch batches): legacy vs new decode at n = 1 per shape, and
-//! `rows_exact` at rows 1, 2, 4, 8, 16 against rows x new decode and rows x legacy
-//! decode. Asserts every comparison is equal.
+//! Prints per-case PASS/FAIL with mismatching words and max abs diff, then a timing table
+//! (median of launch batches): the decode kernel at n = 1 per shape, and `rows_exact` at
+//! rows 1, 2, 4, 8, 16 against rows x decode. Asserts every comparison is equal.
 //!
 //! `Q8_FAST_SKIP_LMHEAD=1` skips the 706 MB lm_head shape.
 //!
-//! `#[ignore]`d: needs a HIP GPU (gfx1100 / gfx1201 take the fast kernel; elsewhere the
-//! comparison is trivially legacy == legacy). Run explicitly, through the fabric lock:
+//! `#[ignore]`d: needs a HIP GPU (gfx1100 / gfx1201 take the fast kernels; elsewhere both sides run the same kernel). Run explicitly, through the fabric lock:
 //!
 //!   cargo test -p rdna-compute --release --test gemv_q8_0_fast_parity -- --ignored --nocapture
 
@@ -97,11 +91,10 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-/// `rows` launches of the decode GEMV (`legacy`: the previous narrow kernel) on row views.
+/// `rows` launches of the decode GEMV on row views.
 #[allow(clippy::too_many_arguments)]
 fn per_row(
     gpu: &mut Gpu,
-    legacy: bool,
     w: &GpuTensor,
     x: &GpuTensor,
     y: &GpuTensor,
@@ -111,12 +104,7 @@ fn per_row(
 ) {
     for r in 0..rows {
         let (xr, yr) = (x.sub_offset(r * k, k), y.sub_offset(r * m, m));
-        if legacy {
-            gpu.gemv_q8_0_narrow_legacy(w, &xr, &yr, m, k)
-        } else {
-            gpu.gemv_q8_0(w, &xr, &yr, m, k)
-        }
-        .expect("decode gemv");
+        gpu.gemv_q8_0(w, &xr, &yr, m, k).expect("decode gemv");
     }
 }
 
@@ -142,7 +130,7 @@ fn time_us(gpu: &mut Gpu, reps: usize, mut run: impl FnMut(&mut Gpu)) -> f64 {
 
 #[test]
 #[ignore = "needs a HIP GPU"]
-fn gemv_q8_0_fast_is_bit_identical_to_the_legacy_decode_kernel() {
+fn gemv_q8_0_rows_exact_fast_kernels_are_bit_identical_to_the_decode_kernel() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.clone();
     let mut seed = 0x0f45_0001u64;
@@ -190,37 +178,7 @@ fn gemv_q8_0_fast_is_bit_identical_to_the_legacy_decode_kernel() {
             }
         );
 
-        // 1. decode launcher vs legacy kernel (a few activation rows).
-        for trial in 0..if big { 1 } else { 3 } {
-            let x = gpu
-                .upload_f32(&activations(&mut seed, k), &[k])
-                .expect("upload x");
-            let y_new = sentinel(&mut gpu, m + 1);
-            let y_old = sentinel(&mut gpu, m + 1);
-            gpu.gemv_q8_0(&w, &x, &y_new, m, k).expect("decode (new)");
-            gpu.gemv_q8_0_narrow_legacy(&w, &x, &y_old, m, k)
-                .expect("decode (legacy)");
-            let (got, want) = (bits(&gpu, &y_new), bits(&gpu, &y_old));
-            let guard_ok = got[m] == SENTINEL;
-            let holes = want[..m].iter().filter(|&&v| v == SENTINEL).count();
-            let (bad, max_abs) = compare(&got[..m], &want[..m]);
-            let pass = bad == 0 && guard_ok && holes == 0;
-            cases += 1;
-            println!(
-                "{} decode new==legacy m={m} k={k} trial={trial}: mismatching words {bad}/{m}, max abs diff {max_abs:e}{}{}",
-                if pass { "PASS" } else { "FAIL" },
-                if guard_ok { "" } else { ", WROTE PAST THE END" },
-                if holes == 0 { "" } else { ", legacy left holes" },
-            );
-            if !pass {
-                failures.push(format!("decode m={m} k={k} trial={trial} bad={bad}"));
-            }
-            gpu.free_tensor(x).expect("free");
-            gpu.free_tensor(y_new).expect("free");
-            gpu.free_tensor(y_old).expect("free");
-        }
-
-        // 2. rows-exact r1..r16 (+17, 32) vs the per-row decode, new and legacy.
+        // rows-exact 1..=16 (+17, 32) vs the per-row decode launch.
         let row_set: Vec<usize> = if big {
             vec![1, 2, 4, 8, 16]
         } else {
@@ -233,28 +191,25 @@ fn gemv_q8_0_fast_is_bit_identical_to_the_legacy_decode_kernel() {
             let y = sentinel(&mut gpu, (rows + 1) * m);
             gpu.gemv_q8_0_rows_exact(&w, &x, &y, m, k, rows)
                 .unwrap_or_else(|e| panic!("rows_exact m={m} k={k} rows={rows}: {e:?}"));
-            let y_new = sentinel(&mut gpu, (rows + 1) * m);
-            let y_old = sentinel(&mut gpu, (rows + 1) * m);
-            per_row(&mut gpu, false, &w, &x, &y_new, m, k, rows);
-            per_row(&mut gpu, true, &w, &x, &y_old, m, k, rows);
-            let (got, new_ref, old_ref) = (bits(&gpu, &y), bits(&gpu, &y_new), bits(&gpu, &y_old));
+            let y_ref = sentinel(&mut gpu, (rows + 1) * m);
+            per_row(&mut gpu, &w, &x, &y_ref, m, k, rows);
+            let (got, want) = (bits(&gpu, &y), bits(&gpu, &y_ref));
             let n = rows * m;
             let guard_ok = got[n..].iter().all(|&v| v == SENTINEL);
-            let (bad_new, max_new) = compare(&got[..n], &new_ref[..n]);
-            let (bad_old, max_old) = compare(&got[..n], &old_ref[..n]);
-            let pass = bad_new == 0 && bad_old == 0 && guard_ok;
+            let holes = want[..n].iter().filter(|&&v| v == SENTINEL).count();
+            let (bad, max_abs) = compare(&got[..n], &want[..n]);
+            let pass = bad == 0 && guard_ok && holes == 0;
             cases += 1;
             println!(
-                "{} rows_exact m={m} k={k} rows={rows}: vs new decode {bad_new}/{n} (max {max_new:e}), vs legacy decode {bad_old}/{n} (max {max_old:e}){}",
+                "{} rows_exact m={m} k={k} rows={rows}: vs per-row decode {bad}/{n} mismatching words (max abs diff {max_abs:e}){}{}",
                 if pass { "PASS" } else { "FAIL" },
                 if guard_ok { "" } else { ", WROTE PAST THE END" },
+                if holes == 0 { "" } else { ", decode left holes" },
             );
             if !pass {
-                failures.push(format!(
-                    "rows_exact m={m} k={k} rows={rows} bad_new={bad_new} bad_old={bad_old}"
-                ));
+                failures.push(format!("rows_exact m={m} k={k} rows={rows} bad={bad}"));
             }
-            for t in [x, y, y_new, y_old] {
+            for t in [x, y, y_ref] {
                 gpu.free_tensor(t).expect("free");
             }
         }
@@ -266,23 +221,17 @@ fn gemv_q8_0_fast_is_bit_identical_to_the_legacy_decode_kernel() {
     }
     println!("{cases} comparisons, {} failed", failures.len());
 
-    // Timing: legacy vs new decode at n = 1; rows_exact vs rows x decode.
+    // Timing: the decode kernel at n = 1; rows_exact vs rows x decode.
     println!("== timing (us per call, median of 9 batches; K > 1536 shapes of the decode step)");
-    println!("   m     k   legacy_decode  new_decode  speedup");
+    println!("   m     k   decode");
     for (m, k, w) in &timed {
         let (m, k) = (*m, *k);
         let x = gpu.upload_f32(&activations(&mut seed, k), &[k]).expect("x");
         let y = sentinel(&mut gpu, m);
-        let t_old = time_us(&mut gpu, 50, |g| {
-            g.gemv_q8_0_narrow_legacy(w, &x, &y, m, k).unwrap()
-        });
-        let t_new = time_us(&mut gpu, 50, |g| g.gemv_q8_0(w, &x, &y, m, k).unwrap());
-        println!(
-            "{m:6} {k:5} {t_old:14.2} {t_new:11.2} {:8.2}x",
-            t_old / t_new
-        );
+        let t = time_us(&mut gpu, 50, |g| g.gemv_q8_0(w, &x, &y, m, k).unwrap());
+        println!("{m:6} {k:5} {t:8.2}");
     }
-    println!("   m     k  rows  rows_exact  rows x new  rows x legacy  vs new  vs legacy");
+    println!("   m     k  rows  rows_exact  rows x decode  speedup");
     for (m, k, w) in &timed {
         let (m, k) = (*m, *k);
         for rows in [1usize, 2, 4, 8, 16] {
@@ -293,18 +242,16 @@ fn gemv_q8_0_fast_is_bit_identical_to_the_legacy_decode_kernel() {
             let t_rows = time_us(&mut gpu, 30, |g| {
                 g.gemv_q8_0_rows_exact(w, &x, &y, m, k, rows).unwrap()
             });
-            let t_new = time_us(&mut gpu, 30, |g| per_row(g, false, w, &x, &y, m, k, rows));
-            let t_old = time_us(&mut gpu, 30, |g| per_row(g, true, w, &x, &y, m, k, rows));
+            let t_dec = time_us(&mut gpu, 30, |g| per_row(g, w, &x, &y, m, k, rows));
             println!(
-                "{m:6} {k:5} {rows:5} {t_rows:11.2} {t_new:11.2} {t_old:14.2} {:6.2}x {:9.2}x",
-                t_new / t_rows,
-                t_old / t_rows
+                "{m:6} {k:5} {rows:5} {t_rows:11.2} {t_dec:14.2} {:7.2}x",
+                t_dec / t_rows
             );
         }
     }
 
     assert!(
         failures.is_empty(),
-        "fast narrow Q8_0 GEMV differs from the legacy decode kernel: {failures:?}"
+        "row-exact Q8_0 GEMV differs from the per-row decode kernel: {failures:?}"
     );
 }
