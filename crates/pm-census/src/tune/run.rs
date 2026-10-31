@@ -204,6 +204,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Run `pm_loop` with `args`, stdin closed. Linux refuses `execve` with
+/// ETXTBSY while any process still holds the executable open for writing; a
+/// sibling thread's fork can inherit a write descriptor of a just-written
+/// binary until that child execs. That window is milliseconds, so ETXTBSY is
+/// retried a bounded number of times; every other error returns at once.
+fn run_pm_loop(pm_loop: &Path, args: &[String]) -> std::io::Result<std::process::Output> {
+    const ETXTBSY: i32 = 26;
+    let mut attempt = 0;
+    loop {
+        match std::process::Command::new(pm_loop)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            r => return r,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Process driver
 
@@ -344,10 +367,7 @@ impl Driver<'_> {
         }
 
         let t0 = Instant::now();
-        let out = std::process::Command::new(&self.cfg.pm_loop)
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .output()
+        let out = run_pm_loop(&self.cfg.pm_loop, &args)
             .map_err(|e| format!("{}: {e}", self.cfg.pm_loop.display()))?;
         let wall_s = t0.elapsed().as_secs_f64();
         self.processes += 1;
