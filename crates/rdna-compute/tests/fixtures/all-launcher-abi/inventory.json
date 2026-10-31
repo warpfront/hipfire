@@ -1,5 +1,5 @@
 {
-  "scope": "Kernels and launchers changed by 38ce67a44 (fix/moe-router-nonfinite) plus the S1 slow-link kernels moved to kernels/src/slowlink_prefill.hip, plus the gfx942 BF16 MFMA GEMM source kernels/src/gemm_bf16_mfma.gfx942.hip (the 32x32-tile entry gemm_bf16_mfma_gfx942 and the few-row entries gemm_bf16_mfma_gfx942_rows16 / _rows16_x2, launched by Gpu::launch_gemm_bf16_mfma_tiled and Gpu::launch_gemm_bf16_mfma_rows16) with the metadata parity of its non-production PM twin (pm_twins). hip_sources/pm_emitters/pm_images are the closed lists below, not a counted receipt: the tests derive their sizes from these lists. Launchers under crates/*/src, examples/, tests/ and benches/ are all checked; only the OLD-ABI call variants in old_variants are exempt, one per call.",
+  "scope": "Kernels and launchers changed by 38ce67a44 (fix/moe-router-nonfinite) plus the S1 slow-link kernels moved to kernels/src/slowlink_prefill.hip, plus the gfx942 BF16 MFMA GEMM source kernels/src/gemm_bf16_mfma.gfx942.hip (the 32x32-tile entry gemm_bf16_mfma_gfx942 and the few-row entries gemm_bf16_mfma_gfx942_rows16 / _rows16_x2, launched by Gpu::launch_gemm_bf16_mfma_tiled and Gpu::launch_gemm_bf16_mfma_rows16) with the metadata parity of its non-production PM twin (pm_twins), plus the llama3 RoPE kernels (rope.hip, rope_batched.hip; HIPF-193). hip_sources/pm_emitters/pm_images are the closed lists below, not a counted receipt: the tests derive their sizes from these lists. Launchers under crates/*/src, examples/, tests/ and benches/ are all checked; only the OLD-ABI call variants in old_variants are exempt, one per call.",
   "hip_sources": [
     "kernels/src/ep_gather_rows_by_owner.hip",
     "kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip",
@@ -161,7 +161,9 @@
     "kernels/src/qwen4_moe_scatter_fused_k8.hip",
     "kernels/src/qwen4_moe_scatter_stable_top10.hip",
     "kernels/src/qwen4_slab_union_plan.hip",
-    "kernels/src/slowlink_prefill.hip"
+    "kernels/src/slowlink_prefill.hip",
+    "kernels/src/rope.hip",
+    "kernels/src/rope_batched.hip"
   ],
   "pm_emitters": [
     "crates/peacemaker-isa/src/kernels/cdna/fp8_moe_gate_up.rs",
