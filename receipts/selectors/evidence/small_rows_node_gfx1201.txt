@@ -1,7 +1,7 @@
 # gemm_bf16_small_rows node sweep, R9700 (gfx1201), standalone hipcc harness (events around back-to-back launches, X rotated over >=2 buffers, median of 5 repeats, min over 3 rounds)
 # fabric jobs: j5919 (rows 1..4096, 3 rounds, bit-identity vs gemm_bf16_xf32_batched/_xbf16_batched at every row count and odd M/K/N shapes) and j5921 (threshold rows); both confounded=false, card A
 # harness: g4small-ev/lab/{harness.hpp,lab.cpp,cand6.hip} (lab.cpp md5 ceeee2d029cdb86e826a0661c1314f2b, harness.hpp 254a84535f219f5c61e9e81b743b1c5d, cand6.hip 12cb1d38d6c4ecdad12567746fb72963); binary lab_sr_1201 md5 2e0b539a50b19fecfcd03e51e60ff70c
-# arms: ref = gemm_bf16_x{f32,bf16}_batched, inc = the previous selection (batched below 512 rows, tiled at/above), sr_p1/sr_p4/sr_p8 = the three small-rows profiles forced, sr_sel = the profile selection of stream_mix.rs
+# arms: ref = gemm_bf16_x{f32,bf16}_batched, inc = the previous selection (batched below 512 rows, tiled at/above), sr_p1/sr_p4/sr_p8 = the three small-rows profiles forced, sr_sel = the profile selection at the time of j5919 (router rows 9/256, selector 33/512; the SHIPPED thresholds, router 16/256 and selector 80/512, are read from the sr_p1/sr_p4/sr_p8 rows of j5919 + j5921)
 # geo router = M128 K2560 F32 x; selector_bf16x = M17 K10240 BF16 x. us = per call; GBs = (W+X+Y bytes)/us
 # ===== j5919
 # device AMD Radeon AI PRO R9700 arch gfx1201
