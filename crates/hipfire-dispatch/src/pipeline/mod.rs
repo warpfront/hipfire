@@ -43,7 +43,7 @@ pub use moe_program::{
 pub use moe_program::{MoeStage, SealedMoeOp};
 pub use q8_prefill::{
     grouped_sym_tier_admits, prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_runs,
-    PrefillActTier, PREFILL_QUANT_MIN_ROWS,
+    q8_0_weight_admits, PrefillActTier, PREFILL_QUANT_MIN_ROWS,
 };
 pub(crate) mod draft_head;
 pub mod moe_capture;

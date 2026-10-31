@@ -603,7 +603,6 @@ module	gemm_paro_q4g128_moe_grouped_mmq_gfx1151	codec-outside-core-rungs	PARO co
 module	gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2706-2733
 module	gemm_paro_q4g128_moe_grouped_wmma_k2	codec-outside-core-rungs	PARO route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2710-2737
 module	gemm_q8_0_batched_wide_exact	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/pipeline/sandwich.rs:1405
-module	gemm_q8_0_mmq_4w_gfx1151	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/gemm.rs:26554
 module	gemm_q8_0_mmq_gfx1030	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemm.rs:30706-30711
 module	gemm_q8_0_moe_grouped_top10	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; moe.rs:2742-2754
 module	gemm_q8_0_wmma_x64	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; families/gemm.rs:597
