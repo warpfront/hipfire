@@ -29,6 +29,7 @@ use hipfire_runtime::session_cache::{
 use rdna_compute::Gpu;
 
 use crate::bundle::RaonBundle;
+use crate::forward::require_whole_band;
 
 /// Snapshot boundary stride in prompt tokens, before rounding up to a
 /// multiple of the prefill width.
@@ -179,7 +180,13 @@ impl SessionState for RaonBundle {
     /// device, prefill route and width (batched and serial prefill write
     /// different bits), the mirror format and budget (which route attends),
     /// the MLA route policy and the resolved precision tiers.
+    ///
+    /// A partial band (a mesh rank) has no scope: its state is a slice of the
+    /// model, so no snapshot of it is restorable on its own.
     fn snapshot_scope(&self, route: SessionRoute) -> Option<String> {
+        if !self.weights.band.is_whole() {
+            return None;
+        }
         match route {
             SessionRoute::Mtp => None,
             SessionRoute::Ar => Some(self.session_scope(route)),
@@ -196,6 +203,7 @@ impl SessionState for RaonBundle {
         _route: SessionRoute,
         position: usize,
     ) -> Result<SnapshotParts<'_>, String> {
+        require_whole_band(&self.weights, "session capture")?;
         if self.state.n_tokens() != position {
             return Err(format!(
                 "raon1_mini session capture: state at {}, not {position}",
@@ -225,6 +233,7 @@ impl SessionState for RaonBundle {
         _route: SessionRoute,
         meta: &[u8],
     ) -> Result<StateLayout<'_>, String> {
+        require_whole_band(&self.weights, "session restore")?;
         let meta = parse_meta(meta)?;
         if !self.meta_matches(&meta) {
             return Err(

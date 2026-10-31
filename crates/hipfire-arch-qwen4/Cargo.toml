@@ -27,6 +27,8 @@ railgun = { path = "../railgun", features = ["npu"] }
 [dev-dependencies]
 half.workspace = true
 memmap2.workspace = true
+# `mtp_head_reference_pin_hw` decodes the artifact head tensors the HIP head reads (qt44 / qt53 experts).
+hipfire-cpu = { path = "../hipfire-cpu" }
 saddle-quant = { path = "../saddle-quant" }
 # `greedy_mtp_identity_hw` loads through the product loader (`load_qwen4_rank`) so the
 # split-base PLE sidecar, trunk overlay and expert hot set are the serve load's own.

@@ -122,11 +122,15 @@ pub struct FeatureFlags {
     /// elsewhere.
     pub qwen4_router_fast: bool,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
-    /// on for gfx1151, off elsewhere (gfx1201 opts in with `=1`).
+    /// on for gfx1151 and gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_gdn_lanes: bool,
     /// Multi-lane fn-lanes QSA decode core (`HIPFIRE_QWEN4_QSA_LANES`), default
-    /// off on every arch (exact gfx1201 only when set).
+    /// on for exact gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_qsa_lanes: bool,
+    /// Multi-lane fn-lanes GDN verify-rows core (`HIPFIRE_QWEN4_GDN_LANES_ROWS`),
+    /// default off on every arch (exact gfx1201 only, and only with
+    /// `HIPFIRE_QWEN4_GDN_LANES` on).
+    pub qwen4_gdn_lanes_rows: bool,
     /// Qwen4 MQ4G128V2 K=640 indexed MoE down with four weight rows per wave
     /// (`HIPFIRE_QWEN4_MOE_DOWN_R4`), default on for gfx1151.
     pub qwen4_moe_down_r4: bool,
@@ -1030,8 +1034,9 @@ impl FeatureFlags {
                 .unwrap_or(halo_hyper_default || is_gfx1201),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST")
                 .unwrap_or(exact_unit_default),
-            qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(arch == "gfx1151"),
-            qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(false),
+            qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
+            qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
+            qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(false),
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4").unwrap_or(arch == "gfx1151"),
             qwen4_shared_down_fuse: parse_bool("HIPFIRE_QWEN4_SHARED_DOWN_FUSE")
                 .unwrap_or(arch == "gfx1151"),
@@ -1699,13 +1704,20 @@ impl FeatureFlags {
     /// Wave-per-token E512/top-10 router for batched prefill
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`). Exact gfx1151 / gfx1201.
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`). Exact
-    /// gfx1151 (default on) and exact gfx1201 (default off, `=1` opts in).
+    /// gfx1151 and exact gfx1201 (both default on, `=0` kills it).
     pub fn qwen4_gdn_lanes_enabled(&self) -> bool {
         self.qwen4_gdn_lanes && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
+    /// Multi-lane fn-lanes GDN verify-rows core (`HIPFIRE_QWEN4_GDN_LANES_ROWS`).
+    /// Exact gfx1201 only, default off (`=1` enables) and it needs
+    /// [`Self::qwen4_gdn_lanes_enabled`] too (`HIPFIRE_QWEN4_GDN_LANES=0` kills both).
+    pub fn qwen4_gdn_lanes_rows_enabled(&self) -> bool {
+        self.qwen4_gdn_lanes_rows && self.qwen4_gdn_lanes_enabled() && self.arch == "gfx1201"
+    }
+
     /// Multi-lane fn-lanes QSA decode core (`HIPFIRE_QWEN4_QSA_LANES`). Exact
-    /// gfx1201 only, off unless set.
+    /// gfx1201 only, default on (`=0` kills it).
     pub fn qwen4_qsa_lanes_enabled(&self) -> bool {
         self.qwen4_qsa_lanes && self.arch == "gfx1201"
     }
@@ -1881,6 +1893,7 @@ impl FeatureFlags {
             qwen4_router_fast: false,
             qwen4_gdn_lanes: false,
             qwen4_qsa_lanes: false,
+            qwen4_gdn_lanes_rows: false,
             qwen4_moe_down_r4: false,
             qwen4_shared_down_fuse: false,
             qwen4_decode_zba_x3: false,
@@ -4417,8 +4430,38 @@ mod tests {
         }
     }
 
-    /// `HIPFIRE_QWEN4_GDN_LANES`: exact gfx1151 defaults on, exact gfx1201 is
-    /// opt-in (`=1`), `=0` kills it everywhere, and no other arch ever enables
+    /// `HIPFIRE_QWEN4_QSA_LANES`: exact gfx1201 defaults on, `=0` kills it, no
+    /// other arch ever enables it.
+    #[test]
+    fn qsa_lanes_default_and_override_by_arch() {
+        let flags = |arch: &str, value: Option<&str>| {
+            FeatureFlags::from_lookup(arch, |name| match value {
+                Some(v) if name == "HIPFIRE_QWEN4_QSA_LANES" => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        for (arch, unset, forced_on, forced_off) in [
+            ("gfx1201", true, true, false),
+            ("gfx1151", false, false, false),
+            ("gfx1100", false, false, false),
+            ("gfx1201:xnack-", false, false, false),
+        ] {
+            assert_eq!(flags(arch, None).qwen4_qsa_lanes_enabled(), unset, "{arch}");
+            assert_eq!(
+                flags(arch, Some("1")).qwen4_qsa_lanes_enabled(),
+                forced_on,
+                "{arch}"
+            );
+            assert_eq!(
+                flags(arch, Some("0")).qwen4_qsa_lanes_enabled(),
+                forced_off,
+                "{arch}"
+            );
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_GDN_LANES`: exact gfx1151 and exact gfx1201 default on,
+    /// `=0` kills it everywhere, and no other arch ever enables
     /// it, whatever the value.
     #[test]
     fn gdn_lanes_default_and_override_by_arch() {
@@ -4430,7 +4473,7 @@ mod tests {
         };
         for (arch, unset, forced_on, forced_off) in [
             ("gfx1151", true, true, false),
-            ("gfx1201", false, true, false),
+            ("gfx1201", true, true, false),
             ("gfx1100", false, false, false),
             ("gfx942", false, false, false),
             ("gfx1200", false, false, false),
@@ -4461,6 +4504,52 @@ mod tests {
                 unset,
                 "{arch}: 2"
             );
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_GDN_LANES_ROWS`: exact gfx1201 only, default off, `=1`
+    /// enables it, and it also needs `HIPFIRE_QWEN4_GDN_LANES` on (`=0` there
+    /// kills it too); no other arch ever enables it, whatever the values.
+    #[test]
+    fn gdn_lanes_rows_is_opt_in_on_gfx1201_and_needs_the_lanes_flag() {
+        let flags = |arch: &str, rows: Option<&str>, lanes: Option<&str>| {
+            FeatureFlags::from_lookup(arch, |name| match (name, rows, lanes) {
+                ("HIPFIRE_QWEN4_GDN_LANES_ROWS", Some(v), _) => Ok(v.to_owned()),
+                ("HIPFIRE_QWEN4_GDN_LANES", _, Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1201:xnack-"] {
+            let exact = arch == "gfx1201";
+            assert!(
+                !flags(arch, None, None).qwen4_gdn_lanes_rows_enabled(),
+                "{arch}: unset"
+            );
+            for on in ["1", "true", "on"] {
+                assert_eq!(
+                    flags(arch, Some(on), None).qwen4_gdn_lanes_rows_enabled(),
+                    exact,
+                    "{arch}: {on}"
+                );
+            }
+            for off in ["0", "false", "off", "2"] {
+                assert!(
+                    !flags(arch, Some(off), None).qwen4_gdn_lanes_rows_enabled(),
+                    "{arch}: {off}"
+                );
+            }
+            // Both flags: the lanes kill switch also kills the rows route, and
+            // the AR route does not imply the rows route.
+            assert!(
+                !flags(arch, Some("1"), Some("0")).qwen4_gdn_lanes_rows_enabled(),
+                "{arch}: lanes off"
+            );
+            assert_eq!(
+                flags(arch, Some("1"), Some("1")).qwen4_gdn_lanes_rows_enabled(),
+                exact,
+                "{arch}: both on"
+            );
+            assert!(!flags(arch, None, Some("1")).qwen4_gdn_lanes_rows_enabled());
         }
     }
 }

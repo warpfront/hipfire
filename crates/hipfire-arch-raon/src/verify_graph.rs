@@ -105,7 +105,7 @@ fn graph_key(rows: usize, with_features: bool) -> usize {
 /// allocates inside the batched GEMM, `None` when every one is capture-safe.
 fn projections_capturable(w: &RaonWeights) -> Option<&'static str> {
     let qt44 = |t: &hipfire_runtime::llama::WeightTensor| t.gpu_dtype == DType::MQ4G256V2;
-    if qt44(&w.lm_head) {
+    if w.lm_head.as_ref().is_some_and(qt44) {
         return Some("lm_head");
     }
     for layer in &w.layers {

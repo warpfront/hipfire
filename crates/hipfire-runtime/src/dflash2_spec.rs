@@ -36,12 +36,82 @@ use crate::dflash::{draft_forward_based, propose_candidates_device, DflashConfig
 use crate::dflash::{DflashWeights, DFLASH_BLOCK_MAX};
 use crate::hfq::HfqFile;
 use crate::spec::{
-    accept_greedy_prefix, terminal_prefix_replay, PrefillOutcome, SpecAdvance, SpecGrammar,
-    SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
+    accept_greedy_prefix, terminal_prefix_replay, PrefillOutcome, RowPick, SpecAdvance,
+    SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use crate::spec_sampling::{accept_sampled_prefix, SampleSpec, SparseDist, SpecRng};
 use rdna_compute::Gpu;
 use std::path::Path;
+
+/// One draft window as the oracle sees it: what the draft forward and the
+/// selector produced before any verify ([`trace_windows_begin`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftWindowTrace {
+    pub position: usize,
+    pub seed: u32,
+    pub block: usize,
+    /// The selector's drafted tokens (`block - 1`).
+    pub tokens: Vec<u32>,
+    /// Bit patterns of the selector's per-row confidences.
+    pub confidence_bits: Vec<u32>,
+    /// FNV-1a over the bit patterns of the draft's final hidden rows `1..block`.
+    pub hidden_fnv: u64,
+    /// Device-synced ms of the draft forward alone.
+    pub draft_ms: f64,
+    /// Device-synced ms of the target head + selector over the draft rows.
+    pub selector_ms: f64,
+}
+
+static WINDOW_TRACE: std::sync::Mutex<Option<Vec<DraftWindowTrace>>> = std::sync::Mutex::new(None);
+/// 0 = follow `HIPFIRE_DFLASH_DRAFT_GRAPH`, 1 = force off, 2 = force on.
+static DRAFT_GRAPH_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Developer oracle hook: from now on every speculator window records a
+/// [`DraftWindowTrace`] (and device-syncs around the draft forward to time
+/// it). Process-wide; [`trace_windows_take`] ends it.
+pub fn trace_windows_begin() {
+    *WINDOW_TRACE.lock().unwrap() = Some(Vec::new());
+}
+
+/// The windows traced since [`trace_windows_begin`]; tracing stops.
+pub fn trace_windows_take() -> Vec<DraftWindowTrace> {
+    WINDOW_TRACE.lock().unwrap().take().unwrap_or_default()
+}
+
+fn tracing_windows() -> bool {
+    WINDOW_TRACE.lock().unwrap().is_some()
+}
+
+/// Developer oracle hook: force the graph-captured draft window on (`Some(true)`),
+/// off (`Some(false)`), or back to `HIPFIRE_DFLASH_DRAFT_GRAPH` (`None`) for every
+/// speculator built after this call.
+pub fn set_draft_graph_override(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    DRAFT_GRAPH_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fnv1a_f32_bits(v: &[f32]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for x in v {
+        for byte in x.to_bits().to_le_bytes() {
+            h = (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Graph counters of the most recently freed speculator's scratch (oracle read-out).
+static LAST_GRAPH_STATS: std::sync::Mutex<Option<crate::dflash::DraftGraphStats>> =
+    std::sync::Mutex::new(None);
+
+/// Draft-graph counters of the last speculator freed (see [`Speculator::free`]).
+pub fn last_draft_graph_stats() -> Option<crate::dflash::DraftGraphStats> {
+    LAST_GRAPH_STATS.lock().unwrap().clone()
+}
 
 /// Target-generic DFlash2 chain speculator. Owns the draft, its scratch, the
 /// cumulative committed feature rows (`[rows × feature_width]` F32,
@@ -69,6 +139,9 @@ pub struct Dflash2Speculator {
     mask_row: Vec<f32>,
     request: SpecRequestConfig,
     rng: SpecRng,
+    /// The target's measured break-even line for this draft
+    /// ([`SpecTarget::dflash_retire_break_even`]); `Some` arms the AR step.
+    retire: Option<crate::spec_retire::BreakEven>,
 }
 
 impl Dflash2Speculator {
@@ -201,7 +274,9 @@ impl Dflash2Speculator {
         }
     }
 
-    /// Verify `[seed]` alone: one target token, no draft.
+    /// One target token, no draft: the committed row `[seed]`
+    /// ([`SpecTarget::commit_row`], no rollback snapshot needed) with its
+    /// feature capture, then the greedy or sampled pick.
     fn step_one_token(
         &mut self,
         gpu: &mut Gpu,
@@ -209,20 +284,15 @@ impl Dflash2Speculator {
         position: usize,
         seed: u32,
     ) -> Result<SpecStep, String> {
-        let block = [seed];
         let mut rows = Vec::with_capacity(self.row_elems());
-        let token = if self.sampled() {
-            let mut vs = self.verify_scratch.take().ok_or("verify scratch freed")?;
-            let logits =
-                target.verify_block_logits(gpu, &block, position, vs.as_mut(), Some(&mut rows));
-            self.verify_scratch = Some(vs);
-            self.sample_row(&logits?)?
-        } else {
-            let vs = self.verify_scratch()?;
-            target.verify_block(gpu, &block, position, vs.as_mut(), Some(&mut rows))?[0]
+        let sampled = self.sampled();
+        let vs = self.verify_scratch()?;
+        let pick = target.commit_row(gpu, seed, position, vs.as_mut(), Some(&mut rows), sampled)?;
+        let token = match pick {
+            RowPick::Logits(logits) => self.sample_row(&logits)?,
+            RowPick::Argmax(token) => token,
         };
-        target.commit_prefix(gpu, &block, 0, position, self.verify_scratch()?.as_mut())?;
-        self.append_rows(&rows, &block)?;
+        self.append_rows(&rows, &[seed])?;
         Ok(SpecStep::new(std::iter::once(token), token, 0, 0).cap_emit(1))
     }
 
@@ -352,6 +422,11 @@ impl Speculator for Dflash2Speculator {
         // Context rows sit at their absolute positions, the block after them.
         let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
         let positions_k: Vec<i32> = (0..(position + b) as i32).collect();
+        let traced = tracing_windows();
+        let t_draft = traced.then(|| {
+            let _ = gpu.hip.device_synchronize();
+            std::time::Instant::now()
+        });
         draft_forward_based(
             gpu,
             &self.weights,
@@ -367,6 +442,11 @@ impl Speculator for Dflash2Speculator {
             false,
         )
         .map_err(|e| format!("Dflash2Speculator draft_forward: {e}"))?;
+        let draft_ms = t_draft.map(|t| {
+            let _ = gpu.hip.device_synchronize();
+            t.elapsed().as_secs_f64() * 1e3
+        });
+        let t_selector = traced.then(std::time::Instant::now);
 
         // Selector over the target head's logits of the draft rows 1..b.
         let hidden_rows = self.scratch.x.sub_offset(h, drafts_n * h);
@@ -389,6 +469,25 @@ impl Speculator for Dflash2Speculator {
             sampled.then_some(uniforms.as_slice()),
         )
         .map_err(|e| format!("Dflash2Speculator selector: {e}"))?;
+        if let (Some(draft_ms), Some(t_selector)) = (draft_ms, t_selector) {
+            let selector_ms = t_selector.elapsed().as_secs_f64() * 1e3;
+            let hidden = gpu
+                .download_f32(&hidden_rows)
+                .map_err(|e| format!("Dflash2Speculator trace download: {e}"))?;
+            let trace = DraftWindowTrace {
+                position,
+                seed,
+                block: b,
+                tokens: proposal.tokens.clone(),
+                confidence_bits: proposal.confidence.iter().map(|c| c.to_bits()).collect(),
+                hidden_fnv: fnv1a_f32_bits(&hidden[..drafts_n * h]),
+                draft_ms,
+                selector_ms,
+            };
+            if let Some(log) = WINDOW_TRACE.lock().unwrap().as_mut() {
+                log.push(trace);
+            }
+        }
         // Verify only the confident prefix of the drafts: an unconfident draft
         // rarely survives the verify but still costs its target row. The cut is
         // draft-side only, so greedy output stays AR's and sampled acceptance
@@ -428,6 +527,37 @@ impl Speculator for Dflash2Speculator {
             self.check_host_rows(start_pos + tokens.len())?;
         }
         Ok(true)
+    }
+
+    fn supports_ar_step(&self) -> bool {
+        self.retire.is_some()
+    }
+
+    /// A one-row window: the target's verify of `[seed]` (its recorded
+    /// one-row graph after the first use) with the feature capture, the
+    /// greedy or sampled pick of [`Self::step_one_token`], and the committed
+    /// row appended to the draft context, which therefore stays whole.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        if self.retire.is_none() {
+            return Err("Dflash2Speculator: this target has no AR step".into());
+        }
+        self.check_host_rows(position)?;
+        let result = self.step_one_token(gpu, target, position, seed);
+        self.settle(gpu, target, result).map(|step| step.next_seed)
+    }
+
+    fn supports_sampled_ar_step(&self) -> bool {
+        true
+    }
+
+    fn retire_break_even(&self) -> Option<crate::spec_retire::BreakEven> {
+        self.retire
     }
 
     fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
@@ -524,6 +654,7 @@ impl Speculator for Dflash2Speculator {
             ..
         } = *self;
         weights.free_gpu(gpu);
+        *LAST_GRAPH_STATS.lock().unwrap() = Some(scratch.draft_graph_stats());
         scratch.free_gpu(gpu);
         if let Some(vs) = verify_scratch {
             vs.free(gpu);
@@ -668,6 +799,37 @@ fn verify_depth(confidence: &[f32]) -> usize {
     confident.max(1).min(confidence.len())
 }
 
+/// The draft scratch [`build_dflash2_speculator`] runs on: an all-sliding
+/// draft was trained over its declared window, so it reads its context
+/// through the projected rows only and stages the raw feature rows from the
+/// host ([`DflashScratch::new_windowed_staged`]) instead of keeping a
+/// window-high raw ring on the device; a split draft keeps the raw window
+/// (its full layer reads it); an unwindowed draft keeps every row. Running
+/// the draft over any other span than its declared window is a
+/// train/inference mask mismatch.
+pub fn new_draft_scratch(
+    gpu: &mut Gpu,
+    config: &DflashConfig,
+    block: usize,
+    ctx_capacity: usize,
+    has_mq: bool,
+) -> Result<DflashScratch, String> {
+    match config.declared_window {
+        Some(w) if config.all_layers_sliding => DflashScratch::new_windowed_staged(
+            gpu,
+            config,
+            block,
+            w,
+            ctx_capacity,
+            has_mq,
+            FEATURE_STAGE_ROWS,
+        ),
+        Some(w) => DflashScratch::new_windowed(gpu, config, block, w, w, ctx_capacity, has_mq),
+        None => DflashScratch::new_with_mq(gpu, config, block, ctx_capacity, has_mq),
+    }
+    .map_err(|e| format!("{e}"))
+}
+
 /// Build a DFlash2 speculator for `target` from a converted draft HFQ
 /// (`dflash_convert`, F16 or MQ). `block` is the runtime proposal width
 /// (seed included), `2..=DFLASH_BLOCK_MAX`; the caller bounds it by the
@@ -707,33 +869,19 @@ pub fn build_dflash2_speculator(
         weights.free_gpu(gpu);
         return Err("DFlash2 draft: candidate selector tensors are missing".into());
     }
-    // The draft was trained over its declared sliding window; running it
-    // over any other span is a train/inference mask mismatch. An all-sliding
-    // draft reads its context through the projected rows only, and the raw
-    // feature rows come from `target_hidden_host`: stage them instead of
-    // keeping a window-high raw ring on the device.
-    let scratch = match config.declared_window {
-        Some(w) if config.all_layers_sliding => DflashScratch::new_windowed_staged(
-            gpu,
-            &config,
-            block,
-            w,
-            ctx_capacity,
-            weights.has_mq,
-            FEATURE_STAGE_ROWS,
-        ),
-        Some(w) => {
-            DflashScratch::new_windowed(gpu, &config, block, w, w, ctx_capacity, weights.has_mq)
-        }
-        None => DflashScratch::new_with_mq(gpu, &config, block, ctx_capacity, weights.has_mq),
-    };
-    let scratch = match scratch {
+    let scratch = new_draft_scratch(gpu, &config, block, ctx_capacity, weights.has_mq);
+    let mut scratch = match scratch {
         Ok(scratch) => scratch,
         Err(e) => {
             weights.free_gpu(gpu);
-            return Err(format!("{e}"));
+            return Err(e);
         }
     };
+    match DRAFT_GRAPH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => scratch.set_draft_graph(false),
+        2 => scratch.set_draft_graph(true),
+        _ => {}
+    }
     // An all-sliding draft reads only its last `W` context rows: the host and
     // the target keep just those (a split draft's full layer reads them all).
     let feature_window = config.declared_window.filter(|_| config.all_layers_sliding);
@@ -741,6 +889,7 @@ pub fn build_dflash2_speculator(
     if let Some(window) = feature_window {
         target.set_dflash_feature_window(window);
     }
+    let retire = target.dflash_retire_break_even(gpu, weights.has_mq);
     let verify_scratch = match target.new_spec_scratch(gpu, block) {
         Ok(vs) => vs,
         Err(e) => {
@@ -764,6 +913,7 @@ pub fn build_dflash2_speculator(
         mask_row: Vec::new(),
         request: SpecRequestConfig::default(),
         rng: SpecRng::new(0),
+        retire,
     }))
 }
 

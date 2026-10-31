@@ -4,7 +4,7 @@
 
 //! Generic-op GEMM/GEMV launchers (hipcc): dense Q8_0/F32 GEMMs, grouped MoE GEMMs, embedding.
 //!
-//! Ten contracts, each with a [`WorkSpecV1`] sidecar:
+//! Sixteen contracts, each with a [`WorkSpecV1`] sidecar:
 //!
 //! | contract | exports | launcher |
 //! |---|---|---|
@@ -13,6 +13,7 @@
 //! | [`GEMM_F32_BATCHED`] | `gemm_f32_batched` (gfx1201, gfx1100) | `Gpu::gemm_f32_batched` (`gemm.rs`) |
 //! | [`GEMM_BF16_XF32_BATCHED`] | `gemm_bf16_xf32_batched` (gfx1201, gfx1100) | `Gpu::gemm_bf16_xf32_batched` (`gemm.rs`) |
 //! | [`GEMM_BF16_XF32_TILED_ROWS`] / [`GEMM_BF16_XF32_TILED_ROWS_MP4`] | `gemm_bf16_xf32_tiled_rows`, `gemm_bf16_xf32_tiled_rows_mp4` (gfx1201) | `Gpu::gemm_bf16_xf32_tiled_rows` (`gemm.rs`), selector `rows_gemm` (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`) |
+//! | [`GEMM_BF16_XF32_SMALL_ROWS_R1`] / `_R4` / `_R8`, [`GEMM_BF16_XBF16_SMALL_ROWS_S1`] / `_S4` / `_S8` | `gemm_bf16_xf32_small_rows_{r1,r4,r8}`, `gemm_bf16_xbf16_small_rows_{s1,s4,s8}` (gfx1201) | `Gpu::gemm_bf16_small_rows` (`gemm.rs`), selector `rows_gemm` and `helmert_selector_gemm` (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`) |
 //! | [`GEMV_Q8_0`] | `gemv_q8_0` (gfx1201, gfx1100) | `Gpu::gemv_q8_0` (`crates/rdna-compute/src/gemv.rs`) |
 //! | [`EMBEDDING_Q8_BATCHED`] | `embedding_q8_batched` (gfx1201, gfx1100) | `Gpu::embedding_lookup_q8_batched` (`crates/rdna-compute/src/embedding.rs`) |
 //! | [`MOE_GROUPED_QT44_A8_SYM`] | `moe_grouped_qt44_a8_sym_gfx1201_nt{1,2}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` (`crates/rdna-compute/src/moe_grouped_qt44_iu4.rs`) |
@@ -68,7 +69,7 @@ pub const NUMERIC_Q8_0_WMMA_F16: NumericContractId =
 pub const NUMERIC_MQ4_GROUPED_WMMA_F16: NumericContractId =
     NumericContractId("generic_gemm.mq4g256v2_grouped_x_f16.wmma_f32acc");
 /// F32 x F32, lane-strided FMA over K (lane `l` takes `k = l, l+32, ...`) then a width-32 `shfl_down` tree.
-/// `gemm_f32_batched`, `gemm_bf16_xf32_batched` and `gemm_bf16_xf32_tiled_rows*` share it (BF16 operand
+/// `gemm_f32_batched`, `gemm_bf16_xf32_batched`, `gemm_bf16_xf32_tiled_rows*` and `gemm_bf16_{xf32,xbf16}_small_rows_*` share it (BF16 operand
 /// A widens exactly, so the BF16 kernels are bit-identical to the F32 kernel on the widened weight).
 pub const NUMERIC_F32_LANE_STRIDED: NumericContractId =
     NumericContractId("generic_gemm.f32.lane_strided_fma.shfl_tree32");
@@ -529,7 +530,8 @@ pub static WORK_GEMM_MQ4G256V2_MOE_GROUPED_WMMA: WorkSpecV1 = WorkSpecV1 {
 };
 
 // ================================================================================================
-// gemm_f32_batched / gemm_bf16_xf32_batched / gemm_bf16_xf32_tiled_rows / gemm_bf16_xf32_tiled_rows_mp4
+// gemm_f32_batched / gemm_bf16_xf32_batched / gemm_bf16_xf32_tiled_rows / gemm_bf16_xf32_tiled_rows_mp4 /
+// gemm_bf16_{xf32,xbf16}_small_rows_{r,s}{1,4,8}
 // ================================================================================================
 
 const PARAMS_F32_GEMM: &[ParamV1] = &[
@@ -835,6 +837,188 @@ pub static GEMM_BF16_XF32_TILED_ROWS_MP4: KernelAbiV1 = KernelAbiV1 {
     }],
 };
 
+// ---- gemm_bf16_small_rows: register-tiled exact-order small-M GEMMs -------------------------------
+
+/// BF16 activation operand of the `gemm_bf16_xbf16_small_rows_*` kernels (`B`, the mHC selector's BF16
+/// stream rows): the same flat BF16 format as the weight, widened exactly (`bits << 16`) in registers.
+const OPS_BF16_XBF16_GEMM: &[OperandV1] = &[
+    OperandV1 {
+        name: "A",
+        format: FORMAT_BF16_FLAT,
+        access: Access::ReadOnly,
+        align: 2,
+        extent: Some(Expr::Mul(&[P_M, P_K, Expr::Const(2)])),
+        nullable: false,
+        note: "BF16 weight `[M, K]` row-major (u16 words, 2-byte aligned), widened exactly to f32 in registers",
+    },
+    OperandV1 {
+        name: "B",
+        format: FORMAT_BF16_FLAT,
+        access: Access::ReadOnly,
+        align: 2,
+        extent: Some(Expr::Mul(&[P_N, P_K, Expr::Const(2)])),
+        nullable: false,
+        note: "BF16 activations `[N, K]` (u16 words, 2-byte aligned), widened exactly to f32 in registers",
+    },
+    OperandV1 {
+        name: "Y",
+        format: FORMAT_F32_N_M,
+        access: Access::WriteOnly,
+        align: 4,
+        extent: Some(Expr::Mul(&[P_N, P_M, Expr::Const(4)])),
+        nullable: false,
+        note: "F32 output `[N, M]`; every element is written once (lane 0 of its wave)",
+    },
+];
+
+/// `K` granularity of every small-rows kernel (`BF16_SMALL_ROWS_K_MULTIPLE` in `rdna-compute` `gemm.rs`).
+const SMALL_ROWS_K_MULTIPLE: u64 = 512;
+
+/// Domain of the 1-row small-rows kernels: grid y = N must fit the HIP y-grid limit (the launcher
+/// chunks), and K is a multiple of 512 (no k tail).
+const DOMAIN_SMALL_ROWS_NT1: &[DomainRuleV1] = &[
+    rule(Rule::Positive(P_M), "no output rows"),
+    rule(Rule::Positive(P_K), "empty reduction"),
+    rule(
+        Rule::MultipleOf(P_K, SMALL_ROWS_K_MULTIPLE),
+        "the small-rows kernels have no k tail: K must be a multiple of 512 (the launcher rejects other K)",
+    ),
+    rule(Rule::Positive(P_N), "no activation rows"),
+    rule(
+        Rule::AtMost(P_N, GRID_Y_MAX),
+        "grid y = N must fit the HIP y-grid limit (the launcher chunks)",
+    ),
+];
+
+/// Domain of the `NT`-rows-per-CTA small-rows kernels: grid y = ceil(N / NT) must fit the HIP y-grid
+/// limit (the launcher chunks at `65535 * NT` rows).
+const DOMAIN_SMALL_ROWS_NT4: &[DomainRuleV1] = &[
+    rule(Rule::Positive(P_M), "no output rows"),
+    rule(Rule::Positive(P_K), "empty reduction"),
+    rule(
+        Rule::MultipleOf(P_K, SMALL_ROWS_K_MULTIPLE),
+        "the small-rows kernels have no k tail: K must be a multiple of 512 (the launcher rejects other K)",
+    ),
+    rule(Rule::Positive(P_N), "no activation rows"),
+    rule(
+        Rule::AtMost(P_N, GRID_Y_MAX * 4),
+        "grid y = ceil(N/4) must fit the HIP y-grid limit (the launcher chunks at 65535 * 4 rows)",
+    ),
+];
+
+const DOMAIN_SMALL_ROWS_NT8: &[DomainRuleV1] = &[
+    rule(Rule::Positive(P_M), "no output rows"),
+    rule(Rule::Positive(P_K), "empty reduction"),
+    rule(
+        Rule::MultipleOf(P_K, SMALL_ROWS_K_MULTIPLE),
+        "the small-rows kernels have no k tail: K must be a multiple of 512 (the launcher rejects other K)",
+    ),
+    rule(Rule::Positive(P_N), "no activation rows"),
+    rule(
+        Rule::AtMost(P_N, GRID_Y_MAX * 8),
+        "grid y = ceil(N/8) must fit the HIP y-grid limit (the launcher chunks at 65535 * 8 rows)",
+    ),
+];
+
+/// One `gemm_bf16_small_rows` contract. Every entry shares the 36-byte kernarg layout of
+/// [`GEMM_BF16_XF32_BATCHED`] (`A@0 B@8 Y@16`, `M@24 K@28 N@32`; the kernels never read `blockDim`, so no
+/// hidden block and segment 36 / align 8), no LDS, and the lane-strided numerics of `gemm_f32_batched`.
+/// `NT` activation rows and `OS` outputs per wave live in registers; a CTA of `NW` waves owns
+/// `NW * OS` outputs and `NT` rows (grid x = ceil(M / (NW * OS)), grid y = ceil(N / NT)); `UR` is the
+/// k-unroll. hipcc-JIT'd from `kernels/src/gemm_bf16_small_rows.hip` (no hsaco hash is pinned).
+macro_rules! small_rows_abi {
+    (
+        $(#[$meta:meta])*
+        $name:ident, $id:literal, $symbol:literal, $ops:ident, $domain:ident,
+        nt: $nt:literal, os: $os:literal, nw: $nw:literal, ur: $ur:literal,
+        outputs: $outputs:literal, block: $block:literal, grid_y: $grid_y:expr
+    ) => {
+        $(#[$meta])*
+        pub static $name: KernelAbiV1 = KernelAbiV1 {
+            id: $id,
+            version: 1,
+            wave: 32,
+            numeric: NUMERIC_F32_LANE_STRIDED,
+            params: PARAMS_F32_GEMM,
+            operands: $ops,
+            fields: FIELDS_F32_GEMM,
+            hidden: &[],
+            explicit_bytes: 36,
+            segment_bytes: 36,
+            segment_align: 8,
+            domain: $domain,
+            exports: &[ExportV1 {
+                symbol: $symbol,
+                arch: Arch::Gfx1201,
+                object: ObjectRefV1::HipccSource {
+                    module: "gemm_bf16_small_rows",
+                    source: "kernels/src/gemm_bf16_small_rows.hip",
+                },
+                block: [$block, 1, 1],
+                dynamic_lds: 0,
+                group_segment_fixed: 0,
+                grid: [Expr::DivCeil(&P_M, $outputs), $grid_y, ONE],
+                consts: &[("NT", $nt), ("OS", $os), ("NW", $nw), ("UR", $ur)],
+            }],
+        };
+    };
+}
+
+small_rows_abi!(
+    /// `gemm_bf16_xf32_small_rows_r1` (router, F32 activations): 1 row per CTA, 8 waves x 1 output = 8
+    /// outputs per CTA, block 256.
+    GEMM_BF16_XF32_SMALL_ROWS_R1, "generic_gemm.bf16_xf32_small_rows.r1", "gemm_bf16_xf32_small_rows_r1",
+    OPS_BF16_XF32_GEMM, DOMAIN_SMALL_ROWS_NT1,
+    nt: 1, os: 1, nw: 8, ur: 16, outputs: 8, block: 256, grid_y: P_N
+);
+small_rows_abi!(
+    /// `gemm_bf16_xf32_small_rows_r4` (router, F32 activations): 4 rows per CTA, 8 waves x 4 outputs = 32
+    /// outputs per CTA, block 256.
+    GEMM_BF16_XF32_SMALL_ROWS_R4, "generic_gemm.bf16_xf32_small_rows.r4", "gemm_bf16_xf32_small_rows_r4",
+    OPS_BF16_XF32_GEMM, DOMAIN_SMALL_ROWS_NT4,
+    nt: 4, os: 4, nw: 8, ur: 8, outputs: 32, block: 256, grid_y: Expr::DivCeil(&P_N, 4)
+);
+small_rows_abi!(
+    /// `gemm_bf16_xf32_small_rows_r8` (router, F32 activations): 8 rows per CTA, 8 waves x 8 outputs = 64
+    /// outputs per CTA, block 256.
+    GEMM_BF16_XF32_SMALL_ROWS_R8, "generic_gemm.bf16_xf32_small_rows.r8", "gemm_bf16_xf32_small_rows_r8",
+    OPS_BF16_XF32_GEMM, DOMAIN_SMALL_ROWS_NT8,
+    nt: 8, os: 8, nw: 8, ur: 8, outputs: 64, block: 256, grid_y: Expr::DivCeil(&P_N, 8)
+);
+small_rows_abi!(
+    /// `gemm_bf16_xbf16_small_rows_s1` (mHC selector, BF16 activations): 1 row per CTA, 17 waves x 1
+    /// output = 17 outputs per CTA, block 544.
+    GEMM_BF16_XBF16_SMALL_ROWS_S1, "generic_gemm.bf16_xbf16_small_rows.s1", "gemm_bf16_xbf16_small_rows_s1",
+    OPS_BF16_XBF16_GEMM, DOMAIN_SMALL_ROWS_NT1,
+    nt: 1, os: 1, nw: 17, ur: 16, outputs: 17, block: 544, grid_y: P_N
+);
+small_rows_abi!(
+    /// `gemm_bf16_xbf16_small_rows_s4` (mHC selector, BF16 activations): 4 rows per CTA, 6 waves x 3
+    /// outputs = 18 outputs per CTA, block 192.
+    GEMM_BF16_XBF16_SMALL_ROWS_S4, "generic_gemm.bf16_xbf16_small_rows.s4", "gemm_bf16_xbf16_small_rows_s4",
+    OPS_BF16_XBF16_GEMM, DOMAIN_SMALL_ROWS_NT4,
+    nt: 4, os: 3, nw: 6, ur: 8, outputs: 18, block: 192, grid_y: Expr::DivCeil(&P_N, 4)
+);
+small_rows_abi!(
+    /// `gemm_bf16_xbf16_small_rows_s8` (mHC selector, BF16 activations): 8 rows per CTA, 4 waves x 5
+    /// outputs = 20 outputs per CTA, block 128.
+    GEMM_BF16_XBF16_SMALL_ROWS_S8, "generic_gemm.bf16_xbf16_small_rows.s8", "gemm_bf16_xbf16_small_rows_s8",
+    OPS_BF16_XBF16_GEMM, DOMAIN_SMALL_ROWS_NT8,
+    nt: 8, os: 5, nw: 4, ur: 8, outputs: 20, block: 128, grid_y: Expr::DivCeil(&P_N, 8)
+);
+
+/// Admission of the `gemm_bf16_small_rows` family: the selector `rows_gemm` (and the stream-mix selector
+/// GEMM) send gfx1201 calls here at every row count unless `HIPFIRE_BF16W_SMALL_ROWS=0`. `small_rows_profile`
+/// picks the kernel by activation dtype (F32 + M > 32: router `_r*`; BF16 + M <= 32: selector `_s*`) and by
+/// row count, and only for K a multiple of 512 (`small_rows_route`; the kernels have no k tail and the
+/// launcher rejects other K). Every kernel is correct at every row count, so the domain is not row-limited.
+const ADMIT_BF16_SMALL_ROWS: RowDomainV1 = RowDomainV1 {
+    min_rows: 1,
+    max_rows: None,
+    predicate: "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::small_rows_profile",
+    kill_env: Some("HIPFIRE_BF16W_SMALL_ROWS"),
+};
+
 /// Weight binding of the F32 GEMMs: any codec (the runtime holds F32 whatever the file codec), fused
 /// sibling rows allowed (mHC phi_pre/post/z fused into one 17-row weight).
 const BIND_F32_K: BindV1 = BindV1 {
@@ -860,7 +1044,10 @@ const ADMIT_F32_BATCHED: RowDomainV1 = RowDomainV1 {
 
 /// Admission of `gemm_bf16_xf32_batched`: the selector `rows_gemm` sends BF16-resident weights with
 /// `n < BF16_TILED_ROWS_MIN_N` (512) here, and every row count on archs without the tiled kernel
-/// (gfx1100) or with `HIPFIRE_BF16W_TILED_ROWS=0`; Raon's router calls it directly.
+/// (gfx1100) or with `HIPFIRE_BF16W_TILED_ROWS=0`. On gfx1201 the router-shaped (F32 activation, M > 32)
+/// and selector-shaped (BF16 activation, M <= 32) calls take the `gemm_bf16_small_rows` kernels instead
+/// ([`ADMIT_BF16_SMALL_ROWS`]) unless `HIPFIRE_BF16W_SMALL_ROWS=0`; other shapes and direct callers
+/// still run this kernel.
 const ADMIT_BF16_XF32_BATCHED: RowDomainV1 = RowDomainV1 {
     min_rows: 1,
     max_rows: None,
@@ -920,8 +1107,9 @@ pub static WORK_GEMM_BF16_XF32_BATCHED: WorkSpecV1 = WorkSpecV1 {
         bind: &[BIND_BF16_K],
         note: "One wave per output: grid (M, N) gives M and N exactly; K from the BF16 weight. Bytes = A + B + Y \
                extents (A is 2 bytes per element). Every output re-reads its activation row (L2-served), so the \
-               true traffic exceeds the operand extents. Selector `rows_gemm`'s n < 512 / non-gfx1201 / \
-               kill-switch route for BF16-resident weights, and Raon's router.",
+               true traffic exceeds the operand extents. Selector `rows_gemm`'s route for BF16-resident weights \
+               at n < 512 / non-gfx1201 / kill-switch (`HIPFIRE_BF16W_SMALL_ROWS=0` on gfx1201: the small-rows \
+               kernels take the router and selector shapes otherwise), and direct callers.",
     },
 };
 
@@ -945,7 +1133,8 @@ pub static WORK_GEMM_BF16_XF32_TILED_ROWS: WorkSpecV1 = WorkSpecV1 {
         ],
         note: "Grid y = ceil(N/4) leaves N in an interval of 4: ChunkRows narrows it. M in (32, ..] takes this entry, \
                M <= 32 the mp4 entry. Admitted on gfx1201 only, at n >= 512 rows, `HIPFIRE_BF16W_TILED_ROWS=0` \
-               restores gemm_bf16_xf32_batched. Bytes = A + X + Y extents.",
+               restores gemm_bf16_xf32_batched. The router shape (F32 activation) takes the small-rows kernels \
+               instead unless `HIPFIRE_BF16W_SMALL_ROWS=0`. Bytes = A + X + Y extents.",
     },
 };
 
@@ -970,9 +1159,96 @@ pub static WORK_GEMM_BF16_XF32_TILED_ROWS_MP4: WorkSpecV1 = WorkSpecV1 {
         note: "The MPW=4 entry of the tiled kernel, taken when M <= 32 (the mHC selector, M = 17). Grid x = ceil(M/32) \
                is 1 for every admitted M, so the grid only bounds M to [1, 32]; the weight match (by M, interval \
                [1, 32]) then binds M exactly (e.g. the 17-row fused mHC phi) and K. Same row domain as \
-               gemm_bf16_xf32_tiled_rows.",
+               gemm_bf16_xf32_tiled_rows. The BF16-activation selector takes the small-rows kernels (or \
+               gemm_bf16_xbf16_tiled_rows) instead; this entry serves an F32 activation, or \
+               `HIPFIRE_BF16W_SMALL_ROWS=0`.",
     },
 };
+
+/// Weight/row bindings of the 1-row small-rows profiles: grid y = N pins N exactly, so only the weight
+/// match (M, K) binds.
+const BINDS_SMALL_ROWS_EXACT: &[BindV1] = &[BIND_BF16_K];
+
+/// Bindings of the multi-row small-rows profiles: grid y = ceil(N/NT) leaves N in an interval of `NT`
+/// (ChunkRows narrows it), then the weight match binds M and K.
+const BINDS_SMALL_ROWS_CHUNKED: &[BindV1] = &[
+    BindV1 {
+        param: "N",
+        source: BindSource::ChunkRows,
+    },
+    BIND_BF16_K,
+];
+
+/// Work spec of one `gemm_bf16_small_rows` kernel.
+macro_rules! small_rows_work {
+    ($name:ident, $abi:ident, $bind:ident, $note:literal) => {
+        pub static $name: WorkSpecV1 = WorkSpecV1 {
+            abi: &$abi,
+            work: WorkV1 {
+                op_class: op_class::GEMM,
+                codec: "bf16",
+                pipe: Pipe::ValuF32,
+                macs: Some(Expr::Mul(&[P_M, P_N, P_K])),
+                flops: None,
+                bytes: None,
+                rows: Some("N"),
+                admit: ADMIT_BF16_SMALL_ROWS,
+                bind: $bind,
+                note: $note,
+            },
+        };
+    };
+}
+
+small_rows_work!(
+    WORK_GEMM_BF16_XF32_SMALL_ROWS_R1,
+    GEMM_BF16_XF32_SMALL_ROWS_R1,
+    BINDS_SMALL_ROWS_EXACT,
+    "Router shape (F32 activation, M > 32), decode / speculative verify row counts. Grid y = N pins N; grid x = \
+     ceil(M/8) leaves M in an interval of 8 that the weight match (by M) binds exactly, with K. Admitted on \
+     gfx1201 only, K % 512 == 0 (no k tail), `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
+);
+small_rows_work!(
+    WORK_GEMM_BF16_XF32_SMALL_ROWS_R4,
+    GEMM_BF16_XF32_SMALL_ROWS_R4,
+    BINDS_SMALL_ROWS_CHUNKED,
+    "Router shape (F32 activation, M > 32), 4 rows per CTA. Grid y = ceil(N/4) leaves N in an interval of 4: \
+     ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 only, K % 512 == 0 (no k tail), \
+     `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
+);
+small_rows_work!(
+    WORK_GEMM_BF16_XF32_SMALL_ROWS_R8,
+    GEMM_BF16_XF32_SMALL_ROWS_R8,
+    BINDS_SMALL_ROWS_CHUNKED,
+    "Router shape (F32 activation, M > 32), 8 rows per CTA (prefill row counts). Grid y = ceil(N/8) leaves N in \
+     an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 only, K % 512 == 0 (no k tail), \
+     `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
+);
+small_rows_work!(
+    WORK_GEMM_BF16_XBF16_SMALL_ROWS_S1,
+    GEMM_BF16_XBF16_SMALL_ROWS_S1,
+    BINDS_SMALL_ROWS_EXACT,
+    "mHC selector shape (BF16 activation, M <= 32), decode / speculative verify row counts. Grid y = N pins N; \
+     grid x = ceil(M/17) is 1 for M <= 17 and the weight match (by M) binds M exactly (the 17-row fused mHC \
+     phi) and K. Admitted on gfx1201 only, K % 512 == 0 (no k tail), `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled \
+     routes. Bytes = A + X + Y extents (X is 2 bytes per element)."
+);
+small_rows_work!(
+    WORK_GEMM_BF16_XBF16_SMALL_ROWS_S4,
+    GEMM_BF16_XBF16_SMALL_ROWS_S4,
+    BINDS_SMALL_ROWS_CHUNKED,
+    "mHC selector shape (BF16 activation, M <= 32), 4 rows per CTA. Grid y = ceil(N/4) leaves N in an interval \
+     of 4: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 only, K % 512 == 0 (no k tail), \
+     `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled routes. Bytes = A + X + Y extents."
+);
+small_rows_work!(
+    WORK_GEMM_BF16_XBF16_SMALL_ROWS_S8,
+    GEMM_BF16_XBF16_SMALL_ROWS_S8,
+    BINDS_SMALL_ROWS_CHUNKED,
+    "mHC selector shape (BF16 activation, M <= 32), 8 rows per CTA (prefill row counts). Grid y = ceil(N/8) \
+     leaves N in an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 only, K % 512 == 0 (no k tail), \
+     `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled routes. Bytes = A + X + Y extents."
+);
 
 // ================================================================================================
 // gemv_q8_0
@@ -1681,6 +1957,12 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &GEMM_BF16_XF32_BATCHED,
     &GEMM_BF16_XF32_TILED_ROWS,
     &GEMM_BF16_XF32_TILED_ROWS_MP4,
+    &GEMM_BF16_XF32_SMALL_ROWS_R1,
+    &GEMM_BF16_XF32_SMALL_ROWS_R4,
+    &GEMM_BF16_XF32_SMALL_ROWS_R8,
+    &GEMM_BF16_XBF16_SMALL_ROWS_S1,
+    &GEMM_BF16_XBF16_SMALL_ROWS_S4,
+    &GEMM_BF16_XBF16_SMALL_ROWS_S8,
     &GEMV_Q8_0,
     &EMBEDDING_Q8_BATCHED,
     &MOE_GROUPED_QT44_A8_SYM,
@@ -1695,6 +1977,12 @@ pub static WORK: &[&WorkSpecV1] = &[
     &WORK_GEMM_BF16_XF32_BATCHED,
     &WORK_GEMM_BF16_XF32_TILED_ROWS,
     &WORK_GEMM_BF16_XF32_TILED_ROWS_MP4,
+    &WORK_GEMM_BF16_XF32_SMALL_ROWS_R1,
+    &WORK_GEMM_BF16_XF32_SMALL_ROWS_R4,
+    &WORK_GEMM_BF16_XF32_SMALL_ROWS_R8,
+    &WORK_GEMM_BF16_XBF16_SMALL_ROWS_S1,
+    &WORK_GEMM_BF16_XBF16_SMALL_ROWS_S4,
+    &WORK_GEMM_BF16_XBF16_SMALL_ROWS_S8,
     &WORK_GEMV_Q8_0,
     &WORK_EMBEDDING_Q8_BATCHED,
     &WORK_MOE_GROUPED_QT44_A8_SYM,
@@ -1823,7 +2111,7 @@ mod tests {
 
     #[test]
     fn every_contract_self_checks() {
-        assert_eq!(ABIS.len(), 10);
+        assert_eq!(ABIS.len(), 16);
         for abi in ABIS {
             if let Err(e) = abi.self_check() {
                 panic!("{}: {e:#?}", abi.id);
@@ -2096,13 +2384,19 @@ mod tests {
                 .chain((0..ns).map(|i| (8 * np + 4 * i, 4)))
                 .collect()
         };
-        let cases: [(&KernelAbiV1, u32, u32, Vec<(u32, u32)>); 10] = [
+        let cases: [(&KernelAbiV1, u32, u32, Vec<(u32, u32)>); 16] = [
             (&GEMM_Q8_0_WMMA, 36, 36, ptr_scalar(3, 3)),
             (&GEMM_MQ4G256V2_MOE_GROUPED_WMMA, 60, 60, ptr_scalar(5, 5)),
             (&GEMM_F32_BATCHED, 36, 36, ptr_scalar(3, 3)),
             (&GEMM_BF16_XF32_BATCHED, 36, 36, ptr_scalar(3, 3)),
             (&GEMM_BF16_XF32_TILED_ROWS, 36, 296, ptr_scalar(3, 3)),
             (&GEMM_BF16_XF32_TILED_ROWS_MP4, 36, 296, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XF32_SMALL_ROWS_R1, 36, 36, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XF32_SMALL_ROWS_R4, 36, 36, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XF32_SMALL_ROWS_R8, 36, 36, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XBF16_SMALL_ROWS_S1, 36, 36, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XBF16_SMALL_ROWS_S4, 36, 36, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XBF16_SMALL_ROWS_S8, 36, 36, ptr_scalar(3, 3)),
             (&GEMV_Q8_0, 32, 32, ptr_scalar(3, 2)),
             (&EMBEDDING_Q8_BATCHED, 28, 288, ptr_scalar(3, 1)),
             (&MOE_GROUPED_QT44_A8_SYM, 72, 72, ptr_scalar(6, 6)),
@@ -2161,6 +2455,188 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("BF16_TILED_ROWS_MIN_N: usize = 512;"));
+    }
+
+    /// `(abi, work, symbol, NT, outputs per CTA, block, x operand format)` of the six small-rows kernels.
+    fn small_rows_cases() -> [(
+        &'static KernelAbiV1,
+        &'static WorkSpecV1,
+        &'static str,
+        u64,
+        u64,
+        u32,
+        FormatId,
+    ); 6] {
+        [
+            (
+                &GEMM_BF16_XF32_SMALL_ROWS_R1,
+                &WORK_GEMM_BF16_XF32_SMALL_ROWS_R1,
+                "gemm_bf16_xf32_small_rows_r1",
+                1,
+                8,
+                256,
+                FORMAT_F32_FLAT,
+            ),
+            (
+                &GEMM_BF16_XF32_SMALL_ROWS_R4,
+                &WORK_GEMM_BF16_XF32_SMALL_ROWS_R4,
+                "gemm_bf16_xf32_small_rows_r4",
+                4,
+                32,
+                256,
+                FORMAT_F32_FLAT,
+            ),
+            (
+                &GEMM_BF16_XF32_SMALL_ROWS_R8,
+                &WORK_GEMM_BF16_XF32_SMALL_ROWS_R8,
+                "gemm_bf16_xf32_small_rows_r8",
+                8,
+                64,
+                256,
+                FORMAT_F32_FLAT,
+            ),
+            (
+                &GEMM_BF16_XBF16_SMALL_ROWS_S1,
+                &WORK_GEMM_BF16_XBF16_SMALL_ROWS_S1,
+                "gemm_bf16_xbf16_small_rows_s1",
+                1,
+                17,
+                544,
+                FORMAT_BF16_FLAT,
+            ),
+            (
+                &GEMM_BF16_XBF16_SMALL_ROWS_S4,
+                &WORK_GEMM_BF16_XBF16_SMALL_ROWS_S4,
+                "gemm_bf16_xbf16_small_rows_s4",
+                4,
+                18,
+                192,
+                FORMAT_BF16_FLAT,
+            ),
+            (
+                &GEMM_BF16_XBF16_SMALL_ROWS_S8,
+                &WORK_GEMM_BF16_XBF16_SMALL_ROWS_S8,
+                "gemm_bf16_xbf16_small_rows_s8",
+                8,
+                20,
+                128,
+                FORMAT_BF16_FLAT,
+            ),
+        ]
+    }
+
+    #[test]
+    fn small_rows_grids_and_layouts_follow_the_launcher() {
+        for (abi, _, symbol, nt, outputs, block, x_format) in small_rows_cases() {
+            let ex = export(abi, Arch::Gfx1201, symbol);
+            assert_eq!(abi.exports.len(), 1, "{symbol}: gfx1201 only");
+            assert_eq!(ex.block, [block, 1, 1], "{symbol}");
+            assert_eq!(ex.dynamic_lds, 0);
+            assert_eq!(ex.group_segment_fixed, 0);
+            assert!(
+                abi.hidden.is_empty(),
+                "{symbol}: the kernels read no blockDim"
+            );
+            assert_eq!(abi.operands[1].format, x_format, "{symbol}: B format");
+            assert_eq!(
+                abi.operands[0].format, FORMAT_BF16_FLAT,
+                "{symbol}: A format"
+            );
+            // Launcher grid: [ceil(M/outputs), ceil(N/NT)] at the Raon router (M=128) and selector (M=17).
+            for (m, n) in [(128u64, 1u64), (128, 9), (128, 512), (17, 33), (17, 513)] {
+                let wg = eval_grid(abi, ex, &[("M", m), ("K", 2560), ("N", n)]);
+                assert_eq!(
+                    wg,
+                    [m.div_ceil(outputs), n.div_ceil(nt), 1],
+                    "{symbol} M={m} N={n}"
+                );
+            }
+            // The interval each grid axis pins contains the launched value.
+            let (lo, hi) = interval(&ex.grid[0], 128u64.div_ceil(outputs), "M");
+            assert!(
+                (lo..=hi).contains(&128),
+                "{symbol}: M interval [{lo}, {hi}]"
+            );
+            let (lo, hi) = interval(&ex.grid[1], 9u64.div_ceil(nt), "N");
+            assert!((lo..=hi).contains(&9), "{symbol}: N interval [{lo}, {hi}]");
+            let consts = |name: &str| ex.consts.iter().find(|(n, _)| *n == name).unwrap().1;
+            assert_eq!(consts("NT"), nt, "{symbol}");
+            assert_eq!(consts("NW") * consts("OS"), outputs, "{symbol}");
+            assert_eq!(consts("NW") * 32, u64::from(block), "{symbol}");
+        }
+        // Router shape (M = 128) and selector shape (M = 17) at N = 512 on the 8-row profiles.
+        check_grid(
+            &GEMM_BF16_XF32_SMALL_ROWS_R8,
+            Arch::Gfx1201,
+            "gemm_bf16_xf32_small_rows_r8",
+            [2 * 256, 64],
+            &[("M", 128), ("K", 2560), ("N", 512)],
+            [Some("M"), Some("N")],
+        );
+        check_grid(
+            &GEMM_BF16_XBF16_SMALL_ROWS_S8,
+            Arch::Gfx1201,
+            "gemm_bf16_xbf16_small_rows_s8",
+            [128, 64],
+            &[("M", 17), ("K", 10240), ("N", 512)],
+            [Some("M"), Some("N")],
+        );
+    }
+
+    #[test]
+    fn small_rows_domain_requires_k_multiple_of_512() {
+        let root = repo_root();
+        let text = std::fs::read_to_string(root.join("crates/rdna-compute/src/gemm.rs")).unwrap();
+        assert!(text.contains("BF16_SMALL_ROWS_K_MULTIPLE: usize = 512;"));
+        for (abi, _, symbol, ..) in small_rows_cases() {
+            let ex = export(abi, Arch::Gfx1201, symbol);
+            let Some(Rule::MultipleOf(expr, m)) = abi
+                .domain
+                .iter()
+                .map(|d| d.rule)
+                .find(|r| matches!(r, Rule::MultipleOf(..)))
+            else {
+                panic!("{symbol}: no K % 512 domain rule");
+            };
+            assert_eq!(m, 512, "{symbol}");
+            // The rule's expression is K: it admits the Raon K and rejects the ragged K the launcher refuses.
+            for (k, admitted) in [
+                (512u64, true),
+                (2560, true),
+                (5120, true),
+                (10240, true),
+                (40, false),
+                (511, false),
+                (513, false),
+                (2600, false),
+            ] {
+                let v = eval(&expr, abi, ex, &[128, k, 64]).unwrap();
+                assert_eq!(v, k, "{symbol}: the rule is over K");
+                assert_eq!(v.is_multiple_of(m), admitted, "{symbol}: K = {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn small_rows_admission_is_the_dispatch_profile_selector() {
+        for (_, w, symbol, ..) in small_rows_cases() {
+            assert_eq!(w.work.admit.min_rows, 1, "{symbol}");
+            assert_eq!(w.work.admit.max_rows, None, "{symbol}");
+            assert_eq!(
+                w.work.admit.kill_env,
+                Some("HIPFIRE_BF16W_SMALL_ROWS"),
+                "{symbol}"
+            );
+            assert!(
+                w.work
+                    .admit
+                    .predicate
+                    .ends_with("stream_mix.rs::small_rows_profile"),
+                "{symbol}"
+            );
+            assert_eq!(w.work.codec, "bf16", "{symbol}");
+            assert_eq!(w.work.pipe, Pipe::ValuF32, "{symbol}");
+        }
     }
 
     #[test]

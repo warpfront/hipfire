@@ -67,6 +67,41 @@ fn q8_0_verify_extents(m: usize, k: usize, rows: usize) -> Option<[usize; 3]> {
         .then_some(bytes)
 }
 
+/// Every [`Bf16SmallRowsProfile`] kernel runs its loop over groups of `32 * UR` k steps with UR
+/// in {8, 16}, so `k` must be a multiple of this (Raon: router K = 2560, selector K = 10240).
+pub const BF16_SMALL_ROWS_K_MULTIPLE: usize = 512;
+
+/// Row profile of [`Gpu::gemm_bf16_small_rows`]: activation rows per CTA (`Rows1`/`Rows4`/`Rows8`).
+/// More rows per CTA reuse every weight fetch over more rows (prefill); one row per CTA has the
+/// shortest dependency chain (decode, speculative verify). Every profile is bit-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bf16SmallRowsProfile {
+    Rows1,
+    Rows4,
+    Rows8,
+}
+
+impl Bf16SmallRowsProfile {
+    /// Activation rows per CTA.
+    pub fn rows(self) -> usize {
+        self.launch(false).1
+    }
+
+    /// `(kernel symbol, rows per CTA, outputs per CTA, threads per CTA)`; the F32-activation
+    /// kernels (`_r*`, router-shaped M) own 8/32/64 outputs per CTA, the BF16-activation
+    /// kernels (`_s*`, selector-shaped M) 17/18/20.
+    fn launch(self, x_bf16: bool) -> (&'static str, usize, usize, usize) {
+        match (x_bf16, self) {
+            (false, Self::Rows1) => ("gemm_bf16_xf32_small_rows_r1", 1, 8, 256),
+            (false, Self::Rows4) => ("gemm_bf16_xf32_small_rows_r4", 4, 32, 256),
+            (false, Self::Rows8) => ("gemm_bf16_xf32_small_rows_r8", 8, 64, 256),
+            (true, Self::Rows1) => ("gemm_bf16_xbf16_small_rows_s1", 1, 17, 544),
+            (true, Self::Rows4) => ("gemm_bf16_xbf16_small_rows_s4", 4, 18, 192),
+            (true, Self::Rows8) => ("gemm_bf16_xbf16_small_rows_s8", 8, 20, 128),
+        }
+    }
+}
+
 const F32_BATCHED_MAX_GRID_Y: usize = 65535;
 
 fn f32_batched_chunks(rows: usize) -> impl Iterator<Item = (usize, usize)> {
@@ -29971,6 +30006,87 @@ impl Gpu {
         )
     }
 
+    /// Whether [`Self::gemm_f16_skinny_xf32`] can serve `Y[n, m] = W[m, :] . X[n, :]`:
+    /// 1..=16 activation rows, `k % 8 == 0`, 16-byte aligned operands, full
+    /// extents, and an arch whose kernels are packed for it.
+    pub fn gemm_f16_skinny_admitted(
+        &self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        (1..=16).contains(&n)
+            && m > 0
+            && k > 0
+            && k % 8 == 0
+            && m.checked_mul(k).is_some_and(|e| w.buf.size() >= e * 2)
+            && n.checked_mul(k).is_some_and(|e| x.buf.size() >= e * 4)
+            && (w.buf.as_ptr() as usize) % 16 == 0
+            && (x.buf.as_ptr() as usize) % 16 == 0
+            && (self.arch_caps.is_gfx1100()
+                || self.arch_caps.is_gfx1151()
+                || self.arch_caps.is_gfx1201())
+    }
+
+    /// Few-row F16-weight x F32-activation GEMM, the weights read once:
+    /// `Y[n, m] = sum_k W[m, k] X[n, k]` for `n` in `1..=16` rows (`k % 8 == 0`,
+    /// 16-byte aligned `w` / `x`; see [`Self::gemm_f16_skinny_admitted`]).
+    /// Activations stay F32 (no F16 rounding of X, unlike the WMMA GEMMs), the
+    /// K reduction is spread over 256 threads in a fixed order, so the result is
+    /// deterministic run to run but is not the WMMA kernel's summation. Grid
+    /// `[ceil(m / 4)]`, block `[256]`.
+    pub fn gemm_f16_skinny_xf32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.gemm_f16_skinny_admitted(w, x, m, k, n)
+            || y.buf.size() < n * m * 4
+            || m > i32::MAX as usize
+            || k > i32::MAX as usize
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_f16_skinny_xf32: needs 1..=16 rows, k % 8 == 0, 16-byte aligned full \
+                 F16 weight / F32 activation views, a full F32 output and a gfx11/gfx12 arch",
+            ));
+        }
+        self.ensure_kernel(
+            "gemm_f16_skinny_xf32",
+            kernels::GEMM_F16_SKINNY_XF32_SRC,
+            "gemm_f16_skinny_xf32",
+        )?;
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        launch_params_blob!(
+            self,
+            "gemm_f16_skinny_xf32",
+            [m.div_ceil(4) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            params; wp, xp, yp, mi, ki, ni
+        )
+    }
+
     /// Tiled F16 GEMM — 8-way ILP unrolled, lane-coalesced stride-32 reads,
     /// no shared memory (high occupancy). Arbitrary M, K, N.
     /// Grid=[M, N], Block=[32], LDS=0.
@@ -30281,6 +30397,103 @@ impl Gpu {
                 kname,
                 [grid_x as u32, take.div_ceil(NT) as u32, 1],
                 [256, 1, 1],
+                0,
+                params; wp, xp, yp, mi, ki, ni
+            )?;
+            off += take;
+        }
+        Ok(())
+    }
+
+    /// Register-tiled exact-order BF16-weight small-M GEMM `Y[N,M] = X[N,K] @ W[M,K]^T`
+    /// (`kernels/src/gemm_bf16_small_rows.hip`): the Raon MoE router (F32 `x`, any M)
+    /// and mHC selector (BF16 `x`, any M) at every row count. Bit-identical per output
+    /// to [`Self::gemm_bf16_xf32_batched`] (and so to [`Self::gemm_f32_batched`] on the
+    /// widened weight, with a BF16 activation widened exactly first): lane-strided FMA
+    /// over k, then the width-32 shuffle tree. Only the register layout differs: a CTA
+    /// owns `profile.rows()` activation rows and keeps outputs x rows accumulators in
+    /// registers, reading each weight once per row group and each activation once per
+    /// output group. The caller picks the profile from the row count
+    /// (`hipfire-dispatch` `rows_gemm`); every profile is correct at every `n`, and the
+    /// kernels require `k % BF16_SMALL_ROWS_K_MULTIPLE == 0` (the launcher rejects other
+    /// `k`; the dispatch keeps the batched kernels for them).
+    ///
+    /// `x` is read as F32 when its dtype is F32/Raw and as BF16 when it is `DType::BF16`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_small_rows(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        profile: Bf16SmallRowsProfile,
+    ) -> HipResult<()> {
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        if !k.is_multiple_of(BF16_SMALL_ROWS_K_MULTIPLE) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "BF16 small-rows GEMM needs K to be a multiple of 512",
+            ));
+        }
+        let x_bf16 = x.dtype == DType::BF16;
+        let bytes = f32_batched_extents(m, k, n).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                1,
+                "BF16 small-rows GEMM dimensions or byte extents overflow",
+            )
+        })?;
+        let x_elem = if x_bf16 { 2 } else { 4 };
+        let ok = matches!(weight.dtype, DType::BF16 | DType::Raw)
+            && (x_bf16 || matches!(x.dtype, DType::F32 | DType::Raw))
+            && y.dtype == DType::F32
+            && weight.buf.size() >= bytes[0] / 2
+            && x.buf.size() >= n * k * x_elem
+            && y.buf.size() >= bytes[2];
+        if !ok {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "BF16 small-rows GEMM needs full-window BF16 weight, F32 or BF16 activation and F32 output views",
+            ));
+        }
+        self.bind_thread()?;
+        let (kname, nt, outputs_per_cta, threads) = profile.launch(x_bf16);
+        self.ensure_kernel(
+            "gemm_bf16_small_rows",
+            kernels::GEMM_BF16_SMALL_ROWS_SRC,
+            kname,
+        )?;
+        // Chunk the grid-y extent (row-group count) at the launch limit.
+        let chunk_rows = F32_BATCHED_MAX_GRID_Y * nt;
+        let grid_x = m.div_ceil(outputs_per_cta);
+        let mut off = 0usize;
+        while off < n {
+            let take = (n - off).min(chunk_rows);
+            let mut wp = weight.buf.as_ptr();
+            let mut xp = x.buf.as_ptr().wrapping_byte_add(off * k * x_elem);
+            let mut yp = y
+                .buf
+                .as_ptr()
+                .wrapping_byte_add(off * m * std::mem::size_of::<f32>());
+            let mut mi = m as i32;
+            let mut ki = k as i32;
+            let mut ni = take as i32;
+            let mut params = [
+                &mut wp as *mut _ as *mut c_void,
+                &mut xp as *mut _ as *mut c_void,
+                &mut yp as *mut _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+            ];
+            launch_params_blob!(
+                self,
+                kname,
+                [grid_x as u32, take.div_ceil(nt) as u32, 1],
+                [threads as u32, 1, 1],
                 0,
                 params; wp, xp, yp, mi, ki, ni
             )?;

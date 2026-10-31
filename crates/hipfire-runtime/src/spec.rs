@@ -461,6 +461,35 @@ pub trait SpecTarget {
         Err("target does not expose verify_block_logits".into())
     }
 
+    /// One committed target row: feed `token` at `position` (a drafter's
+    /// one-row step, whose row is always kept), capture its feature row into
+    /// `hidden_out` as [`verify_block`](Self::verify_block) does, and return
+    /// its argmax, or its full logits when `want_logits`. Leaves the target at
+    /// `position + 1` with no verify outstanding. Since nothing is rolled back,
+    /// a target may skip the snapshot a verify takes; on `Err` the target
+    /// state is then undefined and the caller resets it (as it does on any
+    /// failed spec step). Default: a one-row verify plus
+    /// [`commit_prefix`](Self::commit_prefix).
+    fn commit_row(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        want_logits: bool,
+    ) -> Result<RowPick, String> {
+        let block = [token];
+        let pick = if want_logits {
+            RowPick::Logits(self.verify_block_logits(gpu, &block, position, scratch, hidden_out)?)
+        } else {
+            let picks = self.verify_block(gpu, &block, position, scratch, hidden_out)?;
+            RowPick::Argmax(*picks.first().ok_or("verify returned no pick")?)
+        };
+        self.commit_prefix(gpu, &block, 0, position, scratch)?;
+        Ok(pick)
+    }
+
     /// Like [`verify_block`](Self::verify_block), but captures the per-position
     /// extract-layer residual hidden into the caller-owned GPU buffer
     /// `hidden_gpu` (position-major `[n_pos × dflash_extract_layers().len() ×
@@ -568,6 +597,20 @@ pub trait SpecTarget {
     /// re-derives its base from the end position). Default: keep every row.
     fn set_dflash_feature_window(&mut self, _rows: usize) {}
 
+    /// The measured spec → AR break-even line of a DFlash2 drafter on this
+    /// target and device (`draft_quantized`: the draft carries MQ weights),
+    /// in AR decode steps per spec cycle ([`crate::spec_retire::BreakEven`]).
+    /// `Some` also arms the drafter's AR step, so a request whose drafts do
+    /// not pay continues as plain AR. Default `None`: no measured line, the
+    /// drafter never retires.
+    fn dflash_retire_break_even(
+        &self,
+        _gpu: &Gpu,
+        _draft_quantized: bool,
+    ) -> Option<crate::spec_retire::BreakEven> {
+        None
+    }
+
     /// Roll back a verify whose window will not reach
     /// [`commit_prefix`](Self::commit_prefix) (the drafter failed after the
     /// verify ran): restore whatever the verify snapshotted into `scratch`.
@@ -674,6 +717,14 @@ pub trait SpecScratch {
     /// Forget per-window state that names target state a reset discarded
     /// (an outstanding verify ticket). Default: nothing to forget.
     fn clear(&mut self) {}
+}
+
+/// Outcome of [`SpecTarget::commit_row`]: the row's argmax, or its full
+/// `vocab` logits.
+#[derive(Debug, Clone)]
+pub enum RowPick {
+    Argmax(u32),
+    Logits(Vec<f32>),
 }
 
 /// Outcome of [`SpecTarget::spec_advance`].
@@ -889,11 +940,13 @@ pub trait Speculator {
         false
     }
 
-    /// One greedy target-only token for a request the spec-retire policy
-    /// retired: feed `seed` at absolute `position` through the target, keep
+    /// One target-only token for a request the spec-retire policy retired:
+    /// feed `seed` at absolute `position` through the target, keep
     /// drafter-local per-position state in sync (a later request that hits
-    /// this prompt cache drafts from those rows), and return the target's
-    /// argmax next token. No draft runs.
+    /// this prompt cache drafts from those rows), and return the next token:
+    /// the target's argmax, or for a sampled request on a speculator with
+    /// [`Self::supports_sampled_ar_step`] a draw from the request's sampling
+    /// law. No draft runs.
     fn ar_step(
         &mut self,
         gpu: &mut Gpu,
@@ -903,6 +956,20 @@ pub trait Speculator {
     ) -> Result<u32, String> {
         let _ = (gpu, target, position, seed);
         Err(format!("{}: speculator has no AR step", self.name()))
+    }
+
+    /// Whether [`Self::ar_step`] samples a temperature > 0 request with the
+    /// request's own law (so the spec-retire policy may retire a sampled
+    /// request). Default: greedy AR steps only.
+    fn supports_sampled_ar_step(&self) -> bool {
+        false
+    }
+
+    /// The drafter's measured spec → AR break-even line for this target
+    /// ([`crate::spec_retire::BreakEven`]; `HIPFIRE_SPEC_RETIRE` overrides it).
+    /// `None`: the shared [`crate::spec_retire::DEFAULT_BREAK_EVEN`].
+    fn retire_break_even(&self) -> Option<crate::spec_retire::BreakEven> {
+        None
     }
 
     /// Repair a terminal that consumed only a strict prefix of the most recent

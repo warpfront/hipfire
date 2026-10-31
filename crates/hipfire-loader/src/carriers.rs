@@ -690,18 +690,30 @@ impl Carrier for Qwen4Carrier {
         &self,
         _arch_id: u32,
         is_dir: bool,
-        pp: usize,
+        _pp: usize,
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
         if is_dir {
             return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
         }
-        if pp == 0 || pp > QWEN4_PP_MAX {
-            return Err(format!(
-                "qwen4: topology.pp = {pp} is outside the admitted 1..={QWEN4_PP_MAX}"
-            ));
-        }
         Ok(())
+    }
+    fn topology_caps(&self) -> crate::TopologyCaps {
+        crate::TopologyCaps {
+            pp: Some(crate::PpCaps {
+                dir_sources: false,
+                max_degree: QWEN4_PP_MAX,
+                executor: crate::PpExecutor::Mesh {
+                    numerical_policy: crate::admission::QWEN4_PP_NUMERICAL_POLICY,
+                    first_band_min_layers: crate::admission::QWEN4_PP_FIRST_BAND_MIN_LAYERS,
+                },
+                bench: crate::PpBenchRoute::Qwen4Pp,
+            }),
+            ep: Some(crate::EpCaps {
+                kill_switch_env: Some(hipfire_config::topology::QWEN4_EP_KILL_SWITCH_ENV),
+            }),
+            tp: None,
+        }
     }
     fn admit_options(
         &self,
@@ -8293,7 +8305,8 @@ pub(crate) fn qwen4_pp_mesh_refusal(
 /// is replaced by the admitted one, so `devices[r]` is exactly logical rank
 /// `r`. A device the admitted ranks do not name refuses before any model
 /// allocation.
-fn init_qwen4_pp_gpus(
+pub fn init_pp_gpus(
+    family: &str,
     admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
     placement: &hipfire_runtime::mesh_placement::BandPlacement,
 ) -> Result<hipfire_runtime::multi_gpu::Gpus, String> {
@@ -8307,16 +8320,15 @@ fn init_qwen4_pp_gpus(
         || ordinals.len() != admitted.ranks.len()
         || ordinals.iter().any(|ordinal| *ordinal < 0)
     {
-        return Err(
-            "qwen4: topology.pp admitted ranks must be one distinct, non-negative device per band"
-                .into(),
-        );
+        return Err(format!(
+            "{family}: topology.pp admitted ranks must be one distinct, non-negative device per band"
+        ));
     }
     let counts: Vec<usize> = (0..placement.stages())
         .map(|stage| placement.band(stage).len())
         .collect();
     let mut gpus = hipfire_runtime::multi_gpu::Gpus::init_layers(&counts)
-        .map_err(|error| format!("qwen4: topology.pp device initialization failed: {error}"))?;
+        .map_err(|error| format!("{family}: topology.pp device initialization failed: {error}"))?;
     let mut pool: Vec<Option<rdna_compute::Gpu>> = std::mem::take(&mut gpus.devices)
         .into_iter()
         .map(Some)
@@ -8331,7 +8343,7 @@ fn init_qwen4_pp_gpus(
             Some(device) => ordered.push(device),
             None => {
                 return Err(format!(
-                    "qwen4: topology.pp rank {} names device {}, which the process did not open \
+                    "{family}: topology.pp rank {} names device {}, which the process did not open \
                      for {} pipeline ranks",
                     rank.logical,
                     rank.device_ordinal,
@@ -8348,10 +8360,79 @@ fn init_qwen4_pp_gpus(
     // share one ordered stream per device.
     for (rank, gpu) in gpus.devices.iter_mut().enumerate() {
         gpu.ensure_capture_stream().map_err(|error| {
-            format!("qwen4: topology.pp rank {rank} launch stream creation failed: {error}")
+            format!("{family}: topology.pp rank {rank} launch stream creation failed: {error}")
         })?;
     }
     Ok(gpus)
+}
+
+/// Structural re-check of an admitted pipeline mesh at load, before any
+/// device beyond the daemon's is touched, for a carrier on the generic mesh
+/// executor (`PpExecutor::Mesh`): `pp` ranks with `tp = ep = 1`, one rank per
+/// band in logical order, every rank the daemon's architecture, and the
+/// daemon's own device (the owner of generation buffers) the output rank.
+/// Admission already refused anything else; this keeps the carrier from
+/// loading against a mesh it was not admitted for.
+pub fn pp_mesh_load_check(
+    family: &str,
+    admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
+    placement: &hipfire_runtime::mesh_placement::BandPlacement,
+    pp: usize,
+    daemon_device: i32,
+    daemon_arch: &str,
+) -> Result<(), String> {
+    use hipfire_runtime::device_mesh::DimKind;
+    let mesh = &admitted.mesh;
+    if mesh.size_of(DimKind::Pp) != pp
+        || mesh.size_of(DimKind::Tp) != 1
+        || mesh.size_of(DimKind::Ep) != 1
+        || mesh.n_devices() != pp
+        || admitted.ranks.len() != pp
+        || placement.stages() != pp
+    {
+        return Err(format!(
+            "{family}: topology.pp admits pipeline parallelism with tp = ep = 1 only; the admitted \
+             mesh, ranks and band placement disagree about pp = {pp}"
+        ));
+    }
+    placement
+        .validate_for(mesh, placement.n_trunk_layers)
+        .map_err(|error| format!("{family}: topology.pp band placement: {error}"))?;
+    for (index, rank) in admitted.ranks.iter().enumerate() {
+        if rank.logical != index {
+            return Err(format!(
+                "{family}: topology.pp rank {index} carries logical id {}",
+                rank.logical
+            ));
+        }
+        if rank.arch != daemon_arch {
+            return Err(format!(
+                "{family}: topology.pp admits homogeneous ranks only; rank {index} is {} while \
+                 the output device is {daemon_arch}",
+                rank.arch
+            ));
+        }
+    }
+    let output = admitted
+        .ranks
+        .last()
+        .ok_or_else(|| format!("{family}: topology.pp mesh has no ranks"))?;
+    if output.device_ordinal != daemon_device {
+        return Err(format!(
+            "{family}: topology.pp output rank is device {} but the daemon's generation device is \
+             {daemon_device}; generation buffers must live on the output card",
+            output.device_ordinal
+        ));
+    }
+    Ok(())
+}
+
+/// Qwen4's mesh-PP device bring-up: [`init_pp_gpus`] for the `qwen4` family.
+fn init_qwen4_pp_gpus(
+    admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
+    placement: &hipfire_runtime::mesh_placement::BandPlacement,
+) -> Result<hipfire_runtime::multi_gpu::Gpus, String> {
+    init_pp_gpus("qwen4", admitted, placement)
 }
 
 /// Unwind a failed PP load: drain the edge leases first (nothing was
@@ -9012,19 +9093,82 @@ impl Carrier for Qwen35Carrier {
     fn mtp_measured_ar_floor(&self) -> bool {
         hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR
     }
-    fn admit_topology(
-        &self,
-        _arch_id: u32,
-        is_dir: bool,
-        pp: usize,
-        _kv_backend: KvBackend,
-    ) -> Result<(), String> {
-        // Qwen3.5 is the only carrier with a pp>1 path (load_qwen35_pp), HFQ
-        // only. Dir + pp>1 is refused; VMM + pp>1 is refused globally upstream.
-        if pp > 1 && is_dir {
-            return Err(crate::pp_unsupported_message("qwen35", true, pp));
+    fn topology_caps(&self) -> crate::TopologyCaps {
+        crate::TopologyCaps {
+            // The hand-rolled per-layer loop (`load_qwen35_pp`), HFQ only.
+            pp: Some(crate::PpCaps {
+                dir_sources: false,
+                max_degree: hipfire_config::topology::PP_MAX_DEGREE,
+                executor: crate::PpExecutor::Legacy,
+                bench: crate::PpBenchRoute::Qwen35Pp,
+            }),
+            ep: None,
+            // Dense -> tensor parallel, MoE -> expert parallel; HFQ only.
+            tp: Some(crate::TpCaps { dir_sources: false }),
         }
-        Ok(())
+    }
+    fn pp_layer_count(&self, src: &ModelSource) -> Result<usize, String> {
+        match src {
+            ModelSource::Hfq(h) => hipfire_arch_qwen35::qwen35::config_from_hfq(h),
+            ModelSource::Dir(d) => hipfire_arch_qwen35::qwen35::config_from_safetensors(d),
+        }
+        .map(|cfg| cfg.n_layers)
+        .map_err(|e| format!("Qwen KV admission config: {e}"))
+    }
+    fn tp_mesh_axis(
+        &self,
+        src: &ModelSource,
+        tp: usize,
+    ) -> Result<hipfire_runtime::device_mesh::DimKind, String> {
+        // Density probe (HFQ-only): dense (`num_experts == 0`) runs the
+        // dense-TP path on the Tp axis; MoE shards its experts on the Ep
+        // axis where the sealed per-rank loader admits (tp=2|4, experts
+        // divide evenly), with the loader's exact refusal text.
+        let ModelSource::Hfq(hfq) = src else {
+            return Err("expert parallelism for Qwen3.5 needs an HFQ model file, not a safetensors directory; load a single HFQ file or set tp=1".to_string());
+        };
+        let num_experts = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+            .map_err(|e| format!("qwen35 config: {e}"))?
+            .num_experts;
+        if let Some(refusal) = crate::qwen35_ep_moe_topology_refusal(hfq.arch_id, num_experts, tp) {
+            return Err(refusal);
+        }
+        Ok(if num_experts > 0 {
+            hipfire_runtime::device_mesh::DimKind::Ep
+        } else {
+            hipfire_runtime::device_mesh::DimKind::Tp
+        })
+    }
+    fn load_tp(
+        &self,
+        admission: crate::admission::SourceAdmission,
+        args: crate::TpLoadArgs<'_>,
+    ) -> Result<LoadedModel, String> {
+        crate::load_model_ep_qwen35(
+            args.path,
+            admission.max_seq,
+            args.tp,
+            args.kv_mode,
+            args.kv_k,
+            args.kv_v,
+            admission.qwen_default_q8,
+            Some(admission.kv_backend.as_str()),
+            args.state_quant,
+            args.mtp_path,
+            args.spec,
+        )
+    }
+    fn load_tp_with_compressor_cache(
+        &self,
+        path: &str,
+        max_seq: usize,
+        tp: usize,
+        compressor_cache: hipfire_config::Deepseek4CompressorCache,
+    ) -> Result<LoadedModel, String> {
+        if compressor_cache != hipfire_config::Deepseek4CompressorCache::F32 {
+            return Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to Qwen3.5 models; remove it for this model".to_string());
+        }
+        crate::load_model_ep_with_kv_mode(path, max_seq, tp, None, None, None)
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -10166,6 +10310,41 @@ impl Carrier for Deepseek4Carrier {
     fn name(&self) -> &'static str {
         "deepseek4"
     }
+    fn topology_caps(&self) -> crate::TopologyCaps {
+        crate::TopologyCaps {
+            tp: Some(crate::TpCaps { dir_sources: false }),
+            ..crate::TopologyCaps::default()
+        }
+    }
+    fn tp_mesh_axis(
+        &self,
+        _src: &ModelSource,
+        _tp: usize,
+    ) -> Result<hipfire_runtime::device_mesh::DimKind, String> {
+        Ok(hipfire_runtime::device_mesh::DimKind::Ep)
+    }
+    fn load_tp(
+        &self,
+        admission: crate::admission::SourceAdmission,
+        args: crate::TpLoadArgs<'_>,
+    ) -> Result<LoadedModel, String> {
+        crate::load_model_ep_ds4(
+            args.path,
+            admission.max_seq,
+            args.tp,
+            crate::resolve_deepseek4_compressor_cache_kv_mode(args.kv_mode)?,
+            admission.kv_backend,
+        )
+    }
+    fn load_tp_with_compressor_cache(
+        &self,
+        path: &str,
+        max_seq: usize,
+        tp: usize,
+        compressor_cache: hipfire_config::Deepseek4CompressorCache,
+    ) -> Result<LoadedModel, String> {
+        crate::load_model_ep_ds4(path, max_seq, tp, compressor_cache, KvBackend::Vmm)
+    }
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
@@ -10402,6 +10581,38 @@ pub struct MinimaxCarrier;
 impl Carrier for MinimaxCarrier {
     fn name(&self) -> &'static str {
         "minimax"
+    }
+    fn topology_caps(&self) -> crate::TopologyCaps {
+        crate::TopologyCaps {
+            tp: Some(crate::TpCaps { dir_sources: false }),
+            ..crate::TopologyCaps::default()
+        }
+    }
+    fn tp_mesh_axis(
+        &self,
+        _src: &ModelSource,
+        _tp: usize,
+    ) -> Result<hipfire_runtime::device_mesh::DimKind, String> {
+        Ok(hipfire_runtime::device_mesh::DimKind::Ep)
+    }
+    fn load_tp(
+        &self,
+        admission: crate::admission::SourceAdmission,
+        args: crate::TpLoadArgs<'_>,
+    ) -> Result<LoadedModel, String> {
+        crate::load_model_ep_minimax(args.path, admission.max_seq, args.tp)
+    }
+    fn load_tp_with_compressor_cache(
+        &self,
+        path: &str,
+        max_seq: usize,
+        tp: usize,
+        compressor_cache: hipfire_config::Deepseek4CompressorCache,
+    ) -> Result<LoadedModel, String> {
+        if compressor_cache != hipfire_config::Deepseek4CompressorCache::F32 {
+            return Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to MiniMax models; remove it for this model".to_string());
+        }
+        crate::load_model_ep_minimax(path, max_seq, tp)
     }
     fn spec_target_guard<'m>(
         &self,
@@ -10677,6 +10888,120 @@ impl Carrier for Lfm2MoeCarrier {
 
 // ─── RaonCarrier ─────────────────────────────────────────────────────
 
+/// Largest `topology.pp` the Raon band route admits.
+const RAON_PP_MAX: usize = 8;
+
+/// Numerical-policy identity of the Raon pipeline route: every band edge is
+/// the mHC stream tensor at a layer boundary, so any cut executes the same
+/// kernels on the same bits as the whole model (cut-exact; `raon_mesh_oracle`
+/// pins it at cuts 1, 13 and 24).
+const RAON_PP_NUMERICAL_POLICY: &str = "raon-pp-cut-exact-v1";
+
+/// The `RaonCarrier` load of a `topology.pp` 2..=8 model: the carrier's
+/// option refusals and the admitted-mesh re-check before any device beyond the
+/// daemon's is touched, then one band per rank on the generic mesh executor
+/// ([`hipfire_arch_raon::RaonMeshModel`]). `LoadedModel.pp` is the admitted
+/// degree and `pp_gpus` holds the generic `Gpus` (the sole hardware owner,
+/// `!Send`, so it cannot live in the `Send` model state). The engine session
+/// cache is not attached: its snapshots are whole-model, single-device state.
+fn load_raon_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    use hipfire_arch_raon as raon;
+    let pp = ctx.pp;
+    raon::carrier::pp_option_refusal(pp, ctx.draft_path, ctx.spec)?;
+    let ep = hipfire_config::topology::ep()?;
+    if ep > 1 {
+        return Err(format!(
+            "raon1_mini: topology.pp = {pp} cannot combine with expert parallelism (topology.ep = {ep})"
+        ));
+    }
+    let (Some(admitted), Some(placement)) = (ctx.admitted_mesh, ctx.band_placement) else {
+        return Err(format!(
+            "raon1_mini: topology.pp = {pp} needs the admitted mesh and band placement from \
+             source admission"
+        ));
+    };
+    pp_mesh_load_check(
+        "raon1_mini",
+        admitted,
+        placement,
+        pp,
+        ctx.gpu.device_id,
+        &ctx.gpu.arch,
+    )?;
+    if ctx.gpu.is_uma() {
+        return Err("raon1_mini: topology.pp needs discrete GPUs".into());
+    }
+    ctx.gpu
+        .emu_refuse_multi_device("raon1_mini topology.pp")
+        .map_err(|error| format!("raon1_mini: {error}"))?;
+    let meta = resolve_source_meta(&src, ctx.path)?;
+    let ModelSource::Hfq(hfq) = &src else {
+        return Err("raon1_mini: topology.pp needs a single quantized .hfq source".into());
+    };
+    let config = raon::RaonConfig::from_hfq(hfq)?;
+    if ctx.max_seq == 0 || ctx.max_seq > config.max_position {
+        return Err(format!(
+            "raon1_mini: max_seq {} outside 1..={}",
+            ctx.max_seq, config.max_position
+        ));
+    }
+    let edge_rows = raon::mesh_edge_rows(ctx.max_seq);
+    let edge_bytes = raon::RaonMeshModel::edge_capacity_bytes(&config, edge_rows)?;
+    let mut gpus = init_pp_gpus("raon1_mini", admitted, placement)?;
+    gpus.provision_mesh_edges(admitted, placement, edge_bytes)
+        .map_err(|error| format!("raon1_mini: topology.pp edge provisioning failed: {error}"))?;
+    let model = match raon::load_raon_mesh_model(src, &mut gpus, placement, ctx.max_seq) {
+        Ok(model) => model,
+        Err(error) => {
+            for device in gpus.devices.iter_mut() {
+                let _ = device.bind_thread();
+                device.invalidate_weight_caches();
+                device.invalidate_graph_state();
+                device.drain_pool();
+            }
+            return Err(error);
+        }
+    };
+    let ranks: Vec<String> = (0..placement.stages())
+        .map(|rank| {
+            format!(
+                "layers {:?} on device {}",
+                placement.band(rank),
+                admitted.ranks[rank].device_ordinal
+            )
+        })
+        .collect();
+    eprintln!(
+        "raon1_mini PP plan: {} bands ({}), prefill chunk {} rows, edge payload up to {} MiB",
+        placement.stages(),
+        ranks.join("; "),
+        model.prefill_chunk_rows(),
+        edge_bytes >> 20,
+    );
+    hipfire_config::load_summary::note(
+        hipfire_config::load_summary::Facet::Placement,
+        format!("pipeline-parallel x{pp}: {}", ranks.join("; ")),
+    );
+    hipfire_config::load_summary::note(
+        hipfire_config::load_summary::Facet::Prefill,
+        format!("chunk {} rows", model.prefill_chunk_rows()),
+    );
+    Ok(LoadedModel {
+        state: Some(Box::new(model)),
+        pp,
+        pp_gpus: Some(gpus),
+        ..LoadedModel::skeleton(
+            meta.arch_id,
+            meta.tokenizer,
+            ctx.max_seq,
+            ctx.max_seq,
+            ctx.path.to_string(),
+            meta.chat_template,
+            meta.chat_template_source,
+        )
+    })
+}
+
 pub struct RaonCarrier;
 impl Carrier for RaonCarrier {
     fn name(&self) -> &'static str {
@@ -10704,6 +11029,32 @@ impl Carrier for RaonCarrier {
         // struct carries only temp/top_p/repeat_penalty).
         saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
     }
+    fn topology_caps(&self) -> crate::TopologyCaps {
+        crate::TopologyCaps {
+            // Pipeline parallelism on the generic mesh executor: layer bands
+            // (`RaonMeshModel`), one band per device, HFQ only. The cut is the
+            // mHC stream tensor at a layer boundary, so any split is exact.
+            pp: Some(crate::PpCaps {
+                dir_sources: false,
+                max_degree: RAON_PP_MAX,
+                executor: crate::PpExecutor::Mesh {
+                    numerical_policy: RAON_PP_NUMERICAL_POLICY,
+                    first_band_min_layers: 1,
+                },
+                bench: crate::PpBenchRoute::Carrier,
+            }),
+            ep: None,
+            tp: None,
+        }
+    }
+    fn admit_pp_options(
+        &self,
+        pp: usize,
+        draft_path: Option<&str>,
+        options: crate::admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        hipfire_arch_raon::carrier::pp_option_refusal(pp, draft_path, options.spec)
+    }
     fn bench_prefill(
         &self,
         m: &mut crate::LoadedModel,
@@ -10712,6 +11063,17 @@ impl Carrier for RaonCarrier {
         _n: usize,
         prefill_err: &mut Option<String>,
     ) -> Option<bool> {
+        if let Some((mesh, gpus)) = m.raon_mesh_mut() {
+            // The mesh drains every epoch and syncs every rank; the daemon
+            // `gpu` is not a model device here.
+            return match mesh.bench_prefill_rows(gpus, synthetic.len()) {
+                Ok(()) => Some(true),
+                Err(e) => {
+                    *prefill_err = Some(format!("raon1_mini bench prefill: {e}"));
+                    Some(false)
+                }
+            };
+        }
         let bundle = m.raon_mut()?;
         match bundle.bench_prefill_rows(gpu, synthetic.len()) {
             Ok(()) => Some(true),
@@ -10750,6 +11112,20 @@ impl Carrier for RaonCarrier {
         iterations: usize,
         decode_err: &mut Option<String>,
     ) -> Option<bool> {
+        if let Some((mesh, gpus)) = m.raon_mesh_mut() {
+            let (_, _, vocab) = mesh.dims();
+            let vocab = vocab as u64;
+            let lo = 1024u64.min(vocab.saturating_sub(1));
+            let span = vocab - lo;
+            for i in 0..iterations as u64 {
+                let token = (lo + i.wrapping_mul(2654435761).wrapping_add(17) % span) as u32;
+                if let Err(e) = mesh.decode_step(gpus, token) {
+                    *decode_err = Some(format!("raon1_mini bench decode step {i}: {e}"));
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
         let Some(bundle) = m.raon_mut() else {
             *decode_err = Some("raon1_mini bench decode missing state".into());
             return Some(false);
@@ -10793,6 +11169,9 @@ impl Carrier for RaonCarrier {
         Ok(Qwen35Emit::from_ctx_template_think_close(ctx))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return load_raon_pp_model(src, ctx);
+        }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         // `load_raon_bundle` refuses every speculation request this arch
@@ -10913,18 +11292,6 @@ impl Carrier for Cohere2MoeCarrier {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
     }
-    fn admit_topology(
-        &self,
-        _arch_id: u32,
-        is_dir: bool,
-        pp: usize,
-        _kv_backend: KvBackend,
-    ) -> Result<(), String> {
-        if pp > 1 {
-            return Err(crate::pp_unsupported_message("cohere2moe", is_dir, pp));
-        }
-        Ok(())
-    }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -11039,18 +11406,6 @@ impl Carrier for MapleCarrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 15
-    }
-    fn admit_topology(
-        &self,
-        _arch_id: u32,
-        is_dir: bool,
-        pp: usize,
-        _kv_backend: KvBackend,
-    ) -> Result<(), String> {
-        if pp > 1 {
-            return Err(crate::pp_unsupported_message("maple", is_dir, pp));
-        }
-        Ok(())
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -11173,18 +11528,6 @@ impl Carrier for Gemma4Carrier {
         // "no carrier" error and keeps the two namespaces aligned. Primary serve of 22 alone
         // would still need a target model, so it naturally fails later in generate routing.
         matches!(arch_id, 13 | 22)
-    }
-    fn admit_topology(
-        &self,
-        _arch_id: u32,
-        is_dir: bool,
-        pp: usize,
-        _kv_backend: KvBackend,
-    ) -> Result<(), String> {
-        if pp > 1 {
-            return Err(crate::pp_unsupported_message("gemma4", is_dir, pp));
-        }
-        Ok(())
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {

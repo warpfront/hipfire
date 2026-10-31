@@ -58,7 +58,7 @@ use crate::moe::{
     RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs, RaonMoeScratch,
 };
 use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
-use crate::projection::{project, OutRound};
+use crate::projection::{prepare_a8, project, project_prepared, OutRound};
 use crate::rda::{
     rda_forward_rows_taped, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
     RdaTape,
@@ -140,14 +140,19 @@ impl RaonWork {
 
     /// Device bytes of the work for `rows` rows once the bundle is assembled
     /// (every module buffer plus the packed absorbed MLA weights): what the
-    /// prefill chunk admission charges against free memory.
-    pub fn required_bytes(cfg: &RaonConfig, rows: usize) -> Result<usize, String> {
+    /// prefill chunk admission charges against free memory. `chunked_rda_arch`: the device has
+    /// the chunked RDA kernel ([`Gpu::gated_delta_vector_chunked_arch_supported`]).
+    pub fn required_bytes(
+        cfg: &RaonConfig,
+        rows: usize,
+        chunked_rda_arch: bool,
+    ) -> Result<usize, String> {
         if rows == 0 {
             return Err("raon work: rows == 0".into());
         }
         let (mhc_shape, rda_geom, moe_dims) = Self::shapes(cfg)?;
         Ok(RaonMhcWork::required_bytes(&mhc_shape, rows)
-            + RdaScratch::required_bytes(&rda_geom, rows)
+            + RdaScratch::required_bytes(&rda_geom, rows, chunked_rda_arch)
             + RaonMoeScratch::required_bytes(&moe_dims, rows)?
             + RaonDenseScratch::required_bytes(&moe_dims, rows)?
             + RaonMlaWork::required_bytes(cfg, rows)?)
@@ -251,6 +256,9 @@ fn free_rda_scratch(gpu: &mut Gpu, r: RdaScratch) {
     ] {
         let _ = gpu.free_tensor(t);
     }
+    if let Some(c) = r.chunk {
+        let _ = gpu.free_gated_delta_vector_chunk_scratch(c);
+    }
 }
 
 // ───────────────────────── taps ─────────────────────────
@@ -271,7 +279,9 @@ pub enum TapSite {
 }
 
 /// Observer of the stream state (`[rows, streams, hidden]` F32 holding BF16
-/// values). Oracle only: a tap downloads and is not graph-capturable.
+/// values). Oracle only: a tap downloads and is not graph-capturable. With BF16
+/// stream planes (`HIPFIRE_RAON_MHC_BF16_STREAMS=1`) the forward widens them
+/// exactly into a temporary F32 tensor first, so a tap always sees F32.
 pub type LayerTap<'a> =
     &'a mut dyn FnMut(&mut Gpu, TapSite, &GpuTensor, usize) -> Result<(), String>;
 
@@ -281,11 +291,23 @@ fn fire(
     site: TapSite,
     streams: &GpuTensor,
     rows: usize,
+    width: usize,
 ) -> Result<(), String> {
-    if let Some(t) = tap.as_mut() {
-        (**t)(gpu, site, streams, rows)?;
+    let Some(t) = tap.as_mut() else {
+        return Ok(());
+    };
+    if streams.dtype != rdna_compute::DType::BF16 {
+        return (**t)(gpu, site, streams, rows);
     }
-    Ok(())
+    let wide = gpu
+        .alloc_tensor(&[rows, width], rdna_compute::DType::F32)
+        .map_err(|e| format!("raon1_mini: tap staging alloc: {e:?}"))?;
+    let r = gpu
+        .stream_mix_widen_rows(streams, &wide, rows, width, width, 0)
+        .map_err(|e| format!("raon1_mini: tap widen: {e:?}"))
+        .and_then(|()| (**t)(gpu, site, &wide, rows));
+    let _ = gpu.free_tensor(wide);
+    r
 }
 
 /// Fire a stage tap with the first `rows` rows of a `[cap_rows, width]` plane
@@ -319,7 +341,7 @@ fn fire_stage_width(
         return Ok(());
     }
     let view = t.sub_offset(0, rows * width);
-    fire(tap, gpu, TapSite::Stage(layer, name), &view, rows)
+    fire(tap, gpu, TapSite::Stage(layer, name), &view, rows, width)
 }
 
 /// Census taps of an mHC site's controls (`prefix` is `attn` or `ffn`).
@@ -557,6 +579,16 @@ fn capture_streams(
 ) -> Result<(), String> {
     let width = cfg.mhc_streams * cfg.hidden;
     let (dst_stride, dst_col) = capture_geometry(cap.layers.len(), width, cap.row0, k);
+    if streams.dtype == rdna_compute::DType::BF16 {
+        return gpu
+            .stream_mix_widen_rows(streams, cap.dst, rows, width, dst_stride, dst_col)
+            .map_err(|e| {
+                format!(
+                    "raon1_mini: DFlash capture of layer {}: {e:?}",
+                    cap.layers[k]
+                )
+            });
+    }
     gpu.copy_rows_strided_f32(
         streams, cap.dst, rows, width, width, dst_stride, dst_col, None,
     )
@@ -669,19 +701,24 @@ fn run_mix(gpu: &mut Gpu, op: &StreamMixOp<'_>) -> Result<(), String> {
 }
 
 /// Controls of one site from the OLD streams (selector/params are the loaded
-/// `[17, n*hidden]` F32 matrix and the F32 parameter vector of the site).
-fn mhc_route(
+/// `[17, n*hidden]` BF16 (or F32) matrix and the F32 parameter vector of the
+/// site) and its branch input `out = RMSNorm(round(sum_s pre_s X_s))`. One stage:
+/// with `HIPFIRE_RAON_MHC_FUSED=1` the old streams are read once for the weightless
+/// RMS and the aggregate; otherwise the stage launches route then aggregate.
+fn mhc_route_aggregate(
     gpu: &mut Gpu,
     work: &RaonWork,
     site: &MhcSiteWeights,
     rows: usize,
     streams: &GpuTensor,
+    norm: StreamNorm<'_>,
+    out: &GpuTensor,
 ) -> Result<(), String> {
     let shape = &work.mhc_shape;
     let op = mix_op(
         shape,
         rows,
-        StreamMixStage::Route {
+        StreamMixStage::RouteAggregate {
             streams,
             chart: StreamChart::HelmertBounded {
                 selector: &site.selector.buf,
@@ -690,25 +727,6 @@ fn mhc_route(
                 selector_eps: shape.selector_eps,
             },
             selector_out: work.mhc.selector_out(),
-            controls: work.mhc.controls(),
-        },
-    );
-    run_mix(gpu, &op)
-}
-
-fn mhc_aggregate(
-    gpu: &mut Gpu,
-    work: &RaonWork,
-    rows: usize,
-    streams: &GpuTensor,
-    norm: StreamNorm<'_>,
-    out: &GpuTensor,
-) -> Result<(), String> {
-    let op = mix_op(
-        &work.mhc_shape,
-        rows,
-        StreamMixStage::Aggregate {
-            streams,
             controls: work.mhc.controls(),
             norm: Some(norm),
             out,
@@ -764,10 +782,14 @@ fn rda_mixer(
     };
     let qkvg = work.site_tiers.get(RaonPrecisionSite::RdaQkvg);
     let f16 = PrefillActTier::F16;
-    project(gpu, &w.q_proj, x, q_raw, rows, b, qkvg)?;
-    project(gpu, &w.k_proj, x, k_raw, rows, b, qkvg)?;
-    project(gpu, &w.v_proj, x, v_raw, rows, b, qkvg)?;
-    project(gpu, &w.g_proj, x, &scratch.rda_z, rows, b, qkvg)?;
+    // One A8 quantization of `x` serves q/k/v/g (same tier, same input); `None` -> each projection
+    // takes its ordinary route (reuse off, rows < 64, graph capture, non-A8 tier).
+    let prep = prepare_a8(gpu, &w.q_proj, x, rows, qkvg)?;
+    let prep = prep.as_ref();
+    project_prepared(gpu, &w.q_proj, x, q_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.k_proj, x, k_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.v_proj, x, v_raw, rows, b, qkvg, prep)?;
+    project_prepared(gpu, &w.g_proj, x, &scratch.rda_z, rows, b, qkvg, prep)?;
     project(gpu, &w.b_proj, x, &scratch.rda_b, rows, b, f16)?;
     project(gpu, &w.rda_w_proj, x, &scratch.rda_delta, rows, b, f16)?;
     project(gpu, &w.f_a_proj, x, &scratch.rda_f_lat, rows, b, f16)?;
@@ -941,9 +963,25 @@ fn mla_mixer(
     let q_tier = work.site_tiers.get(RaonPrecisionSite::MlaQ);
     let kv_tier = work.site_tiers.get(RaonPrecisionSite::MlaKv);
     let go_tier = work.site_tiers.get(RaonPrecisionSite::MlaGo);
-    project(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b, q_tier)?;
-    project(gpu, &w.kv_a_proj, x, &scratch.mla_kv_a, rows, b, kv_tier)?;
-    project(gpu, &w.g_proj, x, &scratch.mla_g, rows, b, go_tier)?;
+    // q_a / kv_a / g read the same `x`: quantize it once for whichever of them runs A8.
+    let prep = if [q_tier, kv_tier, go_tier].contains(&PrefillActTier::A8) {
+        prepare_a8(gpu, &w.q_a_proj, x, rows, PrefillActTier::A8)?
+    } else {
+        None
+    };
+    let prep = prep.as_ref();
+    project_prepared(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b, q_tier, prep)?;
+    project_prepared(
+        gpu,
+        &w.kv_a_proj,
+        x,
+        &scratch.mla_kv_a,
+        rows,
+        b,
+        kv_tier,
+        prep,
+    )?;
+    project_prepared(gpu, &w.g_proj, x, &scratch.mla_g, rows, b, go_tier, prep)?;
 
     run_latent(
         gpu,
@@ -1248,12 +1286,13 @@ pub(crate) fn embed_lookup(
     rows: usize,
     out: &GpuTensor,
 ) -> Result<(), String> {
+    let embed = w.embed_table()?;
     let res = match w.embed_format {
         EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8_batched(&w.embed, out, &scratch.token_ids, rows, cfg.hidden)
+            gpu.embedding_lookup_q8_batched(embed, out, &scratch.token_ids, rows, cfg.hidden)
         }
         EmbeddingFormat::F32 => {
-            gpu.embedding_lookup_f32_batched(&w.embed, out, &scratch.token_ids, rows, cfg.hidden)
+            gpu.embedding_lookup_f32_batched(embed, out, &scratch.token_ids, rows, cfg.hidden)
         }
         other => {
             return Err(format!(
@@ -1308,13 +1347,13 @@ pub fn readout_logits(
     let width = cfg.mhc_streams * cfg.hidden;
     let view = scratch.stream_a.sub_offset(row0 * width, count * width);
     let norm = StreamNorm {
-        gamma: &w.final_norm,
+        gamma: w.final_norm_weight()?,
         eps: cfg.rms_eps,
     };
     final_mean_norm(gpu, &work.mhc_shape, count, &view, norm, &scratch.branch_in)?;
     project(
         gpu,
-        &w.lm_head,
+        w.lm_head_weight()?,
         &scratch.branch_in,
         out,
         count,
@@ -1340,6 +1379,7 @@ fn forward_impl(
     capture: Option<&DflashCapture<'_>>,
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
+    require_whole_band(w, "token/row forward")?;
     let rows = tokens.len();
     if rows == 0 || rows > scratch.rows || rows > work.rows {
         return Err(format!(
@@ -1466,7 +1506,7 @@ pub fn decode_body(
         gpu,
         1,
         s.n_tokens(),
-        true,
+        w.band.is_last(),
         &mut None,
         None,
         None,
@@ -1491,6 +1531,7 @@ pub(crate) fn verify_body(
     capture: Option<&DflashCapture<'_>>,
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
+    require_whole_band(w, "verify forward")?;
     if let Some(cap) = capture {
         cap.check(cfg, rows)?;
     }
@@ -1541,8 +1582,8 @@ pub(crate) fn rows_binding(
 ) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x100_0000_01b3);
-    mix(w.embed.buf.as_ptr() as u64);
-    mix(w.lm_head.buf.buf.as_ptr() as u64);
+    mix(w.embed.as_ref().map_or(0, |t| t.buf.as_ptr() as u64));
+    mix(w.lm_head.as_ref().map_or(0, |t| t.buf.buf.as_ptr() as u64));
     mix(s.seq_len.buf.as_ptr() as u64);
     for t in s
         .rda
@@ -1594,8 +1635,19 @@ fn forward_body(
     capture: Option<&DflashCapture<'_>>,
     ring: Option<&RdaRing<'_>>,
 ) -> Result<(), String> {
-    embed_staged(cfg, w, scratch, work, gpu, rows)?;
-    fire(tap, gpu, TapSite::Embedding, &scratch.stream_a, rows)?;
+    // A band past the first receives its streams in `scratch.stream_a` (rows
+    // `[0, rows)`) from the previous band instead of embedding.
+    if w.band.is_first() {
+        embed_staged(cfg, w, scratch, work, gpu, rows)?;
+        fire(
+            tap,
+            gpu,
+            TapSite::Embedding,
+            &scratch.stream_a,
+            rows,
+            cfg.mhc_streams * cfg.hidden,
+        )?;
+    }
 
     let mut ctx = DispatchCtx::new(gpu);
     ctx.batch_size = rows;
@@ -1613,11 +1665,10 @@ fn forward_body(
             } else {
                 (&scratch.stream_b, &scratch.stream_a)
             };
-            mhc_route(gpu, work, &layer.attn_mhc, rows, cur)?;
-            stage_route(tap, gpu, work, l, rows, "attn")?;
-            mhc_aggregate(
+            mhc_route_aggregate(
                 gpu,
                 work,
+                &layer.attn_mhc,
                 rows,
                 cur,
                 StreamNorm {
@@ -1626,6 +1677,9 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            // The fused stage still writes the selector and control planes, so the census taps
+            // them after it (one stage, same planes as the unfused route).
+            stage_route(tap, gpu, work, l, rows, "attn")?;
             fire_stage_scratch(
                 tap,
                 gpu,
@@ -1680,6 +1734,7 @@ fn forward_body(
                 &scratch.stream_b
             },
             rows,
+            cfg.mhc_streams * cfg.hidden,
         )?;
 
         // ── FFN site ──
@@ -1689,11 +1744,10 @@ fn forward_body(
             } else {
                 (&scratch.stream_b, &scratch.stream_a)
             };
-            mhc_route(gpu, work, &layer.ffn_mhc, rows, cur)?;
-            stage_route(tap, gpu, work, l, rows, "ffn")?;
-            mhc_aggregate(
+            mhc_route_aggregate(
                 gpu,
                 work,
+                &layer.ffn_mhc,
                 rows,
                 cur,
                 StreamNorm {
@@ -1702,6 +1756,7 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            stage_route(tap, gpu, work, l, rows, "ffn")?;
             // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`):
             // names this layer and its first row's position; a no-op when both are unset.
             hipfire_dispatch::pipeline::moe_capture::set_site(l, start);
@@ -1730,6 +1785,7 @@ fn forward_body(
                 &scratch.stream_b
             },
             rows,
+            cfg.mhc_streams * cfg.hidden,
         )?;
         if let Some(cap) = capture {
             if let Some(k) = cap.layers.iter().position(|&id| id == l) {
@@ -1757,13 +1813,13 @@ fn forward_body(
         let width = cfg.mhc_streams * cfg.hidden;
         let view = scratch.stream_a.sub_offset(last * width, width);
         let norm = StreamNorm {
-            gamma: &w.final_norm,
+            gamma: w.final_norm_weight()?,
             eps,
         };
         final_mean_norm(gpu, &work.mhc_shape, 1, &view, norm, &scratch.final_norm)?;
         project(
             gpu,
-            &w.lm_head,
+            w.lm_head_weight()?,
             &scratch.final_norm,
             &scratch.logits,
             1,
@@ -1950,6 +2006,173 @@ pub fn forward_rows_verify_tapped(
         capture,
         ring,
     )
+}
+
+// ───────────────────────── band forward ─────────────────────────
+//
+// A band ([`crate::band::RaonBand`]) runs its layers only: the first band
+// embeds staged token ids into `scratch.stream_a`, every other band expects the
+// previous band's streams already in `scratch.stream_a` rows `[0, rows)` (the
+// edge, [`crate::band::edge_view`]); the last band reads the logits out. Each
+// band keeps its own `seq_len` / `n_tokens` and advances them once per call.
+//
+// The host work (context admission / map-ahead, token staging) is split from
+// the device-only body so a mesh executor can run the body per rank with no
+// host wait in it.
+
+/// `Err` unless `w` covers the whole model: whole-model logits, speculation
+/// (DFlash capture, verify, rollback) and session snapshots are not defined
+/// under a partial band.
+pub(crate) fn require_whole_band(w: &RaonWeights, what: &str) -> Result<(), String> {
+    if w.band.is_whole() {
+        Ok(())
+    } else {
+        Err(format!(
+            "raon1_mini: {what} is not supported on a partial band ({}): the whole-model \
+             forward, DFlash/speculation, rollback and session snapshots need the whole model \
+             on one device; drive the band with the band forward",
+            w.band.label()
+        ))
+    }
+}
+
+/// What one band call consumes.
+#[derive(Clone, Copy, Debug)]
+pub enum BandInput<'a> {
+    /// The first band: token ids to embed (`1..=scratch rows`).
+    Tokens(&'a [u32]),
+    /// A later band: `rows` stream rows already in `scratch.stream_a`.
+    Streams { rows: usize },
+}
+
+impl BandInput<'_> {
+    /// Rows of the call.
+    pub fn rows(&self) -> usize {
+        match self {
+            BandInput::Tokens(t) => t.len(),
+            BandInput::Streams { rows } => *rows,
+        }
+    }
+}
+
+/// Host phase of a band call: validate the input against the band, admit the
+/// context (map-ahead of the band's latent caches and expanded mirror) for
+/// `n_tokens + rows`, and stage the token ids on the first band. Returns the
+/// rows of the call. Outside capture only.
+#[allow(clippy::too_many_arguments)]
+pub fn band_admit(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    input: BandInput<'_>,
+) -> Result<usize, String> {
+    let rows = input.rows();
+    if rows == 0 || rows > scratch.rows || rows > work.rows {
+        return Err(format!(
+            "raon1_mini: {rows} rows outside 1..={} (scratch rows {}, work rows {})",
+            scratch.rows.min(work.rows),
+            scratch.rows,
+            work.rows
+        ));
+    }
+    if w.layers.len() != cfg.n_layers || w.layers.len() != w.band.len() {
+        return Err(format!(
+            "raon1_mini: weights hold {} layers, config view {}, {}",
+            w.layers.len(),
+            cfg.n_layers,
+            w.band.label()
+        ));
+    }
+    match input {
+        BandInput::Tokens(_) if !w.band.is_first() => {
+            return Err(format!(
+                "raon1_mini: token input on {}: only the first band embeds",
+                w.band.label()
+            ))
+        }
+        BandInput::Streams { .. } if w.band.is_first() => {
+            return Err(format!(
+                "raon1_mini: stream input on {}: the first band takes tokens",
+                w.band.label()
+            ))
+        }
+        _ => {}
+    }
+    ensure_context(cfg, w, s, scratch, work, gpu, s.n_tokens() + rows)?;
+    if let BandInput::Tokens(tokens) = input {
+        stage_tokens(cfg, scratch, gpu, tokens)?;
+    }
+    Ok(rows)
+}
+
+/// Device-only body of a band call over `rows` rows from the slot's current
+/// position: (first band) embedding of the staged ids, the band's layers,
+/// (last band, `want_logits`) final norm + `lm_head` of the last row into
+/// `scratch.logits`, then a device-side `seq_len += rows`. Issues launches over
+/// stable device buffers only (no host wait), so it is recordable into a
+/// hipGraph at `rows == 1` exactly like [`decode_body`]. The host mirror
+/// ([`RaonState::note_host_tokens`]) is the caller's.
+#[allow(clippy::too_many_arguments)]
+pub fn band_body(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    rows: usize,
+    want_logits: bool,
+) -> Result<(), String> {
+    if want_logits && !w.band.is_last() {
+        return Err(format!(
+            "raon1_mini: logits requested on {}: only the last band reads them out",
+            w.band.label()
+        ));
+    }
+    forward_body(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        rows,
+        s.n_tokens(),
+        want_logits,
+        &mut None,
+        None,
+        None,
+    )?;
+    gpu.device_counter_add_i32(&s.seq_len, rows as i32)
+        .map_err(|e| format!("raon1_mini: device seq_len advance: {e:?}"))
+}
+
+/// One band call: [`band_admit`], [`band_body`], then the host mirror advance.
+/// The slot advances by the call's rows exactly once.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_band(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &mut RaonPrefillScratch,
+    work: &mut RaonWork,
+    gpu: &mut Gpu,
+    input: BandInput<'_>,
+    want_logits: bool,
+) -> Result<(), String> {
+    if want_logits && !w.band.is_last() {
+        return Err(format!(
+            "raon1_mini: logits requested on {}: only the last band reads them out",
+            w.band.label()
+        ));
+    }
+    let rows = band_admit(cfg, w, s, scratch, work, gpu, input)?;
+    band_body(cfg, w, s, scratch, work, gpu, rows, want_logits)?;
+    s.note_host_tokens(rows);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -204,6 +204,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
 
     if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
         add!(
+            "gemm_f16_skinny_xf32",
+            kernels::GEMM_F16_SKINNY_XF32_SRC,
+            ["gemm_f16_skinny_xf32"]
+        );
+        add!(
             "qsa_filter_select",
             kernels::QSA_FILTER_SELECT_SRC,
             [
@@ -1206,6 +1211,29 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     // generic RoPE, gated short-conv and sampler kernels. A host without hipcc
     // can only run what the pack carries, so each is packaged for all three
     // (`pack_carries_every_shared_launcher_module_on_every_arch`).
+    if matches!(arch, "gfx1201" | "gfx1100") {
+        add!(
+            "gemv_q8_0_fast",
+            kernels::GEMV_Q8_0_FAST_SRC,
+            [
+                "gemv_q8_0_fast_r2",
+                "gemv_q8_0_fast_r3",
+                "gemv_q8_0_fast_r4",
+                "gemv_q8_0_fast_r5",
+                "gemv_q8_0_fast_r6",
+                "gemv_q8_0_fast_r7",
+                "gemv_q8_0_fast_r8",
+                "gemv_q8_0_fast_r9",
+                "gemv_q8_0_fast_r10",
+                "gemv_q8_0_fast_r11",
+                "gemv_q8_0_fast_r12",
+                "gemv_q8_0_fast_r13",
+                "gemv_q8_0_fast_r14",
+                "gemv_q8_0_fast_r15",
+                "gemv_q8_0_fast_r16",
+            ]
+        );
+    }
     if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
         add!(
             "gemv_q8_0_wide",
@@ -1746,6 +1774,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "topk_values_fixup_f32",
             crate::select_regrid::TOPK_VALUES_FIXUP_SRC,
             ["topk_values_fixup_f32"]
+        );
+        add!(
+            "topk_values_tie_exact",
+            crate::select_regrid::TOPK_VALUES_TIE_SRC,
+            ["topk_values_tie_exact_f32"]
         );
     }
     if arch == "gfx1100" {
@@ -4440,11 +4473,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_Q8_0_MMQ_I8_GFX12_SRC,
             [
                 "gemm_q8_0_mmq_i8_t128x128",
+                "gemm_q8_0_mmq_i8_t128x128_bf16",
                 "gemm_q8_0_mmq_i8_t128x128_slow",
+                "gemm_q8_0_mmq_i8_t128x128_ps",
+                "gemm_q8_0_mmq_i8_t128x128_ps_bf16",
+                "gemm_q8_0_mmq_i8_t128x128_slow_bf16",
                 "gemm_q8_0_mmq_i8_t128x64",
+                "gemm_q8_0_mmq_i8_t128x64_bf16",
                 "gemm_q8_0_mmq_i8_t128x64_slow",
+                "gemm_q8_0_mmq_i8_t128x64_slow_bf16",
                 "gemm_q8_0_mmq_i8_t64x64",
+                "gemm_q8_0_mmq_i8_t64x64_bf16",
                 "gemm_q8_0_mmq_i8_t64x64_slow",
+                "gemm_q8_0_mmq_i8_t64x64_slow_bf16",
                 "quantize_x_q8_blk32",
             ]
         );
@@ -5358,6 +5399,20 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_bf16_xf32_tiled_rows",
             kernels::GEMM_BF16_XF32_TILED_ROWS_SRC,
             ["gemm_bf16_xf32_tiled_rows", "gemm_bf16_xf32_tiled_rows_mp4"]
+        );
+        // Register-tiled exact-order small-M twins of the pair above (router F32
+        // activations `_r*`, mHC selector BF16 activations `_s*`), every row count.
+        add!(
+            "gemm_bf16_small_rows",
+            kernels::GEMM_BF16_SMALL_ROWS_SRC,
+            [
+                "gemm_bf16_xf32_small_rows_r1",
+                "gemm_bf16_xf32_small_rows_r4",
+                "gemm_bf16_xf32_small_rows_r8",
+                "gemm_bf16_xbf16_small_rows_s1",
+                "gemm_bf16_xbf16_small_rows_s4",
+                "gemm_bf16_xbf16_small_rows_s8"
+            ]
         );
     }
     // lm_head rm2 muse tile (`gemm_hfq4g256_residual_muse_gfx1100_rm` rm=2):
@@ -10729,11 +10784,11 @@ mod tests {
         // MQ4V2 verify-tile (`*_vt`) GEMM modules, the expert-parallel row
         // gathers, the 27B AR route's plain q8 attention and slab sigmoid
         // producer, plus the opt-in twins, decode twins, QSA modules, slab
-        // planner, pruned router, Q8 wide module and DFlash-draft overwrite
-        // twins. Those 158 are the pre-S1 inventory; the S1 slow-link kernels
+        // planner, pruned router, Q8 wide module, the fast narrow Q8 GEMV
+        // module and DFlash-draft overwrite twins. Those 159 are the pre-S1 inventory; the S1 slow-link kernels
         // add exactly the modules in `S1_ADDED_MODULES` (not P0 modules, not
         // in the provenance fixture), each its own isolated source.
-        const PRE_S1_ADDED_SINCE_P0: usize = 158;
+        const PRE_S1_ADDED_SINCE_P0: usize = 159;
         const S1_ADDED_MODULES: [&str; 1] = ["slowlink_prefill"];
         for module in S1_ADDED_MODULES {
             assert!(by_name.contains_key(module), "missing S1 module {module}");
@@ -11093,10 +11148,28 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // BF16-weight GEMMs (batched + x-stationary tiled) for the Raon mHC selector
-        // and grouped-MoE router.
-        const BF16_XF32_ROWS_ADDED_MODULES: [&str; 2] =
-            ["gemm_bf16_xf32_batched", "gemm_bf16_xf32_tiled_rows"];
+        // DFlash2 draft: few-row F16 `fc` GEMM and the block-parallel tie-row top-K recompute.
+        const DRAFT_SKINNY_TIE_ADDED_MODULES: [&str; 2] =
+            ["gemm_f16_skinny_xf32", "topk_values_tie_exact"];
+        for module in DRAFT_SKINNY_TIE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing DFlash2 draft module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // BF16-weight GEMMs (batched, x-stationary tiled, register-tiled small rows) for the
+        // Raon mHC selector and grouped-MoE router.
+        const BF16_XF32_ROWS_ADDED_MODULES: [&str; 3] = [
+            "gemm_bf16_xf32_batched",
+            "gemm_bf16_xf32_tiled_rows",
+            "gemm_bf16_small_rows",
+        ];
         for module in BF16_XF32_ROWS_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
@@ -11198,7 +11271,8 @@ mod tests {
                 + BF16_XF32_ROWS_ADDED_MODULES.len()
                 + Q8_0_MMQ_ACT_ADDED_MODULES.len()
                 + FFN_ROTATE_I8_ADDED_MODULES.len()
-                + QSA_LANES_ADDED_MODULES.len(),
+                + QSA_LANES_ADDED_MODULES.len()
+                + DRAFT_SKINNY_TIE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -14302,6 +14376,7 @@ extern "C" __global__ void NAMED(int* p) {}
             ("railgun_fill", "railgun_fill_u32"),
             ("select_regrid", "topk_values_regrid_f32"),
             ("topk_values_fixup_f32", "topk_values_fixup_f32"),
+            ("topk_values_tie_exact", "topk_values_tie_exact_f32"),
             ("select_regrid", "argmax_f32_batched_regrid"),
             (
                 "attention_dflash_sliding_f32",

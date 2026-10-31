@@ -140,6 +140,9 @@ pub struct RaonStateDims {
     /// Expanded K/V mirror stored as INT8 codes + one F16 scale per (row, head,
     /// plane) instead of BF16 ([`crate::mla::MlaPolicy::mirror_q8`]).
     pub mirror_q8: bool,
+    /// Keep Q8 even when a BF16 mirror would cover the reserved context
+    /// ([`crate::mla::MlaPolicy::mirror_q8_forced`]).
+    pub mirror_q8_forced: bool,
 }
 
 impl RaonStateDims {
@@ -173,6 +176,7 @@ impl RaonStateDims {
             mhc_controls: 17,
             decay_bottleneck: 128,
             mirror_q8: true,
+            mirror_q8_forced: false,
         }
     }
 
@@ -1298,7 +1302,7 @@ impl RaonState {
     /// `(mirror is Q8, budget rows)` for `usable` bytes.
     fn plan_mirror(&self, usable: usize) -> (bool, usize) {
         let mut q8 = self.dims.mirror_q8;
-        if q8 && self.mirror.is_none() {
+        if q8 && !self.dims.mirror_q8_forced && self.mirror.is_none() {
             let bf16 = RaonStateDims {
                 mirror_q8: false,
                 ..self.dims.clone()
@@ -1701,6 +1705,21 @@ impl ElemKind {
     }
 }
 
+/// `HIPFIRE_RAON_MHC_FUSED=1` + `HIPFIRE_RAON_MHC_BF16_STREAMS=1` (see
+/// [`crate::mhc::bf16_streams_enabled`]): the mHC stream ping-pong planes are
+/// BF16 bits instead of F32 planes carrying BF16 values (same values, half the
+/// bytes). Every other scratch buffer is unchanged.
+fn retarget_stream_kinds(d: &RaonStateDims, specs: &mut [(&'static str, ElemKind, Vec<usize>)]) {
+    if !crate::mhc::bf16_streams_enabled(d.n_streams, d.hidden) {
+        return;
+    }
+    for (name, kind, _) in specs.iter_mut() {
+        if matches!(*name, "stream_a" | "stream_b") {
+            *kind = ElemKind::BF16;
+        }
+    }
+}
+
 /// One planned scratch buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScratchEntry {
@@ -1799,7 +1818,9 @@ macro_rules! scratch_buffers {
         fn scratch_specs($d: &RaonStateDims, $r: usize)
             -> Vec<(&'static str, ElemKind, Vec<usize>)>
         {
-            vec![ $( (stringify!($name), ElemKind::$kind, vec![$($dim),+]) ),+ ]
+            let mut specs = vec![ $( (stringify!($name), ElemKind::$kind, vec![$($dim),+]) ),+ ];
+            retarget_stream_kinds($d, &mut specs);
+            specs
         }
 
         impl RaonPrefillScratch {
@@ -2016,7 +2037,15 @@ mod tests {
             p512.entry("moe_act").is_none(),
             "FFN/MoE work buffers are module-owned, not scratch fields"
         );
-        assert_eq!(p512.entry("stream_a").unwrap().bytes, 512 * 4 * 2560 * 4);
+        let stream_elem = if crate::mhc::bf16_streams_enabled(d.n_streams, d.hidden) {
+            2
+        } else {
+            4
+        };
+        assert_eq!(
+            p512.entry("stream_a").unwrap().bytes,
+            512 * 4 * 2560 * stream_elem
+        );
         assert!(scratch_plan(&d, 0).is_err());
         assert!(scratch_plan(&d, MAX_SCRATCH_ROWS + 1).is_err());
     }

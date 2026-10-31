@@ -144,8 +144,12 @@ pub struct MlaPolicy {
     /// `RaonState::fit_mirror_budget` keeps the BF16 mirror when its budget covers
     /// the whole reserved context (it is 1-2% faster) and picks Q8 otherwise.
     /// Needs the tiled kernels (the reference route reads BF16 mirrors only), so
-    /// this is forced off when `tiled` is off. `0` always keeps the BF16 mirror.
+    /// this is forced off when `tiled` is off. `0` always keeps the BF16 mirror;
+    /// `force` always takes Q8 (measurement control for the 8-bit storage arm).
     pub mirror_q8: bool,
+    /// `HIPFIRE_RAON_MIRROR_Q8=force`: Q8 even when a BF16 mirror would cover the
+    /// whole reserved context. Implies [`Self::mirror_q8`].
+    pub mirror_q8_forced: bool,
 }
 
 /// Which attention operands serve a call.
@@ -174,14 +178,22 @@ impl MlaPolicy {
         tiled: true,
         absorb: true,
         mirror_q8: true,
+        mirror_q8_forced: false,
     };
 
     pub fn from_env() -> Result<Self, String> {
         let tiled = parse_flag("HIPFIRE_RAON_ATTN_TILED", Self::DEFAULT.tiled)?;
+        let forced = matches!(
+            hipfire_config::developer_var("HIPFIRE_RAON_MIRROR_Q8")
+                .map(|v| v.trim().to_ascii_lowercase()),
+            Ok(v) if v == "force"
+        );
+        let mirror_q8 = forced || parse_flag("HIPFIRE_RAON_MIRROR_Q8", Self::DEFAULT.mirror_q8)?;
         Ok(Self {
             tiled,
             absorb: parse_flag("HIPFIRE_RAON_MLA_ABSORB", Self::DEFAULT.absorb)?,
-            mirror_q8: parse_flag("HIPFIRE_RAON_MIRROR_Q8", Self::DEFAULT.mirror_q8)? && tiled,
+            mirror_q8: mirror_q8 && tiled,
+            mirror_q8_forced: forced && tiled,
         })
     }
 

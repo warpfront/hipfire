@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! raon_oracle module --module mhc|rda|mla|moe|norm|head --fixtures DIR --out FILE [--negative] [--k v ...]
-//! raon_oracle state  --model M --tokens F --mode serial|batched|graph|state-only --out FILE [--k v ...]
+//! raon_oracle state  --model M --tokens F --mode serial|batched|batched-fp|graph|state-only --out FILE [--k v ...]
 //! raon_oracle logits --model M --tokens F (--teacher F | --kld REF.kldref.bin) --out FILE [--k v ...]
 //! raon_oracle generate --model M [--k v ...]   (generate::run streams text to stdout, exit 0/1; `--json 1` also prints the result object; no --out)
 //! raon_oracle bench  --model M --pp 512,8192 --tg 128 --out FILE [--k v ...]
@@ -46,7 +46,7 @@ type RunFn = fn(&Path, &BTreeMap<String, String>) -> Result<Value, String>;
 
 const USAGE: &str = "usage:
   raon_oracle module --module mhc|rda|mla|moe|norm|head --fixtures DIR --out FILE [--negative]
-  raon_oracle state  --model M --tokens F --mode serial|batched|graph|state-only --out FILE
+  raon_oracle state  --model M --tokens F --mode serial|batched|batched-fp|graph|state-only --out FILE
   raon_oracle logits --model M (--tokens F --teacher F | --kld REF.kldref.bin) --out FILE
   raon_oracle generate --model M ... (streams text to stdout; no --out)
   raon_oracle bench  --model M --pp 512,8192 --tg 128 [--reps 3] [--warmup 1] [--profile] --out FILE
@@ -234,8 +234,13 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
             require(&cli.opts, "model")?;
             require(&cli.opts, "tokens")?;
             let mode = require(&cli.opts, "mode")?;
-            if !matches!(mode, "serial" | "batched" | "graph" | "state-only") {
-                return Err(format!("--mode `{mode}`: serial|batched|graph|state-only"));
+            if !matches!(
+                mode,
+                "serial" | "batched" | "batched-fp" | "graph" | "state-only"
+            ) {
+                return Err(format!(
+                    "--mode `{mode}`: serial|batched|batched-fp|graph|state-only"
+                ));
             }
             run_fn = raon_oracle::state::run;
             fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
@@ -246,8 +251,13 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
             if !cli.opts.contains_key("kld") {
                 require(&cli.opts, "tokens")?;
             }
-            if !cli.opts.contains_key("teacher") && !cli.opts.contains_key("kld") {
-                return Err("logits needs --teacher F or --kld REF.kldref.bin".into());
+            if !cli.opts.contains_key("teacher")
+                && !cli.opts.contains_key("kld")
+                && !cli.opts.contains_key("dump-layers")
+            {
+                return Err(
+                    "logits needs --teacher F, --dump-layers DIR or --kld REF.kldref.bin".into(),
+                );
             }
             run_fn = raon_oracle::logits::run;
             fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));

@@ -312,7 +312,14 @@ fn run_checks(
         out["logits"] = r;
     }
     if let (Some(tok), Some(dir)) = (tokens, dump_dir) {
-        let r = dump_layers(gpu, bundle, tok, Path::new(dir))?;
+        let piece_rows = match opts.get("piece-rows") {
+            Some(s) => Some(
+                s.parse::<usize>()
+                    .map_err(|e| format!("--piece-rows `{s}`: {e}"))?,
+            ),
+            None => None,
+        };
+        let r = dump_layers(gpu, bundle, tok, Path::new(dir), piece_rows)?;
         pass &= r["pass"].as_bool() == Some(true);
         out["dump_layers"] = r;
     }
@@ -768,6 +775,7 @@ fn dump_layers(
     bundle: &mut RaonBundle,
     tokens: &[u32],
     dir: &Path,
+    piece_rows: Option<usize>,
 ) -> Result<Value, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let n = tokens.len();
@@ -775,7 +783,10 @@ fn dump_layers(
     let n_layers = bundle.config.n_layers;
     let vocab = bundle.config.vocab;
     let row_bytes = MHC_STREAMS * hidden * 4;
-    let piece = bundle.scratch.rows.min(512);
+    // Default: up to 512 rows per forward. `--piece-rows N` runs pieces of N rows
+    // (1 = decode shape, 4 = verify shape, 4096 = production prefill chunk), capped
+    // at the scratch rows.
+    let piece = piece_rows.unwrap_or(512).clamp(1, bundle.scratch.rows);
     let meta = [
         ("tokens", n.to_string()),
         ("kind", "layer-dump".to_string()),

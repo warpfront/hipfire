@@ -37,6 +37,9 @@ peacemaker-ir = { path = "../peacemaker-ir" }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-rip = { path = "../peacemaker-rip" }
 [[example]]
+name = "bench_stream_mix_chain_gfx1201"
+required-features = ["lab"]
+[[example]]
 name = "bench_moe_grouped_qt44_iu4"
 required-features = ["lab"]
 [[example]]
@@ -1254,3 +1257,8 @@ required-features = ["lab"]
 [[example]]
 name = "bench_q8_0_a8_gfx12"
 required-features = ["lab"]
+
+# Chunked RDA node gate/bench (needs a gfx1201 GPU).
+[[example]]
+name = "gated_delta_vector_chunk_node"
+required-features = ["deltanet"]

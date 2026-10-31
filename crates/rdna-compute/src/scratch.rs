@@ -437,6 +437,9 @@ pub struct ScratchState {
     /// (`quantize_x_q8_blk32`), laid out by [`q8_a8_x_layout`].
     pub q8_a8_x_scratch: Option<DeviceBuffer>,
     pub q8_a8_x_scratch_bytes: usize,
+    /// Bumped by every [`Self::reserve_q8_a8_x`] (each producer launch rewrites the sidecar), so
+    /// prepared activations can detect that a later quantizer overwrote them.
+    pub q8_a8_x_generation: u64,
     /// A8 `block_i8_128` sidecar, [K/128, N] of 136-byte blocks.
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
@@ -3337,6 +3340,7 @@ impl ScratchState {
             &mut self.q8_a8_x_scratch_bytes,
             needed,
         )?;
+        self.q8_a8_x_generation = self.q8_a8_x_generation.wrapping_add(1);
         let base = self.q8_a8_x_scratch.as_ref().unwrap().as_ptr();
         Ok((
             base,

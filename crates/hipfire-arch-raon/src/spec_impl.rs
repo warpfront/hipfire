@@ -49,14 +49,15 @@ use std::any::Any;
 
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::dflash2_spec::trim_feature_rows;
-use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
+use hipfire_runtime::spec::{RowPick, SpecAdvance, SpecScratch, SpecTarget};
+use hipfire_runtime::spec_retire::BreakEven;
 use rdna_compute::tensor_ops::{argmax_f32, argmax_f32_host_stream_ordered, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::bundle::RaonBundle;
 use crate::forward::{
-    embed_lookup, forward_rows_tapped, readout_logits, stage_decode_token, validate_extract_layers,
-    DflashCapture, TapSite,
+    embed_lookup, forward_rows_tapped, readout_logits, require_whole_band, stage_decode_token,
+    validate_extract_layers, DflashCapture, TapSite,
 };
 use crate::projection::{project_rows_batched, OutRound};
 use crate::rollback::{RdaRingBuf, RollbackMode};
@@ -82,6 +83,69 @@ fn chunk_span(off: usize, len: usize, keep_from: usize) -> Option<(usize, usize)
         let skip = keep_from.saturating_sub(off);
         (skip, len - skip)
     })
+}
+
+// ───────────────────────── spec → AR break-even ─────────────────────────
+
+/// Spec → AR break-even lines of the Raon-1-mini DFlash2 drafter, in AR steps
+/// per spec cycle (`hipfire_runtime::spec_retire`): `(arch, draft quantized,
+/// line)`. The lines price the production cycle: `raon_dflash_oracle costs`
+/// times the speculator's own greedy windows (draft, selector, verify, commit,
+/// feature append and their host round trips) in decode steps and fits
+/// `base + per_row * rows` over them (block 16, graph decode, the shipped
+/// `raon-1-mini-preview-v2.mq4-xts`, mtp-bench `code_python` and
+/// `explain_concept`, receipts `raon/dflash2/evidence/b14` R9700, `b9x` 7900
+/// XTX). The per-call micro costs alone (draft + verify(rows) + partial
+/// commit) under-price a cycle by about 0.2 decode steps. `per_1k_ctx` is the
+/// growth from the short prompts to an 8K-token prompt. Quantized = the MQ4
+/// draft `raon-1-mini-preview-dflash2.mq4` (5.1 ms R9700 / 4.9 ms XTX per
+/// block-16 draft); unquantized = the F16 draft (11.2 ms / 5.9 ms), priced as
+/// the MQ4 line plus its extra draft time.
+const RAON_DFLASH_BREAK_EVEN: &[(&str, bool, BreakEven)] = &[
+    (
+        "gfx1201",
+        true,
+        BreakEven {
+            base: 1.85,
+            per_row: 0.05,
+            per_1k_ctx: 0.025,
+        },
+    ),
+    (
+        "gfx1201",
+        false,
+        BreakEven {
+            base: 2.30,
+            per_row: 0.05,
+            per_1k_ctx: 0.025,
+        },
+    ),
+    (
+        "gfx1100",
+        true,
+        BreakEven {
+            base: 2.00,
+            per_row: 0.05,
+            per_1k_ctx: 0.05,
+        },
+    ),
+    (
+        "gfx1100",
+        false,
+        BreakEven {
+            base: 2.07,
+            per_row: 0.05,
+            per_1k_ctx: 0.05,
+        },
+    ),
+];
+
+/// The [`RAON_DFLASH_BREAK_EVEN`] line of `arch` and the draft's precision.
+fn raon_dflash_break_even(arch: &str, draft_quantized: bool) -> Option<BreakEven> {
+    RAON_DFLASH_BREAK_EVEN
+        .iter()
+        .find(|(a, q, _)| *a == arch && *q == draft_quantized)
+        .map(|&(_, _, line)| line)
 }
 
 // ───────────────────────── bundle-owned spec state ─────────────────────────
@@ -300,6 +364,9 @@ impl RaonBundle {
     /// `hidden_out` is wanted and DFlash is armed) and the per-row logits of
     /// every row into the bundle's verify head. Arms the rollback ticket right
     /// after the snapshot: an error later leaves it armed for `abandon_verify`.
+    /// `rollback == false` ([`SpecTarget::commit_row`]: the rows are always
+    /// kept) takes no snapshot (an RDA slab copy, 47 MB for Raon-1-mini) and
+    /// arms no ticket.
     fn verify_forward(
         &mut self,
         gpu: &mut Gpu,
@@ -307,6 +374,7 @@ impl RaonBundle {
         position: usize,
         scratch: &mut dyn SpecScratch,
         hidden_out: Option<&mut Vec<f32>>,
+        rollback: bool,
     ) -> Result<(usize, bool), String> {
         let ss = spec_scratch(scratch, "verify")?;
         let rows = block.len();
@@ -339,8 +407,10 @@ impl RaonBundle {
         if with_features {
             self.ensure_capture(gpu, rows)?;
         }
-        self.state.snapshot_into(gpu, &mut ss.snapshot)?;
-        ss.ticket = Some((position, rows));
+        if rollback {
+            self.state.snapshot_into(gpu, &mut ss.snapshot)?;
+            ss.ticket = Some((position, rows));
+        }
         // Graph route: one recorded replay of forward + capture + readout +
         // argmax. The first use of a row count (and a non-capturable artifact)
         // runs the eager forward below instead.
@@ -382,6 +452,46 @@ impl RaonBundle {
             append_capture_rows(gpu, capture, self.feature_row_width(), 0, rows, out)?;
         }
         Ok((rows, graphed))
+    }
+
+    /// Per-row argmax of the last verify's `rows` (the AR greedy token's
+    /// kernel, one launch over every row, unless a recorded verify graph
+    /// already ran it).
+    fn verify_picks(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: usize,
+        argmax_done: bool,
+    ) -> Result<Vec<u32>, String> {
+        let vocab = self.config.vocab;
+        let head = self.spec.head.as_ref().expect("verify head just ensured");
+        let logits = head.logits.sub_offset(0, rows * vocab);
+        if !argmax_done {
+            let mut indices = head.argmax.sub_offset(0, rows);
+            indices.dtype = DType::Raw;
+            indices.shape = vec![rows * 4];
+            argmax_f32(
+                gpu,
+                &ArgmaxF32 {
+                    logits: &logits,
+                    indices: &indices,
+                    rows,
+                    vocab,
+                },
+            )
+            .map_err(|e| format!("raon1_mini verify argmax: {e:?}"))?;
+        }
+        let picks = gpu
+            .download_f32_stream_ordered(&head.argmax.sub_offset(0, rows))
+            .map_err(|e| format!("raon1_mini verify argmax download: {e:?}"))?;
+        Ok(picks.into_iter().map(f32::to_bits).collect())
+    }
+
+    /// Full `[rows, vocab]` logits of the last verify.
+    fn verify_logits(&mut self, gpu: &mut Gpu, rows: usize) -> Result<Vec<f32>, String> {
+        let head = self.spec.head.as_ref().expect("verify head just ensured");
+        gpu.download_f32_stream_ordered(&head.logits.sub_offset(0, rows * self.config.vocab))
+            .map_err(|e| format!("raon1_mini verify logits download: {e:?}"))
     }
 
     /// One prefill step over `piece` that also appends the feature rows
@@ -494,6 +604,7 @@ impl SpecTarget for RaonBundle {
         gpu: &mut Gpu,
         block_size: usize,
     ) -> Result<Box<dyn SpecScratch>, String> {
+        require_whole_band(&self.weights, "speculative decoding")?;
         let block_size = block_size.max(2);
         let cap = self.scratch.rows.min(self.work.rows());
         if block_size > cap {
@@ -601,31 +712,9 @@ impl SpecTarget for RaonBundle {
         scratch: &mut dyn SpecScratch,
         hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
-        let (rows, argmax_done) = self.verify_forward(gpu, block, position, scratch, hidden_out)?;
-        let vocab = self.config.vocab;
-        let head = self.spec.head.as_ref().expect("verify head just ensured");
-        let logits = head.logits.sub_offset(0, rows * vocab);
-        if !argmax_done {
-            // The AR greedy token's kernel, one launch over every row (a
-            // recorded verify graph already ran it).
-            let mut indices = head.argmax.sub_offset(0, rows);
-            indices.dtype = DType::Raw;
-            indices.shape = vec![rows * 4];
-            argmax_f32(
-                gpu,
-                &ArgmaxF32 {
-                    logits: &logits,
-                    indices: &indices,
-                    rows,
-                    vocab,
-                },
-            )
-            .map_err(|e| format!("raon1_mini verify argmax: {e:?}"))?;
-        }
-        let picks = gpu
-            .download_f32_stream_ordered(&head.argmax.sub_offset(0, rows))
-            .map_err(|e| format!("raon1_mini verify argmax download: {e:?}"))?;
-        Ok(picks.into_iter().map(f32::to_bits).collect())
+        let (rows, argmax_done) =
+            self.verify_forward(gpu, block, position, scratch, hidden_out, true)?;
+        self.verify_picks(gpu, rows, argmax_done)
     }
 
     fn verify_block_logits(
@@ -636,10 +725,39 @@ impl SpecTarget for RaonBundle {
         scratch: &mut dyn SpecScratch,
         hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<f32>, String> {
-        let (rows, _) = self.verify_forward(gpu, block, position, scratch, hidden_out)?;
-        let head = self.spec.head.as_ref().expect("verify head just ensured");
-        gpu.download_f32_stream_ordered(&head.logits.sub_offset(0, rows * self.config.vocab))
-            .map_err(|e| format!("raon1_mini verify logits download: {e:?}"))
+        let (rows, _) = self.verify_forward(gpu, block, position, scratch, hidden_out, true)?;
+        self.verify_logits(gpu, rows)
+    }
+
+    /// The one-row verify without its rollback snapshot: the row is kept, so
+    /// no ticket is armed and nothing is restored ([`SpecTarget::commit_row`]).
+    fn commit_row(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        want_logits: bool,
+    ) -> Result<RowPick, String> {
+        let (rows, argmax_done) =
+            self.verify_forward(gpu, &[token], position, scratch, hidden_out, false)?;
+        // The forward armed the recurrence-input ring for a rollback that
+        // cannot come.
+        self.spec.clear_ring_ticket();
+        let pick = if want_logits {
+            RowPick::Logits(self.verify_logits(gpu, rows)?)
+        } else {
+            RowPick::Argmax(self.verify_picks(gpu, rows, argmax_done)?[0])
+        };
+        if self.state.n_tokens() != position + 1 {
+            return Err(format!(
+                "raon1_mini commit_row ended at {}, expected {}",
+                self.state.n_tokens(),
+                position + 1
+            ));
+        }
+        Ok(pick)
     }
 
     fn commit_prefix(
@@ -759,6 +877,13 @@ impl SpecTarget for RaonBundle {
         self.spec.set_window(rows);
     }
 
+    /// The measured spec → AR break-even line of the DFlash2 drafter on this
+    /// device ([`RAON_DFLASH_BREAK_EVEN`]); `None` (an unmeasured arch) keeps
+    /// the drafter speculating for the whole request, as before.
+    fn dflash_retire_break_even(&self, gpu: &Gpu, draft_quantized: bool) -> Option<BreakEven> {
+        raon_dflash_break_even(&gpu.arch, draft_quantized)
+    }
+
     /// The raw embedding row of `token_id` (no scaling), the drafter's noise
     /// input: the very lookup the forward's embedding stage runs.
     fn embed_row(&mut self, gpu: &mut Gpu, token_id: u32) -> Result<Vec<f32>, String> {
@@ -800,7 +925,7 @@ impl SpecTarget for RaonBundle {
         // Draft rows are never decode rows: the batched head, row-exact or not.
         project_rows_batched(
             gpu,
-            &self.weights.lm_head,
+            self.weights.lm_head_weight()?,
             &hidden_rows.sub_offset(0, n * hidden),
             &logits,
             n,
@@ -815,6 +940,23 @@ impl SpecTarget for RaonBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn break_even_lines_cover_the_measured_cards_only() {
+        for arch in ["gfx1201", "gfx1100"] {
+            for quantized in [true, false] {
+                let line = raon_dflash_break_even(arch, quantized).expect("measured line");
+                assert!(line.base > 1.0 && line.per_row > 0.0 && line.per_1k_ctx >= 0.0);
+            }
+            // The MQ4 draft is cheaper than the F16 one on every measured card.
+            let (q, f) = (
+                raon_dflash_break_even(arch, true).unwrap(),
+                raon_dflash_break_even(arch, false).unwrap(),
+            );
+            assert!(q.at(2, 0) < f.at(2, 0));
+        }
+        assert_eq!(raon_dflash_break_even("gfx1151", true), None);
+    }
 
     #[test]
     fn keep_from_drops_everything_below_the_window() {

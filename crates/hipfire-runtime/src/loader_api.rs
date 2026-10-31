@@ -470,3 +470,76 @@ mod ep_lane_reservation_request_tests {
         assert_eq!(on.lanes(), Some(4));
     }
 }
+
+/// Which parallelism axis a refusal is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopologyAxis {
+    /// `topology.pp` (pipeline: layer bands across GPUs).
+    Pipeline,
+    /// `topology.ep` (expert-parallel degree).
+    Expert,
+    /// `--tp N` / daemon `params.tp` (tensor/expert parallelism).
+    Tp,
+}
+
+/// The one plain-language refusal for a model family that cannot be split
+/// across GPUs on `axis` at `degree`. `family` is the carrier name (kept as
+/// the stable prefix); `is_dir` selects the safetensors-directory wording
+/// for the pipeline axis (a directory cannot be banded; the other axes have a
+/// single wording). Every refusal site (admission, carrier backstops, bench,
+/// fit) builds its text here so the three axes read the same.
+pub fn topology_refusal(family: &str, axis: TopologyAxis, degree: usize, is_dir: bool) -> String {
+    match axis {
+        TopologyAxis::Pipeline if is_dir => format!(
+            "{family}: a safetensors model directory cannot be split across GPUs in pipeline \
+             mode (topology.pp = {degree}). Set topology.pp = 1 to load it on one GPU, or convert it \
+             to a packed .hfq file first"
+        ),
+        TopologyAxis::Pipeline => format!(
+            "{family}: this model family cannot be split across GPUs in pipeline mode \
+             (topology.pp = {degree}). Set topology.pp = 1 to load it on one GPU"
+        ),
+        TopologyAxis::Expert => format!(
+            "{family}: this model family cannot be split across GPUs in expert-parallel mode \
+             (topology.ep = {degree}). Set topology.ep = 1 to load it on one GPU"
+        ),
+        TopologyAxis::Tp => format!(
+            "{family}: this model family cannot be split across GPUs with --tp {degree} \
+             (tensor/expert parallelism). Set tp = 1 to load it on one GPU"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod topology_refusal_tests {
+    use super::{topology_refusal, TopologyAxis};
+
+    #[test]
+    fn pipeline_text_is_the_historical_pp_sentence() {
+        assert_eq!(
+            topology_refusal("raon1_mini", TopologyAxis::Pipeline, 2, false),
+            "raon1_mini: this model family cannot be split across GPUs in pipeline mode \
+             (topology.pp = 2). Set topology.pp = 1 to load it on one GPU"
+        );
+        assert_eq!(
+            topology_refusal("llama", TopologyAxis::Pipeline, 3, true),
+            "llama: a safetensors model directory cannot be split across GPUs in pipeline \
+             mode (topology.pp = 3). Set topology.pp = 1 to load it on one GPU, or convert it \
+             to a packed .hfq file first"
+        );
+    }
+
+    #[test]
+    fn expert_and_tp_texts_name_the_family_degree_and_fix() {
+        assert_eq!(
+            topology_refusal("raon1_mini", TopologyAxis::Expert, 2, false),
+            "raon1_mini: this model family cannot be split across GPUs in expert-parallel mode \
+             (topology.ep = 2). Set topology.ep = 1 to load it on one GPU"
+        );
+        assert_eq!(
+            topology_refusal("raon1_mini", TopologyAxis::Tp, 4, true),
+            "raon1_mini: this model family cannot be split across GPUs with --tp 4 \
+             (tensor/expert parallelism). Set tp = 1 to load it on one GPU"
+        );
+    }
+}

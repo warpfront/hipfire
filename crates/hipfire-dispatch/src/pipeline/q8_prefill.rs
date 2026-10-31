@@ -9,7 +9,7 @@
 //! (never an error). The tier that actually ran is reported back where a call returns one.
 
 use crate::types::DispatchError;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{Gpu, GpuTensor, Q8A8Activations};
 
 /// Activation precision of one prefill GEMM site.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -153,6 +153,100 @@ pub fn q8_0_prefill_gemm(
     }
     hip!(gpu.gemm_q8_0_batched_chunked(w, x, y, m, k, rows))?;
     Ok(PrefillActTier::F16)
+}
+
+/// One activation tensor quantized once for every A8 Q8_0 consumer of a node (RDA q/k/v/g, MLA
+/// q_a/kv_a/g). The int8 plane and block scales live in the `Gpu`'s shared W8A8 scratch, so the
+/// value is valid only until the next A8/FP8 quantizer runs or the scratch grows: the lifetime is
+/// one node, and [`q8_0_prefill_gemm_prepared`] re-quantizes (never reads stale bytes) when a
+/// later quantizer overwrote it, or when the consumer's `x`, `k` or `rows` differ.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedA8 {
+    acts: Q8A8Activations,
+    x: *const std::ffi::c_void,
+}
+
+/// Quantize `x[rows, k]` once when an A8 Q8_0 projection `[m, k]` runs the gfx1201 W8A8 route
+/// ([`q8_0_prefill_runs`]; the gfx11 int8 MMQ route quantizes inside its own kernel); `None` (nothing launched) otherwise: the consumers then take their
+/// ordinary route. Bit-identical to what each [`q8_0_prefill_gemm`] call quantizes itself.
+pub fn q8_0_prefill_prepare(
+    gpu: &mut Gpu,
+    tier: PrefillActTier,
+    x: &GpuTensor,
+    m: usize,
+    k: usize,
+    rows: usize,
+) -> Result<Option<PreparedA8>, DispatchError> {
+    if tier != PrefillActTier::A8
+        || gpu.arch != "gfx1201"
+        || !q8_0_prefill_runs(gpu, tier, m, k, rows)
+    {
+        return Ok(None);
+    }
+    let acts = hip!(gpu.q8_a8_quantize_x(x, rows, k))?;
+    Ok(Some(PreparedA8 {
+        acts,
+        x: x.buf.as_ptr() as *const std::ffi::c_void,
+    }))
+}
+
+/// What [`q8_0_prefill_gemm_prepared`] ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Q8PrefillRun {
+    /// The activation tier that ran.
+    pub tier: PrefillActTier,
+    /// `y` already holds BF16-rounded values (the A8 epilogue applied the round); the caller must
+    /// not round it again. Only ever `true` when `bf16_out` was requested.
+    pub bf16_fused: bool,
+}
+
+/// [`q8_0_prefill_gemm`] with two optional reuses on the A8 route: it consumes `prepared` when
+/// that still describes this call's `x`, `k` and `rows` (GEMM only, no quantizer launch; else it
+/// quantizes `x` itself), and with `bf16_out` the GEMM epilogue rounds every output to BF16
+/// (bit-identical to a separate in-place `bf16_round_trip_f32_strided` pass, see
+/// `Gpu::gemm_q8_0_a8_gemm_bf16`). Every other case is exactly [`q8_0_prefill_gemm`].
+#[allow(clippy::too_many_arguments)]
+pub fn q8_0_prefill_gemm_prepared(
+    gpu: &mut Gpu,
+    tier: PrefillActTier,
+    prepared: Option<&PreparedA8>,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    rows: usize,
+    bf16_out: bool,
+) -> Result<Q8PrefillRun, DispatchError> {
+    if tier == PrefillActTier::A8
+        && gpu.arch == "gfx1201"
+        && q8_0_prefill_runs(gpu, tier, m, k, rows)
+    {
+        let reuse = prepared.filter(|p| {
+            p.acts.rows() == rows
+                && p.acts.k() == k
+                && p.x == x.buf.as_ptr() as *const std::ffi::c_void
+                && gpu.q8_a8_acts_current(&p.acts)
+        });
+        let acts = match reuse {
+            Some(p) => p.acts,
+            None => hip!(gpu.q8_a8_quantize_x(x, rows, k))?,
+        };
+        if bf16_out {
+            hip!(gpu.gemm_q8_0_a8_gemm_bf16(w, &acts, y, m))?;
+        } else {
+            hip!(gpu.gemm_q8_0_a8_gemm(w, &acts, y, m))?;
+        }
+        return Ok(Q8PrefillRun {
+            tier,
+            bf16_fused: bf16_out,
+        });
+    }
+    let tier = q8_0_prefill_gemm(gpu, tier, w, x, y, m, k, rows)?;
+    Ok(Q8PrefillRun {
+        tier,
+        bf16_fused: false,
+    })
 }
 
 #[cfg(test)]
