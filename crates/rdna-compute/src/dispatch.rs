@@ -6060,11 +6060,11 @@ impl Gpu {
     /// IU4 + gfx1100/gfx1151 + eager (no replay/capture) + the K constraint
     /// of the IU4 MMQ consumer. Every producer grid is row-parallel, and the
     /// gfx11 IU4 MMQ base entry handles partial 128-row tiles.
-    /// With `HIPFIRE_A8_FUSED_PROD=0` an A8-owned shape stays off the sidecar
-    /// so the projections fall back to the standalone A8 quantizer, not IU4.
+    /// An A8-owned shape never takes the sidecar (as on gfx1201): a fused A8
+    /// producer owns it, else the consumer's standalone A8 quantizer does.
     pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
         self.flags.iu4_producer_sidecar_enabled()
-            && (self.flags.a8_fused_prod || !self.a8_prefill_active(batch, k))
+            && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && batch >= 64
@@ -6197,7 +6197,7 @@ impl Gpu {
     pub fn iu4_gfx11_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx11_producer_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
-            && (self.flags.a8_fused_prod || !self.a8_prefill_active(batch, k))
+            && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && batch >= 64
