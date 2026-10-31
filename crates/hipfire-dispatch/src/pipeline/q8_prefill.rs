@@ -142,6 +142,13 @@ pub fn q8_0_prefill_gemm(
 ) -> Result<PrefillActTier, DispatchError> {
     if q8_0_prefill_runs(gpu, tier, m, k, rows) {
         match tier {
+            PrefillActTier::A8
+                if gpu.arch == "gfx1100" && gpu.q8_mmq_gfx11_supported(k, w.buf.as_ptr()) =>
+            {
+                // Tiled i8-MMQ (bit-identical to the 64x64 kernel below; HIPFIRE_Q8_MMQ_GFX11_TILES=0
+                // keeps the 64x64 kernel).
+                hip!(gpu.gemm_q8_0_mmq_gfx11_batched(w, x, y, m, k, rows))?
+            }
             PrefillActTier::A8 if gpu.arch != "gfx1201" => {
                 hip!(gpu.gemm_q8_0_mmq_4w_gfx1151(w, x, y, m, k, rows))?
             }

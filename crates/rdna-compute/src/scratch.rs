@@ -413,6 +413,10 @@ pub struct ScratchState {
     pub fp8_x_source_ptr: *mut c_void,
     pub q8_1_mmq_x_scratch: Option<DeviceBuffer>,
     pub q8_1_mmq_x_scratch_bytes: usize,
+    /// Bumped by every writer of `q8_1_mmq_x_scratch` ([`Self::ensure_q8_1_mmq_x`], its x128 sibling,
+    /// [`Self::reserve_packed_mq4`]), so prepared Q8_1 activations (`gemm_q8_mmq_gfx11.rs`) can detect
+    /// that a later quantizer overwrote or reallocated them.
+    pub q8_1_mmq_x_generation: u64,
     /// Dedicated iu4-direct MMQ pre-pass X buffer (`block_i4_128`, 72 B per
     /// [K/128 block, batch]). Not shared with `q8_1_mmq_x_scratch` (144 B
     /// blocks): the iu4 consumer reads nibble headers the Q8_1 prelude
@@ -2919,6 +2923,7 @@ impl ScratchState {
             &mut self.q8_1_mmq_x_scratch_bytes,
             needed,
         )?;
+        self.q8_1_mmq_x_generation = self.q8_1_mmq_x_generation.wrapping_add(1);
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
@@ -3006,6 +3011,7 @@ impl ScratchState {
             &mut self.q8_1_mmq_x_scratch_bytes,
             needed,
         )?;
+        self.q8_1_mmq_x_generation = self.q8_1_mmq_x_generation.wrapping_add(1);
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
@@ -3549,6 +3555,7 @@ impl ScratchState {
             &mut self.q8_1_mmq_x_scratch_bytes,
             needed,
         )?;
+        self.q8_1_mmq_x_generation = self.q8_1_mmq_x_generation.wrapping_add(1);
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 

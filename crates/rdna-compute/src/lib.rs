@@ -55,6 +55,7 @@ mod gemm_mq6_fp8;
 mod gemm_mq6_i8;
 mod gemm_q8_a8;
 mod gemm_q8_fp8;
+mod gemm_q8_mmq_gfx11;
 mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;
@@ -147,6 +148,7 @@ pub use gemm_mq6_fp8::Mq6Fp8Arm;
 pub use gemm_mq6_i8::{QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM};
 pub use gemm_q8_a8::{Q8A8Activations, Q8A8Sched, Q8A8Tile};
 pub use gemm_q8_fp8::Q8Fp8Activations;
+pub use gemm_q8_mmq_gfx11::{q8_mmq_gfx11_admits, q8_mmq_pick_tile, Q8MmqActivations, Q8MmqTile};
 pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation,
     Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared,

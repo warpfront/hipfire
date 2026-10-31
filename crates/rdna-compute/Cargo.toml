@@ -433,6 +433,10 @@ name = "bench_q8_wmma_4w"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_q8_raon_shapes"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_q8_wmma_variants"
 required-features = ["lab"]
 

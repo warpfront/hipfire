@@ -5284,6 +5284,17 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_Q8_0_MMQ_4W_GFX1151_SRC,
             ["gemm_q8_0_mmq_4w_gfx1151"]
         );
+        // Tiled bit-identical sibling (`gemm_q8_mmq_gfx11.rs`): gfx1100 routes it, gfx1151 builds it
+        // for the Halo guard and the kernel test only.
+        add!(
+            "gemm_q8_0_mmq_i8_gfx11",
+            kernels::GEMM_Q8_0_MMQ_I8_GFX11_SRC,
+            [
+                "gemm_q8_0_mmq_i8_gfx11_t64x64",
+                "gemm_q8_0_mmq_i8_gfx11_t64x128",
+                "gemm_q8_0_mmq_i8_gfx11_t128x128",
+            ]
+        );
     }
     if arch == "gfx1100" {
         // DFlash draft collapse modules (dflash_draft_fusion.rs: module name ==
