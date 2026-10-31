@@ -103,7 +103,7 @@ fn emit_committed_event(
 /// Mirrors `ar::qwen_ar_observe_and_route` minus the ToolOutputRouter: VL
 /// image turns carry no tool contract, so reserved-looking text stays visible
 /// instead of being buffered or failing closed.
-fn vl_route_decode_text(
+pub(crate) fn vl_route_decode_text(
     stdout: &mut impl std::io::Write,
     id: &str,
     filter: &mut EosFilter,
@@ -131,7 +131,7 @@ fn vl_route_decode_text(
     is_stop
 }
 
-fn vl_finish_think_routing(
+pub(crate) fn vl_finish_think_routing(
     stdout: &mut impl std::io::Write,
     id: &str,
     filter: &mut EosFilter,

@@ -4290,34 +4290,7 @@ pub fn generate_dflash(
         commit_qwen4_session(m);
         // Safe stop/tool_calls only — length never stores; Abort suppressed above.
         if effects.store_cache {
-            let stripped = strip_think_for_fingerprint(&decoded_full);
-            let emit_text =
-                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-            let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                eprintln!(
-                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                    fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
-                    emit_text.chars().take(60).collect::<String>(),
-                );
-            }
-            // Legacy (non-qwen-semantic-v2) arches: content-only full body store.
-            // Rich whole-envelope reasoning text is the qwen semantic-v2 path above.
-            m.asst_turn_cache.insert(
-                fp,
-                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                    reasoning: None,
-                    tools: Vec::new(),
-                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: cached_seq,
-                        text: String::new(),
-                    }),
-                },
-            );
+            store_legacy_asst_turn(m, &decoded_full, &wire_calls, cached_seq);
         }
         crate::ar::emit_active_route_done_value(stdout, &pending_done);
     }
@@ -7708,6 +7681,42 @@ pub fn qwen_dflash_wire_terminal(
             wire_tool_calls: Vec::new(),
         }
     }
+}
+
+/// Legacy (non-semantic-v2) assistant-turn store shared by the DFlash/DSpark
+/// spec route and llama AR, so either route's next turn splices the same
+/// verbatim ids. Content-only full body under the stripped-text fingerprint.
+pub fn store_legacy_asst_turn(
+    m: &mut LoadedModel,
+    decoded_full: &str,
+    wire_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+    cached_seq: Vec<u32>,
+) {
+    let stripped = strip_think_for_fingerprint(decoded_full);
+    let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+    let fp = asst_turn_fingerprint(&emit_text, wire_calls);
+    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!(
+            "[qwen-cache store legacy] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
+            fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
+            emit_text.chars().take(60).collect::<String>(),
+        );
+    }
+    m.asst_turn_cache.insert(
+        fp,
+        hipfire_runtime::prompt_frame::CachedAssistantTurn {
+            reasoning: None,
+            tools: Vec::new(),
+            content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                token_ids: cached_seq,
+                text: String::new(),
+            }),
+        },
+    );
 }
 
 pub fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> TurnCacheAction {

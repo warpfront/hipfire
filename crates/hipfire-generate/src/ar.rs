@@ -6433,6 +6433,8 @@ pub fn generate(
         // strip-think, byte-level stop_at); see crates/engine/src/eos_filter.rs.
         let mut stream_bytes: Vec<u8> = Vec::new();
         let mut filter = EosFilter::new(EosFilterConfig::default());
+        // Same reasoning/content split as the DFlash/DSpark emitter.
+        let mut think = ThinkOutputRouter::new(started_in_think);
 
         let mut hit_stop = false;
         for _ in 0..max_tokens {
@@ -6462,20 +6464,13 @@ pub fn generate(
                 || tokenizer.is_terminator(next_token);
             let fed = stream_bytes.len();
             tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
-            let new_bytes = &stream_bytes[fed..];
-            let action = if is_stop {
-                FilterAction::Hold
-            } else {
-                filter.observe(new_bytes)
-            };
-            if let FilterAction::Emit(text_bytes) = action {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
+            if !is_stop {
+                crate::vision::vl_route_decode_text(
                     stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
                     id,
-                    serde_json::to_string(&text).unwrap_or_default(),
-                    active_attempt_id()
+                    &mut filter,
+                    &mut think,
+                    &stream_bytes[fed..],
                 );
                 let _ = stdout.flush();
             }
@@ -6554,6 +6549,8 @@ pub fn generate(
             rng_state = rng;
         }
         m.seq_pos += generated;
+        crate::vision::vl_finish_think_routing(stdout, id, &mut filter, &mut think);
+        let open_think = think.in_think();
 
         // ChatML \n boundary — run through forward to keep KV cache in sync
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
@@ -6612,6 +6609,7 @@ pub fn generate(
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
             "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+            "cached_tokens": cached_tokens_count,
             "finish_reason": if hit_stop { "stop" } else { "length" },
             "attempt_id": active_attempt_id(),
         });
@@ -6626,7 +6624,17 @@ pub fn generate(
             }
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => emit_active_route_done(stdout, id, &pending_done),
+            ClientTerminalDecision::Commit => {
+                // Same store as the legacy spec route: completed, closed turns only.
+                if hit_stop && !open_think {
+                    let nl_set: std::collections::HashSet<u32> = nl.iter().copied().collect();
+                    let cached_seq =
+                        crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
+                    let decoded_full = tokenizer.decode(&streamed_tokens);
+                    crate::qwen::store_legacy_asst_turn(m, &decoded_full, &[], cached_seq);
+                }
+                emit_active_route_done(stdout, id, &pending_done)
+            }
             ClientTerminalDecision::Abort => {
                 // Abort after commit: full fail-closed rollback first, then
                 // the attested aborted+done pair (or a single unattested
