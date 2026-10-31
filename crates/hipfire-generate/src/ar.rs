@@ -6784,13 +6784,20 @@ pub fn generate(
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
             ClientTerminalDecision::Commit => {
-                // Same store as the legacy spec route: completed, closed turns only.
-                if hit_stop && !open_think {
+                // Same store decision as the legacy spec route.
+                let decoded_full = tokenizer.decode(&streamed_tokens);
+                let action = crate::qwen::legacy_asst_turn_action(
+                    !hit_stop,
+                    open_think,
+                    started_in_think,
+                    &decoded_full,
+                    &[],
+                );
+                if action.store {
                     let nl_set: std::collections::HashSet<u32> = nl.iter().copied().collect();
                     let cached_seq =
                         crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
-                    let decoded_full = tokenizer.decode(&streamed_tokens);
-                    crate::qwen::store_legacy_asst_turn(m, &decoded_full, &[], cached_seq);
+                    crate::qwen::store_legacy_asst_turn(m, &action, cached_seq);
                 }
                 emit_active_route_done(stdout, id, &pending_done)
             }
