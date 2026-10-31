@@ -723,6 +723,16 @@ refused at staging with a label (`native-MTP lanes are refused on an EP reserve-
 lanes instead (`spec=off (...)`). Without `--spec mtp`, or with `HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes and
 take the 32-layer decoupled placement.
 
+Lab override `HIPFIRE_EP_MTP_RESERVE_SHARE=1` (default off) lifts both refusals so an MTP lane store loads on the
+decoupled placement. Static audit of the mesh window phases against the borrow window (a borrowed epoch is only ever
+opened by a prompt forward of more than 512 rows, inside `forward_chunk`): the verify (`forward_lanes`) enters through
+`ep_reserve_lane_step_enter` (restores a dirty epoch, resident bank, rows checked); the head draft rounds and catch-ups
+run on the head's own scratch and weights and the EP gather buffers, never the trunk scratch bank or donor layers (the
+singleton MTP draft is the same code); prepare (ring row rollback and head rebuild) runs no trunk forward; prompt tiles
+of an MTP lane run the singleton `mtp_prefill_chunk` inside the step's `share_prompt_begin_mtp_fill` / `share_prompt_end`
+bracket, so the donors are whole before the step returns. A mesh window refuses to start on an open epoch, and the
+staging refuses a step row budget wider than the resident bank. Unmeasured on a card.
+
 **EP prefill-chunk auto-fit (opt-in, `HIPFIRE_EP_CHUNK_AUTOFIT=1`).** The PP lever steps the chunk down because a band
 must fit; an EP load always fits (host-mapped layers), so the question is only decode against prefill. EP2 mq4-xts, 2x
 R9700, no lanes, one binary, `hipfire bench --matrix` (`mgmtp/epfit/runs/pr1-*`): pp16384 / pp65536 tok/s at 4096 rows

@@ -887,6 +887,14 @@ impl Qwen4GpuForward {
             .map(|reserve| reserve.banks.resident_rows())
     }
 
+    /// Whether a borrowed-bank epoch is open (donors dirty); `false` on an
+    /// ordinary load.
+    pub(crate) fn ep_reserve_epoch_open(&self) -> bool {
+        self.ep_reserve
+            .as_ref()
+            .is_some_and(|reserve| reserve.epoch.dirty())
+    }
+
     /// Entry of a lane decode step (`forward_lanes`, `rows` decode rows) on an
     /// EP reserve-sharing load; a no-op on an ordinary load. A lane step reads
     /// the Full peer tables and the donor layers' experts, so a dirty borrow

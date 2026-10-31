@@ -3006,20 +3006,26 @@ pub fn qwen4_ep_vram_layers(
         // on the borrowed bank), and the mesh lane protocol's draft/verify
         // windows and head fill are not proven on the borrowed bank. The
         // stage after this load refuses a spec store on a reserve-sharing
-        // load for the same reason, so the two always agree.
-        let admission = admission.and_then(|()| match lane.as_ref() {
-            Some(lane)
-                if spec_k.is_some()
-                    && hipfire_arch_qwen4::lane_switch::spec_lane_count(
-                        lane.lanes,
-                        hipfire_arch_qwen4::lane_switch::max_active(),
-                    ) > 0 =>
-            {
-                Err("native-MTP EP lanes are staged (`--spec mtp`): the decoupled reserve admits AR lanes only; pass no `--spec mtp` (or HIPFIRE_EP_MTP_LANES=0) for 32-layer AR lanes"
-                    .to_string())
-            }
-            _ => Ok(()),
+        // load for the same reason, so the two always agree. The lab override
+        // `HIPFIRE_EP_MTP_RESERVE_SHARE=1` lifts both.
+        let share_override = hipfire_arch_qwen4::ep_reserve::ep_mtp_reserve_share_enabled();
+        let spec_slots = lane.as_ref().map_or(0, |lane| {
+            hipfire_arch_qwen4::lane_switch::spec_lane_count(
+                lane.lanes,
+                hipfire_arch_qwen4::lane_switch::max_active(),
+            )
         });
+        let admission =
+            admission.and_then(
+                |()| match hipfire_arch_qwen4::ep_reserve::spec_store_blocks_reserve(
+                    spec_k,
+                    spec_slots,
+                    share_override,
+                ) {
+                    Some(why) => Err(why.to_string()),
+                    None => Ok(()),
+                },
+            );
         Some((
             admission,
             qwen4_expert_table_bytes(

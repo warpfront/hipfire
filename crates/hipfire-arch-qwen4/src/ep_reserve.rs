@@ -29,6 +29,86 @@ use std::fmt;
 /// load); unset or any other value is the default route.
 pub const EP_RESERVE_DECOUPLE_ENV: &str = "HIPFIRE_EP_RESERVE_DECOUPLE";
 
+/// Lab override (default OFF): let a native-MTP EP lane store (`--spec mtp`,
+/// the mixed store) load on the decoupled-reserve (route B) placement instead
+/// of the ordinary one. Without it the loader skips decoupling for a load that
+/// stages spec lanes and the EP lane staging
+/// refuses a spec store on a reserve-sharing load (the daemon then stages AR
+/// lanes). Developer variable; read through the process configuration.
+pub const EP_MTP_RESERVE_SHARE_ENV: &str = "HIPFIRE_EP_MTP_RESERVE_SHARE";
+
+/// [`EP_MTP_RESERVE_SHARE_ENV`] (`1` on; unset or anything else off).
+pub fn ep_mtp_reserve_share_enabled() -> bool {
+    hipfire_config::developer_bool(EP_MTP_RESERVE_SHARE_ENV, false)
+}
+
+/// Whether a spec lane store keeps the decoupled reserve off a load (the
+/// load-time half): `Some(reason)` when MTP lanes will be staged
+/// (`spec_k` set and at least one MTP slot of `lanes`) and the lab override
+/// is off.
+pub fn spec_store_blocks_reserve(
+    spec_k: Option<usize>,
+    spec_slots: usize,
+    share_override: bool,
+) -> Option<&'static str> {
+    (spec_k.is_some() && spec_slots > 0 && !share_override).then_some(
+        "native-MTP EP lanes are staged (`--spec mtp`): the decoupled reserve admits AR lanes only; pass no `--spec mtp` (or HIPFIRE_EP_MTP_LANES=0) for 32-layer AR lanes, or HIPFIRE_EP_MTP_RESERVE_SHARE=1 (lab) to run MTP lanes on it",
+    )
+}
+
+/// The stage-time half: whether a spec lane store (`row_budget` decode rows
+/// per step) may be staged on a reserve-sharing load whose resident bank holds
+/// `resident_rows`. Lane decode steps and every mesh verify window run on the
+/// resident bank only, so a step wider than it is refused here, labeled,
+/// instead of at the first step.
+pub fn spec_store_reserve_verdict(
+    reserve_active: bool,
+    share_override: bool,
+    row_budget: usize,
+    resident_rows: Option<usize>,
+) -> Result<(), String> {
+    if !reserve_active {
+        return Ok(());
+    }
+    if !share_override {
+        return Err(
+            "native-MTP lanes are refused on an EP reserve-sharing load: the mesh lane \
+             protocol's draft/verify windows and head fill are not proven on the borrowed \
+             reserve bank (AR lanes are admitted; load without `--spec mtp`, set \
+             HIPFIRE_EP_MTP_LANES=0, or HIPFIRE_EP_MTP_RESERVE_SHARE=1 for the lab route)"
+                .to_string(),
+        );
+    }
+    match resident_rows {
+        Some(rows) if row_budget <= rows => Ok(()),
+        Some(rows) => Err(format!(
+            "native-MTP lanes on an EP reserve-sharing load run every window on the {rows}-row \
+             resident scratch bank; a {row_budget}-row step budget does not fit"
+        )),
+        None => Err(
+            "native-MTP lanes on an EP reserve-sharing load: the resident scratch bank is not \
+             attached"
+                .to_string(),
+        ),
+    }
+}
+
+/// The mesh-window start guard: a mesh decode window (draft rounds, verify,
+/// prepare) never opens or crosses a borrowed-bank epoch (prompt tiles are
+/// their own steps and restore the donors before returning), so an open epoch
+/// at a window start is a bracket bug and refuses the window.
+pub fn mesh_window_epoch_check(epoch_open: bool) -> Result<(), String> {
+    if epoch_open {
+        return Err(
+            "an EP reserve borrowed-bank epoch is open at a mesh lane window start (a prompt \
+             tile's donors were not restored); refusing to run the native-MTP window on dirty \
+             donor layers"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Prompt chunk of an admitted load; it is never lowered.
 pub const EP_RESERVE_PROMPT_ROWS: usize = 4096;
 /// Rows of the resident (dedicated) scratch bank.
@@ -1471,5 +1551,51 @@ mod tests {
         b.source_generation = 2;
         assert!(a.agree(&b).is_err());
         assert!(plan.describe().contains("33 resident layers"));
+    }
+
+    #[test]
+    fn a_spec_store_keeps_the_ordinary_reserve_unless_the_lab_override_is_on() {
+        // AR store (no spec_k) and an MTP-less slot count never block.
+        assert!(spec_store_blocks_reserve(None, 3, false).is_none());
+        assert!(spec_store_blocks_reserve(Some(2), 0, false).is_none());
+        // A spec store blocks the decoupled reserve, naming the way out.
+        let why = spec_store_blocks_reserve(Some(2), 3, false).expect("blocked");
+        assert!(why.contains("--spec mtp") && why.contains("HIPFIRE_EP_MTP_RESERVE_SHARE=1"));
+        // The override lifts it.
+        assert!(spec_store_blocks_reserve(Some(2), 3, true).is_none());
+    }
+
+    #[test]
+    fn the_stage_verdict_refuses_a_spec_store_on_a_reserve_load_unless_overridden() {
+        // An ordinary load never reaches the reserve rules.
+        assert_eq!(spec_store_reserve_verdict(false, false, 9999, None), Ok(()));
+        // A reserve load without the override: labeled refusal.
+        let refused = spec_store_reserve_verdict(true, false, 8, Some(512)).unwrap_err();
+        assert!(refused.contains("refused on an EP reserve-sharing load"));
+        // With the override a step that fits the resident bank is admitted...
+        assert_eq!(spec_store_reserve_verdict(true, true, 8, Some(512)), Ok(()));
+        assert_eq!(
+            spec_store_reserve_verdict(true, true, 512, Some(512)),
+            Ok(())
+        );
+        // ...a wider one, or an unattached bank, is refused with the numbers.
+        let wide = spec_store_reserve_verdict(true, true, 513, Some(512)).unwrap_err();
+        assert!(wide.contains("512-row") && wide.contains("513-row"));
+        assert!(spec_store_reserve_verdict(true, true, 8, None).is_err());
+    }
+
+    #[test]
+    fn a_mesh_window_refuses_to_start_on_an_open_borrow_epoch() {
+        assert_eq!(mesh_window_epoch_check(false), Ok(()));
+        let error = mesh_window_epoch_check(true).unwrap_err();
+        assert!(error.contains("borrowed-bank epoch is open"));
+        // The epoch type the guard reads: a borrowed call opens it, the
+        // outermost prompt end restores it.
+        let mut epoch = crate::gpu_forward::ep_reserve_forward::EpEpoch::default();
+        assert!(!epoch.dirty());
+        epoch.acquired();
+        assert!(mesh_window_epoch_check(epoch.dirty()).is_err());
+        epoch.restored();
+        assert_eq!(mesh_window_epoch_check(epoch.dirty()), Ok(()));
     }
 }

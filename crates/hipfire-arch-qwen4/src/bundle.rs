@@ -1917,6 +1917,14 @@ impl Qwen4Bundle {
                 .is_some_and(|mesh| mesh.reserve_receipt().is_some())
     }
 
+    /// Whether this rank holds a borrowed-bank epoch open (a prompt tile's
+    /// donors not yet restored); `false` on an ordinary load.
+    pub(crate) fn ep_reserve_epoch_open(&self) -> bool {
+        self.execution
+            .as_ref()
+            .is_some_and(|forward| forward.ep_reserve_epoch_open())
+    }
+
     /// Require this rank's donors resident before a reset, state restore or
     /// state handoff: the forward's local drain/restore followed by the mesh's
     /// abortable rendezvous (a proven clean epoch, and any load that does not

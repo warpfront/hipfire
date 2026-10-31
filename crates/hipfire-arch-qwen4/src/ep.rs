@@ -2177,18 +2177,29 @@ impl Qwen4Bundle {
         if spec.is_some() && self.ep_reserve_active() {
             // AR lanes are admitted on a reserve-sharing load (lane decode
             // steps run on the resident bank, lane prefill tiles borrow like
-            // a singleton prompt tile). The native-MTP window (draft rounds,
-            // verify block, head fill) is not bracketed that way, so a spec
-            // store is refused here with a label; the staging caller falls
-            // back to AR lanes. The loader never reserves a spec store under
-            // the decoupled reserve (`qwen4_ep_vram_layers`), so this fires
-            // only for a load that was not planned with MTP lanes.
-            return Err(ep_err(
-                "native-MTP lanes are refused on an EP reserve-sharing load: the mesh lane \
-                 protocol's draft/verify windows and head fill are not proven on the borrowed \
-                 reserve bank (AR lanes are admitted; load without `--spec mtp` or set \
-                 HIPFIRE_EP_MTP_LANES=0)",
-            ));
+            // a singleton prompt tile). A native-MTP store is refused with a
+            // label unless the lab override `HIPFIRE_EP_MTP_RESERVE_SHARE=1`
+            // is on (then every window must fit the resident bank, see
+            // `spec_store_reserve_verdict` and the mesh window epoch guard);
+            // the staging caller falls back to AR lanes on the refusal. The
+            // loader never reserves a spec store under the decoupled reserve
+            // without the override (`qwen4_ep_vram_layers`), so the refusal
+            // fires only for a load that was not planned with MTP lanes.
+            let resident_rows = self
+                .execution
+                .as_ref()
+                .and_then(|forward| forward.ep_reserve_resident_rows());
+            crate::ep_reserve::spec_store_reserve_verdict(
+                true,
+                crate::ep_reserve::ep_mtp_reserve_share_enabled(),
+                row_budget,
+                resident_rows,
+            )
+            .map_err(ep_err)?;
+            eprintln!(
+                "  qwen4 EP: native-MTP lanes staged on a reserve-sharing load \
+                 (HIPFIRE_EP_MTP_RESERVE_SHARE=1, lab)"
+            );
         }
         if let Some(spec) = spec {
             // Spec lanes decode only through the mesh lane protocol

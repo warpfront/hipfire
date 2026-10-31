@@ -405,6 +405,10 @@ impl RankLane<'_> {
     /// head's position, arenas and the head ticket where the plan wants it).
     /// Nothing here moves lane state beyond mapping and tickets.
     fn preflight(&mut self, start: &WindowStart) -> R<()> {
+        // A mesh window runs draft rounds, the verify and the repair on the
+        // resident bank over whole donor layers: an open borrowed-bank epoch
+        // (EP reserve-sharing load) refuses the window.
+        crate::ep_reserve::mesh_window_epoch_check(self.bundle.ep_reserve_epoch_open())?;
         let Self { bundle, gpu, .. } = self;
         let (spec_k, rows_cap, max_lanes) = {
             let store = bundle

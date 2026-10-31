@@ -1105,7 +1105,13 @@ fn run_prefill_tiles(
     // the resident rows and restored ONCE when the entry ends (the decode rows
     // of this step already ran, and the next step's decode rows need them
     // restored), not once per tile. A no-op on every other load.
-    bundle.share_prompt_begin();
+    // An MTP lane's tile also runs the head fill inside the entry (receipt
+    // phase `mtp_fill`, like the singleton's native-MTP fill).
+    if lanes.iter().any(|lane| lane.spec.is_some()) {
+        bundle.share_prompt_begin_mtp_fill();
+    } else {
+        bundle.share_prompt_begin();
+    }
     let tiles_ran: Result<(), String> = (|| {
         for (i, (r, lane)) in tiles.iter().zip(lanes.iter_mut()).enumerate() {
             let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
