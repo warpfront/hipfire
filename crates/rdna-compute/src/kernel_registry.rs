@@ -3402,6 +3402,222 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_decode_prologue_q8",
             ]
         );
+        // Exact-gfx1201 multi-lane fn-lanes GDN decode core (opt-in `HIPFIRE_QWEN4_GDN_LANES=1`; tensor_ops.rs gated_delta_core_lanes).
+        // Same source construction and compile recipe as `tensor_ops` above plus the two lane
+        // kernels, so the lane kernels inline the singleton bodies under identical flags.
+        add!(
+            "gdn_lanes",
+            crate::tensor_ops::GDN_LANES_SRC,
+            [
+                // GDN_LANES_SRC also compiles the complete tensor_ops translation unit.
+                "argmax_f32",
+                "bf16_roundtrip_f32",
+                "bf16_scaled_add_batched_f32",
+                "bf16_scaled_add_f32",
+                "copy_regions_u32",
+                "gated_delta_conv_bf16_f32",
+                "gated_delta_conv_bf16_f32_batched_k4",
+                "gated_delta_conv_params_bf16_f32",
+                "gated_delta_conv_qknorm_bf16_f32_batched_k4",
+                "gated_delta_gate_bf16_f32",
+                "gated_delta_gate_bf16_f32_batched",
+                "gated_delta_gate_rotate_bf16_f32_batched",
+                "gated_delta_params_bf16_f32",
+                "gated_delta_params_bf16_f32_batched",
+                "gated_delta_params_f32",
+                "gated_delta_qk_norm_bf16_batched",
+                "gated_delta_rollback_layers_f32",
+                "gated_delta_rollback_layers_q8",
+                "gated_delta_step_f32",
+                "gated_delta_step_gate_norm128_gfx1151",
+                "gated_delta_step_gate_norm128_q8",
+                "gated_delta_step_gate_norm128_q8ef",
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+                "gated_delta_step_halves_state128_persistent256_capture_f32",
+                "gated_delta_step_halves_state128_persistent256_capture_q8",
+                "gated_delta_step_halves_state128_persistent256_capture_q8ef",
+                "gated_delta_step_halves_state128_persistent256_f32",
+                "gated_delta_step_halves_state128_persistent256_q8",
+                "gated_delta_step_halves_state128_persistent256_q8ef",
+                "gated_delta_step_norm128_q8",
+                "gated_delta_step_norm128_q8ef",
+                "gated_delta_step_pipe128_f32",
+                "gated_delta_step_pipe128_q8",
+                "gated_delta_step_pipe128_q8ef",
+                "gated_delta_step_shared_norm128_gfx1151",
+                "gdn_q8ef_residual_zero",
+                "gdn_state_f32_to_q8",
+                "gdn_state_f32_to_q8ef",
+                "gdn_state_q8_to_f32",
+                "gdn_state_q8ef_to_f32",
+                "hc_activation_fused_f32",
+                "hc_state_bf16_add_f32",
+                "hc_state_bf16_to_f32",
+                "hyper_norm_f32",
+                "hyper_norm_gate_f32",
+                "hyper_norm_gate_outputs",
+                "hyper_norm_gate_outputs_f32",
+                "hyper_read_f32",
+                "hyper_read_projected_f32",
+                "hyper_read_up_fused_f32",
+                "hyper_write_bf16x2",
+                "hyper_write_bf16x8_gfx1201",
+                "hyper_write_f32",
+                "indexed_attention_attention_f32",
+                "indexed_attention_attention_f32_batched",
+                "indexed_attention_attention_f32_batched_hg12",
+                "indexed_attention_attention_f32_batched_hg4",
+                "indexed_attention_attention_f32_batched_serial",
+                "indexed_attention_attention_f32_serial",
+                "indexed_attention_attention_fp8",
+                "indexed_attention_attention_fp8_batched",
+                "indexed_attention_attention_fp8_batched_hg4",
+                "indexed_attention_attention_fp8_batched_serial",
+                "indexed_attention_attention_fp8_serial",
+                "indexed_attention_attention_q8",
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4_lite",
+                "indexed_attention_attention_q8_batched_serial",
+                "indexed_attention_attention_q8_serial",
+                "indexed_attention_cache_append_f32",
+                "indexed_attention_cache_append_f32_batched",
+                "indexed_attention_cache_append_fp8_batched",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_decode_prologue_f32",
+                "indexed_attention_decode_prologue_fp8",
+                "indexed_attention_decode_prologue_q8",
+                "indexed_attention_index_key_append_bf16_batched",
+                "indexed_attention_norm_rope_f32",
+                "indexed_attention_norm_rope_f32_batched",
+                "indexed_attention_pool_rope_bf16",
+                "indexed_attention_pool_rope_f32",
+                "indexed_attention_reuse_selection",
+                "indexed_attention_rope_table_f32",
+                "indexed_attention_select_bf16_batched",
+                "indexed_attention_select_bf16_batched_serial",
+                "indexed_attention_select_f32",
+                "indexed_attention_select_f32_batched",
+                "indexed_attention_select_f32_batched_serial",
+                "indexed_attention_select_f32_serial",
+                "indexed_attention_select_from_scores",
+                "indexed_attention_select_scores_rows16_f32",
+                "indexed_attention_select_scores_rows32_f32",
+                "indexed_attention_select_scores_rows8_f32",
+                "scale_f32",
+                "gated_delta_conv_params_bf16_f32_lanes",
+                "gated_delta_step_gate_norm128_q8_lanes"
+            ]
+        );
+        // Exact-gfx1201 multi-lane fn-lanes QSA decode core (off unless HIPFIRE_QWEN4_QSA_LANES=1; qsa_core_lanes.rs qsa_core_lanes).
+        add!(
+            "qsa_lanes",
+            crate::tensor_ops::QSA_LANES_SRC,
+            [
+                // QSA_LANES_SRC also compiles the complete tensor_ops translation unit.
+                "argmax_f32",
+                "bf16_roundtrip_f32",
+                "bf16_scaled_add_batched_f32",
+                "bf16_scaled_add_f32",
+                "copy_regions_u32",
+                "gated_delta_conv_bf16_f32",
+                "gated_delta_conv_bf16_f32_batched_k4",
+                "gated_delta_conv_params_bf16_f32",
+                "gated_delta_conv_qknorm_bf16_f32_batched_k4",
+                "gated_delta_gate_bf16_f32",
+                "gated_delta_gate_bf16_f32_batched",
+                "gated_delta_gate_rotate_bf16_f32_batched",
+                "gated_delta_params_bf16_f32",
+                "gated_delta_params_bf16_f32_batched",
+                "gated_delta_params_f32",
+                "gated_delta_qk_norm_bf16_batched",
+                "gated_delta_rollback_layers_f32",
+                "gated_delta_rollback_layers_q8",
+                "gated_delta_step_f32",
+                "gated_delta_step_gate_norm128_gfx1151",
+                "gated_delta_step_gate_norm128_q8",
+                "gated_delta_step_gate_norm128_q8ef",
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+                "gated_delta_step_halves_state128_persistent256_capture_f32",
+                "gated_delta_step_halves_state128_persistent256_capture_q8",
+                "gated_delta_step_halves_state128_persistent256_capture_q8ef",
+                "gated_delta_step_halves_state128_persistent256_f32",
+                "gated_delta_step_halves_state128_persistent256_q8",
+                "gated_delta_step_halves_state128_persistent256_q8ef",
+                "gated_delta_step_norm128_q8",
+                "gated_delta_step_norm128_q8ef",
+                "gated_delta_step_pipe128_f32",
+                "gated_delta_step_pipe128_q8",
+                "gated_delta_step_pipe128_q8ef",
+                "gated_delta_step_shared_norm128_gfx1151",
+                "gdn_q8ef_residual_zero",
+                "gdn_state_f32_to_q8",
+                "gdn_state_f32_to_q8ef",
+                "gdn_state_q8_to_f32",
+                "gdn_state_q8ef_to_f32",
+                "hc_activation_fused_f32",
+                "hc_state_bf16_add_f32",
+                "hc_state_bf16_to_f32",
+                "hyper_norm_f32",
+                "hyper_norm_gate_f32",
+                "hyper_norm_gate_outputs",
+                "hyper_norm_gate_outputs_f32",
+                "hyper_read_f32",
+                "hyper_read_projected_f32",
+                "hyper_read_up_fused_f32",
+                "hyper_write_bf16x2",
+                "hyper_write_bf16x8_gfx1201",
+                "hyper_write_f32",
+                "indexed_attention_attention_f32",
+                "indexed_attention_attention_f32_batched",
+                "indexed_attention_attention_f32_batched_hg12",
+                "indexed_attention_attention_f32_batched_hg4",
+                "indexed_attention_attention_f32_batched_serial",
+                "indexed_attention_attention_f32_serial",
+                "indexed_attention_attention_fp8",
+                "indexed_attention_attention_fp8_batched",
+                "indexed_attention_attention_fp8_batched_hg4",
+                "indexed_attention_attention_fp8_batched_serial",
+                "indexed_attention_attention_fp8_serial",
+                "indexed_attention_attention_q8",
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4_lite",
+                "indexed_attention_attention_q8_batched_serial",
+                "indexed_attention_attention_q8_serial",
+                "indexed_attention_cache_append_f32",
+                "indexed_attention_cache_append_f32_batched",
+                "indexed_attention_cache_append_fp8_batched",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_decode_prologue_f32",
+                "indexed_attention_decode_prologue_fp8",
+                "indexed_attention_decode_prologue_q8",
+                "indexed_attention_index_key_append_bf16_batched",
+                "indexed_attention_norm_rope_f32",
+                "indexed_attention_norm_rope_f32_batched",
+                "indexed_attention_pool_rope_bf16",
+                "indexed_attention_pool_rope_f32",
+                "indexed_attention_reuse_selection",
+                "indexed_attention_rope_table_f32",
+                "indexed_attention_select_bf16_batched",
+                "indexed_attention_select_bf16_batched_serial",
+                "indexed_attention_select_f32",
+                "indexed_attention_select_f32_batched",
+                "indexed_attention_select_f32_batched_serial",
+                "indexed_attention_select_f32_serial",
+                "indexed_attention_select_from_scores",
+                "indexed_attention_select_scores_rows16_f32",
+                "indexed_attention_select_scores_rows32_f32",
+                "indexed_attention_select_scores_rows8_f32",
+                "scale_f32",
+                "indexed_attention_decode_prologue_fp8_lanes",
+                "indexed_attention_pool_rope_bf16_lanes",
+                "indexed_attention_select_bf16_lanes",
+                "indexed_attention_attention_fp8_lanes",
+            ]
+        );
         // Default >= 512-row prefill: BF16 -> F16 WMMA projections (HC
         // input_mix_down 160 x 80 split-K tile + reducer, router/shared 128 x
         // 128, wider projections 128 x 256), the HC read-up tile, and the
@@ -10834,6 +11050,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Multi-lane fn-lanes QSA decode core (gfx1201, HIPFIRE_QWEN4_QSA_LANES).
+        const QSA_LANES_ADDED_MODULES: [&str; 1] = ["qsa_lanes"];
+        for module in QSA_LANES_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing QSA lanes module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // gfx12 W8A8 / W8-FP8 Q8_0 prefill GEMMs (quantized-activation tiers).
         const Q8_0_MMQ_ACT_ADDED_MODULES: [&str; 2] =
             ["gemm_q8_0_mmq_i8_gfx12", "gemm_q8_0_mmq_fp8_gfx12"];
@@ -10924,10 +11154,25 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Opt-in multi-lane fn-lanes GDN decode core (tensor_ops + gdn_lanes.hip).
+        const GDN_LANES_ADDED_MODULES: [&str; 1] = ["gdn_lanes"];
+        for module in GDN_LANES_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing GDN lanes module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
                 + MQ3V25_ADDED_MODULES.len()
+                + GDN_LANES_ADDED_MODULES.len()
                 + PRE_S1_ADDED_SINCE_P0
                 + S1_ADDED_MODULES.len()
                 + NATIVE_A3B_ADDED_MODULES.len()
@@ -10952,7 +11197,8 @@ mod tests {
                 + A3B_LANE_PROJ_ADDED_MODULES.len()
                 + BF16_XF32_ROWS_ADDED_MODULES.len()
                 + Q8_0_MMQ_ACT_ADDED_MODULES.len()
-                + FFN_ROTATE_I8_ADDED_MODULES.len(),
+                + FFN_ROTATE_I8_ADDED_MODULES.len()
+                + QSA_LANES_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -12550,6 +12796,72 @@ mod tests {
             ] {
                 assert!(declared.contains(symbol), "{arch}: {symbol}");
             }
+        }
+    }
+
+    /// `gdn_lanes` is `tensor_ops` plus the two multi-lane GDN core kernels,
+    /// on the two arches that run them (exact gfx1151 default on, exact gfx1201
+    /// opt-in): the index declares exactly what its source defines for the
+    /// arch, the lane kernels inline the singleton bodies under the SAME
+    /// compile recipe as `tensor_ops`, and no other arch registers it.
+    #[test]
+    fn gdn_lanes_declares_its_source_and_shares_the_tensor_ops_recipe() {
+        for arch in ["gfx1151", "gfx1201"] {
+            let lanes = lookup(arch, "gdn_lanes", "").unwrap();
+            let base = lookup(arch, "tensor_ops", "").unwrap();
+            let defined = active_kernel_names(lanes.source(), &entry_predefs(arch, &lanes.flags));
+            let declared: std::collections::BTreeSet<String> =
+                lanes.symbols.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(
+                defined.difference(&declared).collect::<Vec<_>>(),
+                Vec::<&String>::new(),
+                "{arch}: gdn_lanes source defines kernels the entry does not declare"
+            );
+            assert_eq!(
+                declared.difference(&defined).collect::<Vec<_>>(),
+                Vec::<&String>::new(),
+                "{arch}: gdn_lanes declares kernels its source does not define"
+            );
+            let lane_kernels: Vec<&str> = lanes
+                .symbols
+                .iter()
+                .copied()
+                .filter(|s| s.ends_with("_lanes"))
+                .collect();
+            assert_eq!(
+                lane_kernels,
+                [
+                    "gated_delta_conv_params_bf16_f32_lanes",
+                    "gated_delta_step_gate_norm128_q8_lanes"
+                ],
+                "{arch}"
+            );
+            // Everything tensor_ops declares is also declared (the lane kernels
+            // are the whole difference) and the flags/profile are identical.
+            let base_symbols: std::collections::BTreeSet<String> =
+                base.symbols.iter().map(|s| (*s).to_owned()).collect();
+            let extra: Vec<&String> = declared.difference(&base_symbols).collect();
+            assert_eq!(
+                extra,
+                [
+                    "gated_delta_conv_params_bf16_f32_lanes",
+                    "gated_delta_step_gate_norm128_q8_lanes"
+                ],
+                "{arch}"
+            );
+            assert!(base_symbols.is_subset(&declared), "{arch}");
+            assert_eq!(lanes.flags, base.flags, "{arch}: compile flags");
+            assert_eq!(
+                lanes.scheduler_profile, base.scheduler_profile,
+                "{arch}: scheduler profile"
+            );
+            assert!(
+                lanes.source().starts_with(base.source()),
+                "{arch}: gdn_lanes source is tensor_ops plus the lane kernels"
+            );
+        }
+        for arch in ["gfx1100", "gfx906", "gfx942"] {
+            assert!(lookup(arch, "gdn_lanes", "").is_err(), "{arch}");
         }
     }
 
