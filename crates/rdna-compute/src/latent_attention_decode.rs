@@ -53,6 +53,20 @@ const PARTIAL_KERNEL: &str = "latent_attention_decode_partial";
 const MERGE_KERNEL: &str = "latent_attention_decode_merge";
 const PARTIAL_Q8_KERNEL: &str = "latent_attention_decode_partial_q8";
 
+/// The multi-row build of the same source (`-DLA_DEC_ROWS`): module
+/// `latent_attention_decode_rows`, kernels `*_rows` with the query row in grid
+/// `z`. See [`Gpu::latent_attention_decode_split_rows`].
+pub const LATENT_ATTENTION_DECODE_ROWS_SRC: &str = concat!(
+    "#define LA_DEC_ROWS 1\n",
+    include_str!("../../../kernels/src/latent_attention_decode.hip")
+);
+const DECODE_ROWS_MODULE: &str = "latent_attention_decode_rows";
+const PARTIAL_ROWS_KERNEL: &str = "latent_attention_decode_partial_rows";
+const MERGE_ROWS_KERNEL: &str = "latent_attention_decode_merge_rows";
+const PARTIAL_Q8_ROWS_KERNEL: &str = "latent_attention_decode_partial_q8_rows";
+/// Most query rows one [`Gpu::latent_attention_decode_split_rows`] launch serves.
+pub const LATENT_DECODE_ROWS_MAX: usize = 16;
+
 /// Number of key splits (grid `x` of the partials kernel). Fixed: the merge
 /// order, and therefore the output bytes for a given `len`, depend on it.
 pub const LATENT_DECODE_SPLITS: usize = 32;
@@ -120,7 +134,7 @@ impl Gpu {
         a: &TiledAttention<'_>,
         workspace: &GpuTensor,
     ) -> HipResult<()> {
-        self.decode_split_impl(a, workspace, false)
+        self.decode_split_impl(a, workspace, false, false)
     }
 
     /// [`Self::latent_attention_decode_split`] over a Q8 expanded mirror:
@@ -134,7 +148,35 @@ impl Gpu {
         a: &TiledAttention<'_>,
         workspace: &GpuTensor,
     ) -> HipResult<()> {
-        self.decode_split_impl(a, workspace, true)
+        self.decode_split_impl(a, workspace, true, false)
+    }
+
+    /// Row-exact multi-row split-KV decode: `a.n_rows = K` in
+    /// `1..=`[`LATENT_DECODE_ROWS_MAX`] query rows in ONE launch pair (grid `z` =
+    /// row), where row `r` sees keys `j < min(*pos + pos_offset + r + 1, max_rows)`
+    /// (the K new rows are already in the cache) and its partials and merge are
+    /// bit-identical to the rows == 1 call [`Self::latent_attention_decode_split`]
+    /// makes with `pos_offset + r` (same split partition for that length, same
+    /// partial math, same merge order): the kernels are the singleton's source with
+    /// a row offset. `a.q` / `a.y` are F32 `[K, n_heads, dq|dv]`; `workspace` needs
+    /// [`latent_attention_decode_workspace_elems`]`(n_heads, dv) * K` elements
+    /// (`[K][n_heads][SPLITS][dv + 2]`).
+    pub fn latent_attention_decode_split_rows(
+        &mut self,
+        a: &TiledAttention<'_>,
+        workspace: &GpuTensor,
+    ) -> HipResult<()> {
+        self.decode_split_impl(a, workspace, false, true)
+    }
+
+    /// [`Self::latent_attention_decode_split_rows`] over a Q8 expanded mirror
+    /// (the multi-row twin of [`Self::latent_attention_decode_split_q8`]).
+    pub fn latent_attention_decode_split_rows_q8(
+        &mut self,
+        a: &TiledAttention<'_>,
+        workspace: &GpuTensor,
+    ) -> HipResult<()> {
+        self.decode_split_impl(a, workspace, true, true)
     }
 
     fn decode_split_impl(
@@ -142,10 +184,18 @@ impl Gpu {
         a: &TiledAttention<'_>,
         workspace: &GpuTensor,
         q8: bool,
+        rows_mode: bool,
     ) -> HipResult<()> {
-        if a.n_rows != 1 {
+        if !rows_mode && a.n_rows != 1 {
             return Err(err(format!(
                 "latent_attention decode: supports exactly one query row, got n_rows = {}",
+                a.n_rows
+            )));
+        }
+        if rows_mode && !(1..=LATENT_DECODE_ROWS_MAX).contains(&a.n_rows) {
+            return Err(err(format!(
+                "latent_attention decode: multi-row decode supports 1..={LATENT_DECODE_ROWS_MAX} \
+                 query rows, got n_rows = {}",
                 a.n_rows
             )));
         }
@@ -181,7 +231,7 @@ impl Gpu {
         check_view(&a.k_a, "k_a")?;
         check_view(&a.k_b, "k_b")?;
         check_view(&a.v, "v")?;
-        let ws_need = latent_attention_decode_workspace_elems(a.n_heads, dv);
+        let ws_need = latent_attention_decode_workspace_elems(a.n_heads, dv) * a.n_rows;
         if workspace.dtype != DType::F32 {
             return Err(err(format!(
                 "latent_attention decode: workspace must be F32, got {:?}",
@@ -191,8 +241,9 @@ impl Gpu {
         if workspace.numel() < ws_need {
             return Err(err(format!(
                 "latent_attention decode: workspace holds {} elements, needs {ws_need} \
-                 ([{}][{LATENT_DECODE_SPLITS}][{dv} + 2])",
+                 ([{}][{}][{LATENT_DECODE_SPLITS}][{dv} + 2])",
                 workspace.numel(),
+                a.n_rows,
                 a.n_heads
             )));
         }
@@ -219,15 +270,36 @@ impl Gpu {
         let (kb_tok, kb_head) = (a.k_b.tok_stride as i64, a.k_b.head_stride as i64);
         let (v_tok, v_head) = (a.v.tok_stride as i64, a.v.head_stride as i64);
 
-        let partial_kernel = if q8 {
-            PARTIAL_Q8_KERNEL
-        } else {
-            PARTIAL_KERNEL
+        let (module, src, partial_kernel, merge_kernel) = match (rows_mode, q8) {
+            (false, false) => (
+                DECODE_MODULE,
+                LATENT_ATTENTION_DECODE_SRC,
+                PARTIAL_KERNEL,
+                MERGE_KERNEL,
+            ),
+            (false, true) => (
+                DECODE_MODULE,
+                LATENT_ATTENTION_DECODE_SRC,
+                PARTIAL_Q8_KERNEL,
+                MERGE_KERNEL,
+            ),
+            (true, false) => (
+                DECODE_ROWS_MODULE,
+                LATENT_ATTENTION_DECODE_ROWS_SRC,
+                PARTIAL_ROWS_KERNEL,
+                MERGE_ROWS_KERNEL,
+            ),
+            (true, true) => (
+                DECODE_ROWS_MODULE,
+                LATENT_ATTENTION_DECODE_ROWS_SRC,
+                PARTIAL_Q8_ROWS_KERNEL,
+                MERGE_ROWS_KERNEL,
+            ),
         };
         let nh = to_i32(a.n_heads, "n_heads")?;
         self.bind_thread()?;
-        self.ensure_kernel(DECODE_MODULE, LATENT_ATTENTION_DECODE_SRC, partial_kernel)?;
-        self.ensure_kernel(DECODE_MODULE, LATENT_ATTENTION_DECODE_SRC, MERGE_KERNEL)?;
+        self.ensure_kernel(module, src, partial_kernel)?;
+        self.ensure_kernel(module, src, merge_kernel)?;
 
         let mut partial_params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
@@ -255,7 +327,11 @@ impl Gpu {
         }
         self.launch_maybe_blob(
             partial_kernel,
-            [LATENT_DECODE_SPLITS as u32, a.n_heads as u32, 1],
+            [
+                LATENT_DECODE_SPLITS as u32,
+                a.n_heads as u32,
+                a.n_rows as u32,
+            ],
             [DECODE_BLOCK, 1, 1],
             0,
             &mut partial_params,
@@ -298,8 +374,8 @@ impl Gpu {
             &round_y as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            MERGE_KERNEL,
-            [a.n_heads as u32, 1, 1],
+            merge_kernel,
+            [a.n_heads as u32, 1, a.n_rows as u32],
             [DECODE_BLOCK, 1, 1],
             0,
             &mut merge_params,
@@ -316,5 +392,50 @@ impl Gpu {
                 b
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The multi-row module is the singleton source plus one leading define: the
+    /// singleton's own text (and so its object) is the shared source verbatim,
+    /// and every row-dimension hook is a macro that is empty without it.
+    #[test]
+    fn rows_module_is_the_singleton_source_with_the_rows_define() {
+        assert_eq!(
+            LATENT_ATTENTION_DECODE_ROWS_SRC,
+            format!("#define LA_DEC_ROWS 1\n{LATENT_ATTENTION_DECODE_SRC}")
+        );
+        assert!(!LATENT_ATTENTION_DECODE_SRC.contains("#define LA_DEC_ROWS 1"));
+        for (module_symbol, rows_symbol) in [
+            (PARTIAL_KERNEL, PARTIAL_ROWS_KERNEL),
+            (MERGE_KERNEL, MERGE_ROWS_KERNEL),
+            (PARTIAL_Q8_KERNEL, PARTIAL_Q8_ROWS_KERNEL),
+        ] {
+            assert_eq!(rows_symbol, format!("{module_symbol}_rows"));
+            // Names come from the LA_DEC_* macros: bare in the singleton build,
+            // `_rows` in the multi-row build.
+            assert!(LATENT_ATTENTION_DECODE_SRC.contains(&format!(
+                "#define LA_DEC_{} {module_symbol}\n",
+                macro_suffix(module_symbol)
+            )));
+            assert!(LATENT_ATTENTION_DECODE_SRC.contains(&format!(
+                "#define LA_DEC_{} {rows_symbol}\n",
+                macro_suffix(module_symbol)
+            )));
+        }
+        assert!(LATENT_DECODE_ROWS_MAX >= 16);
+    }
+
+    fn macro_suffix(symbol: &str) -> &'static str {
+        if symbol.ends_with("partial_q8") {
+            "PARTIAL_Q8"
+        } else if symbol.ends_with("partial") {
+            "PARTIAL"
+        } else {
+            "MERGE"
+        }
     }
 }

@@ -1104,6 +1104,7 @@ module	kv_transcode_k_fwht4_to_fwht2	config-opt-in	Non-default configuration: at
 module	kv_transcode_k_fwht4_to_fwht3	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12421
 module	kv_transcode_v_lloyd_down	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12333
 module	kv_transcode_v_q8_to_lloyd4	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12286
+module	latent_attention_decode_rows	config-opt-in	Non-default configuration: opt-in MlaRowsRoute::DecodeExact / AttentionRoute::{TiledRows,AbsorbedRows} multi-row exact decode (default routes unchanged); rdna-compute/src/latent_attention_decode.rs:291
 module	layernorm_f32	config-opt-in	Non-default configuration: vision.mode / vision.rs; qwen35_vl.rs:1329
 module	layernorm_modulate	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:1971
 module	logit_softcap_f32	non-core-family	Non-core family route: Muse Glimmer, Gemma, LFM2; forward.rs:507-3897

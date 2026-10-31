@@ -129,6 +129,23 @@ pub struct AbsorbOperands<'a> {
     pub z: &'a GpuTensor,
 }
 
+/// How a tiled attention stage with `rows > 1` query rows is served.
+/// `rows == 1` is always the split-KV decode call, so the choice only matters
+/// for multi-row stages (speculative-decode verify, prefill chunks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MlaRowsRoute {
+    /// The tiled causal flash prefill kernel (the default; reordered arithmetic,
+    /// not bit-equal to the decode call of the same row).
+    #[default]
+    Flash,
+    /// One multi-row split-KV decode launch (`rows <= LATENT_DECODE_ROWS_MAX`,
+    /// needs the split-KV `workspace` sized for `rows`): row `r` is bit-identical
+    /// to the rows == 1 decode call at length `*pos + r + 1`, so a verify row
+    /// equals the autoregressive decode row bit for bit. The `rows` new cache
+    /// rows (and mirror rows) must already be written.
+    DecodeExact,
+}
+
 /// Which attention kernels serve an [`LatentAttentionOp::Attention`] stage.
 #[derive(Clone, Copy)]
 pub enum AttentionRoute<'a> {
@@ -139,12 +156,37 @@ pub enum AttentionRoute<'a> {
     /// (`rows == 1`, needs `workspace`) over the expanded mirror. Reordered
     /// arithmetic: inside the BF16 band, not bit-exact to `Reference`.
     Tiled { workspace: Option<&'a GpuTensor> },
+    /// [`Self::Tiled`] with an explicit multi-row route; `rows_route: Flash` is
+    /// exactly `Tiled`. Opt-in: nothing selects `DecodeExact` implicitly.
+    TiledRows {
+        workspace: Option<&'a GpuTensor>,
+        rows_route: MlaRowsRoute,
+    },
     /// Absorbed latent attention (no mirror needed); the tiled kernels run in
     /// latent space and the value expansion is applied to `z`.
     Absorbed {
         ops: AbsorbOperands<'a>,
         workspace: Option<&'a GpuTensor>,
     },
+    /// [`Self::Absorbed`] with an explicit multi-row route for its latent-space
+    /// attention (`rows_route: Flash` is exactly `Absorbed`).
+    AbsorbedRows {
+        ops: AbsorbOperands<'a>,
+        workspace: Option<&'a GpuTensor>,
+        rows_route: MlaRowsRoute,
+    },
+}
+
+impl AttentionRoute<'_> {
+    /// The multi-row route of this attention route (`Flash` unless a `*Rows`
+    /// variant says otherwise).
+    pub fn rows_route(&self) -> MlaRowsRoute {
+        match self {
+            AttentionRoute::TiledRows { rows_route, .. }
+            | AttentionRoute::AbsorbedRows { rows_route, .. } => *rows_route,
+            _ => MlaRowsRoute::Flash,
+        }
+    }
 }
 
 /// One stage of the latent attention pipeline.
@@ -497,7 +539,8 @@ fn attention(
             )
             .map_err(hip)
         }
-        AttentionRoute::Tiled { workspace } => {
+        AttentionRoute::Tiled { workspace } | AttentionRoute::TiledRows { workspace, .. } => {
+            let rows_route = route.rows_route();
             let m = need_mirror(mirror, cache, rows, "tiled")?;
             // BF16 mirror: element-unit views; Q8 mirror: byte-unit plane views.
             let (k_a, v) = if m.q8 {
@@ -555,9 +598,11 @@ fn attention(
                 max_rows: cache.capacity_rows.min(m.capacity_rows),
                 round_y_bf16: true,
             };
-            run_tiled(gpu, &a, *workspace, m.q8)
+            run_tiled(gpu, &a, *workspace, m.q8, rows_route)
         }
-        AttentionRoute::Absorbed { ops, workspace } => {
+        AttentionRoute::Absorbed { ops, workspace }
+        | AttentionRoute::AbsorbedRows { ops, workspace, .. } => {
+            let rows_route = route.rows_route();
             let packed_ok = ops.packed.dtype == rdna_compute::DType::BF16
                 && ops.packed.numel()
                     >= rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems(
@@ -604,7 +649,7 @@ fn attention(
                 max_rows: cache.capacity_rows,
                 round_y_bf16: false,
             };
-            run_tiled(gpu, &a, *workspace, false)?;
+            run_tiled(gpu, &a, *workspace, false, rows_route)?;
             gpu.latent_attention_absorb_v(
                 ops.z, ops.packed, y, rows, g.n_heads, g.nope, g.v_dim, g.latent, true,
             )
@@ -613,13 +658,15 @@ fn attention(
     }
 }
 
-/// Prefill kernel for `rows > 1`, split-KV decode for `rows == 1`; `q8`: the
+/// Prefill kernel for `rows > 1` (or the multi-row decode kernel under
+/// [`MlaRowsRoute::DecodeExact`]), split-KV decode for `rows == 1`; `q8`: the
 /// K_nope and V views are Q8 mirror planes.
 fn run_tiled(
     gpu: &mut Gpu,
     a: &TiledAttention<'_>,
     workspace: Option<&GpuTensor>,
     q8: bool,
+    rows_route: MlaRowsRoute,
 ) -> Result<(), DispatchError> {
     if a.n_rows == 1 {
         let ws =
@@ -629,9 +676,51 @@ fn run_tiled(
         } else {
             gpu.latent_attention_decode_split(a, ws).map_err(hip)
         }
+    } else if rows_route == MlaRowsRoute::DecodeExact {
+        let ws = workspace
+            .ok_or_else(|| refuse("multi-row exact decode needs the split-KV workspace".into()))?;
+        if q8 {
+            gpu.latent_attention_decode_split_rows_q8(a, ws)
+                .map_err(hip)
+        } else {
+            gpu.latent_attention_decode_split_rows(a, ws).map_err(hip)
+        }
     } else if q8 {
         gpu.latent_attention_flash_prefill_q8(a).map_err(hip)
     } else {
         gpu.latent_attention_flash_prefill(a).map_err(hip)
+    }
+}
+
+#[cfg(test)]
+mod rows_route_tests {
+    use super::*;
+
+    /// The multi-row exact decode is opt-in: the default route and the plain
+    /// `Tiled` / `Absorbed` routes keep the flash prefill for `rows > 1`.
+    #[test]
+    fn decode_exact_is_opt_in() {
+        assert_eq!(MlaRowsRoute::default(), MlaRowsRoute::Flash);
+        assert_eq!(AttentionRoute::Reference.rows_route(), MlaRowsRoute::Flash);
+        assert_eq!(
+            AttentionRoute::Tiled { workspace: None }.rows_route(),
+            MlaRowsRoute::Flash
+        );
+        assert_eq!(
+            AttentionRoute::TiledRows {
+                workspace: None,
+                rows_route: MlaRowsRoute::DecodeExact
+            }
+            .rows_route(),
+            MlaRowsRoute::DecodeExact
+        );
+        assert_eq!(
+            AttentionRoute::TiledRows {
+                workspace: None,
+                rows_route: MlaRowsRoute::Flash
+            }
+            .rows_route(),
+            MlaRowsRoute::Flash
+        );
     }
 }
