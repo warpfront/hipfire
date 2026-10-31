@@ -989,6 +989,8 @@ module	gemv_q6k	codec-outside-core-rungs	Q6K route absent from admitted core art
 module	gemv_q8_0_moe_down_residual_scaled_k8_indexed	non-core-family	Non-core family route: Gemma, LFM2, MiniMax/Maple; sandwich.rs:1338
 module	gemv_q8_0_moe_down_top10_indexed_batched_expanded	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; moe.rs:2742-2754
 module	gemv_q8_0_moe_gate_up_k8_indexed	non-core-family	Non-core family route: Gemma, LFM2, MiniMax/Maple; hipfire-dispatch/src/pipeline/sandwich.rs:1324
+module	gemv_q8_0_rows_exact	no-caller	No production caller yet: the row-exact multi-row Q8_0 GEMV (K > 1536 arm) is reached only by tests and the not-yet-wired spec-verify consumer; rdna-compute/src/gemv.rs:20798
+module	gemv_q8_0_wide_rows_exact	no-caller	No production caller yet: the row-exact multi-row Q8_0 GEMV (K <= 1536 arm) is reached only by tests and the not-yet-wired spec-verify consumer; rdna-compute/src/gemv.rs:20789
 module	gemv_q8hfq	codec-outside-core-rungs	Q8HFQ route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:540
 module	gemv_q8hfq_wide	codec-outside-core-rungs	Q8HFQ route absent from admitted core artifact rungs; gemv.rs:18791-18832
 module	gemv_tq2g128	codec-outside-core-rungs	TQ2G128 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:534

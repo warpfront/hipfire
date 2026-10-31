@@ -254,6 +254,48 @@ impl GemvFamily {
         self.run_input(ctx, gpu, w, RotInput::Raw(x), y)
     }
 
+    /// Row-exact multi-row GEMV: `y[r, :] = W · x[r, :]` for `rows` activation
+    /// rows (`x` F32 `[rows, k]`, `y` F32 `[rows, m]`), where every output row is
+    /// bit-identical to what [`Self::run_auto`] (the rows == 1 decode GEMV
+    /// `weight_gemv` launches) writes for that `x` row, so a speculative-decode
+    /// verify row equals the autoregressive decode row bit for bit. Generic over
+    /// the consumer: nothing here names a model.
+    ///
+    /// Q8_0 (Q8F16) only today: it resolves the same `KernelKey::GemvQ8_0` arch
+    /// gate as the singleton, then runs [`Gpu::gemv_q8_0_rows_exact`] (hipcc
+    /// multi-row kernels on gfx1100/gfx1201, per-row singleton launches
+    /// elsewhere; see `rdna_compute::gemv::Q8RowsExactRoute`). Any other dtype is
+    /// `UnsupportedVariant` rather than a silently different reduction order.
+    /// `rows` is 1..=any: the launcher groups by 16.
+    pub fn run_rows_exact(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        w: &WeightRef,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        rows: usize,
+    ) -> Result<(), DispatchError> {
+        if w.dtype != DType::Q8_0 {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "rows_exact_q8_0_only",
+                arch: "",
+                quant: "",
+            });
+        }
+        // The singleton's own gate (`run` resolves with batch_size 1).
+        let shape = ShapeInfo {
+            batch_size: 1,
+            head_dim: 0,
+            m: w.m,
+            is_tree: false,
+        };
+        self.resolve(w.dtype, GemvVariant::Plain, false, ctx, Some(&shape))?;
+        gpu.gemv_q8_0_rows_exact(w.buf, x, y, w.m, w.k, rows)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
     /// Run a GEMV with a raw or pre-rotated input.
     ///
     /// `RotInput::Raw(x)` — family auto-rotates if the dtype requires it,

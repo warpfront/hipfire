@@ -1360,6 +1360,53 @@ pub fn fused_silu_mul_rotate_mq_f16_batched_for(
     )
 }
 
+/// Row-exact multi-row `weight_gemv`: `y[r, :] = W · x[r, :]` for `rows`
+/// activation rows (`x` F32 `[rows, w.k]`, `y` F32 `[rows, w.m]`), every output
+/// row bit-identical to what `weight_gemv` writes for that `x` row (the rows == 1
+/// decode GEMV), so a speculative-decode verify row equals the autoregressive
+/// decode row bit for bit.
+///
+/// Q8F16 (`DType::Q8_0`) weights run the multi-row kernels
+/// (`hipfire_dispatch::families::gemv::GemvFamily::run_rows_exact`,
+/// `Gpu::gemv_q8_0_rows_exact`: weights read once for up to 16 rows). Every other
+/// dtype runs `weight_gemv` once per row on row views of `x`/`y` — the singleton
+/// itself, exact by construction, weights re-read per row.
+pub fn weight_gemv_rows_exact(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+) -> HipResult<()> {
+    reject_mq4g128v2(w.gpu_dtype)?;
+    if w.gpu_dtype == DType::Q8_0 {
+        use hipfire_dispatch::context::DispatchCtx;
+        use hipfire_dispatch::families::gemv::WeightRef;
+        let ctx = DispatchCtx::new(gpu);
+        let wr = WeightRef {
+            buf: &w.buf,
+            dtype: w.gpu_dtype,
+            m: w.m,
+            k: w.k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+            lloyd_lut_f16: w.lloyd_lut_f16,
+            lloyd_lut_c16: w.lloyd_lut_c16,
+        };
+        return crate::llama::gemv_family()
+            .run_rows_exact(&ctx, gpu, &wr, x, y, rows)
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
+    }
+    for row in 0..rows {
+        let x_row = x.sub_offset(row * w.k, w.k);
+        let y_row = y.sub_offset(row * w.m, w.m);
+        weight_gemv(gpu, w, &x_row, &y_row)?;
+    }
+    Ok(())
+}
+
 /// GEMV with optional pre-rotated x for MagnumQuant weights.
 ///
 /// - MQ4 + `x_rot = Some(..)`: calls the arch-tuned HFQ4 GEMV on the pre-rotated buffer,

@@ -7864,6 +7864,16 @@ pub const GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_batched_wide_exact.hip");
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
+/// Row-exact multi-row twins of the rows == 1 decode Q8_0 GEMV singletons
+/// (module names `gemv_q8_0_rows_exact` / `gemv_q8_0_wide_rows_exact`; one
+/// kernel per row count, `..._r1` .. `..._r16`). Row r of the output is
+/// bit-identical to the singleton's output for x row r:
+/// [`GEMV_Q8_0_ROWS_EXACT_SRC`] mirrors `gemv_q8_0` (K > 1536),
+/// [`GEMV_Q8_0_WIDE_ROWS_EXACT_SRC`] mirrors `gemv_q8_0_wide` (K <= 1536).
+pub const GEMV_Q8_0_ROWS_EXACT_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_rows_exact.hip");
+pub const GEMV_Q8_0_WIDE_ROWS_EXACT_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_wide_rows_exact.hip");
 /// Qwen4 siblings of `gemv_q8_0` (module `qwen4_gemv_q8_0`): the staged
 /// K=320/2560 and eight-wave split kernels with their few-row variants,
 /// BF16 -> Q8_0 requantization and the Q8_0 draft-head re-score.
