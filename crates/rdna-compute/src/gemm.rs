@@ -32410,9 +32410,10 @@ impl Gpu {
         result
     }
 
-    /// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 64x64 4-warp tile (gfx1151).
-    /// Takes F32 `x` (auto-quantized to Q8_1), int8 WMMA at ~2x. Drop-in for
-    /// `gemm_q8_0_wmma_4w`. Requires M%64==0, N%64==0, K%128==0.
+    /// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 64x64 4-warp tile (gfx1151, gfx1100).
+    /// Takes F32 `x` (auto-quantized to Q8_1), int8 WMMA at ~2x. Requires K%128==0; M and N
+    /// tails are bounds-checked in the kernel (tests/gemm_q8_0_mmq_gfx11.rs). The DeepSeek4
+    /// route still gates it at N%64==0 and M%64==0 itself.
     pub fn gemm_q8_0_mmq_4w_gfx1151(
         &mut self,
         a: &GpuTensor,
@@ -32423,11 +32424,11 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch != "gfx1151" {
+        if self.arch != "gfx1151" && self.arch != "gfx1100" {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "gemm_q8_0_mmq_4w_gfx1151 requires gfx1151; current arch = {}",
+                    "gemm_q8_0_mmq_4w_gfx1151 requires gfx1151 or gfx1100; current arch = {}",
                     self.arch
                 ),
             ));

@@ -7279,7 +7279,7 @@ fn gated_ffn_from_basis(
         if rows == 1 && weight.dtype == DType::Q8_0 {
             return hip!(gpu.gemv_q8_0(weight.buf, xin, y, m, k));
         }
-        if weight.dtype == DType::Q8_0 && q8_0_prefill_runs(gpu, tier, k, rows) {
+        if weight.dtype == DType::Q8_0 && q8_0_prefill_runs(gpu, tier, m, k, rows) {
             return q8_0_prefill_gemm(gpu, tier, weight.buf, xin, y, m, k, rows).map(|_| ());
         }
         gemm.run_key(

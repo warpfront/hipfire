@@ -5018,6 +5018,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemv_mq4g256v2"]
         );
     }
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        // Q8_0 W8A8 i8-MMQ 64x64 prefill GEMM (Raon's tiered Q8_0 route on gfx1100, opt-in on
+        // gfx1151, and the DeepSeek4 dense route on gfx1151; `q8_prefill.rs`, `gemm.rs`). The kernel
+        // file keeps its gfx1151 name and builds for both.
+        add!(
+            "gemm_q8_0_mmq_4w_gfx1151",
+            kernels::GEMM_Q8_0_MMQ_4W_GFX1151_SRC,
+            ["gemm_q8_0_mmq_4w_gfx1151"]
+        );
+    }
     if arch == "gfx1100" {
         // DFlash draft collapse modules (dflash_draft_fusion.rs: module name ==
         // symbol, all over `COLLAPSE_SRC`); previously only exported as

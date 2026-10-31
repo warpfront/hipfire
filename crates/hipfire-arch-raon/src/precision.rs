@@ -127,16 +127,20 @@ impl RaonSiteTiers {
 /// measurement on R9700 (`raon/pfx/ev/fp8/`, CHANGELOG): A8 and FP8 run at the same speed at every
 /// site, A8 has the lower KLD at every site, A4 alone exceeds the +0.002 KLD budget at every FFN
 /// site, and all-A8 costs code24 +0.0003 / WT2 +0.0011 vs all-F16 on the shipped artifact.
-/// gfx1100 / gfx1151: the routed experts run W4A8 on the gfx11 twin of the grouped kernel
-/// (7900 XTX pp512 +6.0%, Strix Halo +4.9%, KLD code24 -0.0005 / WT2 +0.00004 vs all-F16; receipts
-/// `raon/pfx/ev/a8r3/`); shared and dense FFN can run it too but are unmeasured there, and the Q8_0
-/// attention class has no gfx11 int8 route. Every other arch: all F16.
+/// gfx1100: A8 at every site too. The routed experts run W4A8 on the gfx11 twin of the grouped
+/// kernel (7900 XTX pp512 +6.0%, KLD code24 -0.0005 / WT2 +0.00004 vs all-F16; receipts
+/// `raon/pfx/ev/a8r3/`); the Q8_0 sites (attention class, and the shared / dense FFN of the shipped
+/// Q8F16 artifact) run W8A8 on the i8-MMQ 64x64 kernel (receipts `raon/pfx/ev/xtxa8/`). Shared and
+/// dense FFN that are qt44 but not loader-verified symmetric (the older `-s` artifact) fall back to
+/// F16 at load with the reason logged.
+/// gfx1151: the routed experts only (Strix Halo measured there; the Q8_0 i8 route is admitted on
+/// gfx1151 but is opt-in via the env until it is measured on that card). Every other arch: all F16.
 pub fn default_table(arch: &str) -> RaonSiteTiers {
-    /// gfx1201 default, indexed like [`RaonPrecisionSite::ALL`].
-    const GFX1201: RaonSiteTiers = RaonSiteTiers::all(PrefillActTier::A8);
+    /// gfx1201 / gfx1100 default, indexed like [`RaonPrecisionSite::ALL`].
+    const ALL_A8: RaonSiteTiers = RaonSiteTiers::all(PrefillActTier::A8);
     match arch {
-        "gfx1201" => GFX1201,
-        "gfx1100" | "gfx1151" => {
+        "gfx1201" | "gfx1100" => ALL_A8,
+        "gfx1151" => {
             let mut t = RaonSiteTiers::ALL_F16;
             t.set(RaonPrecisionSite::RoutedGateUp, PrefillActTier::A8);
             t.set(RaonPrecisionSite::RoutedDown, PrefillActTier::A8);
@@ -234,8 +238,9 @@ impl RaonPrecisionPolicy {
 /// What a site's weight is, as far as the tier resolution cares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiteWeight {
-    /// Q8_0 (Q8F16) weight, `k` input columns.
+    /// Q8_0 (Q8F16) weight `[m, k]`.
     Q8 {
+        m: usize,
         k: usize,
     },
     /// qt44 (`MQ4G256V2`) weight; `symmetric`: loader-verified `zp == -8 * sc`; `ffn`: the site
@@ -254,7 +259,7 @@ pub enum SiteWeight {
 impl SiteWeight {
     pub fn of(w: &WeightTensor, symmetric: bool, ffn: bool) -> Self {
         match w.gpu_dtype {
-            DType::Q8_0 => Self::Q8 { k: w.k },
+            DType::Q8_0 => Self::Q8 { m: w.m, k: w.k },
             DType::MQ4G256V2 => Self::Qt44 {
                 symmetric,
                 m: w.m,
@@ -277,19 +282,12 @@ impl SiteWeight {
                 },
             );
         }
-        if arch != "gfx1201" && matches!(*self, Self::Q8 { .. }) {
-            return Err("Q8_0 has no gfx11 int8 route");
+        if let Self::Q8 { m, k } = *self {
+            hipfire_dispatch::pipeline::q8_0_weight_admits(arch, tier, m, k)?;
         }
         match *self {
-            Self::Q8 { k } => {
-                if tier == PrefillActTier::A4 {
-                    Err("Q8_0 has no A4 route")
-                } else if k % 32 != 0 {
-                    Err("Q8_0 K is not a multiple of 32")
-                } else {
-                    Ok(())
-                }
-            }
+            // Shape and arch conditions were checked by `q8_0_weight_admits` above.
+            Self::Q8 { .. } => Ok(()),
             Self::Qt44 {
                 symmetric,
                 m,
@@ -513,16 +511,16 @@ mod tests {
         let mut gfx11 = RaonSiteTiers::ALL_F16;
         gfx11.set(S::RoutedGateUp, A8);
         gfx11.set(S::RoutedDown, A8);
-        for arch in ["gfx1100", "gfx1151"] {
-            assert_eq!(default_table(arch), gfx11, "{arch}");
-        }
+        // gfx1100: A8 at every site (routed W4A8 + Q8_0 W8A8); gfx1151: routed experts only
+        assert_eq!(default_table("gfx1100"), d);
+        assert_eq!(default_table("gfx1151"), gfx11);
         for arch in ["gfx1200", "gfx942", ""] {
             assert_eq!(default_table(arch), RaonSiteTiers::ALL_F16, "{arch}");
         }
         assert_eq!(parse("").unwrap().requested_tiers(), d);
         assert_eq!(parse("  default ").unwrap().requested_tiers(), d);
         assert_eq!(
-            RaonPrecisionPolicy::parse("default", "gfx1100")
+            RaonPrecisionPolicy::parse("default", "gfx1151")
                 .unwrap()
                 .requested_tiers(),
             gfx11
@@ -563,8 +561,8 @@ mod tests {
         let p = parse("default,shared=fp8").unwrap();
         assert_eq!(p.requested(S::RoutedGateUp), A8);
         assert_eq!(p.requested(S::Shared), Fp8);
-        // other arch: default base is all F16
-        let p = RaonPrecisionPolicy::parse("dense=a8", "gfx1100").unwrap();
+        // other arch: default base is all F16 (gfx1151: routed experts only)
+        let p = RaonPrecisionPolicy::parse("dense=a8", "gfx1151").unwrap();
         assert_eq!(p.requested(S::RoutedGateUp), A8);
         assert_eq!(p.requested(S::Shared), F16);
         assert_eq!(p.requested(S::Dense), A8);
@@ -600,7 +598,7 @@ mod tests {
 
     #[test]
     fn effective_tier_per_dtype() {
-        let q8 = SiteWeight::Q8 { k: 2560 };
+        let q8 = SiteWeight::Q8 { m: 5120, k: 2560 };
         let sym = |ffn| SiteWeight::Qt44 {
             symmetric: true,
             m: 1088,
@@ -619,7 +617,7 @@ mod tests {
         assert_eq!(r.effective, F16);
         assert_eq!(r.reason, Some("Q8_0 has no A4 route"));
         // K not a multiple of 32
-        let r = effective_tier(R9700, A8, &[SiteWeight::Q8 { k: 100 }]);
+        let r = effective_tier(R9700, A8, &[SiteWeight::Q8 { m: 5120, k: 100 }]);
         assert_eq!(r.effective, F16);
         // qt44 FFN: every quantized tier runs on symmetric-verified weights
         for t in [A4, A8, Fp8] {
@@ -658,12 +656,26 @@ mod tests {
             (r.effective, r.reason),
             (F16, Some("F32 weights are never tiered"))
         );
-        // gfx11: A8 runs on the symmetric qt44 FFN weight (grouped gfx11 twin), never on Q8_0;
-        // A4/FP8 stay gfx1201-only; other archs: F16 with the reason
+        // gfx11: A8 runs on the symmetric qt44 FFN weight (grouped gfx11 twin) and on Q8_0 weights
+        // with K % 128 == 0 (i8-MMQ); A4/FP8 stay gfx1201-only
+        let q8_odd_k = SiteWeight::Q8 { m: 5120, k: 576 };
+        let q8_odd_m = SiteWeight::Q8 { m: 40, k: 2560 };
+        let q8_odd_k2 = SiteWeight::Q8 { m: 576, k: 100 };
         for arch in ["gfx1100", "gfx1151"] {
             let r = effective_tier(arch, A8, &[q8, sym(true)]);
+            assert_eq!((r.effective, r.runnable, r.total), (A8, 2, 2), "{arch}");
+            assert_eq!(effective_tier(arch, A8, &[q8]).effective, A8, "{arch}");
+            // M tails run (the kernel bounds-checks them); K % 128 != 0 stays F16
+            assert_eq!(
+                effective_tier(arch, A8, &[q8_odd_m]).effective,
+                A8,
+                "{arch}"
+            );
+            let r = effective_tier(arch, A8, &[q8_odd_k, q8_odd_k2]);
+            assert_eq!((r.effective, r.runnable, r.total), (F16, 0, 2), "{arch}");
+            assert_eq!(r.reason, Some("Q8_0 gfx11 int8 route needs K % 128 == 0"));
+            let r = effective_tier(arch, A8, &[q8, q8_odd_k]);
             assert_eq!((r.effective, r.runnable, r.total), (A8, 1, 2), "{arch}");
-            assert_eq!(effective_tier(arch, A8, &[q8]).effective, F16, "{arch}");
             let r = effective_tier(arch, Fp8, &[sym(true)]);
             assert_eq!(r.effective, F16, "{arch}");
             assert_eq!(r.reason, Some("A4/FP8 prefill tiers are gfx1201-only"));
@@ -674,11 +686,12 @@ mod tests {
             r.reason,
             Some("quantized prefill tiers are gfx1201/gfx1100/gfx1151-only")
         );
-        let d = default_table("gfx1100");
+        let d = default_table("gfx1151");
         assert_eq!(d.get(RaonPrecisionSite::RoutedGateUp), A8);
         assert_eq!(d.get(RaonPrecisionSite::RoutedDown), A8);
         assert_eq!(d.get(RaonPrecisionSite::Shared), F16);
         assert_eq!(d.get(RaonPrecisionSite::MlaQ), F16);
+        assert_eq!(default_table("gfx1100").get(RaonPrecisionSite::MlaQ), A8);
         // an F16 request never has a reason, a site without weights falls back with one
         assert_eq!(effective_tier(R9700, F16, &[q8]).reason, None);
         let r = effective_tier(R9700, A8, &[]);
@@ -692,7 +705,7 @@ mod tests {
     #[test]
     fn resolve_and_coverage_line() {
         let mut w = SiteWeights::default();
-        let q8 = SiteWeight::Q8 { k: 2560 };
+        let q8 = SiteWeight::Q8 { m: 5120, k: 2560 };
         let sym = SiteWeight::Qt44 {
             symmetric: true,
             m: 2176,
@@ -726,9 +739,16 @@ mod tests {
         assert_eq!(plan.effective.get(S::MlaQ), A8);
         assert_eq!(plan.effective.get(S::RoutedGateUp), F16);
         assert!(plan.coverage_line().contains("mla_q=a8"));
-        // an all-A8 request resolved on gfx1100: the Q8_0 attention class falls back to F16, the
-        // symmetric qt44 FFN sites keep A8 (gfx11 grouped twin)
-        let plan = parse("default").unwrap().resolve("gfx1100", &w);
+        // the default resolved on gfx1100: the tileable Q8_0 attention class runs A8 (i8-MMQ), as
+        // do the symmetric qt44 FFN sites (gfx11 grouped twin); on gfx1151 only the routed experts
+        let plan = RaonPrecisionPolicy::parse("default", "gfx1100")
+            .unwrap()
+            .resolve("gfx1100", &w);
+        assert_eq!(plan.effective.get(S::MlaQ), A8);
+        assert_eq!(plan.effective.get(S::RoutedGateUp), A8);
+        let plan = RaonPrecisionPolicy::parse("default", "gfx1151")
+            .unwrap()
+            .resolve("gfx1151", &w);
         assert_eq!(plan.effective.get(S::MlaQ), F16);
         assert_eq!(plan.effective.get(S::RoutedGateUp), A8);
     }
