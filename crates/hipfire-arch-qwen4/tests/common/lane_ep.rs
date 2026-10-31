@@ -137,9 +137,11 @@ pub(super) fn tokens_left(ids_len: usize) -> usize {
     (TOKENS + 1).saturating_sub(ids_len).max(1)
 }
 
-/// Whether a request holding `ids` is finished: `TOKENS` ids, or EOS last.
+/// Whether a request holding `ids` is finished: `TOKENS` ids, or an EOS
+/// anywhere (the mesh root never closes a lane on EOS, so a window may carry
+/// ids past it; the row is cut after the first EOS).
 pub(super) fn request_done(ids: &[u32], eos: u32) -> bool {
-    ids.len() >= TOKENS || ids.last() == Some(&eos)
+    ids.len() >= TOKENS || ids.contains(&eos)
 }
 
 // --------------------------------------------------------------- windows
@@ -268,6 +270,28 @@ pub(super) fn assemble_rows(trials: &[Vec<RequestRecord>]) -> Vec<Vec<u32>> {
         .iter()
         .flat_map(|trial| trial.iter().map(|record| record.row.clone()))
         .collect()
+}
+
+// ---------------------------------------------------------------- timing
+
+/// `first_trial_s` (it pays the kernel loads), then the mean / median / max
+/// of the remaining trials: the figure shard sizing wants.
+pub(super) fn trial_timing(seconds: &[f64]) -> String {
+    let Some((first, rest)) = seconds.split_first() else {
+        return "timing: no trials".to_string();
+    };
+    if rest.is_empty() {
+        return format!("timing: first_trial_s={first:.3} (no later trial)");
+    }
+    let mut sorted = rest.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mean = rest.iter().sum::<f64>() / rest.len() as f64;
+    format!(
+        "timing: first_trial_s={first:.3} rest_trials={} rest_mean_s={mean:.3} rest_median_s={:.3} rest_max_s={:.3}",
+        rest.len(),
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1]
+    )
 }
 
 // -------------------------------------------------------------- evidence
@@ -1149,8 +1173,11 @@ pub(super) fn run_ep_arm(
     let mut evidence = LaneEvidence::with_samples(EVIDENCE_SAMPLES);
     let mut trials: Vec<Vec<RequestRecord>> = Vec::with_capacity(range.1 - range.0);
     let started = std::time::Instant::now();
+    let mut trial_secs = Vec::with_capacity(range.1 - range.0);
     for trial in range.0..range.1 {
+        let trial_started = std::time::Instant::now();
         let records = run.run_trial(trial, arm, &prompt, &sampler, &mut evidence.mesh)?;
+        trial_secs.push(trial_started.elapsed().as_secs_f64());
         let tokenizer = &run.tokenizer;
         evidence.observe_trial(range.0, &records, &|ids| tokenizer.decode(ids));
         trials.push(records);
@@ -1205,6 +1232,7 @@ pub(super) fn run_ep_arm(
         wall / (range.1 - range.0) as f64,
         run.tokenizer.decode(&rows[0])
     );
+    println!("ARM {arm} {}", trial_timing(&trial_secs));
     println!(
         "ARM {arm} mesh: steps={} by_lanes={:?} lane_windows={} native={} copy={} ar={} offered={} accepted={}",
         evidence.mesh.steps,
@@ -1365,11 +1393,21 @@ mod tests {
     }
 
     #[test]
+    fn trial_timing_separates_the_first_trial_from_the_steady_state() {
+        assert_eq!(trial_timing(&[]), "timing: no trials");
+        assert!(trial_timing(&[2.0]).contains("first_trial_s=2.000 (no later trial)"));
+        let line = trial_timing(&[9.0, 1.0, 3.0, 2.0]);
+        assert!(line.contains("first_trial_s=9.000"), "{line}");
+        assert!(line.contains("rest_trials=3 rest_mean_s=2.000 rest_median_s=2.000 rest_max_s=3.000"), "{line}");
+    }
+
+    #[test]
     fn a_request_is_done_at_the_token_count_or_after_eos() {
         assert!(!request_done(&[1, 2, 3], 9));
         assert!(request_done(&[1, 2, 3, 4], 9));
         assert!(request_done(&[1, 2, 3, 4, 5], 9));
         assert!(request_done(&[1, 9], 9));
+        assert!(request_done(&[1, 9, 3], 9), "an EOS inside a window ends the request");
         assert!(!request_done(&[], 9));
     }
 
