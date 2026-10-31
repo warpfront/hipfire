@@ -15186,7 +15186,9 @@ mod qwen4_ep_reserve_loader_tests {
             Some(lane),
         )
         .unwrap();
-        let plan = split.reserve.expect("the decoupled plan applies with lanes");
+        let plan = split
+            .reserve
+            .expect("the decoupled plan applies with lanes");
         assert_eq!(plan.resident_layers, 31);
         assert!(plan.resident_layers > ordinary.layers);
         assert_eq!(split.vram.layers, 31);
