@@ -96,8 +96,9 @@ fn need_projection_scratch(
 }
 
 /// Greedy EAGLE (`HIPFIRE_GEMMA4_EAGLE=1`) turns off the fusions that are not
-/// byte-identical to their unfused form and keeps batched Q8 GEMMs on the
-/// unchunked scalar kernel, so batched verify and single-row decode share one
+/// byte-identical to their unfused form and keeps batched Q8 GEMMs on decode's
+/// `gemv_q8_0` arithmetic (the few-row `gemv_q8_0_rows` on gfx1151, else the
+/// unchunked scalar kernel), so batched verify and single-row decode share one
 /// arithmetic.
 static EAGLE_STRICT: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
@@ -265,6 +266,11 @@ pub fn gemm_rows(
         DType::F32 => gpu
             .gemm_f32_batched(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
+        // gfx1151 few-row verify: decode's gemv_q8_0 over every row, the
+        // weights read once (the scalar GEMM reaches ~30 GB/s here).
+        DType::Q8_0 if strict && gpu.gemv_q8_0_rows_supported(w.k, rows) => {
+            gpu.gemv_q8_0_rows(w.buf, x, y, w.m, w.k, rows).map_err(hip)
+        }
         DType::Q8_0 if strict => gpu
             .gemm_q8_0_batched(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),

@@ -27829,6 +27829,9 @@ impl Gpu {
         if self.gemv_q8_0_staged_rows_supported(k, self.route_rows(n)) {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
         }
+        if self.gemv_q8_0_rows_supported(k, n) {
+            return self.gemv_q8_0_rows(a_raw, x, y, m, k, n);
+        }
         if exact_verify {
             if n > 8 && self.gemv_q8_0_rowtile_supported(k, n) {
                 return self.lab_gemv_q8_0_rows_t8(a_raw, x, y, m, k, n);

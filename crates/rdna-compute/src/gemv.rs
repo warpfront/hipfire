@@ -21586,6 +21586,74 @@ impl Gpu {
         })
     }
 
+    /// Whether [`Gpu::gemv_q8_0_rows`] serves this shape: gfx1151, a K where
+    /// [`Gpu::gemv_q8_0`] runs the plain `gemv_q8_0` kernel, K % 64 == 0 (the
+    /// kernel stages weight rows with dword loads, so row starts must be
+    /// 4-byte aligned), and `route_rows` within [`FEW_ROW_ROUTE_ROWS`].
+    pub fn gemv_q8_0_rows_supported(&self, k: usize, rows: usize) -> bool {
+        self.arch_caps.is_gfx1151()
+            && k > 1536
+            && k != 2560
+            && k.is_multiple_of(64)
+            && (1..=FEW_ROW_ROUTE_ROWS).contains(&self.route_rows(rows))
+    }
+
+    /// `gemv_q8_0` over `rows` (1..=[`FEW_ROW_ROUTE_ROWS`]) activation rows
+    /// (x `[rows, k]`, y `[rows, m]`) in one launch: each weight row is read
+    /// once and every output row is bitwise the single-row kernel's. One row
+    /// is `gemv_q8_0` itself (~10% faster than the tile). Admission is
+    /// [`Gpu::gemv_q8_0_rows_supported`].
+    pub fn gemv_q8_0_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        if !self.gemv_q8_0_rows_supported(k, rows) {
+            return Err(hip_bridge::HipError::new(1, "gemv_q8_0_rows shape"));
+        }
+        if rows == 1 {
+            return self.gemv_q8_0(a_raw, x, y, m, k);
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_q8_0_rows";
+        // Weight rows per wave (`Q8_ROWS_W` in the kernel).
+        const W: usize = 4;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let (m_val, k_val, rows_val) = (m as i32, k as i32, rows as i32);
+        let mut params = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * (k / 32) * 34 + rows * (k + m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let grid = m.div_ceil(W) as u32;
+        let result = self.launch_maybe_blob(FUNC, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(rows_val);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// [`Gpu::gemv_q8_0_staged_rows`] (K = 2560) of two matrices that read
     /// the same `rows` (1..=[`WIDE_VERIFY_MAX_ROWS`]) activation rows; each
     /// output row is bitwise the single-matrix kernel's. Few-row verify,
@@ -26394,6 +26462,70 @@ mod mq6_k2560_tests {
                 }
             }
             eprintln!("MQ6 API oracle: M={m} K={k}, scalar/multirow/guards/graph passed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemv_q8_0_rows_tests {
+    use super::*;
+
+    /// Every row of `gemv_q8_0_rows` must be bitwise `gemv_q8_0` of that row,
+    /// at the Gemma 4 projection K values and a K with a sub-256 tail.
+    #[test]
+    fn rows_are_bitwise_gemv_q8_0() {
+        let Ok(mut gpu) = crate::gpu_test::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.gemv_q8_0_rows_supported(4096, 4) {
+            eprintln!("skip: gemv_q8_0_rows unsupported on this arch");
+            return;
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Not a multiple of the kernel's 4 weight rows per wave.
+        const M: usize = 602;
+        // 1600: 50 blocks, a two-block tail after the 8-block chunks; 6144:
+        // the Qwen4 MTP verify Q8 projection.
+        for k in [1600usize, 2816, 3840, 4096, 6144, 8192] {
+            let mut bytes = vec![0u8; M * k / 32 * 34];
+            for block in bytes.chunks_exact_mut(34) {
+                let scale = 0x1C00u16 + (next() % 0x0800) as u16;
+                block[..2].copy_from_slice(&scale.to_le_bytes());
+                for b in &mut block[2..] {
+                    *b = next() as u8;
+                }
+            }
+            let a = gpu.upload_raw(&bytes, &[bytes.len()]).expect("q8 matrix");
+            for rows in 2..=FEW_ROW_ROUTE_ROWS {
+                let x: Vec<f32> = (0..rows * k)
+                    .map(|_| (next() % 8191) as f32 / 4096.0 - 1.0)
+                    .collect();
+                let x = gpu.upload_f32(&x, &[rows * k]).expect("x");
+                let single = gpu.zeros(&[rows * M], DType::F32).expect("y");
+                let multi = gpu.zeros(&[rows * M], DType::F32).expect("y");
+                for r in 0..rows {
+                    let (xr, yr) = (x.sub_offset(r * k, k), single.sub_offset(r * M, M));
+                    gpu.gemv_q8_0(&a, &xr, &yr, M, k).expect("gemv_q8_0");
+                }
+                gpu.gemv_q8_0_rows(&a, &x, &multi, M, k, rows)
+                    .expect("gemv_q8_0_rows");
+                let want = gpu.download_f32(&single).expect("download");
+                let got = gpu.download_f32(&multi).expect("download");
+                assert!(want.iter().all(|v| *v != 0.0));
+                let differing = want
+                    .iter()
+                    .zip(&got)
+                    .filter(|(p, q)| p.to_bits() != q.to_bits())
+                    .count();
+                assert_eq!(differing, 0, "k={k} rows={rows}: {differing} cells differ");
+            }
         }
     }
 }

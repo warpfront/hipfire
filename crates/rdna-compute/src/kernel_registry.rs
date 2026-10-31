@@ -2820,6 +2820,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_q8_0_k8_rows_r6",
                 "gemv_q8_0_k8_rows_r7",
                 "gemv_q8_0_k8_rows_r8",
+                "gemv_q8_0_rows",
                 "quantize_bf16_q8_0",
                 "topk8_partial_f32",
                 "topk8_rescore_q8_0_k2560",
