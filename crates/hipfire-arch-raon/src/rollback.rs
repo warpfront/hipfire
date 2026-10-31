@@ -325,6 +325,7 @@ impl RaonBundle {
                 &tape.beta,
                 discard,
                 keep,
+                None,
             )
             .map_err(|e| format!("raon1_mini rollback L-rda{ri} recurrence: {e}"))?;
 

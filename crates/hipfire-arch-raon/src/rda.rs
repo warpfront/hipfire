@@ -28,6 +28,7 @@ use hipfire_dispatch::ops::delta_net::{
 use rdna_compute::gated_delta_vector::{
     CausalConvRowsGeom, GatedRmsnormRowsGeom, RdaPrepareLaunch,
 };
+use rdna_compute::gated_delta_vector_chunk::{chunked_enabled, GatedDeltaVectorChunkScratch};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Fixed RDA geometry and constants of the checkpoint.
@@ -128,6 +129,16 @@ pub struct RdaScratch {
     pub beta: GpuTensor,
     /// BF16-rounded recurrence output (`out = cast_model(y)`) `[N, P]`.
     pub y: GpuTensor,
+    /// Chunked-RDA workspace, allocated only with `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED=1` on a
+    /// device that has the chunked kernel; `None` keeps the serial recurrence.
+    pub chunk: Option<GatedDeltaVectorChunkScratch>,
+}
+
+/// Rows per chunked-RDA scratch segment (a longer prefill chunk runs as several segments).
+pub const RDA_CHUNK_SCRATCH_ROWS: usize = 512;
+
+fn chunk_scratch_rows(max_rows: usize) -> usize {
+    max_rows.min(RDA_CHUNK_SCRATCH_ROWS)
 }
 
 impl RdaScratch {
@@ -148,6 +159,17 @@ impl RdaScratch {
             log_alpha: plane(gpu, p)?,
             beta: plane(gpu, geom.n_heads)?,
             y: plane(gpu, p)?,
+            chunk: if chunked_enabled() && gpu.gated_delta_vector_chunked_arch_supported() {
+                Some(
+                    gpu.alloc_gated_delta_vector_chunk_scratch(
+                        chunk_scratch_rows(max_rows),
+                        geom.n_heads,
+                    )
+                    .map_err(|e| format!("rda chunk scratch alloc: {e:?}"))?,
+                )
+            } else {
+                None
+            },
         })
     }
 
@@ -158,7 +180,14 @@ impl RdaScratch {
         // qconv, kconv, vconv, q, k, vprime, log_alpha, y: `[rows, P]`; beta: `[rows, heads]`.
         let mut elems = [max_rows * p; 8].to_vec();
         elems.push(max_rows * geom.n_heads);
-        elems.into_iter().map(|e| (e * 4).max(256)).sum()
+        let planes: usize = elems.into_iter().map(|e| (e * 4).max(256)).sum();
+        // Charged whenever the flag is on (an arch without the kernel allocates none).
+        let chunk = if chunked_enabled() {
+            GatedDeltaVectorChunkScratch::required_bytes(chunk_scratch_rows(max_rows), geom.n_heads)
+        } else {
+            0
+        };
+        planes + chunk
     }
 }
 
@@ -198,6 +227,7 @@ pub(crate) fn rda_recurrence(
     beta: &GpuTensor,
     output: &GpuTensor,
     n: usize,
+    chunk: Option<&GatedDeltaVectorChunkScratch>,
 ) -> Result<(), String> {
     let h = geom.n_heads;
     let kd = geom.head_dim;
@@ -224,6 +254,7 @@ pub(crate) fn rda_recurrence(
             round_output_bf16: geom.round_bf16,
             slot: st.slot,
             strides,
+            chunk_scratch: chunk,
         },
     )
     .map_err(|e| e.to_string())
@@ -338,8 +369,20 @@ pub fn rda_forward_rows_taped(
     })
     .map_err(|e| err("prepare", format!("{e:?}")))?;
 
-    rda_recurrence(gpu, geom, st, q, k, vprime, log_alpha, beta, &scratch.y, n)
-        .map_err(|e| err("recurrence", e))?;
+    rda_recurrence(
+        gpu,
+        geom,
+        st,
+        q,
+        k,
+        vprime,
+        log_alpha,
+        beta,
+        &scratch.y,
+        n,
+        scratch.chunk.as_ref(),
+    )
+    .map_err(|e| err("recurrence", e))?;
 
     gpu.gated_rmsnorm_sigmoid_rows_f32(
         gated,

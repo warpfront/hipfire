@@ -251,6 +251,9 @@ fn free_rda_scratch(gpu: &mut Gpu, r: RdaScratch) {
     ] {
         let _ = gpu.free_tensor(t);
     }
+    if let Some(c) = r.chunk {
+        let _ = gpu.free_gated_delta_vector_chunk_scratch(c);
+    }
 }
 
 // ───────────────────────── taps ─────────────────────────

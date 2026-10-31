@@ -449,6 +449,7 @@ fn module_case(
                 decay_axis: DecayAxis::PerKeyChannel,
                 round_output_bf16: bf16,
                 slot: 0,
+                chunk_scratch: None,
                 strides: GatedDeltaStrides::contiguous(
                     h,
                     1,
@@ -571,6 +572,7 @@ fn scalar_equiv_case(
                 decay_axis: axis,
                 round_output_bf16: false,
                 slot: 0,
+                chunk_scratch: None,
                 strides: GatedDeltaStrides::contiguous(h, 1, kd, kd, axis),
             },
         )
