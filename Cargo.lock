@@ -1510,6 +1510,7 @@ dependencies = [
  "half",
  "hip-bridge",
  "hipfire-config",
+ "hipfire-cpu",
  "hipfire-dispatch",
  "hipfire-loader",
  "hipfire-runtime",
