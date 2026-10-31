@@ -290,6 +290,7 @@ pub fn preload_stream_mix(gpu: &mut Gpu) -> Result<(), DispatchError> {
     .map_err(|e| hip_err("stream_mix selector f32 gemm preload", e))
 }
 
+// selector-receipt: receipts/selectors/mhc_fused_min_rows.json
 /// Smallest row count that takes the fused route+aggregate kernel. Decode and
 /// speculative verify (rows <= 16) keep the two-stage chain.
 pub const MHC_FUSED_MIN_ROWS: usize = 64;
@@ -299,7 +300,7 @@ pub const MHC_FUSED_MIN_ROWS: usize = 64;
 fn mhc_fused_admitted(n: usize, width: usize, rows: usize) -> bool {
     rows >= MHC_FUSED_MIN_ROWS
         && Gpu::stream_mix_route_aggregate_supported(n, width)
-        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", false)
+        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", true)
 }
 
 /// Selector projection `selector_out[r, :] = selector . streams[r, :]` of a

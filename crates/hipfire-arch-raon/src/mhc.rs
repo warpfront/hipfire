@@ -48,8 +48,8 @@ pub const RAON_SELECTOR_EPS: f32 = 1e-5;
 /// kernel is instantiated for. `HIPFIRE_RAON_MHC_FUSED=0` kills both.
 pub fn bf16_streams_enabled(streams: usize, width: usize) -> bool {
     Gpu::stream_mix_route_aggregate_supported(streams, width)
-        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", false)
-        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_BF16_STREAMS", false)
+        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", true)
+        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_BF16_STREAMS", true)
         && crate::weights::mhc_selectors_all_bf16()
 }
 
