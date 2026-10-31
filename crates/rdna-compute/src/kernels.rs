@@ -10161,6 +10161,10 @@ pub const GEMM_F16_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_f16_
 pub const GEMM_F16_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma_mb4.hip");
 /// MB=8: 8 N-subtiles per block (128 N-cols). Grid=[ceil(M/16), ceil(N/128)], block=[32].
 pub const GEMM_F16_WMMA_MB8_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma_mb8.hip");
+/// Few-row (N <= 16) F16-weight x F32-activation GEMM that reads the weights once
+/// (DFlash2 `fc` projection of the new feature rows). Grid=[ceil(M/4)], block=[256].
+pub const GEMM_F16_SKINNY_XF32_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_skinny_xf32.hip");
 /// gfx12/RDNA4 sibling of the MB=8 fused-transpose F16 WMMA GEMM.
 pub const GEMM_F16_WMMA_MB8_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_wmma_mb8.gfx12.hip");

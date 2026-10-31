@@ -116,6 +116,9 @@
 //!   and the graph arm recorded and replayed segment graphs without refusing. Prints the
 //!   median / mean device-synced draft-forward and selector ms of both arms (the graph
 //!   arm's warm-up windows excluded from the steady-state figure) and the graph counters.
+//!   `--fc-compare on` (default) adds an informational eager arm with the skinny staged `fc`
+//!   projection forced off (`HIPFIRE_DFLASH_FC_SKINNY=0`'s route) and reports how many windows'
+//!   draft tokens / confidences / hidden rows it changes and both arms' draft and head+selector ms.
 //!
 //! Exit status: 0 pass, 1 verdict failed, 2 usage / runtime error.
 
@@ -2025,8 +2028,10 @@ fn draftgraph_arm(
     block: usize,
     n: usize,
     graph: bool,
+    fc_skinny: Option<bool>,
 ) -> Result<DraftArm, String> {
     bundle.reset(gpu)?;
+    hipfire_runtime::dflash::set_fc_skinny_override(fc_skinny);
     let ctx_capacity = bundle.max_seq();
     let eos: Vec<u32> = bundle.eos.clone();
     let prof: SharedProf = Rc::new(RefCell::new(Prof::default()));
@@ -2053,6 +2058,7 @@ fn draftgraph_arm(
     };
     let windows = trace_windows_take();
     set_draft_graph_override(None);
+    hipfire_runtime::dflash::set_fc_skinny_override(None);
     let run = run?;
     let stats = last_draft_graph_stats().ok_or("no draft graph counters (speculator not freed)")?;
     Ok(DraftArm {
@@ -2091,8 +2097,8 @@ fn run_draftgraph(
     if n < 2 {
         return Err("--tokens must be >= 2".into());
     }
-    let eager = draftgraph_arm(gpu, bundle, prompt, draft_path, block, n, false)?;
-    let graph = draftgraph_arm(gpu, bundle, prompt, draft_path, block, n, true)?;
+    let eager = draftgraph_arm(gpu, bundle, prompt, draft_path, block, n, false, None)?;
+    let graph = draftgraph_arm(gpu, bundle, prompt, draft_path, block, n, true, None)?;
 
     let mut failures: Vec<String> = Vec::new();
     if eager.stream != graph.stream {
@@ -2196,6 +2202,51 @@ fn run_draftgraph(
         graph.stats.launch_secs * 1e3,
         graph.stats.refused
     );
+    // Information only (never fails the gate): what the skinny staged `fc` projection
+    // changed against the batched WMMA one, window by window.
+    let mut fc_json = Value::Null;
+    if on_off(opts, "fc-compare", true)? {
+        let wmma = draftgraph_arm(
+            gpu,
+            bundle,
+            prompt,
+            draft_path,
+            block,
+            n,
+            false,
+            Some(false),
+        )?;
+        let pairs = eager.windows.len().min(wmma.windows.len());
+        let (mut d_tok, mut d_conf, mut d_hid) = (0usize, 0usize, 0usize);
+        for (e, w) in eager.windows.iter().zip(&wmma.windows) {
+            d_tok += usize::from(e.tokens != w.tokens);
+            d_conf += usize::from(e.confidence_bits != w.confidence_bits);
+            d_hid += usize::from(e.hidden_fnv != w.hidden_fnv);
+        }
+        let (mut e_d, mut w_d) = (draft(&eager, steady), draft(&wmma, steady));
+        let (mut e_s, mut w_s) = (selector(&eager, steady), selector(&wmma, steady));
+        println!(
+            "  fc skinny vs WMMA (eager arms, windows >= {steady}): draft ms median {:.3} vs {:.3}; head+selector ms median {:.3} vs {:.3}",
+            median_of(&mut e_d),
+            median_of(&mut w_d),
+            median_of(&mut e_s),
+            median_of(&mut w_s)
+        );
+        println!(
+            "    over {pairs} paired windows: draft tokens differ in {d_tok}, selector confidences in {d_conf}, draft hidden rows in {d_hid}; \
+             windows {} (skinny) vs {} (WMMA); verified streams {}",
+            eager.windows.len(),
+            wmma.windows.len(),
+            if eager.stream == wmma.stream { "identical" } else { "DIFFER" }
+        );
+        fc_json = json!({
+            "paired_windows": pairs, "tokens_differ": d_tok, "confidences_differ": d_conf,
+            "hidden_differ": d_hid, "windows_skinny": eager.windows.len(),
+            "windows_wmma": wmma.windows.len(), "streams_identical": eager.stream == wmma.stream,
+            "wmma_draft_ms": wmma.windows.iter().map(|w| w.draft_ms).collect::<Vec<_>>(),
+            "wmma_selector_ms": wmma.windows.iter().map(|w| w.selector_ms).collect::<Vec<_>>(),
+        });
+    }
     let pass = failures.is_empty();
     for f in &failures {
         println!("  FAIL: {f}");
@@ -2226,7 +2277,7 @@ fn run_draftgraph(
             &dir.join("draftgraph.json"),
             &json!({
                 "pass": pass, "block": block, "prompt_tokens": prompt.len(),
-                "failures": failures, "eager": arm(&eager), "graph": arm(&graph),
+                "failures": failures, "eager": arm(&eager), "graph": arm(&graph), "fc_compare": fc_json,
             }),
         )?;
     }

@@ -204,6 +204,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
 
     if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
         add!(
+            "gemm_f16_skinny_xf32",
+            kernels::GEMM_F16_SKINNY_XF32_SRC,
+            ["gemm_f16_skinny_xf32"]
+        );
+        add!(
             "qsa_filter_select",
             kernels::QSA_FILTER_SELECT_SRC,
             [

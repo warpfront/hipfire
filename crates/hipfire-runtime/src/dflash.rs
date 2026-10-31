@@ -2568,6 +2568,61 @@ fn gemm_dispatch_shared<const N: usize>(
     Ok(())
 }
 
+/// `HIPFIRE_DFLASH_FC_SKINNY=0` (developer kill switch, default on): the staged
+/// `fc` projection of a window's few new feature rows goes back to the batched
+/// WMMA GEMM instead of [`Gpu::gemm_f16_skinny_xf32`].
+static FC_SKINNY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_FC_SKINNY").map_or(true, |v| v.trim() != "0")
+});
+
+/// 0 = follow `HIPFIRE_DFLASH_FC_SKINNY`, 1 = force off, 2 = force on.
+static FC_SKINNY_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Developer oracle hook: force the skinny staged `fc` projection on / off for
+/// every later draft forward in this process (`None`: back to the env switch).
+pub fn set_fc_skinny_override(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    FC_SKINNY_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fc_skinny_on() -> bool {
+    match FC_SKINNY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => *FC_SKINNY,
+    }
+}
+
+/// [`gemm_dispatch`] for the draft's staged `fc` projection (`n` new feature
+/// rows, `K = num_extract x streams x hidden`). An F16 `fc` (what the converter
+/// keeps for a multi-stream draft) over at most 16 rows reads its weights once
+/// through [`Gpu::gemm_f16_skinny_xf32`] instead of the one-wave-per-16-rows
+/// WMMA GEMM, which streamed the 260 MB weight at ~100 GB/s. The draft only
+/// proposes, so the different (deterministic, F32-activation) summation order
+/// can change a draft token, never the verified output.
+fn gemm_dispatch_fc_rows(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    w: &WeightTensor,
+    y: &GpuTensor,
+    n: usize,
+    mq_x_rot: Option<&GpuTensor>,
+    mq_x_rot_f16: Option<&GpuTensor>,
+) -> HipResult<()> {
+    if fc_skinny_on()
+        && w.gpu_dtype == DType::F16
+        && w.row_stride == 0
+        && gpu.gemm_f16_skinny_admitted(&w.buf, x, w.m, w.k, n)
+    {
+        return gpu.gemm_f16_skinny_xf32(&w.buf, x, y, w.m, w.k, n);
+    }
+    gemm_dispatch(gpu, x, w, y, n, mq_x_rot, mq_x_rot_f16)
+}
+
 /// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
 /// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
 /// HFQ4-G256 GEMM kernel against the pre-rotated weights.
@@ -4068,7 +4123,7 @@ fn draft_forward_based_inner(
                 let thp_slice = scratch
                     .target_hidden_proj
                     .sub_offset((slot0 + done) * h, n * h);
-                gemm_dispatch(
+                gemm_dispatch_fc_rows(
                     gpu,
                     &th_slice,
                     &weights.fc,

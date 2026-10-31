@@ -29971,6 +29971,87 @@ impl Gpu {
         )
     }
 
+    /// Whether [`Self::gemm_f16_skinny_xf32`] can serve `Y[n, m] = W[m, :] . X[n, :]`:
+    /// 1..=16 activation rows, `k % 8 == 0`, 16-byte aligned operands, full
+    /// extents, and an arch whose kernels are packed for it.
+    pub fn gemm_f16_skinny_admitted(
+        &self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        (1..=16).contains(&n)
+            && m > 0
+            && k > 0
+            && k % 8 == 0
+            && m.checked_mul(k).is_some_and(|e| w.buf.size() >= e * 2)
+            && n.checked_mul(k).is_some_and(|e| x.buf.size() >= e * 4)
+            && (w.buf.as_ptr() as usize) % 16 == 0
+            && (x.buf.as_ptr() as usize) % 16 == 0
+            && (self.arch_caps.is_gfx1100()
+                || self.arch_caps.is_gfx1151()
+                || self.arch_caps.is_gfx1201())
+    }
+
+    /// Few-row F16-weight x F32-activation GEMM, the weights read once:
+    /// `Y[n, m] = sum_k W[m, k] X[n, k]` for `n` in `1..=16` rows (`k % 8 == 0`,
+    /// 16-byte aligned `w` / `x`; see [`Self::gemm_f16_skinny_admitted`]).
+    /// Activations stay F32 (no F16 rounding of X, unlike the WMMA GEMMs), the
+    /// K reduction is spread over 256 threads in a fixed order, so the result is
+    /// deterministic run to run but is not the WMMA kernel's summation. Grid
+    /// `[ceil(m / 4)]`, block `[256]`.
+    pub fn gemm_f16_skinny_xf32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.gemm_f16_skinny_admitted(w, x, m, k, n)
+            || y.buf.size() < n * m * 4
+            || m > i32::MAX as usize
+            || k > i32::MAX as usize
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_f16_skinny_xf32: needs 1..=16 rows, k % 8 == 0, 16-byte aligned full \
+                 F16 weight / F32 activation views, a full F32 output and a gfx11/gfx12 arch",
+            ));
+        }
+        self.ensure_kernel(
+            "gemm_f16_skinny_xf32",
+            kernels::GEMM_F16_SKINNY_XF32_SRC,
+            "gemm_f16_skinny_xf32",
+        )?;
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        launch_params_blob!(
+            self,
+            "gemm_f16_skinny_xf32",
+            [m.div_ceil(4) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            params; wp, xp, yp, mi, ki, ni
+        )
+    }
+
     /// Tiled F16 GEMM — 8-way ILP unrolled, lane-coalesced stride-32 reads,
     /// no shared memory (high occupancy). Arbitrary M, K, N.
     /// Grid=[M, N], Block=[32], LDS=0.
