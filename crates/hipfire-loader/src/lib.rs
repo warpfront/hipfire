@@ -53,20 +53,15 @@ use std::path::Path;
 
 /// Plain-language refusal for a model family that cannot be split across GPUs
 /// in pipeline mode. `family` is the carrier name (kept as the stable prefix),
-/// `pp` is the requested degree. Names the setting that fixes it.
+/// `pp` is the requested degree. Names the setting that fixes it. Delegates to
+/// the shared builder so pp/ep/tp refusals read the same.
 pub(crate) fn pp_unsupported_message(family: &str, is_dir: bool, pp: usize) -> String {
-    if is_dir {
-        format!(
-            "{family}: a safetensors model directory cannot be split across GPUs in pipeline \
-             mode (topology.pp = {pp}). Set topology.pp = 1 to load it on one GPU, or convert it \
-             to a packed .hfq file first"
-        )
-    } else {
-        format!(
-            "{family}: this model family cannot be split across GPUs in pipeline mode \
-             (topology.pp = {pp}). Set topology.pp = 1 to load it on one GPU"
-        )
-    }
+    hipfire_runtime::loader_api::topology_refusal(
+        family,
+        hipfire_runtime::loader_api::TopologyAxis::Pipeline,
+        pp,
+        is_dir,
+    )
 }
 
 pub trait Carrier: Send + Sync {
@@ -4706,11 +4701,19 @@ pub fn qwen35_ep_moe_topology_refusal(
     None
 }
 
-/// Message constructor shared by [`ep_admission`] and the per-entry match
-/// backstops so the refusal text cannot drift between the two.
-pub(crate) fn ep_unsupported_arch_message(arch_id: u32) -> String {
-    format!(
-        "expert parallelism (tp>1) is not supported for arch_id={arch_id}; it works for Qwen3.5 (5|6), DeepSeek V4 (9) and MiniMax (10). Set tp=1 for this model"
+/// Message constructor shared by [`ep_admission`], admission's `tp>1` branch and
+/// the per-entry match backstops so the refusal text cannot drift between them.
+/// The family is the carrier name for `arch_id` (`arch{id}` only where no
+/// carrier claims the id).
+pub(crate) fn ep_unsupported_arch_message(arch_id: u32, tp: usize) -> String {
+    let family = carrier_for(arch_id)
+        .map(|carrier| carrier.name().to_string())
+        .unwrap_or_else(|| format!("arch{arch_id}"));
+    hipfire_runtime::loader_api::topology_refusal(
+        &family,
+        hipfire_runtime::loader_api::TopologyAxis::Tp,
+        tp,
+        false,
     )
 }
 
@@ -4720,10 +4723,10 @@ pub(crate) fn ep_unsupported_arch_message(arch_id: u32) -> String {
 /// HFQ probe, before any device init — otherwise they would reach
 /// `generate_ep` with no correct server. Pure so the contract is
 /// unit-testable; both `load_model_ep_*` entries call it before dispatching.
-pub fn ep_admission(arch_id: u32) -> Result<(), String> {
+pub fn ep_admission(arch_id: u32, tp: usize) -> Result<(), String> {
     match arch_id {
         5 | 6 | 9 | 10 => Ok(()),
-        id => Err(ep_unsupported_arch_message(id)),
+        id => Err(ep_unsupported_arch_message(id, tp)),
     }
 }
 
@@ -4905,7 +4908,7 @@ pub fn load_model_ep_admitted(
         // Route through the shared constructor (not `unreachable!`) so the
         // refusal survives a future edit that drops the early classification,
         // and so this message never drifts from `ep_admission`'s.
-        id => Err(ep_unsupported_arch_message(id)),
+        id => Err(ep_unsupported_arch_message(id, tp)),
     }
 }
 
@@ -4920,7 +4923,7 @@ pub fn load_model_ep_with_compressor_cache(
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     // Admission: refuse archs with no `EpArch` before any per-arch device init.
-    ep_admission(hfq.arch_id)?;
+    ep_admission(hfq.arch_id, tp)?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(path, max_seq, tp, compressor_cache, KvBackend::Vmm),
         10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
@@ -4936,7 +4939,7 @@ pub fn load_model_ep_with_compressor_cache(
         // Backstop: `ep_admission` above already refused these; route through the
         // shared constructor (not `unreachable!`) so the refusal survives a
         // future edit that drops the early call.
-        id => Err(ep_unsupported_arch_message(id)),
+        id => Err(ep_unsupported_arch_message(id, tp)),
     }
 }
 
@@ -6795,22 +6798,29 @@ mod ep_admission_tests {
     fn ep_without_eparch_refuses_but_served_archs_admit() {
         // LFM2 (11), Cohere2 (12) and anything else with no `EpArch` variant:
         for arch in [11u32, 12, 13, 0, 99] {
-            let err = match ep_admission(arch) {
+            let err = match ep_admission(arch, 2) {
                 Ok(()) => panic!("arch {arch} + EP must refuse"),
                 Err(e) => e,
             };
-            assert!(
-                err.contains("expert parallelism (tp>1) is not supported"),
-                "reason: {err}"
+            let family = super::carrier_for(arch)
+                .map(|carrier| carrier.name().to_string())
+                .unwrap_or_else(|| format!("arch{arch}"));
+            assert_eq!(
+                err,
+                hipfire_runtime::loader_api::topology_refusal(
+                    &family,
+                    hipfire_runtime::loader_api::TopologyAxis::Tp,
+                    2,
+                    false,
+                ),
+                "uniform Tp sentence with the carrier family name"
             );
-            assert!(
-                err.contains(&arch.to_string()),
-                "reason names the arch: {err}"
-            );
+            assert!(err.starts_with(&format!("{family}: ")), "reason: {err}");
+            assert!(err.contains("--tp 2"), "reason names the degree: {err}");
         }
         // Adjacent supported: DS4, MiniMax and Qwen3.5 keep their EP entries.
         for arch in [5u32, 6, 9, 10] {
-            assert!(ep_admission(arch).is_ok(), "arch {arch} + EP must admit");
+            assert!(ep_admission(arch, 2).is_ok(), "arch {arch} + EP must admit");
         }
     }
 

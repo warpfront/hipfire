@@ -7,7 +7,9 @@
 //! `LoadedModel`. This crate does not depend on the loader.
 
 use hipfire_runtime::dflash::DflashBlockPolicy;
-use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{
+    topology_refusal, LoadCtx, ModelSource, SpecLoadCfg, TopologyAxis,
+};
 use hipfire_runtime::spec::Speculator;
 use rdna_compute::Gpu;
 
@@ -116,21 +118,28 @@ pub fn build_raon_dflash2_speculator(
 /// safetensors directory (the official MXFP8
 /// checkpoint is quantized offline by `hipfire quantize`, never half-loaded),
 /// a non-arch-19 container, and a context length outside `1..=max_position`.
-/// Tensor parallelism never reaches this carrier (it has its own route).
+/// Admission (`hipfire_loader::admission`) refuses tp, ep and pp above one for
+/// this family first; the pp/ep checks below are backstops for callers that
+/// bypass admission and share its refusal sentence.
 /// The DFlash2 speculator, when requested, is built by the caller with
 /// [`build_raon_dflash2_speculator`] on the returned bundle.
 pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonBundle, String> {
     dflash_draft(ctx.draft_path, ctx.spec)?;
     if ctx.pp > 1 {
-        return Err(format!(
-            "raon1_mini: pipeline parallelism (topology.pp = {}) is unsupported",
-            ctx.pp
+        return Err(topology_refusal(
+            "raon1_mini",
+            TopologyAxis::Pipeline,
+            ctx.pp,
+            src.is_dir(),
         ));
     }
     let ep = hipfire_config::topology::ep()?;
     if ep > 1 {
-        return Err(format!(
-            "raon1_mini: expert parallelism (topology.ep = {ep}) is unsupported"
+        return Err(topology_refusal(
+            "raon1_mini",
+            TopologyAxis::Expert,
+            ep,
+            src.is_dir(),
         ));
     }
     let hfq = match src {

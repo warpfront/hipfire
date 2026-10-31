@@ -1421,6 +1421,40 @@ fn resolve_carrier(src: &ModelSource) -> Result<&'static dyn Carrier, String> {
     Ok(carrier)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread stand-in for the process-wide `topology.ep` snapshot, which
+    /// cannot be varied between unit tests.
+    static TEST_EP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// `topology.ep` is consumed only by Qwen4's own admission branch. For every
+/// other source, `ep > 1` has no executable route, so it is refused here,
+/// before any other topology verdict and before the daemon's eager unload,
+/// instead of reaching a single-device carrier. The family is the carrier
+/// name (`arch{id}` only where no carrier claims the source).
+fn non_qwen4_ep_refusal(source: &ModelSource, arch_id: u32) -> Result<(), String> {
+    #[cfg(test)]
+    let ep = match TEST_EP_OVERRIDE.with(std::cell::Cell::get) {
+        Some(ep) => ep,
+        None => hipfire_config::topology::ep()?,
+    };
+    #[cfg(not(test))]
+    let ep = hipfire_config::topology::ep()?;
+    if ep > 1 {
+        let family = resolve_carrier(source)
+            .map(|carrier| carrier.name().to_string())
+            .unwrap_or_else(|_| format!("arch{arch_id}"));
+        return Err(hipfire_runtime::loader_api::topology_refusal(
+            &family,
+            hipfire_runtime::loader_api::TopologyAxis::Expert,
+            ep,
+            source.is_dir(),
+        ));
+    }
+    Ok(())
+}
+
 /// Pure DFlash lm-head refusal: `Some(message)` when a draft is attached but the
 /// target's lm_head/embed quant type is not admitted for DFlash's batched
 /// lm-head verify on `gpu_arch`. MQ V2 (qt 44/47/48/49/50) and MQ3 (qt 17)
@@ -2648,6 +2682,7 @@ pub fn admit_source_with_options(
         };
         (topology, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
+        non_qwen4_ep_refusal(&source, arch_id)?;
         // Expert-parallel admission (HFQ-only). Mirrors
         // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
         // refusal: DeepSeek V4 (9) serves vmm by design; Qwen3.5-MoE (5|6)
@@ -2659,7 +2694,7 @@ pub fn admit_source_with_options(
             );
         }
         if !matches!(arch_id, 5 | 6 | 9 | 10) {
-            return Err(crate::ep_unsupported_arch_message(arch_id));
+            return Err(crate::ep_unsupported_arch_message(arch_id, tp));
         }
         // Qwen3.5 density probe (HFQ-only past the `is_dir` refusal above, so
         // the destructure is infallible): dense (`num_experts == 0`) runs the
@@ -2706,6 +2741,7 @@ pub fn admit_source_with_options(
     } else {
         // Single / pipeline-parallel via the carrier registry.
         let carrier = resolve_carrier(&source)?;
+        non_qwen4_ep_refusal(&source, arch_id)?;
         // Selection follows topology validation; unsupported automatic requests
         // fall back rather than making a non-Qwen source unloadable.
         // #666 G2: refuse an impossible pipeline degree before any teardown
@@ -6055,6 +6091,129 @@ mod tests {
             let discrete = DeviceMemory { uma: false, ..halo };
             assert_eq!(device_free_from(discrete), Some(40_000 * MIB));
         }
+    }
+}
+
+#[cfg(test)]
+mod non_qwen4_ep_admission_tests {
+    use super::*;
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use hipfire_runtime::loader_api::{topology_refusal, TopologyAxis};
+
+    /// Raon (arch 19) carries a registered carrier with no pp/ep/tp route, so
+    /// it exercises both non-Qwen4 topology branches.
+    const RAON_ARCH: u32 = 19;
+
+    fn write_fake_hfq(name: &str, arch_id: u32) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-ep-admit-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.hfq"));
+        let tensors = vec![HfqMemTensor {
+            name: "model.embed_tokens.weight".into(),
+            quant_type: 1,
+            shape: vec![4, 4],
+            group_size: 0,
+            data: vec![0u8; 32],
+        }];
+        write_hfqm_package_mem(&path, arch_id, "{}", &tensors).unwrap();
+        path
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    fn admit(path: &std::path::Path, tp: usize, pp: usize) -> Result<SourceAdmission, String> {
+        admit_source(
+            path.to_str().unwrap(),
+            tp,
+            pp,
+            KvBackendRequest::Automatic,
+            None,
+            "gfx1201",
+            None,
+            "auto",
+            None,
+            4096,
+            KvBackendHints::without_device(),
+        )
+    }
+
+    fn raon_family() -> String {
+        crate::carrier_for(RAON_ARCH)
+            .expect("raon carrier is registered")
+            .name()
+            .to_string()
+    }
+
+    #[test]
+    fn ep_above_one_is_refused_in_the_single_pp_branch_before_the_pp_verdict() {
+        let path = write_fake_hfq("ep-single", RAON_ARCH);
+        TEST_EP_OVERRIDE.with(|cell| cell.set(Some(2)));
+        // pp=2 would otherwise get the pipeline sentence: ep wins.
+        for pp in [1usize, 2] {
+            let err = admit(&path, 1, pp)
+                .map(|_| ())
+                .expect_err("ep=2 must refuse");
+            assert_eq!(
+                err,
+                topology_refusal(&raon_family(), TopologyAxis::Expert, 2, false),
+                "pp={pp}"
+            );
+        }
+        TEST_EP_OVERRIDE.with(|cell| cell.set(None));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ep_above_one_is_refused_in_the_tp_branch_before_the_arch_allow_list() {
+        let path = write_fake_hfq("ep-tp", RAON_ARCH);
+        TEST_EP_OVERRIDE.with(|cell| cell.set(Some(4)));
+        let err = admit(&path, 2, 1)
+            .map(|_| ())
+            .expect_err("ep=4 must refuse");
+        assert_eq!(
+            err,
+            topology_refusal(&raon_family(), TopologyAxis::Expert, 4, false)
+        );
+        TEST_EP_OVERRIDE.with(|cell| cell.set(None));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tp_on_an_arch_without_a_route_gets_the_tp_sentence_with_the_family() {
+        let path = write_fake_hfq("tp-raon", RAON_ARCH);
+        TEST_EP_OVERRIDE.with(|cell| cell.set(Some(1)));
+        let err = admit(&path, 2, 1)
+            .map(|_| ())
+            .expect_err("tp=2 must refuse");
+        assert_eq!(
+            err,
+            topology_refusal(&raon_family(), TopologyAxis::Tp, 2, false)
+        );
+        assert!(err.starts_with("raon1_mini: "), "{err}");
+        TEST_EP_OVERRIDE.with(|cell| cell.set(None));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ep_of_one_never_yields_the_expert_sentence() {
+        let path = write_fake_hfq("pp-raon", RAON_ARCH);
+        TEST_EP_OVERRIDE.with(|cell| cell.set(Some(1)));
+        // pp=2 is refused by the geometry gate or the carrier, per the visible
+        // device count of the host; either way it is not the expert refusal.
+        let err = admit(&path, 1, 2)
+            .map(|_| ())
+            .expect_err("pp=2 must refuse");
+        assert!(!err.contains("expert-parallel mode"), "{err}");
+        assert!(
+            err.contains("pp=2") || err.contains("topology.pp = 2"),
+            "{err}"
+        );
+        TEST_EP_OVERRIDE.with(|cell| cell.set(None));
+        cleanup(&path);
     }
 }
 

@@ -6,6 +6,18 @@ Scope: `crates/hipfire-runtime/src`, `crates/hipfire-loader/src`, `crates/hipfir
 
 Method: every string literal of 30+ characters in non-test code of the three crates that carries a refusal/failure keyword (`refus`, `cannot`, `unsupported`, `must`, `requires`, `invalid`, `failed`, `missing`, `mismatch`, `exceed`, `truncat`, ...) was extracted (1,302 candidates) and classified by reachability. Rule applied to each reachable string: say what happened, name the setting/flag that changes it (or the command that repairs the file), keep internal symbol names out, keep the semantics (same loads refused/admitted) and keep the stable tokens below.
 
+## One sentence per parallelism axis
+
+Every refusal of a split the model family has no route for is built by `hipfire_runtime::loader_api::topology_refusal(family, axis, degree, is_dir)`, so the three axes read alike, name the family (the carrier name), the setting and the fix. Admission refuses before the daemon unloads the resident model and reports class `validation`:
+
+| Axis | Sentence |
+|---|---|
+| pipeline (`topology.pp`) | `<family>: this model family cannot be split across GPUs in pipeline mode (topology.pp = N). Set topology.pp = 1 to load it on one GPU` (a safetensors directory: `<family>: a safetensors model directory cannot be split across GPUs in pipeline mode (topology.pp = N). Set topology.pp = 1 to load it on one GPU, or convert it to a packed .hfq file first`) |
+| expert (`topology.ep`) | `<family>: this model family cannot be split across GPUs in expert-parallel mode (topology.ep = N). Set topology.ep = 1 to load it on one GPU` |
+| `--tp N` / `params.tp` | `<family>: this model family cannot be split across GPUs with --tp N (tensor/expert parallelism). Set tp = 1 to load it on one GPU` |
+
+`topology.ep` above 1 is served only by Flash-Next (Qwen4), which has its own admission branch; for every other model `admit_source_with_options` refuses it first in both the single/pp and the `tp > 1` branch (ahead of any other topology verdict), so no `ep > 1` load reaches a carrier. The Raon carrier keeps backstops that use the same sentences for callers that bypass admission.
+
 ## Stable text that was preserved on purpose
 
 - The `load refused:` prefix and the `pp=N`, `tp=N`, `num_experts=N`, `n_layers=N`, `visible HIP device count=N` tokens (`hipfire-loader` admission, pinned by tests and by users' logs).
@@ -61,7 +73,7 @@ Line numbers are on the branch tip after this change.
 | 39 | `hipfire-loader/src/admission.rs:2070` | HIPFIRE_MESH_TRANSPORT=peer without evidence | HIPFIRE_MESH_TRANSPORT (auto/host) | `Peer edges for Qwen4 PP need an admission-time qualification step ...` | `"{prefix}: peer-to-peer transfers between the pipeline GPUs were requested ({MESH_TRANSPORT_ENV}=peer) but could not be verified: {e}. Use {MESH_TRANSPORT_ENV}=auto or ho` |
 | 40 | `hipfire-loader/src/admission.rs:2198` | HIPFIRE_WEIGHT_HOST=1 on an unsupported model | HIPFIRE_WEIGHT_HOST | `HIPFIRE_WEIGHT_HOST=1 supports only a single-device dense Qwen3.5 HFQ ...` | `"HIPFIRE_WEIGHT_HOST=1 only supports a single-GPU dense Qwen3.5 HFQ model (arch 5, tp=1, pp=1); this load is arch {arch_id}{}, tp={tp}, pp={pp}. Unset HIPFIRE_WEIGHT_HOST` |
 | 41 | `hipfire-loader/src/admission.rs:2311` | Qwen4 memory.max_seq above model context | memory.max_seq, attention.yarn_factor | `qwen4: max_seq N exceeds the model's RoPE context M (max_position_embeddings, or YaRN ...)` | `"qwen4: max_seq {max_seq} exceeds the model's trained context of {positions} tokens` |
-| 42 | `hipfire-loader/src/lib.rs:3869` | tp>1 on a model without an expert-parallel path (shared by admission + backstops) | tp | `EP not supported for arch_id=N (expected 5\|6 ...)` | `pub(crate) fn ep_unsupported_arch_message(arch_id: u32) -> String {` |
+| 42 | `hipfire-loader/src/lib.rs:3869` | tp>1 on a model without an expert-parallel path (shared by admission + backstops) | tp | `EP not supported for arch_id=N (expected 5\|6 ...)` | `<family>: this model family cannot be split across GPUs with --tp N (tensor/expert parallelism). Set tp = 1 to load it on one GPU` (`pub(crate) fn ep_unsupported_arch_message(arch_id: u32, tp: usize)`, built by the shared `hipfire_runtime::loader_api::topology_refusal`; `<family>` is the carrier name, `arch<id>` only when no carrier claims the id) |
 | 43 | `hipfire-loader/src/admission.rs:2350` | tp>1 on a safetensors Qwen3.5 dir | tp | `EP qwen35 requires an HFQ source` | `return Err("expert parallelism for Qwen3.5 needs an HFQ model file, not a safetensors directory; load a single HFQ file or set tp=1".to_string());` |
 | 44 | `hipfire-loader/src/admission.rs:2336` | tp>1 on a safetensors dir | tp | `EP not supported for safetensors directory sources (load as a single HFQ file)` | `"expert/tensor parallelism (tp>1) is not supported for safetensors directory sources; load a single HFQ file or set tp=1"` |
 | 45 | `hipfire-loader/src/admission.rs:2420` | explicit --kv-backend vmm on mixed-GPU DeepSeek | memory.kv_backend | `heterogeneous DeepSeek compressor owner uses a dense gfx1100 cache with no VMM layout` | `"this mixed-GPU DeepSeek setup keeps its compressor cache in a layout the VMM backend cannot manage"` |

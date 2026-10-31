@@ -25,10 +25,22 @@ load (`tp > 1 && pp > 1` → error); Flash-Next expert parallelism (`topology.ep
 cannot be combined with either (`pp` or `tp` ≠ 1 is refused when `ep > 1`), and
 Flash-Next pipeline parallelism (`topology.pp`) needs `tp = ep = 1`.
 
+**Refusals are uniform and happen at admission.** A model family with no route
+for a requested split is refused with one sentence per axis (the family is the
+carrier name; see [load-refusal-wording.md](load-refusal-wording.md#one-sentence-per-parallelism-axis)):
+`topology.pp > 1` (pipeline), `topology.ep > 1` (expert-parallel) and `--tp N`
+(tensor/expert) each name the family, the setting and the fix. `topology.ep` above
+1 is served only by Flash-Next (Qwen4); on every other model it is refused during
+load admission, before the resident model is unloaded, with class `validation`
+(it used to be ignored by admission and fail inside the carrier after the unload).
+`hipfire fit` reports the same refusal as `DOES NOT FIT`, and `hipfire fit --tp N`
+asks the `--tp` question. `HIPFIRE_TP` is not an input anywhere in the daemon,
+CLI or loader; the degree is `--tp N` / `params.tp`.
+
 | Mode | Load knob | What it does | Source-wired runtime surface (audited ref) |
 |---|---|---|---|
 | **Pipeline parallel (PP), generic** | daemon load `params.pp` (`N`, default `1`) | Contiguous **layer bands** across `N` devices; the residual stream crosses bands via `boundary_copy`, a peer memcpy. The route is built on peer access (P2P) between the cards; hipfire has no host-staged edge service for it | Qwen3.5 / 3.6 **HFQ** only (`arch_id` 5 dense, 6 MoE/A3B) via `load_qwen35_pp` |
-| **Expert parallel (EP / `tp`)** | `params.tp`, or CLI `hipfire serve --tp N` → `HIPFIRE_TP` | Within-layer expert sharding + all-reduce; every rank runs every layer (`Gpus::init_tp`) | MiniMax-M2 (`arch_id` 10) and DeepSeek V4 Flash (`arch_id` 9) via `load_model_ep` |
+| **Expert parallel (EP / `tp`)** | `params.tp`, or CLI `--tp N` (`run`, `serve`, `bench`, `fit`); nothing reads `HIPFIRE_TP` | Within-layer expert sharding + all-reduce; every rank runs every layer (`Gpus::init_tp`) | MiniMax-M2 (`arch_id` 10) and DeepSeek V4 Flash (`arch_id` 9) via `load_model_ep` |
 | **Flash-Next expert parallel (EP, N = 2..=8)** | config `topology.ep` (`hipfire config set topology.ep N`; env `HIPFIRE_TOPOLOGY_EP`; default `1`, allowed `1..=8`; `HIPFIRE_QWEN4_EP=0` forces `1`). **Not `--tp`.** | Routed experts shard by id (`e % N`; an N that does not divide 512 gives uneven per-rank counts); every rank holds the whole trunk and runs the unchanged single-device program on its own worker thread; a copy-only owner exchange feeds the unchanged slot-order combine. **Opt-in, experimental.** | Qwen3.8 Flash-Next (Qwen4, `arch_id` 16) on N = 2..=8 homogeneous cards of one exact arch, **gfx1100** (7900 XTX) or **gfx1201** (R9700), every directed card pair peer-accessible (Qwen4 carrier, `load_qwen4_rank`; admission in `crates/hipfire-loader/src/admission.rs`) |
 | **Flash-Next pipeline parallel (PP, N = 2..=8), host-staged** | config `topology.pp` (`hipfire config set topology.pp N`; env `HIPFIRE_TOPOLOGY_PP`; default `1`, allowed `1..=8`) or daemon load `params.pp`. No load-time `--pp` flag; **not `--tp`.** | Contiguous **layer bands**, one per card, every band fully VRAM-resident; the hyper-connection (HC) streams cross each band edge through pinned host memory, so no peer access is needed. The output card (physical card 0) runs the last logical band. **Opt-in, experimental.** See [Flash-Next pipeline parallelism (host-staged)](#flash-next-pipeline-parallelism-host-staged) | Qwen3.8 Flash-Next (Qwen4, `arch_id` 16) on N = 2..=8 homogeneous cards of one exact arch, **gfx1100** (7900 XTX) or **gfx1201** (R9700), with `tp = ep = 1` (admission in `crates/hipfire-loader/src/admission.rs`, `admit_qwen4_pp_mesh`) |
 
@@ -65,8 +77,12 @@ sequential PP=2 (see [Appendix A](#appendix-a-historical-pp-evidence-immutable))
 | Dense Qwen 27B-class that fits one card (registry weights: 11.78 GB for `qwen3.8:27b-mq3-xt`, [`MODELS.md`](MODELS.md); the historical probe in Appendix A shows about 15.5 GB for the mq4 27B proxy) | 2+ | **One model per card** (one daemon per card, each pinned by `hardware.devices`; the per-card lock makes two daemons asking for `gfx1201` get different cards) or **batched serving** on one card ([`SERVE.md`](SERVE.md) continuous batching) rather than splitting | Splitting a model that already fits adds cross-card traffic and, under PP, a sequential decode penalty; it does not buy multi-user throughput. |
 | Qwen3.5 / 3.6 HFQ that does not fit one card at the wanted context | 2+ (peer access between the cards) | **PP** (`params.pp`, generic route) | PP is a **capacity** tool, not a speedup: historical PP=2 decode measured about two thirds of single-card decode on short prompts (Appendix A). The generic route moves the residual with a peer memcpy; without peer access it is not a qualified configuration. |
 
-**CLI note:** the shipped CLI forwards **`tp`** (`HIPFIRE_TP` / `--tp`) on serve
-load messages; that is the knob for MiniMax-M2 / DeepSeek V4 Flash. **Do not
+**CLI note:** the shipped CLI forwards **`tp`** (`--tp N`) on `run`, `serve` and
+`bench` load messages; that is the knob for MiniMax-M2 / DeepSeek V4 Flash.
+`hipfire fit --tp N` asks admission the same question without loading. There is
+no `topology.tp` config key, and **nothing in the daemon, CLI or loader reads
+`HIPFIRE_TP`** (only the parity example
+`hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs` does); use `--tp`. **Do not
 pass `--tp` for Flash-Next:** with `topology.ep > 1` a load with `tp` ≠ 1 is
 refused (`cannot combine with pipeline/tensor parallelism`); use `topology.ep`
 for expert parallelism and `topology.pp` for pipeline parallelism. There is **no
@@ -302,7 +318,7 @@ cargo run --release -p hipfire-daemon
 
 ```sh
 HIPFIRE_DEVICES=gfx1201,gfx1201 hipfire serve <minimax-or-deepseek4-tag> --tp 2
-# equivalent: HIPFIRE_TP=2 …
+# `--tp` is the only spelling: HIPFIRE_TP is not read by the CLI or daemon.
 ```
 
 EP does not honor a non-default `--kv-mode` the same way single-GPU load does
@@ -825,7 +841,7 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | `init_uniform` / `init_tp` free-VRAM delta |
 | `HIPFIRE_ALLOW_MIXED_ARCH` | Opt into mixed-arch device sets |
 | `HIPFIRE_DETERMINISTIC` | Deterministic WMMA reduction path (parity / bisect) |
-| `HIPFIRE_TP` | EP degree (CLI `--tp` sets this) |
+| `HIPFIRE_TP` | **Not read by the daemon, CLI or loader** (only the parity example `qwen_dense_tp2_parity.rs` reads it). The degree is `--tp N` / `params.tp` |
 | `HIPFIRE_TOPOLOGY_EP` | Flash-Next EP degree (`topology.ep`, default `1`, allowed `1..=8`); **not** `--tp` |
 | `HIPFIRE_TOPOLOGY_PP` | Pipeline degree (`topology.pp`, default `1`, allowed `1..=8`; an explicit `params.pp` above `1` wins); the Flash-Next PP route takes `2..=8`. **No load-time `--pp` flag** |
 | `HIPFIRE_MESH_TRANSPORT` | Developer-only, Flash-Next PP: how band edges move HC streams: `auto` (default, host-staged), `host` or `peer` (refused) |
