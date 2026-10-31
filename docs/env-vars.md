@@ -605,6 +605,11 @@ logs once per process. The sampled-MTP chi-square oracle
 (`sampled_mtp_distribution_hw`) runs its short arms on a PP2 mesh with
 `HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2` (test harness variable, with
 `HIPFIRE_PP_LAYERS`). This does not admit other speculative engines under PP.
+`HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes` with `HIPFIRE_SAMPLED_MTP_LANES=1|8` selects
+the lane suite of the same test (arms `lane_ar`, `lane_batched`, `lane_adaptive`,
+`lane_copy`; topology `single`, `pp2` or `ep2`; merged and judged per lane in a
+separate output directory per executor). The lane executor itself is an explicit
+not-yet-implemented interface boundary; `scripts/sampled_lane_suite.sh` runs the suite.
 
 #### Logical GPU emulation (developer-only)
 
@@ -2576,9 +2581,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SAMPLED_MTP_ARM` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_CONFIG` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_COPY_LONG_ARMS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
-| `HIPFIRE_SAMPLED_MTP_EXECUTOR` | crates/hipfire-loader/src/batch_staging.rs | developer |
+| `HIPFIRE_SAMPLED_MTP_EXECUTOR` | crates/hipfire-arch-qwen4/tests/common/lane_suite.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs, crates/hipfire-loader/src/batch_staging.rs | harness, developer |
 | `HIPFIRE_SAMPLED_MTP_FREQUENCY_PENALTY` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_GREEDY_TOKENS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_LANES` | crates/hipfire-arch-qwen4/tests/common/lane_suite.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_LATE_TOKENS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_MIN_P` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_OUT` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
@@ -2588,12 +2594,12 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SAMPLED_MTP_RENDER` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_REPEAT_PENALTY` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_REPEAT_WINDOW` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
-| `HIPFIRE_SAMPLED_MTP_SHARD` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_SHARD` | crates/hipfire-arch-qwen4/tests/common/lane_suite.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TEMP` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_THINK_SEEDS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_THINK_TOKENS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOKENS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
-| `HIPFIRE_SAMPLED_MTP_TOPOLOGY` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_TOPOLOGY` | crates/hipfire-arch-qwen4/tests/common/lane_suite.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOP_K` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOP_P` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TRIALS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |

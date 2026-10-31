@@ -490,6 +490,17 @@ forward. Singleton forward bytes and numerics are unchanged.
   stages. The flag is planner capacity only: the oracle's
   singleton-versus-lanes comparison and its `--ks`, `--row-budget` and
   `--policies` are unchanged. The report records `reserve_lanes`.
+- **Speculative-lane schema.** `fn_mesh_lane_oracle` also parses `--spec ar|mtp`
+  (default `ar`: everything above, unchanged), `--k` (1..=7, default 3) and
+  `--routes floor|cycle|batched` (default `cycle`) for `--spec mtp`, plus
+  `--soak-seconds S [--soak-seed N]` and
+  `--fault-point before-draft|head-round|target-edge|repair|before-publish`
+  (`mtp` only; a soak and a fault point are exclusive). Every run writes
+  `manifest.json` (expanded command, SHA-256 of each `--prompt-file` and of the
+  binary, model hash, recorded environment). `--spec mtp` is parsed and
+  recorded but refuses with "not yet implemented by S3/S5" until the EP/PP
+  speculative lane protocol lands; the refusal is an interface boundary, not a
+  pass.
 
 This section records behavior only; it carries no measurement and no exactness
 evidence. The changed placement is not covered by the EP2/EP4 evidence above.
