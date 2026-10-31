@@ -327,6 +327,8 @@ pub(crate) fn try_a8_rmsnorm_prepared(
     if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k) || next.dtype != DType::MQ4G256V2 {
         return Ok(None);
     }
+    // The norm reads `x`: land any residual add a folded GEMM left owed to it.
+    gpu.flush_residual_fold()?;
     let reservation = gpu.reserve_int8_mmq(k, n)?;
     gpu.fused_rmsnorm_rotate_mq_i8_batched(x, weight, next.awq_scale, None, reservation, k, eps, n)
         .map(Some)
