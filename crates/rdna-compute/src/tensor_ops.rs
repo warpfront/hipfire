@@ -2566,6 +2566,13 @@ fn qwen4_hc_up_twin_applies(enabled: bool, exact_gfx1151: bool, rows: usize) -> 
     enabled && exact_gfx1151 && rows >= QWEN4_HC_UP_TWIN_MIN_ROWS
 }
 
+/// Lab arm (`HIPFIRE_QWEN4_HC_UP_TWIN_LAB=1`, default off): run the same bitwise twin on exact
+/// gfx1201 at every row count (FLOOR / KERNEL-SCOPE experiment A1: whether the wave-uniform X
+/// loads becoming scalar loads helps the 8-row decode HC read tail).
+static QWEN4_HC_UP_TWIN_LAB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_TWIN_LAB", false)
+});
+
 /// Same arguments, grid, block, dynamic LDS and kernarg blob for either entry:
 /// on exact gfx1151 with at least 16 rows (and `HIPFIRE_QWEN4_HC_UP_TWIN`
 /// not `0`) the launch is the bitwise twin `hyper_read_up_fused_f32_sx`
@@ -2595,7 +2602,9 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
     let row_grid = checked_u32(p.rows.div_ceil(128), "HC read row grid")?;
     let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
     let (module, source, kernel) =
-        if qwen4_hc_up_twin_applies(*QWEN4_HC_UP_TWIN, gpu.arch_caps.is_gfx1151(), p.rows) {
+        if qwen4_hc_up_twin_applies(*QWEN4_HC_UP_TWIN, gpu.arch_caps.is_gfx1151(), p.rows)
+            || (*QWEN4_HC_UP_TWIN && *QWEN4_HC_UP_TWIN_LAB && gpu.arch_caps.is_gfx1201())
+        {
             (
                 "hyper_read_up_fused_twin",
                 HYPER_READ_UP_FUSED_TWIN_SRC,

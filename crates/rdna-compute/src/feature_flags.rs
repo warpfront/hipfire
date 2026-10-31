@@ -1032,7 +1032,8 @@ impl FeatureFlags {
                 .unwrap_or(exact_unit_default),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
-            qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4").unwrap_or(arch == "gfx1151"),
+            qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
+                .unwrap_or(arch == "gfx1151" || is_gfx1201),
             qwen4_shared_down_fuse: parse_bool("HIPFIRE_QWEN4_SHARED_DOWN_FUSE")
                 .unwrap_or(arch == "gfx1151"),
             qwen4_decode_zba_x3: parse_bool("HIPFIRE_QWEN4_DECODE_ZBA_X3")
@@ -1711,7 +1712,7 @@ impl FeatureFlags {
     }
 
     pub fn qwen4_moe_down_r4_enabled(&self) -> bool {
-        self.qwen4_moe_down_r4 && self.arch == "gfx1151"
+        self.qwen4_moe_down_r4 && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
     pub fn qwen4_shared_down_fuse_enabled(&self) -> bool {
