@@ -370,6 +370,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_the_ep2_topology_has_a_lane_executor() {
+        for topology in [lane_suite::Topology::Single, lane_suite::Topology::Pp2] {
+            let message = lane_topology_unsupported(topology);
+            assert!(message.contains("ep2 only"), "{message}");
+            assert!(message.contains(topology.as_str()), "{message}");
+            assert!(message.contains("ran no trials"), "{message}");
+        }
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lane-run-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
