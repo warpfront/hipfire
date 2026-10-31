@@ -176,6 +176,19 @@ pub trait Carrier: Send + Sync {
         Ok(())
     }
 
+    /// Read-only, per-carrier request-option refusal for a `topology.pp` > 1
+    /// load, run at admission (before any previous model is torn down or a
+    /// device is touched) for every carrier that declares a pipeline route.
+    /// Default: no extra refusal.
+    fn admit_pp_options(
+        &self,
+        _pp: usize,
+        _draft_path: Option<&str>,
+        _options: admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Declared capabilities for this arch. Default is the conservative
     /// “no capability” set — carriers override to declare what they support.
     fn caps(&self) -> saddle_core::caps::ArchCaps {
@@ -1485,6 +1498,40 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<RaonBundle>())
+    }
+
+    /// The Raon pipeline mesh model (`topology.pp` > 1) if this model is one.
+    pub fn raon_mesh(&self) -> Option<&hipfire_arch_raon::RaonMeshModel> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_raon::RaonMeshModel>())
+    }
+
+    /// The Raon pipeline mesh model and its generic `Gpus` as disjoint borrows
+    /// (`state` and `pp_gpus` are separate fields), for generation closures
+    /// that need both at once. `None` unless this is a Raon mesh whose
+    /// `pp_gpus` is present.
+    pub fn raon_mesh_mut(&mut self) -> Option<(&mut hipfire_arch_raon::RaonMeshModel, &mut Gpus)> {
+        let model = self
+            .state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_raon::RaonMeshModel>())?;
+        let gpus = self.pp_gpus.as_mut()?;
+        Some((model, gpus))
+    }
+
+    /// [`ArchModel::reset_session_state`] of the loaded model, through the
+    /// mesh devices when the model owns a mesh lifecycle
+    /// ([`ArchModel::owns_mesh_lifecycle`]) and its `pp_gpus` are present.
+    pub fn reset_arch_session_state(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        let Self { state, pp_gpus, .. } = self;
+        match (state.as_deref_mut(), pp_gpus.as_mut()) {
+            (Some(model), Some(gpus)) if model.owns_mesh_lifecycle() => {
+                model.reset_session_state_mesh(gpu, gpus)
+            }
+            (Some(model), _) => model.reset_session_state(gpu),
+            (None, _) => Ok(()),
+        }
     }
 
     /// MiniMax-M2 bundle if this model is arch_id=10, else None.
@@ -6443,6 +6490,68 @@ fn unload_qwen4_pp(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<()
     gpu.ensure_vmm_cleaned().map_err(|e| e.to_string())
 }
 
+/// What unload reports when a generic mesh-owning model's teardown failed: its
+/// mesh free drains every epoch and edge before freeing anything, and a failed
+/// drain keeps all resources (devices, ranks, edges) alive and unreclaimed.
+fn mesh_owner_quarantine_report(error: &str) -> String {
+    format!("topology.pp unload failed ({error}); mesh resources quarantined until process restart")
+}
+
+/// Unload a pipeline-mesh model that owns its lifecycle over `pp_gpus`
+/// ([`ArchModel::owns_mesh_lifecycle`]; today Raon). [`ArchModel::free_gpu_mesh`]
+/// drains the mesh first and then frees every rank on its own device; a failed
+/// drain quarantines: the model leaked the ranks, and the `Gpus` and the rest of
+/// the `LoadedModel` are leaked here, never freed under possibly in-flight work.
+fn unload_mesh_owner(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    if let Some(spec) = m.speculator.take() {
+        spec.free(gpu);
+    }
+    if let Some(ev) = m.eviction.take() {
+        ev.free_gpu(gpu);
+    }
+    for (_, snap) in std::mem::take(&mut m.prefill_checkpoints) {
+        snap.free_gpu(gpu);
+    }
+    for (_, snap) in std::mem::take(&mut m.dflash_checkpoints) {
+        snap.free_gpu(gpu);
+    }
+    let Some(mut gpus) = m.pp_gpus.take() else {
+        std::mem::forget(m);
+        return Err(mesh_owner_quarantine_report("the PP model carries no Gpus"));
+    };
+    let Some(state) = m.state.take() else {
+        std::mem::forget(gpus);
+        std::mem::forget(m);
+        return Err(mesh_owner_quarantine_report(
+            "the PP model carries no state",
+        ));
+    };
+    if let Err(error) = state.free_gpu_mesh(gpu, &mut gpus) {
+        std::mem::forget(gpus);
+        std::mem::forget(m);
+        return Err(mesh_owner_quarantine_report(&error));
+    }
+    let mut first_err: Option<String> = None;
+    for (rank, device) in gpus.devices.iter_mut().enumerate() {
+        let _ = device.bind_thread();
+        device.invalidate_weight_caches();
+        device.invalidate_graph_state();
+        device.drain_pool();
+        if let Err(error) = device.ensure_vmm_cleaned() {
+            first_err.get_or_insert(format!("unload topology.pp VMM rank {rank}: {error}"));
+        }
+    }
+    drop(gpus);
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
+    let daemon = gpu.ensure_vmm_cleaned().map_err(|e| e.to_string());
+    match first_err {
+        Some(error) => Err(error),
+        None => daemon,
+    }
+}
+
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     gpu.kv_fit_floor = None;
     // The next load (or none) starts lazy; a sealed route never outlives its model.
@@ -6736,6 +6845,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     // `None`), so it must leave before the legacy Qwen3.5 `m.pp > 1` arm.
     if qwen4_pp_mesh_owner(&m) {
         return unload_qwen4_pp(m, gpu);
+    }
+    // Any other mesh-executor model owns its lifecycle through `ArchModel`.
+    if m.pp > 1 && m.state.as_ref().is_some_and(|s| s.owns_mesh_lifecycle()) {
+        return unload_mesh_owner(m, gpu);
     }
     if m.pp > 1 {
         if let Some(b) = m.qwen35_mut() {

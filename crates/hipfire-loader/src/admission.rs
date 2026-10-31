@@ -2879,6 +2879,9 @@ pub fn admit_source_with_options(
     if let Some(carrier) = carrier {
         crate::pp_degree_refusal(carrier.name(), &caps, pp)?;
         carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
+        if pp > 1 {
+            carrier.admit_pp_options(pp, draft_path, options)?;
+        }
     }
     // Qwen MoE on a discrete card keeps the prior 32768 CLI/config default:
     // automatic context there is not validated against expert placement. On
@@ -6227,6 +6230,19 @@ mod topology_caps_tests {
                 }),
                 tp: None,
             },
+            "raon1_mini" => TopologyCaps {
+                pp: Some(PpCaps {
+                    dir_sources: false,
+                    max_degree: 8,
+                    executor: PpExecutor::Mesh {
+                        numerical_policy: "raon-pp-cut-exact-v1",
+                        first_band_min_layers: 1,
+                    },
+                    bench: PpBenchRoute::Carrier,
+                }),
+                ep: None,
+                tp: None,
+            },
             "deepseek4" | "minimax" => TopologyCaps {
                 pp: None,
                 ep: None,
@@ -6247,7 +6263,10 @@ mod topology_caps_tests {
             }
         }
         declaring.sort_unstable();
-        assert_eq!(declaring, ["deepseek4", "minimax", "qwen35", "qwen4"]);
+        assert_eq!(
+            declaring,
+            ["deepseek4", "minimax", "qwen35", "qwen4", "raon1_mini"]
+        );
     }
 
     #[test]
@@ -6283,6 +6302,76 @@ mod topology_caps_tests {
             crate::topology_axes_refusal("qwen4", &carrier.topology_caps(), false, 1, 2, 1),
             Err(topology_refusal("qwen4", TopologyAxis::Tp, 2, false))
         );
+    }
+
+    /// Raon declares the generic mesh pipeline route from its carrier alone:
+    /// the front door passes an HFQ at any degree up to the bound, refuses a
+    /// directory with the uniform sentence, and the generic admission yields
+    /// the mesh and bands (no per-arch admission code).
+    #[test]
+    fn raon_pp_is_admitted_through_the_generic_mesh_branch() {
+        let carrier = crate::carrier_for(19).expect("raon carrier");
+        let caps = carrier.topology_caps();
+        assert_eq!(
+            crate::topology_axes_refusal("raon1_mini", &caps, false, 2, 1, 1),
+            Ok(())
+        );
+        assert_eq!(
+            crate::topology_axes_refusal("raon1_mini", &caps, true, 2, 1, 1),
+            Err(topology_refusal(
+                "raon1_mini",
+                TopologyAxis::Pipeline,
+                2,
+                true
+            ))
+        );
+        assert_eq!(
+            crate::topology_axes_refusal("raon1_mini", &caps, false, 1, 2, 1),
+            Err(topology_refusal("raon1_mini", TopologyAxis::Tp, 2, false))
+        );
+        assert_eq!(crate::pp_degree_refusal("raon1_mini", &caps, 8), Ok(()));
+        assert!(crate::pp_degree_refusal("raon1_mini", &caps, 9).is_err());
+        let Some(PpCaps {
+            executor:
+                PpExecutor::Mesh {
+                    numerical_policy,
+                    first_band_min_layers,
+                },
+            ..
+        }) = caps.pp
+        else {
+            panic!("raon declares a mesh pipeline route");
+        };
+        let visible: Vec<AdmittedRank> = (0..2)
+            .map(|i| AdmittedRank {
+                logical: i,
+                device_ordinal: i as i32,
+                pci_bus_id: Some(format!("0000:{:02x}:00.0", i + 3)),
+                arch: "gfx1201".to_string(),
+            })
+            .collect();
+        let (mesh, bands) = admit_pp_mesh(
+            "raon1_mini",
+            numerical_policy,
+            2,
+            25,
+            &visible,
+            "gfx1201",
+            false,
+            EdgeTransportPolicy::Auto,
+            &|_, _| false,
+            None,
+            first_band_min_layers,
+        )
+        .expect("raon pp2 admits");
+        assert_eq!(mesh.ranks.len(), 2);
+        // OutputCardLast: the primary device owns the last band.
+        assert_eq!(mesh.ranks[1].device_ordinal, 0);
+        let placement = bands.placement;
+        assert_eq!(placement.stages(), 2);
+        assert_eq!(placement.band(0).start, 0);
+        assert_eq!(placement.band(1).end, 25);
+        assert_eq!(placement.band(0).end, placement.band(1).start);
     }
 
     fn write_hfq(name: &str, arch_id: u32, metadata: &str) -> std::path::PathBuf {
@@ -6359,9 +6448,9 @@ mod non_qwen4_ep_admission_tests {
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
     use hipfire_runtime::loader_api::{topology_refusal, TopologyAxis};
 
-    /// Raon (arch 19) carries a registered carrier with no pp/ep/tp route, so
-    /// it exercises both non-Qwen4 topology branches.
-    const RAON_ARCH: u32 = 19;
+    /// LFM2-MoE (arch 11) carries a registered carrier that declares no
+    /// pp/ep/tp route, so it exercises both non-Qwen4 topology branches.
+    const UNDECLARED_ARCH: u32 = 11;
 
     fn write_fake_hfq(name: &str, arch_id: u32) -> std::path::PathBuf {
         let dir =
@@ -6400,16 +6489,16 @@ mod non_qwen4_ep_admission_tests {
         )
     }
 
-    fn raon_family() -> String {
-        crate::carrier_for(RAON_ARCH)
-            .expect("raon carrier is registered")
+    fn undeclared_family() -> String {
+        crate::carrier_for(UNDECLARED_ARCH)
+            .expect("lfm2moe carrier is registered")
             .name()
             .to_string()
     }
 
     #[test]
     fn ep_above_one_is_refused_in_the_single_pp_branch_before_the_pp_verdict() {
-        let path = write_fake_hfq("ep-single", RAON_ARCH);
+        let path = write_fake_hfq("ep-single", UNDECLARED_ARCH);
         TEST_EP_OVERRIDE.with(|cell| cell.set(Some(2)));
         // pp=2 would otherwise get the pipeline sentence: ep wins.
         for pp in [1usize, 2] {
@@ -6418,7 +6507,7 @@ mod non_qwen4_ep_admission_tests {
                 .expect_err("ep=2 must refuse");
             assert_eq!(
                 err,
-                topology_refusal(&raon_family(), TopologyAxis::Expert, 2, false),
+                topology_refusal(&undeclared_family(), TopologyAxis::Expert, 2, false),
                 "pp={pp}"
             );
         }
@@ -6428,14 +6517,14 @@ mod non_qwen4_ep_admission_tests {
 
     #[test]
     fn ep_above_one_is_refused_in_the_tp_branch_before_the_arch_allow_list() {
-        let path = write_fake_hfq("ep-tp", RAON_ARCH);
+        let path = write_fake_hfq("ep-tp", UNDECLARED_ARCH);
         TEST_EP_OVERRIDE.with(|cell| cell.set(Some(4)));
         let err = admit(&path, 2, 1)
             .map(|_| ())
             .expect_err("ep=4 must refuse");
         assert_eq!(
             err,
-            topology_refusal(&raon_family(), TopologyAxis::Expert, 4, false)
+            topology_refusal(&undeclared_family(), TopologyAxis::Expert, 4, false)
         );
         TEST_EP_OVERRIDE.with(|cell| cell.set(None));
         cleanup(&path);
@@ -6443,23 +6532,23 @@ mod non_qwen4_ep_admission_tests {
 
     #[test]
     fn tp_on_an_arch_without_a_route_gets_the_tp_sentence_with_the_family() {
-        let path = write_fake_hfq("tp-raon", RAON_ARCH);
+        let path = write_fake_hfq("tp-undeclared", UNDECLARED_ARCH);
         TEST_EP_OVERRIDE.with(|cell| cell.set(Some(1)));
         let err = admit(&path, 2, 1)
             .map(|_| ())
             .expect_err("tp=2 must refuse");
         assert_eq!(
             err,
-            topology_refusal(&raon_family(), TopologyAxis::Tp, 2, false)
+            topology_refusal(&undeclared_family(), TopologyAxis::Tp, 2, false)
         );
-        assert!(err.starts_with("raon1_mini: "), "{err}");
+        assert!(err.starts_with("lfm2moe: "), "{err}");
         TEST_EP_OVERRIDE.with(|cell| cell.set(None));
         cleanup(&path);
     }
 
     #[test]
     fn ep_of_one_never_yields_the_expert_sentence() {
-        let path = write_fake_hfq("pp-raon", RAON_ARCH);
+        let path = write_fake_hfq("pp-undeclared", UNDECLARED_ARCH);
         TEST_EP_OVERRIDE.with(|cell| cell.set(Some(1)));
         // pp=2 is refused by the geometry gate or the carrier, per the visible
         // device count of the host; either way it is not the expert refusal.

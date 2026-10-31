@@ -10,6 +10,8 @@ use hipfire_runtime::dflash::DflashBlockPolicy;
 use hipfire_runtime::loader_api::{
     topology_refusal, LoadCtx, ModelSource, SpecLoadCfg, TopologyAxis,
 };
+use hipfire_runtime::mesh_placement::BandPlacement;
+use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::Speculator;
 use rdna_compute::Gpu;
 
@@ -17,6 +19,7 @@ use crate::band::RaonBand;
 use crate::bundle::{RaonBundle, PREFILL_SCRATCH_ROWS};
 use crate::config::RaonConfig;
 use crate::forward::RaonWork;
+use crate::mesh::RaonMeshModel;
 use crate::state::{RaonPrefillScratch, RaonState, RaonStateDims};
 use crate::weights::load_raon_weights_band;
 use hipfire_runtime::hfq::HfqFile;
@@ -65,6 +68,29 @@ pub fn dflash_draft<'a>(
         ),
         (false, None) => Ok(None),
     }
+}
+
+/// The refusal of a `topology.pp` > 1 load that asks for speculation: the
+/// DFlash2 draft verifies on one device and the mesh bands run the batched
+/// prefill and band-local decode only. Pure, so admission can refuse before
+/// any previous model is torn down; the load repeats it as a backstop. Every
+/// speculation request [`dflash_draft`] refuses stays refused for its own
+/// reason first.
+pub fn pp_option_refusal(
+    pp: usize,
+    draft_path: Option<&str>,
+    spec: SpecLoadCfg,
+) -> Result<(), String> {
+    if pp < 2 {
+        return Ok(());
+    }
+    if dflash_draft(draft_path, spec)?.is_some() {
+        return Err(format!(
+            "raon1_mini: topology.pp = {pp} does not run speculation (the DFlash2 draft verifies on \
+             one device); drop --spec dflash / --model-draft or set topology.pp = 1"
+        ));
+    }
+    Ok(())
 }
 
 /// The proposal width of a Raon DFlash2 load: an explicit
@@ -120,21 +146,14 @@ pub fn build_raon_dflash2_speculator(
 /// safetensors directory (the official MXFP8
 /// checkpoint is quantized offline by `hipfire quantize`, never half-loaded),
 /// a non-arch-19 container, and a context length outside `1..=max_position`.
-/// Admission (`hipfire_loader::admission`) refuses tp, ep and pp above one for
-/// this family first; the pp/ep checks below are backstops for callers that
-/// bypass admission and share its refusal sentence.
+/// Admission (`hipfire_loader::admission`) refuses tp and ep above one for
+/// this family first; the ep check below is a backstop for callers that
+/// bypass admission and shares its refusal sentence. This is the one-device
+/// load: a `topology.pp` load builds its bands with [`load_raon_mesh_model`].
 /// The DFlash2 speculator, when requested, is built by the caller with
 /// [`build_raon_dflash2_speculator`] on the returned bundle.
 pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonBundle, String> {
     dflash_draft(ctx.draft_path, ctx.spec)?;
-    if ctx.pp > 1 {
-        return Err(topology_refusal(
-            "raon1_mini",
-            TopologyAxis::Pipeline,
-            ctx.pp,
-            src.is_dir(),
-        ));
-    }
     let ep = hipfire_config::topology::ep()?;
     if ep > 1 {
         return Err(topology_refusal(
@@ -212,6 +231,160 @@ pub fn load_raon_band_bundle(
         None => forced_chunk_rows()?,
     };
     assemble_raon_bundle(gpu, hfq, &config, band, max_seq, forced_rows)
+}
+
+/// Rows a mesh edge must carry for a Raon pipeline load reserving `max_seq`
+/// rows: the widest prefill chunk any band can admit
+/// (`min(PREFILL_CHUNK_LADDER[0], max_seq)`). The caller sizes
+/// `Gpus::provision_mesh_edges` with
+/// [`RaonMeshModel::edge_capacity_bytes`] of this many rows before
+/// [`load_raon_mesh_model`].
+pub fn mesh_edge_rows(max_seq: usize) -> usize {
+    PREFILL_CHUNK_LADDER[0].min(max_seq).max(1)
+}
+
+/// The rung below `rows` on [`PREFILL_CHUNK_LADDER`], if any.
+fn next_chunk_rung_below(rows: usize) -> Option<usize> {
+    PREFILL_CHUNK_LADDER.into_iter().find(|&rung| rung < rows)
+}
+
+/// A mesh band load that failed and left nothing loaded: the error, and the
+/// narrower chunk width worth retrying when a later rank refused the width
+/// the earlier ranks admitted.
+struct MeshLoadFailure {
+    error: String,
+    narrower_may_fit: Option<usize>,
+}
+
+/// Load every band of `placement` (band `r` on `gpus.devices[r]`) at one
+/// shared prefill chunk width and assemble the [`RaonMeshModel`]. On error
+/// every band loaded so far is freed on its own device.
+fn load_raon_mesh_bands(
+    hfq: &HfqFile,
+    config: &RaonConfig,
+    gpus: &mut Gpus,
+    placement: &BandPlacement,
+    max_seq: usize,
+    forced: Option<usize>,
+) -> Result<RaonMeshModel, MeshLoadFailure> {
+    let stages = placement.stages();
+    let mut bands: Vec<RaonBundle> = Vec::with_capacity(stages);
+    let mut rows = forced;
+    let free_loaded = |gpus: &mut Gpus, bands: Vec<RaonBundle>| {
+        for (rank, band) in bands.into_iter().enumerate() {
+            let gpu = &mut gpus.devices[rank];
+            if gpu.bind_thread().is_ok() {
+                band.free_all(gpu);
+            } else {
+                std::mem::forget(band);
+            }
+        }
+    };
+    for rank in 0..stages {
+        let loaded = RaonBand::new(placement.band(rank), config.n_layers).and_then(|band| {
+            let gpu = &mut gpus.devices[rank];
+            gpu.bind_thread().map_err(|e| e.to_string())?;
+            load_raon_band_bundle(hfq, gpu, max_seq, &band, rows)
+        });
+        match loaded {
+            Ok(band) => {
+                // Rank 0's admission (auto = the widest rung that fits it)
+                // sets the width every later band must take.
+                rows.get_or_insert(band.prefill_chunk_rows());
+                bands.push(band);
+            }
+            Err(error) => {
+                let narrower_may_fit = (rank > 0 && error.contains("cannot be admitted"))
+                    .then(|| rows.and_then(next_chunk_rung_below))
+                    .flatten();
+                free_loaded(gpus, bands);
+                return Err(MeshLoadFailure {
+                    error: format!("raon1_mini: pipeline band {rank} of {stages}: {error}"),
+                    narrower_may_fit,
+                });
+            }
+        }
+    }
+    match RaonMeshModel::new(config, &gpus.mesh, placement, bands) {
+        Ok(model) => Ok(model),
+        Err((error, bands)) => {
+            free_loaded(gpus, bands);
+            Err(MeshLoadFailure {
+                error,
+                narrower_may_fit: None,
+            })
+        }
+    }
+}
+
+/// Build the Raon pipeline mesh: every band of `placement` on its rank's
+/// device (`gpus.devices[r]`, one launch stream each, `gpus.mesh` the admitted
+/// mesh, edges provisioned for [`mesh_edge_rows`] rows) at one shared prefill
+/// chunk width, assembled into a [`RaonMeshModel`] driven through the generic
+/// mesh executor.
+///
+/// The width is rank 0's admission (`HIPFIRE_RAON_PREFILL_CHUNK_ROWS` or the
+/// widest rung that fits it); a later rank whose free memory cannot admit
+/// that width retries the whole load one rung narrower. On failure nothing is
+/// left loaded: the bands are freed on their own devices and the mesh edges
+/// are drained (a failed drain leaks and says so).
+pub fn load_raon_mesh_model(
+    src: ModelSource,
+    gpus: &mut Gpus,
+    placement: &BandPlacement,
+    max_seq: usize,
+) -> Result<RaonMeshModel, String> {
+    let hfq = match src {
+        ModelSource::Hfq(hfq) => hfq,
+        ModelSource::Dir(_) => {
+            return Err("raon1_mini: topology.pp needs a single quantized .hfq source".into())
+        }
+    };
+    if hfq.arch_id != crate::ARCH_ID {
+        return Err(format!(
+            "raon1_mini: HFQ arch_id {} is not {}",
+            hfq.arch_id,
+            crate::ARCH_ID
+        ));
+    }
+    let config = RaonConfig::from_hfq(&hfq)?;
+    if max_seq == 0 || max_seq > config.max_position {
+        return Err(format!(
+            "raon1_mini: max_seq {max_seq} outside 1..={}",
+            config.max_position
+        ));
+    }
+    if gpus.devices.len() != placement.stages() {
+        return Err(format!(
+            "raon1_mini: {} mesh devices for {} pipeline bands",
+            gpus.devices.len(),
+            placement.stages()
+        ));
+    }
+    let env_forced = forced_chunk_rows()?;
+    let mut forced = env_forced;
+    let failure = loop {
+        match load_raon_mesh_bands(&hfq, &config, gpus, placement, max_seq, forced) {
+            Ok(model) => return Ok(model),
+            Err(failure) => match failure.narrower_may_fit.filter(|_| env_forced.is_none()) {
+                Some(narrower) => {
+                    eprintln!(
+                        "raon1_mini: a later pipeline band cannot admit the prefill chunk the \
+                         first admitted; retrying the load at {narrower} rows"
+                    );
+                    forced = Some(narrower);
+                }
+                None => break failure,
+            },
+        }
+    };
+    Err(match gpus.drain_mesh_edges() {
+        Ok(()) => failure.error,
+        Err(drain) => format!(
+            "{}; mesh edge drain failed ({drain}): resources quarantined until process restart",
+            failure.error
+        ),
+    })
 }
 
 /// Load, state, chunk admission, scratch and work of `band` of the model
@@ -646,5 +819,29 @@ mod dflash_tests {
         // `auto` resolved by the daemon for a batching serve must not apply:
         // Raon never batches.
         assert_eq!(width(Some(8), true), auto);
+    }
+
+    #[test]
+    fn pipeline_loads_refuse_a_draft_or_dflash_before_any_device_is_touched() {
+        let on = cfg(|s| s.dflash = Some(true));
+        let error = pp_option_refusal(2, Some("d.hfq"), on).unwrap_err();
+        assert!(error.contains("topology.pp = 2"), "{error}");
+        assert!(error.contains("does not run speculation"), "{error}");
+        // The single-device refusals of `dflash_draft` stay first.
+        let error = pp_option_refusal(2, Some("d.hfq"), SpecLoadCfg::default()).unwrap_err();
+        assert!(error.contains("speculation.dflash = on"), "{error}");
+        // Plain AR and the single-device load are untouched.
+        assert_eq!(pp_option_refusal(2, None, SpecLoadCfg::default()), Ok(()));
+        assert_eq!(pp_option_refusal(1, Some("d.hfq"), on), Ok(()));
+    }
+
+    #[test]
+    fn mesh_edges_carry_the_widest_chunk_the_context_can_use() {
+        assert_eq!(mesh_edge_rows(32768), 4096);
+        assert_eq!(mesh_edge_rows(4200), 4096);
+        assert_eq!(mesh_edge_rows(300), 300);
+        assert_eq!(next_chunk_rung_below(4096), Some(2048));
+        assert_eq!(next_chunk_rung_below(1024), Some(PREFILL_SCRATCH_ROWS));
+        assert_eq!(next_chunk_rung_below(PREFILL_SCRATCH_ROWS), None);
     }
 }

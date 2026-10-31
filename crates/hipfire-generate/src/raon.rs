@@ -235,14 +235,27 @@ pub fn generate_raon(
     stop: &[String],
     enable_thinking: bool,
 ) {
-    let Some((vocab, eos_tokens, defaults, cap)) = m.raon().map(|b| {
-        (
-            b.config.vocab,
-            b.eos.clone(),
-            b.config.generation.clone(),
-            b.max_seq(),
-        )
-    }) else {
+    let Some((vocab, eos_tokens, defaults, cap)) = m
+        .raon()
+        .map(|b| {
+            (
+                b.config.vocab,
+                b.eos.clone(),
+                b.config.generation.clone(),
+                b.max_seq(),
+            )
+        })
+        .or_else(|| {
+            m.raon_mesh().map(|mesh| {
+                (
+                    mesh.dims().2,
+                    mesh.eos().to_vec(),
+                    mesh.generation().clone(),
+                    mesh.max_seq(),
+                )
+            })
+        })
+    else {
         raon_error(
             stdout,
             id,
@@ -395,6 +408,16 @@ pub fn generate_raon(
         false,
         true,
         |model, device, tokens, logits| {
+            if let Some((mesh, gpus)) = model.raon_mesh_mut() {
+                // Pipeline mesh: cold prefill (no session cache under pp), one
+                // drained epoch per chunk. The logits live on the last rank,
+                // which is the daemon's device (`OutputCardLast`), and the
+                // epoch drain orders them before the daemon-side copy.
+                mesh.reset(gpus)?;
+                mesh.prefill(gpus, tokens)?;
+                device.bind_thread().map_err(|e| e.to_string())?;
+                return copy_logits(device, mesh.logits(), logits, vocab);
+            }
             let bundle = model
                 .raon_mut()
                 .ok_or_else(|| "raon bundle disappeared before prefill".to_string())?;
@@ -413,6 +436,12 @@ pub fn generate_raon(
                 )
                 .map_err(|e| format!("raon logits argmax failed: {e}"))?,
             };
+            if let Some((mesh, gpus)) = model.raon_mesh_mut() {
+                mesh.decode_step(gpus, token)?;
+                device.bind_thread().map_err(|e| e.to_string())?;
+                copy_logits(device, mesh.logits(), logits, vocab)?;
+                return Ok(token);
+            }
             let bundle = model
                 .raon_mut()
                 .ok_or_else(|| "raon bundle disappeared during decode".to_string())?;

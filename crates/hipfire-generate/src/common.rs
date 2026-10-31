@@ -199,6 +199,17 @@ pub fn production_fail_closed_rollback(
             return epilogue;
         }
     }
+    // A pipeline-mesh model that owns its lifecycle (`ArchModel::
+    // owns_mesh_lifecycle`) resets every rank through the PP epilogue.
+    if slot.is_none()
+        && spec.is_none()
+        && m.pp > 1
+        && m.state
+            .as_deref()
+            .is_some_and(|state| state.owns_mesh_lifecycle())
+    {
+        return production_pp_fail_closed_rollback(m, gpu);
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     fail_closed_reset_target_and_spec(m, gpu, slot, spec)
@@ -386,6 +397,17 @@ pub fn production_pp_fail_closed_rollback(
     if m.pp > 1 {
         match m.pp_gpus.as_mut() {
             Some(gpus) => {
+                // The mesh-owning model resets its ranks first (drained), then
+                // the per-device graph invalidation and sync below attest it.
+                if let Some(state) = m
+                    .state
+                    .as_deref_mut()
+                    .filter(|state| state.owns_mesh_lifecycle())
+                {
+                    if let Err(e) = state.reset_session_state_mesh(gpu, gpus) {
+                        push_reset_err(&mut first_err, "pp mesh reset", e);
+                    }
+                }
                 for (rank, dev) in gpus.devices.iter_mut().enumerate() {
                     if let Err(e) = dev.bind_thread() {
                         push_reset_err(

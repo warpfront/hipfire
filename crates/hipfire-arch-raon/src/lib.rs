@@ -31,7 +31,7 @@ pub const ARCH_ID: u32 = 19;
 
 pub use band::{copy_edge_same_device, edge_bytes, edge_view, RaonBand};
 pub use bundle::{DecodeMode, PrefillMode, RaonBundle, PREFILL_SCRATCH_ROWS};
-pub use carrier::{load_raon_band_bundle, load_raon_bundle};
+pub use carrier::{load_raon_band_bundle, load_raon_bundle, load_raon_mesh_model, mesh_edge_rows};
 pub use census::{CensusReport, CensusStage};
 pub use config::{FfnKind, GenerationDefaults, LayerKind, RaonConfig};
 pub use forward::{

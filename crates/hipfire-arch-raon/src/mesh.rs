@@ -1005,6 +1005,67 @@ impl RaonMeshModel {
         self.bands[rank].download_logits(gpu)
     }
 
+    /// End-of-turn token ids (`generation_config.json`), read by the last band.
+    pub fn eos(&self) -> &[u32] {
+        &self.bands[self.bands.len() - 1].eos
+    }
+
+    /// Model generation defaults (sampling and penalty defaults of the card).
+    pub fn generation(&self) -> &crate::config::GenerationDefaults {
+        &self.bands[0].config.generation
+    }
+
+    /// Hidden width, layer count of the whole model and vocabulary.
+    pub fn dims(&self) -> (usize, usize, usize) {
+        let first = &self.bands[0];
+        (first.config.hidden, first.band().total, first.config.vocab)
+    }
+
+    /// Grow every band's context-sized state to `rows` rows ahead of a decode
+    /// that ends there (each band on its own device). Best effort for the
+    /// caller: a failure only leaves growth to the per-step admission.
+    pub fn map_ahead(&mut self, gpus: &mut Gpus, rows: usize) -> Result<()> {
+        self.check_gpus(gpus)?;
+        for (rank, band) in self.bands.iter_mut().enumerate() {
+            let gpu = &mut gpus.devices[rank];
+            gpu.bind_thread().map_err(|e| e.to_string())?;
+            band.state
+                .ensure_capacity(gpu, rows)
+                .map_err(|e| format!("rank {rank}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Block until every rank's device has retired its queued work.
+    pub fn sync_devices(&self, gpus: &Gpus) -> Result<()> {
+        for (rank, gpu) in gpus.devices.iter().enumerate() {
+            gpu.bind_thread().map_err(|e| e.to_string())?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|e| format!("raon1_mini: rank {rank} device sync: {e:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// Reset, then prefill `n_tokens` deterministic synthetic ids through the
+    /// production [`prefill`](Self::prefill) route and wait for every device.
+    /// The same ids as [`RaonBundle::bench_prefill_rows`]. Used by the
+    /// loader's prefill benchmark.
+    pub fn bench_prefill_rows(&mut self, gpus: &mut Gpus, n_tokens: usize) -> Result<()> {
+        if n_tokens == 0 {
+            return Err("raon1_mini: bench prefill of zero tokens".into());
+        }
+        self.reset(gpus)?;
+        let vocab = self.bands[0].config.vocab as u64;
+        let lo = 1024u64.min(vocab.saturating_sub(1));
+        let span = vocab - lo;
+        let tokens: Vec<u32> = (0..n_tokens as u64)
+            .map(|i| (lo + (i.wrapping_mul(2654435761).wrapping_add(17)) % span) as u32)
+            .collect();
+        self.prefill(gpus, &tokens)?;
+        self.sync_devices(gpus)
+    }
+
     /// Tear the model down: drain the mesh edges (all devices, so no in-flight
     /// work reads a band) and free every band on its own device. A failed
     /// drain quarantines: the bands are leaked rather than freed under

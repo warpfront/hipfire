@@ -2134,8 +2134,12 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // (and any decode capture/record): map context ahead for the whole
     // `max_tokens` budget (AR: no draft rows). Best effort; the model logs
     // and swallows a failure, leaving on-demand growth.
-    if let Some(state) = m.state.as_deref_mut() {
-        state.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, 0);
+    match (m.state.as_deref_mut(), m.pp_gpus.as_mut()) {
+        (Some(state), Some(gpus)) if state.owns_mesh_lifecycle() => {
+            state.map_ahead_for_decode_mesh(gpu, gpus, prompt_tokens.len(), max_tokens, 0)
+        }
+        (Some(state), _) => state.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, 0),
+        (None, _) => {}
     }
     let sampler_config = SamplerConfig {
         temperature: temp,

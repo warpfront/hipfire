@@ -8122,6 +8122,67 @@ pub fn init_pp_gpus(
     Ok(gpus)
 }
 
+/// Structural re-check of an admitted pipeline mesh at load, before any
+/// device beyond the daemon's is touched, for a carrier on the generic mesh
+/// executor (`PpExecutor::Mesh`): `pp` ranks with `tp = ep = 1`, one rank per
+/// band in logical order, every rank the daemon's architecture, and the
+/// daemon's own device (the owner of generation buffers) the output rank.
+/// Admission already refused anything else; this keeps the carrier from
+/// loading against a mesh it was not admitted for.
+pub fn pp_mesh_load_check(
+    family: &str,
+    admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
+    placement: &hipfire_runtime::mesh_placement::BandPlacement,
+    pp: usize,
+    daemon_device: i32,
+    daemon_arch: &str,
+) -> Result<(), String> {
+    use hipfire_runtime::device_mesh::DimKind;
+    let mesh = &admitted.mesh;
+    if mesh.size_of(DimKind::Pp) != pp
+        || mesh.size_of(DimKind::Tp) != 1
+        || mesh.size_of(DimKind::Ep) != 1
+        || mesh.n_devices() != pp
+        || admitted.ranks.len() != pp
+        || placement.stages() != pp
+    {
+        return Err(format!(
+            "{family}: topology.pp admits pipeline parallelism with tp = ep = 1 only; the admitted \
+             mesh, ranks and band placement disagree about pp = {pp}"
+        ));
+    }
+    placement
+        .validate_for(mesh, placement.n_trunk_layers)
+        .map_err(|error| format!("{family}: topology.pp band placement: {error}"))?;
+    for (index, rank) in admitted.ranks.iter().enumerate() {
+        if rank.logical != index {
+            return Err(format!(
+                "{family}: topology.pp rank {index} carries logical id {}",
+                rank.logical
+            ));
+        }
+        if rank.arch != daemon_arch {
+            return Err(format!(
+                "{family}: topology.pp admits homogeneous ranks only; rank {index} is {} while \
+                 the output device is {daemon_arch}",
+                rank.arch
+            ));
+        }
+    }
+    let output = admitted
+        .ranks
+        .last()
+        .ok_or_else(|| format!("{family}: topology.pp mesh has no ranks"))?;
+    if output.device_ordinal != daemon_device {
+        return Err(format!(
+            "{family}: topology.pp output rank is device {} but the daemon's generation device is \
+             {daemon_device}; generation buffers must live on the output card",
+            output.device_ordinal
+        ));
+    }
+    Ok(())
+}
+
 /// Qwen4's mesh-PP device bring-up: [`init_pp_gpus`] for the `qwen4` family.
 fn init_qwen4_pp_gpus(
     admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
@@ -10583,6 +10644,120 @@ impl Carrier for Lfm2MoeCarrier {
 
 // ─── RaonCarrier ─────────────────────────────────────────────────────
 
+/// Largest `topology.pp` the Raon band route admits.
+const RAON_PP_MAX: usize = 8;
+
+/// Numerical-policy identity of the Raon pipeline route: every band edge is
+/// the mHC stream tensor at a layer boundary, so any cut executes the same
+/// kernels on the same bits as the whole model (cut-exact; `raon_mesh_oracle`
+/// pins it at cuts 1, 13 and 24).
+const RAON_PP_NUMERICAL_POLICY: &str = "raon-pp-cut-exact-v1";
+
+/// The `RaonCarrier` load of a `topology.pp` 2..=8 model: the carrier's
+/// option refusals and the admitted-mesh re-check before any device beyond the
+/// daemon's is touched, then one band per rank on the generic mesh executor
+/// ([`hipfire_arch_raon::RaonMeshModel`]). `LoadedModel.pp` is the admitted
+/// degree and `pp_gpus` holds the generic `Gpus` (the sole hardware owner,
+/// `!Send`, so it cannot live in the `Send` model state). The engine session
+/// cache is not attached: its snapshots are whole-model, single-device state.
+fn load_raon_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    use hipfire_arch_raon as raon;
+    let pp = ctx.pp;
+    raon::carrier::pp_option_refusal(pp, ctx.draft_path, ctx.spec)?;
+    let ep = hipfire_config::topology::ep()?;
+    if ep > 1 {
+        return Err(format!(
+            "raon1_mini: topology.pp = {pp} cannot combine with expert parallelism (topology.ep = {ep})"
+        ));
+    }
+    let (Some(admitted), Some(placement)) = (ctx.admitted_mesh, ctx.band_placement) else {
+        return Err(format!(
+            "raon1_mini: topology.pp = {pp} needs the admitted mesh and band placement from \
+             source admission"
+        ));
+    };
+    pp_mesh_load_check(
+        "raon1_mini",
+        admitted,
+        placement,
+        pp,
+        ctx.gpu.device_id,
+        &ctx.gpu.arch,
+    )?;
+    if ctx.gpu.is_uma() {
+        return Err("raon1_mini: topology.pp needs discrete GPUs".into());
+    }
+    ctx.gpu
+        .emu_refuse_multi_device("raon1_mini topology.pp")
+        .map_err(|error| format!("raon1_mini: {error}"))?;
+    let meta = resolve_source_meta(&src, ctx.path)?;
+    let ModelSource::Hfq(hfq) = &src else {
+        return Err("raon1_mini: topology.pp needs a single quantized .hfq source".into());
+    };
+    let config = raon::RaonConfig::from_hfq(hfq)?;
+    if ctx.max_seq == 0 || ctx.max_seq > config.max_position {
+        return Err(format!(
+            "raon1_mini: max_seq {} outside 1..={}",
+            ctx.max_seq, config.max_position
+        ));
+    }
+    let edge_rows = raon::mesh_edge_rows(ctx.max_seq);
+    let edge_bytes = raon::RaonMeshModel::edge_capacity_bytes(&config, edge_rows)?;
+    let mut gpus = init_pp_gpus("raon1_mini", admitted, placement)?;
+    gpus.provision_mesh_edges(admitted, placement, edge_bytes)
+        .map_err(|error| format!("raon1_mini: topology.pp edge provisioning failed: {error}"))?;
+    let model = match raon::load_raon_mesh_model(src, &mut gpus, placement, ctx.max_seq) {
+        Ok(model) => model,
+        Err(error) => {
+            for device in gpus.devices.iter_mut() {
+                let _ = device.bind_thread();
+                device.invalidate_weight_caches();
+                device.invalidate_graph_state();
+                device.drain_pool();
+            }
+            return Err(error);
+        }
+    };
+    let ranks: Vec<String> = (0..placement.stages())
+        .map(|rank| {
+            format!(
+                "layers {:?} on device {}",
+                placement.band(rank),
+                admitted.ranks[rank].device_ordinal
+            )
+        })
+        .collect();
+    eprintln!(
+        "raon1_mini PP plan: {} bands ({}), prefill chunk {} rows, edge payload up to {} MiB",
+        placement.stages(),
+        ranks.join("; "),
+        model.prefill_chunk_rows(),
+        edge_bytes >> 20,
+    );
+    hipfire_config::load_summary::note(
+        hipfire_config::load_summary::Facet::Placement,
+        format!("pipeline-parallel x{pp}: {}", ranks.join("; ")),
+    );
+    hipfire_config::load_summary::note(
+        hipfire_config::load_summary::Facet::Prefill,
+        format!("chunk {} rows", model.prefill_chunk_rows()),
+    );
+    Ok(LoadedModel {
+        state: Some(Box::new(model)),
+        pp,
+        pp_gpus: Some(gpus),
+        ..LoadedModel::skeleton(
+            meta.arch_id,
+            meta.tokenizer,
+            ctx.max_seq,
+            ctx.max_seq,
+            ctx.path.to_string(),
+            meta.chat_template,
+            meta.chat_template_source,
+        )
+    })
+}
+
 pub struct RaonCarrier;
 impl Carrier for RaonCarrier {
     fn name(&self) -> &'static str {
@@ -10610,6 +10785,32 @@ impl Carrier for RaonCarrier {
         // struct carries only temp/top_p/repeat_penalty).
         saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
     }
+    fn topology_caps(&self) -> crate::TopologyCaps {
+        crate::TopologyCaps {
+            // Pipeline parallelism on the generic mesh executor: layer bands
+            // (`RaonMeshModel`), one band per device, HFQ only. The cut is the
+            // mHC stream tensor at a layer boundary, so any split is exact.
+            pp: Some(crate::PpCaps {
+                dir_sources: false,
+                max_degree: RAON_PP_MAX,
+                executor: crate::PpExecutor::Mesh {
+                    numerical_policy: RAON_PP_NUMERICAL_POLICY,
+                    first_band_min_layers: 1,
+                },
+                bench: crate::PpBenchRoute::Carrier,
+            }),
+            ep: None,
+            tp: None,
+        }
+    }
+    fn admit_pp_options(
+        &self,
+        pp: usize,
+        draft_path: Option<&str>,
+        options: crate::admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        hipfire_arch_raon::carrier::pp_option_refusal(pp, draft_path, options.spec)
+    }
     fn bench_prefill(
         &self,
         m: &mut crate::LoadedModel,
@@ -10618,6 +10819,17 @@ impl Carrier for RaonCarrier {
         _n: usize,
         prefill_err: &mut Option<String>,
     ) -> Option<bool> {
+        if let Some((mesh, gpus)) = m.raon_mesh_mut() {
+            // The mesh drains every epoch and syncs every rank; the daemon
+            // `gpu` is not a model device here.
+            return match mesh.bench_prefill_rows(gpus, synthetic.len()) {
+                Ok(()) => Some(true),
+                Err(e) => {
+                    *prefill_err = Some(format!("raon1_mini bench prefill: {e}"));
+                    Some(false)
+                }
+            };
+        }
         let bundle = m.raon_mut()?;
         match bundle.bench_prefill_rows(gpu, synthetic.len()) {
             Ok(()) => Some(true),
@@ -10656,6 +10868,20 @@ impl Carrier for RaonCarrier {
         iterations: usize,
         decode_err: &mut Option<String>,
     ) -> Option<bool> {
+        if let Some((mesh, gpus)) = m.raon_mesh_mut() {
+            let (_, _, vocab) = mesh.dims();
+            let vocab = vocab as u64;
+            let lo = 1024u64.min(vocab.saturating_sub(1));
+            let span = vocab - lo;
+            for i in 0..iterations as u64 {
+                let token = (lo + i.wrapping_mul(2654435761).wrapping_add(17) % span) as u32;
+                if let Err(e) = mesh.decode_step(gpus, token) {
+                    *decode_err = Some(format!("raon1_mini bench decode step {i}: {e}"));
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
         let Some(bundle) = m.raon_mut() else {
             *decode_err = Some("raon1_mini bench decode missing state".into());
             return Some(false);
@@ -10699,6 +10925,9 @@ impl Carrier for RaonCarrier {
         Ok(Qwen35Emit::from_ctx_template_think_close(ctx))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return load_raon_pp_model(src, ctx);
+        }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         // `load_raon_bundle` refuses every speculation request this arch
