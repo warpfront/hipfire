@@ -894,13 +894,11 @@ pub(crate) fn prepare_rank_lane(
                 LaneKind::Forced(t) => Some(forced_acceptance(t)),
                 // A sampled window's tokens are the root's draws: the rank
                 // replays the decision (its own argmax picks are evidence only).
-                LaneKind::Decode if p.plan.sampling != SamplingMode::Greedy => {
-                    Some(GreedyAccept {
-                        committed: d.emitted.clone(),
-                        accepted: d.accepted,
-                        hit_eos: d.hit_eos,
-                    })
-                }
+                LaneKind::Decode if p.plan.sampling != SamplingMode::Greedy => Some(GreedyAccept {
+                    committed: d.emitted.clone(),
+                    accepted: d.accepted,
+                    hit_eos: d.hit_eos,
+                }),
                 LaneKind::Decode => None,
             };
             let prepared = prepare_lane_window_with(
