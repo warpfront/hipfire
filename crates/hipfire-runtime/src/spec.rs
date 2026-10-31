@@ -263,8 +263,8 @@ pub trait SpecTarget {
     /// from the current state (cache-hit suffix, or the partial-accept replay).
     ///
     /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
-    /// the target appends, per processed position, the concat of residual hidden
-    /// at `layers` (`layers.len() × dim` f32/row) to the provided `Vec`. Ignored
+    /// the target appends, per processed position, the capture of the residual hidden
+    /// at `layers` (`layers.len() × dflash_streams_per_layer() × dim` f32/row) to the provided `Vec`. Ignored
     /// (no-op) when `None` or when `dflash_extract_layers()` returns `None`.
     fn spec_advance(
         &mut self,
@@ -288,8 +288,8 @@ pub trait SpecTarget {
     /// snapshot nothing.
     ///
     /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
-    /// the target appends, per processed position, the concat of residual hidden
-    /// at `layers` (`layers.len() × dim` f32/row). Ignored when `None` or when
+    /// the target appends, per processed position, the capture of the residual hidden
+    /// at `layers` (`layers.len() × dflash_streams_per_layer() × dim` f32/row). Ignored when `None` or when
     /// `dflash_extract_layers()` returns `None`.
     fn verify_block(
         &mut self,
@@ -393,12 +393,24 @@ pub trait SpecTarget {
 
     /// The layer indices whose residual hidden states the drafter wants captured,
     /// in order. When `Some(layers)`, the target should, on each processed
-    /// position, append `layers.len() × dim` f32 values to the `hidden_out` sink
+    /// position, append `layers.len() × dflash_streams_per_layer() × dim` f32 values to the `hidden_out` sink
     /// passed to [`spec_advance`](Self::spec_advance) / [`verify_block`](Self::verify_block).
     ///
     /// `None` (default) means this target cannot feed a hidden-conditioned drafter.
     fn dflash_extract_layers(&self) -> Option<&[usize]> {
         None
+    }
+
+    /// Hidden rows the target captures per extract layer per position (default
+    /// 1: one `dim`-wide residual row per layer; a target whose residual has
+    /// several streams either averages them down to 1 or exposes all of them).
+    /// A feature row is `layers.len() × dflash_streams_per_layer() × dim` F32,
+    /// layer-major in [`set_dflash_extract_layers`](Self::set_dflash_extract_layers)
+    /// order, then stream-major, then hidden. A hidden-conditioned drafter
+    /// refuses a target whose value differs from its own
+    /// `target_streams_per_layer`.
+    fn dflash_streams_per_layer(&self) -> usize {
+        1
     }
 
     /// Apply the target's lm_head to `n` rows of residual hidden states
@@ -452,7 +464,7 @@ pub trait SpecTarget {
     /// Like [`verify_block`](Self::verify_block), but captures the per-position
     /// extract-layer residual hidden into the caller-owned GPU buffer
     /// `hidden_gpu` (position-major `[n_pos × dflash_extract_layers().len() ×
-    /// dim]` F32) instead of a host `Vec` — keeping the DSpark accepted-prefix-
+    /// dflash_streams_per_layer() × dim]` F32) instead of a host `Vec` — keeping the DSpark accepted-prefix-
     /// hidden reuse entirely on-device (no D2H+H2D per window; ~free on UMA, a
     /// real saving on a discrete-VRAM GPU).
     ///
@@ -461,7 +473,7 @@ pub trait SpecTarget {
     /// whose batched capture path can't run for this block (e.g. llama with
     /// `block.len() < 4`) returns `false` and leaves `hidden_gpu` untouched, and
     /// the caller re-bootstraps the next window. `hidden_gpu` must be
-    /// `≥ block.len() × dflash_extract_layers().len() × dim` F32.
+    /// `≥ block.len() × dflash_extract_layers().len() × dflash_streams_per_layer() × dim` F32.
     ///
     /// Same snapshot/advance contract as [`verify_block`](Self::verify_block).
     /// Returns `Err` by default (target has no GPU-resident hidden capture).

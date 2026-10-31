@@ -157,14 +157,11 @@ impl Gpu {
         )?;
 
         self.bind_thread()?;
-        // gfx1100 PM twin (`gated_delta_vector_pm`): same kernargs, grid and block.
-        let func = if self.gated_delta_vector_pm_rda_admitted(p.head_dim) {
-            self.ensure_embedded_kernel(
-                crate::gated_delta_vector_pm::MODULE,
-                crate::gated_delta_vector_pm::IMAGE,
-                crate::gated_delta_vector_pm::RDA_SYMBOL,
-            )?;
-            crate::gated_delta_vector_pm::RDA_SYMBOL
+        // gfx1100 / gfx1201 PM twin (`gated_delta_vector_pm`): same kernargs, grid and block.
+        let twin = self.gated_delta_vector_pm_rda_admitted(p.head_dim);
+        let func = if let Some(twin) = twin {
+            self.ensure_embedded_kernel(twin.module, twin.image, twin.rda_symbol)?;
+            twin.rda_symbol
         } else {
             self.ensure_kernel(
                 "gated_delta_net_vector_serial",
@@ -335,16 +332,17 @@ impl Gpu {
         )?;
 
         self.bind_thread()?;
-        // gfx1100 PM twin (`gated_delta_vector_pm`): same kernargs and block; row slice 0 alone
-        // touches the history, so it is correct in place and not.
-        let twin = self.gated_delta_vector_pm_conv_admitted(g.ksize);
-        let func = if twin {
-            self.ensure_embedded_kernel(
-                crate::gated_delta_vector_pm::MODULE,
-                crate::gated_delta_vector_pm::IMAGE,
-                crate::gated_delta_vector_pm::CONV_SYMBOL,
-            )?;
-            crate::gated_delta_vector_pm::CONV_SYMBOL
+        // gfx1100 / gfx1201 PM twin (`gated_delta_vector_pm`): same kernargs and block; row slice 0
+        // alone touches the history, so it is correct in place and not (gfx1201 admits in place only).
+        let in_place = hist_in.buf.as_ptr() == hist_out.buf.as_ptr();
+        let twin =
+            self.gated_delta_vector_pm_conv_admitted(crate::gated_delta_vector_pm::ConvShape {
+                ksize: g.ksize,
+                in_place,
+            });
+        let func = if let Some(twin) = twin {
+            self.ensure_embedded_kernel(twin.module, twin.image, twin.conv_symbol)?;
+            twin.conv_symbol
         } else {
             self.ensure_kernel(
                 "causal_conv_depthwise_rows",
@@ -358,7 +356,6 @@ impl Gpu {
         let wp = weight.buf.as_ptr();
         let hip_ = hist_in.buf.as_ptr();
         let hop = hist_out.buf.as_ptr();
-        let in_place = hip_ == hop;
         let rows_per_chunk = if in_place {
             g.n_rows
         } else {
@@ -395,7 +392,7 @@ impl Gpu {
             &round as *const _ as *mut c_void,
         ];
         let block = 128u32;
-        let grid = if twin {
+        let grid = if twin.is_some() {
             // 32 rows per workgroup regardless of `rows_per_chunk`.
             crate::gated_delta_vector_pm::conv_grid(g.n_channels, g.n_rows)
         } else {

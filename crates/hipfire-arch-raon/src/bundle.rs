@@ -7,11 +7,12 @@ use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
 use crate::forward::{
-    admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
-    stage_decode_token, stage_decode_token_on_stream, RaonWork,
+    admit_decode_context, decode_binding, decode_body, forward_rows, forward_rows_captured,
+    forward_token, stage_decode_token, stage_decode_token_on_stream, RaonWork,
 };
-use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
-use crate::weights::RaonWeights;
+use crate::spec_impl::RaonSpecState;
+use crate::state::{RaonPrefillScratch, RaonState};
+use crate::weights::{RaonMixer, RaonWeights};
 
 /// Decode-step execution route (`HIPFIRE_GRAPH`, PLAN §3.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,9 +74,10 @@ struct DecodeGraph {
     launch_secs: f64,
 }
 
-/// Upper bound of token rows one batched prefill call stages (the scratch is
-/// sized for this, so a longer prompt is processed in chunks of at most this
-/// many rows).
+/// Rows of the smallest prefill chunk the loader admits (the floor of the
+/// admission ladder `4096 / 2048 / 1024 / 512`, see
+/// `carrier::admit_prefill_rows`). The admitted chunk is
+/// [`RaonBundle::prefill_chunk_rows`].
 pub const PREFILL_SCRATCH_ROWS: usize = 512;
 
 /// Prefill route. `Batched` is the product route (N rows per module call);
@@ -152,6 +154,71 @@ impl PrefillPrecision {
         }
         gpu.flags = std::sync::Arc::new(flags);
     }
+
+    /// One load-time line per weight class that an `A8`/`A4` request does not
+    /// reach, so the setting never silently does nothing. Only qt44
+    /// (`MQ4G256V2`) attention-class projections go through the
+    /// activation-quantized batched GEMMs (device-dependent admission);
+    /// Q8F16/F32 projections have no such route, and every FFN class (dense
+    /// layer, shared and routed experts) runs the grouped F16-WMMA core.
+    fn report_coverage(self, weights: &RaonWeights) {
+        let label = match self {
+            Self::F16 => return,
+            Self::A8 => "a8",
+            Self::A4 => "a4",
+        };
+        let mut by_dtype: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut note = |w: &hipfire_runtime::llama::WeightTensor| {
+            *by_dtype.entry(format!("{:?}", w.gpu_dtype)).or_default() += 1;
+        };
+        for layer in &weights.layers {
+            match &layer.mixer {
+                RaonMixer::Rda(r) => {
+                    for w in [
+                        &r.q_proj,
+                        &r.k_proj,
+                        &r.v_proj,
+                        &r.g_proj,
+                        &r.o_proj,
+                        &r.f_a_proj,
+                        &r.f_b_proj,
+                        &r.b_proj,
+                        &r.rda_w_proj,
+                    ] {
+                        note(w);
+                    }
+                }
+                RaonMixer::Mla(m) => {
+                    for w in [
+                        &m.q_a_proj,
+                        &m.q_b_proj,
+                        &m.kv_a_proj,
+                        &m.kv_b_proj,
+                        &m.g_proj,
+                        &m.o_proj,
+                    ] {
+                        note(w);
+                    }
+                }
+            }
+        }
+        let eligible = by_dtype.remove("MQ4G256V2").unwrap_or(0);
+        eprintln!(
+            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: {eligible} qt44 attention-class \
+             projections may take the activation-quantized prefill GEMM (device admission)"
+        );
+        for (dtype, n) in by_dtype {
+            eprintln!(
+                "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: {n} {dtype} attention-class \
+                 projections stay F16/F32 (no activation-quantized route for {dtype})"
+            );
+        }
+        eprintln!(
+            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: dense, shared and routed expert FFNs \
+             stay on the grouped F16-WMMA core (no activation-quantized grouped route admits Raon's \
+             qt44 down K=1280 / intermediate 1088 / down-AWQ experts)"
+        );
+    }
 }
 
 /// Everything one loaded Raon-1-mini model owns on the device.
@@ -161,7 +228,7 @@ pub struct RaonBundle {
     pub weights: RaonWeights,
     /// Mutable per-session state (RDA recurrent state, conv history, MLA latent caches).
     pub state: RaonState,
-    /// Bounded prefill scratch (`PREFILL_SCRATCH_ROWS` rows).
+    /// Prefill scratch sized for the admitted chunk rows (`prefill_chunk_rows`).
     pub scratch: RaonPrefillScratch,
     /// Module work buffers (mHC controls, RDA, MoE, dense FFN) matching `scratch`.
     pub work: RaonWork,
@@ -170,6 +237,9 @@ pub struct RaonBundle {
     prefill_mode: PrefillMode,
     decode_mode: DecodeMode,
     graph: DecodeGraph,
+    /// Speculative-decode state (DFlash2 capture, per-row verify head); empty
+    /// until a speculator arms it, never touched by AR prefill or decode.
+    pub(crate) spec: RaonSpecState,
 }
 
 impl RaonBundle {
@@ -187,6 +257,7 @@ impl RaonBundle {
             .and_then(|m| PrefillPrecision::from_env().map(|p| (m, p)))
             .and_then(|(m, p)| {
                 p.apply(gpu);
+                p.report_coverage(&weights);
                 let mut work = RaonWork::new(gpu, &config, scratch.rows)?;
                 if let Err(e) = work.mla.pack_absorbed(gpu, &config, &weights) {
                     work.free(gpu);
@@ -218,6 +289,7 @@ impl RaonBundle {
                     prefill_mode,
                     decode_mode: DecodeMode::resolve(gpu),
                     graph: DecodeGraph::default(),
+                    spec: RaonSpecState::default(),
                 })
             }
             Err(e) => {
@@ -241,6 +313,13 @@ impl RaonBundle {
     /// Prefill route selected at load (see [`PrefillMode::from_env`]).
     pub fn prefill_mode(&self) -> PrefillMode {
         self.prefill_mode
+    }
+
+    /// Rows of one batched prefill chunk: the admitted scratch/work rows (see
+    /// `carrier::admit_prefill_rows`; at least [`PREFILL_SCRATCH_ROWS`] unless
+    /// the reserved context is shorter).
+    pub fn prefill_chunk_rows(&self) -> usize {
+        self.scratch.rows.min(self.work.rows())
     }
 
     /// Override the load-time route (oracle/control use).
@@ -301,6 +380,71 @@ impl RaonBundle {
             .map_err(|e| format!("raon1_mini: download logits: {e:?}"))
     }
 
+    /// Token rows one prefill step stages: 1 on the serial control route, else
+    /// the admitted chunk ([`prefill_chunk_rows`](Self::prefill_chunk_rows)).
+    pub(crate) fn prefill_step_rows(&self) -> usize {
+        match self.prefill_mode {
+            PrefillMode::Serial => 1,
+            PrefillMode::Batched => self.prefill_chunk_rows(),
+        }
+    }
+
+    /// One prefill step: `piece` (1..=[`prefill_step_rows`](Self::prefill_step_rows)
+    /// rows) from the slot's current position. `want_logits` leaves the last
+    /// row's logits in [`logits`](Self::logits). `capture_row0 = Some(r)`
+    /// additionally lands the DFlash2 feature rows of `piece` in the
+    /// speculative capture buffer from row `r` ([`RaonSpecState`]); `None`
+    /// issues exactly the AR launch sequence.
+    pub(crate) fn forward_chunk(
+        &mut self,
+        gpu: &mut Gpu,
+        piece: &[u32],
+        want_logits: bool,
+        capture_row0: Option<usize>,
+    ) -> Result<(), String> {
+        let pos = self.state.n_tokens() as u32;
+        if let Some(row0) = capture_row0 {
+            let capture = self.spec.capture(row0)?;
+            return forward_rows_captured(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                &mut self.scratch,
+                &mut self.work,
+                gpu,
+                piece,
+                pos,
+                want_logits,
+                Some(&capture),
+            );
+        }
+        if piece.len() == 1 {
+            forward_token(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                &mut self.scratch,
+                &mut self.work,
+                gpu,
+                piece[0],
+                pos,
+                want_logits,
+            )
+        } else {
+            forward_rows(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                &mut self.scratch,
+                &mut self.work,
+                gpu,
+                piece,
+                pos,
+                want_logits,
+            )
+        }
+    }
+
     /// Append `tokens` to the slot starting at `n_tokens()`, in chunks of at
     /// most `scratch.rows`; the logits of the final token are left in
     /// [`logits`](Self::logits). A failure leaves the slot partially advanced:
@@ -317,39 +461,10 @@ impl RaonBundle {
                 self.state.max_seq()
             ));
         }
-        let chunk = match self.prefill_mode {
-            PrefillMode::Serial => 1,
-            PrefillMode::Batched => self.scratch.rows.min(self.work.rows()).min(MLA_TILE_ROWS),
-        };
+        let chunk = self.prefill_step_rows();
         let n_chunks = tokens.len().div_ceil(chunk);
         for (ci, piece) in tokens.chunks(chunk).enumerate() {
-            let pos = self.state.n_tokens() as u32;
-            let last = ci + 1 == n_chunks;
-            if chunk == 1 {
-                forward_token(
-                    &self.config,
-                    &self.weights,
-                    &mut self.state,
-                    &mut self.scratch,
-                    &mut self.work,
-                    gpu,
-                    piece[0],
-                    pos,
-                    last,
-                )?;
-            } else {
-                forward_rows(
-                    &self.config,
-                    &self.weights,
-                    &mut self.state,
-                    &mut self.scratch,
-                    &mut self.work,
-                    gpu,
-                    piece,
-                    pos,
-                    last,
-                )?;
-            }
+            self.forward_chunk(gpu, piece, ci + 1 == n_chunks, None)?;
         }
         Ok(())
     }
@@ -534,12 +649,14 @@ impl RaonBundle {
             prefill_mode: _,
             decode_mode: _,
             graph,
+            spec,
         } = self;
         // A recording of this bundle reads the buffers freed below.
         if graph.binding != 0 && gpu.graphs.ar_forward_binding == graph.binding {
             gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
         }
         work.free(gpu);
+        spec.free(gpu);
         if let Err(e) = scratch.free_gpu(gpu) {
             eprintln!("raon1_mini: scratch free: {e}");
         }

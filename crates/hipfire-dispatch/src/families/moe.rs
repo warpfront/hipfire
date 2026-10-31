@@ -1609,8 +1609,11 @@ pub trait MoeTileExchange {
 
     /// Cross-rank host barrier (every rank calls it at the same point); used to
     /// order a rank-local drain (`ep_quiesce`) before any rank launches a chunk
-    /// that reads peer VRAM.
-    fn host_barrier(&self) -> Result<(), String>;
+    /// that reads peer VRAM, and by the EP reserve loan's acquire and restore
+    /// rendezvous. `what` names the rendezvous kind and `epoch` the caller's
+    /// epoch counter: ranks that cross at different kinds, epochs or counts
+    /// fail at once naming both crossings instead of timing out.
+    fn host_barrier(&self, what: u8, epoch: u32) -> Result<(), String>;
 
     /// Publish this rank's `y_down_grouped` and pull the peer-owned tiles into
     /// it. `tile_ids` is the UNMASKED scatter output (the pull's predicate is

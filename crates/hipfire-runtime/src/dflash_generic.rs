@@ -120,7 +120,7 @@ impl TreeMode {
 /// Target-generic chain-mode DFlash speculator.
 ///
 /// Owns the loaded draft weights/scratch/config, the cumulative target-hidden
-/// host buffer (`[committed_rows × num_extract × hidden]` f32, row-major,
+/// host buffer (`[committed_rows × feature_width]` f32, row-major,
 /// extract-layers ascending), and the arch-specific verify scratch the target
 /// minted via [`SpecTarget::new_spec_scratch`]. The target itself is borrowed
 /// per call — never owned — exactly like the qwen35 `DflashSpeculator`.
@@ -157,8 +157,10 @@ pub struct GenericDflashSpeculator {
 }
 
 impl GenericDflashSpeculator {
-    fn num_extract(&self) -> usize {
-        self.config.num_extract()
+    /// Hidden rows (`h` wide) per feature row: `num_extract × streams`, so
+    /// `feature_rows() * hidden == config.feature_width()`.
+    fn feature_rows(&self) -> usize {
+        self.config.num_extract() * self.config.target_streams_per_layer
     }
 
     /// True one-token window: verify only `[seed]`, emit exactly one target
@@ -176,7 +178,7 @@ impl GenericDflashSpeculator {
         seed: u32,
         temp: f32,
     ) -> Result<SpecStep, String> {
-        let ne = self.num_extract();
+        let ne = self.feature_rows();
         let h = self.config.hidden;
         let vocab = self.config.vocab_size;
         let block = [seed];
@@ -287,7 +289,7 @@ impl GenericDflashSpeculator {
         temp: f32,
         max_emit: usize,
     ) -> Result<SpecStep, String> {
-        let ne = self.num_extract();
+        let ne = self.feature_rows();
         let h = self.config.hidden;
         let depth = b - 1; // drafted positions = block_size - 1
 
@@ -675,7 +677,7 @@ impl Speculator for GenericDflashSpeculator {
         let b = cfg_b.min(max_emit).max(2);
         assert!(b >= 2, "dflash block size must be >= 2");
         let h = self.config.hidden;
-        let ne = self.num_extract();
+        let ne = self.feature_rows();
 
         // ── 1. Build the masked block: [seed, MASK, …, MASK] ────────────────
         let mut block: Vec<u32> = vec![self.config.mask_token_id; b];
@@ -929,7 +931,7 @@ impl Speculator for GenericDflashSpeculator {
                     .into(),
             );
         }
-        let ne = self.num_extract();
+        let ne = self.feature_rows();
         let h = self.config.hidden;
         let expected_len = self.target_hidden_host.len() + tokens.len() * ne * h;
         // Host is authoritative at `start_pos` rows going in (same invariant as step).
@@ -1083,6 +1085,14 @@ pub fn build_generic_dflash_speculator(
     let draft_hfq = HfqFile::open(Path::new(draft_hfq_path)).map_err(|e| format!("{e}"))?;
     let config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    let target_streams = target.dflash_streams_per_layer();
+    if target_streams != config.target_streams_per_layer {
+        return Err(format!(
+            "draft '{draft_hfq_path}' expects target_streams_per_layer {} but the target \
+             captures {target_streams} stream(s) per extract layer",
+            config.target_streams_per_layer
+        ));
+    }
     let weights = DflashWeights::load(gpu, &draft_hfq, &config).map_err(|e| format!("{e}"))?;
     let block_size = config.block_size;
     // L3: F16 drafts (dflash_convert) → has_mq=false → DflashScratch::new.

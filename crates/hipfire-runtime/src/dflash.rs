@@ -34,13 +34,13 @@ use std::collections::{HashMap, HashSet};
 
 /// Max rows per call into `gemm_dispatch` for the MQ (FWHT-rotated)
 /// path. The activation rotation scratch (`DflashScratch.mq_x_rot`) is
-/// sized to this many rows × `max(inter, q_dim, num_extract * hidden)`,
+/// sized to this many rows × `max(inter, q_dim, feature_width)`,
 /// regardless of context length. Calls with `batch > MQ_X_ROT_CHUNK_ROWS`
 /// are chunked transparently inside `gemm_dispatch`.
 ///
-/// Sizing rationale: at chunk=1024 and 27B (ne*h = 25600 floats per row),
+/// Sizing rationale: at chunk=1024 and 27B (feature width 25600 floats per row),
 /// the scratch is `1024 × 25600 × 4 ≈ 100 MB`. The pre-2026-05-15
-/// allocator sized this buffer to `max_seq × ne × h`, which at ctx=17K
+/// allocator sized this buffer to `max_seq × feature_width`, which at ctx=17K
 /// reached 1.74 GB on 27B — a multi-GB waste that scaled with `max_seq`.
 /// Chunking adds `ceil(batch / 1024)` extra kernel launches on the
 /// first-call `fc` rotation (one-shot per prompt, negligible vs prefill).
@@ -148,12 +148,22 @@ pub struct DflashConfig {
     pub conv_kernel_size: Option<usize>,
     pub selector_rank: Option<usize>,
     pub selector_top_k: Option<usize>,
+    /// Hidden rows the target appends per extract layer per position
+    /// (`dflash_config.target_streams_per_layer`, default 1). A multi-stream
+    /// residual target (e.g. Raon's 4 mHC streams) contributes every stream.
+    pub target_streams_per_layer: usize,
 }
 
 impl DflashConfig {
     /// Returns the number of target hidden layers concatenated into fc input.
     pub fn num_extract(&self) -> usize {
         self.target_layer_ids.len()
+    }
+
+    /// Width of one feature row (= fc input K):
+    /// `num_extract × target_streams_per_layer × hidden`.
+    pub fn feature_width(&self) -> usize {
+        self.num_extract() * self.target_streams_per_layer * self.hidden
     }
 
     pub fn kv_dim(&self) -> usize {
@@ -182,6 +192,11 @@ impl DflashConfig {
     /// `dflash` object written by `dflash_convert`.
     pub fn from_hfq(hfq: &HfqFile) -> Option<Self> {
         let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
+        Self::from_metadata(&meta)
+    }
+
+    /// Parse from the full HFQ metadata JSON value (see [`Self::from_hfq`]).
+    pub fn from_metadata(meta: &serde_json::Value) -> Option<Self> {
         let df = meta.get("dflash")?;
 
         let n_layers = df.get("num_hidden_layers").and_then(|v| v.as_u64())? as usize;
@@ -292,6 +307,9 @@ impl DflashConfig {
         let conv_kernel_size = dflash_u64("conv_kernel_size");
         let selector_rank = dflash_u64("selector_rank");
         let selector_top_k = dflash_u64("selector_top_k");
+        let target_streams_per_layer = dflash_u64("target_streams_per_layer")
+            .filter(|&s| s >= 1)
+            .unwrap_or(1);
 
         Some(DflashConfig {
             n_layers,
@@ -313,6 +331,7 @@ impl DflashConfig {
             conv_kernel_size,
             selector_rank,
             selector_top_k,
+            target_streams_per_layer,
         })
     }
 }
@@ -363,7 +382,7 @@ impl SelectorCodebook {
 }
 
 pub struct DflashWeights {
-    /// `fc`: Linear(num_extract × hidden → hidden). Shape: [hidden, num_extract × hidden].
+    /// `fc`: Linear(feature_width → hidden). Shape: [hidden, feature_width].
     pub fc: WeightTensor,
     pub hidden_norm: GpuTensor, // [hidden] — F32
     pub norm: GpuTensor,        // [hidden] — F32, final output norm
@@ -960,7 +979,7 @@ impl DflashWeights {
             gpu,
             "fc.weight",
             cfg.hidden,
-            cfg.num_extract() * cfg.hidden,
+            cfg.feature_width(),
         ));
         let i_hidden_norm = gt!(hfq_tensor_f32(
             hfq,
@@ -1595,7 +1614,7 @@ pub const DRAFT_LANE_WS_ROWS: usize = 72;
 pub struct DraftLaneWorkspace {
     /// Packed rows these tensors hold ([`DRAFT_LANE_WS_ROWS`]).
     pub rows: usize,
-    /// Row stride of `input`: `max(num_extract × hidden, hidden)`.
+    /// Row stride of `input`: `max(feature_width, hidden)`.
     pub input_width: usize,
     /// `[rows, input_width]` gathered `target_hidden` (fc) / projected-hidden
     /// (ctx) rows; shape subviews use the actual width of the stage.
@@ -1617,7 +1636,7 @@ impl DraftLaneWorkspace {
         let rows = DRAFT_LANE_WS_ROWS;
         let h = cfg.hidden;
         let kvd = cfg.kv_dim();
-        let input_width = std::cmp::max(cfg.num_extract() * h, h);
+        let input_width = std::cmp::max(cfg.feature_width(), h);
         let mut live: Vec<GpuTensor> = Vec::with_capacity(5);
         for len in [rows * input_width, rows * h, rows * kvd, rows * kvd, rows] {
             match gpu.alloc_tensor(&[len], DType::F32) {
@@ -1679,7 +1698,7 @@ pub struct DflashScratch {
     pub residual: GpuTensor, // [B, hidden]
 
     // Context activations (L rows), where L ≤ max_ctx_len.
-    pub target_hidden: GpuTensor,      // [L, num_extract × hidden]
+    pub target_hidden: GpuTensor,      // [L, feature_width]
     pub target_hidden_proj: GpuTensor, // [L, hidden]
 
     // Concatenated K/V (L + B rows).
@@ -1696,7 +1715,7 @@ pub struct DflashScratch {
     pub lane_positions_q: Vec<i32>,
 
     // FWHT rotation scratch for MQ4 weight paths. Sized to the largest
-    // single-call requirement: max(max_ctx × num_extract*hidden,
+    // single-call requirement: max(max_ctx × feature_width,
     // max_block × max_layer_K). Allocated only when DflashWeights.has_mq.
     pub mq_x_rot: Option<GpuTensor>,
     // Launch-fusion prescaffold (S7): F16 twin of `mq_x_rot` (same element
@@ -1931,7 +1950,7 @@ impl DflashScratch {
         let b = max_block_size;
         let l = max_ctx_len;
         let tot = l + b;
-        let ne = cfg.num_extract();
+        let fw = cfg.feature_width();
         let h = cfg.hidden;
         let inter = cfg.intermediate;
         let qd = cfg.q_dim();
@@ -1984,23 +2003,23 @@ impl DflashScratch {
             // Sized for a CHUNK of the worst-case MQ rotation, not the whole
             // first-call prefix. The rotations called through `gemm_dispatch`
             // are:
-            //   - first-call `fc` (target_hidden):  batch up to `l`, w.k = ne*h
+            //   - first-call `fc` (target_hidden):  batch up to `l`, w.k = feature_width
             //   - per-cycle wq/wk/wv/gate/up:       batch = b,         w.k = h
             //   - per-cycle wo:                     batch = b,         w.k = q_dim
             //   - per-cycle w_down:                 batch = b,         w.k = intermediate
             //   - first-call wk/wv on prefix:       batch up to `l`,   w.k = h
             //
-            // Steady-state cycles only need `b × max(inter, qd, ne*h)`. The
+            // Steady-state cycles only need `b × max(inter, qd, feature_width)`. The
             // first-call rotations against the full prefix used to pin the
-            // buffer to `l × ne × h` (1.7 GB at ctx=17K on 27B). That sizing
+            // buffer to `l × feature_width` (1.7 GB at ctx=17K on 27B). That sizing
             // forced VRAM bloat that scales with max_seq.
             //
-            // Fix: cap the scratch at `MQ_X_ROT_CHUNK_ROWS × max(inter, qd, ne*h)`
+            // Fix: cap the scratch at `MQ_X_ROT_CHUNK_ROWS × max(inter, qd, feature_width)`
             // floats and chunk any call where `batch × w.k > scratch.size()`
             // inside `gemm_dispatch`. The first-call rotations are split into
             // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
             // 1K prefix tokens (negligible vs seconds-scale prefill).
-            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
+            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, fw));
             Some(at!(&[widest]))
         } else {
             None
@@ -2009,7 +2028,7 @@ impl DflashScratch {
         // Joins the `at!` transaction (dtype arm): a bare `?` here would
         // leak every earlier allocation (`GpuTensor` has no `Drop`).
         let i_mq_x_rot_f16 = if with_mq {
-            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
+            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, fw));
             Some(at!(&[widest], DType::F16))
         } else {
             None
@@ -2067,7 +2086,7 @@ impl DflashScratch {
         let i_attn_out = at!(&[b * qd]);
         let i_residual = at!(&[b * h]);
 
-        let i_target_hidden = at!(&[l * ne * h]);
+        let i_target_hidden = at!(&[l * fw]);
         let i_target_hidden_proj = at!(&[l * h]);
 
         let i_k_cat = at!(&[tot * kvd]);
@@ -3097,11 +3116,11 @@ pub fn draft_seed_backfill(
         _ => return Ok(()),
     };
     let h = cfg.hidden;
-    let ne = cfg.num_extract();
+    let fw = cfg.feature_width();
     let kvd = cfg.kv_dim();
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
-    let row_f32 = ne * h;
+    let row_f32 = fw;
     assert_eq!(
         host_hidden.len(),
         prompt_len * row_f32,
@@ -3206,7 +3225,7 @@ pub fn draft_seed_backfill(
 /// Run one draft forward. Inputs:
 /// - `noise_embedding`: `[block_size × hidden]` f32, row-major. Comes from
 ///   `target.embed_tokens(block_output_ids)` on the caller side.
-/// - `target_hidden`:   `[ctx_len × num_extract × hidden]` f32, row-major
+/// - `target_hidden`:   `[ctx_len × feature_width]` f32, row-major
 ///   (5-way concat of target's chosen-layer hidden states at `ctx_len`
 ///   accepted positions).
 /// - `positions_q`:     `[block_size]` i32 — absolute position index of
@@ -3231,7 +3250,7 @@ pub fn draft_seed_backfill(
 ///     D2D copies into `scratch.x` suffice).
 /// `target_hidden`: if `Some`, uploaded into `scratch.target_hidden`.
 ///     If `None`, the caller must have already filled `scratch.target_hidden`
-///     with `ctx_len × num_extract × hidden` F32 rows.
+///     with `ctx_len × feature_width` F32 rows.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_forward(
     gpu: &mut Gpu,
@@ -3394,7 +3413,7 @@ fn draft_forward_based_impl(
     let l = ctx_len;
     let tot = l + b;
     let h = cfg.hidden;
-    let ne = cfg.num_extract();
+    let fw = cfg.feature_width();
     let kvd = cfg.kv_dim();
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
@@ -3406,7 +3425,7 @@ fn draft_forward_based_impl(
         assert_eq!(ne_slice.len(), b * h, "noise_embedding size");
     }
     if let Some(th_slice) = target_hidden {
-        assert_eq!(th_slice.len(), (l - base) * ne * h, "target_hidden size");
+        assert_eq!(th_slice.len(), (l - base) * fw, "target_hidden size");
     }
     match scratch.ctx_mode {
         DraftCtxMode::Legacy => {
@@ -3482,10 +3501,10 @@ fn draft_forward_based_impl(
         // (ctx_slice == None), the prefix grows by accept+1 rows per cycle
         // and rows [0..prev_l) are unchanged since the previous call.
         // Upload only the new tail when detected. This cuts the H2D from
-        // `l × ne × hidden × 4` (e.g. ~90 MB at l=1100 on 9B) to
-        // `(l - uploaded) × ne × hidden × 4` (~700 KB at accept=8).
+        // `l × feature_width × 4` (e.g. ~90 MB at l=1100 on 9B) to
+        // `(l - uploaded) × feature_width × 4` (~700 KB at accept=8).
         //
-        // The optimization only fires when `th_slice.len() == l × ne × h`
+        // The optimization only fires when `th_slice.len() == l × feature_width`
         // and it matches what the caller told us (matches a non-sliced
         // cumulative buffer). ctx_slice callers pass a DIFFERENT slice
         // every cycle (last N rows shift) — for them, force full upload.
@@ -3494,7 +3513,7 @@ fn draft_forward_based_impl(
         // swa_w); only rows [max(prev, l−swa_w)..l) are uploaded, wrap-split
         // at the ring boundary. Out-of-window rows are never read (fc is the
         // only consumer and its fill is span-limited too).
-        let row_f32 = ne * h;
+        let row_f32 = fw;
         let expected_full_len = (l - base) * row_f32;
         let prev = scratch.thlog.uploaded_rows();
         // Full-upload conditions: first call, reset flagged, caller shrank
@@ -3611,9 +3630,7 @@ fn draft_forward_based_impl(
     let delta = l.saturating_sub(fc_start);
     if delta > 0 {
         for (_row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
-            let th_slice = scratch
-                .target_hidden
-                .sub_offset(slot0 * ne * h, len * ne * h);
+            let th_slice = scratch.target_hidden.sub_offset(slot0 * fw, len * fw);
             let thp_slice = scratch.target_hidden_proj.sub_offset(slot0 * h, len * h);
             gemm_dispatch(
                 gpu,
@@ -4385,11 +4402,54 @@ mod block_policy_tests {
             conv_kernel_size: Some(2),
             selector_rank: Some(256),
             selector_top_k: Some(16),
+            target_streams_per_layer: 1,
         };
         assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 16);
         assert_eq!(cfg.runtime_block_size(8), 8);
         cfg.selector_rank = None;
         assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 8);
+    }
+
+    fn meta_with(dflash: serde_json::Value) -> serde_json::Value {
+        let mut df = json!({
+            "num_hidden_layers": 5,
+            "hidden_size": 2560,
+            "intermediate_size": 8192,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 5,
+            "head_dim": 128,
+            "vocab_size": 259840,
+            "block_size": 8,
+            "mask_token_id": 259839,
+            "target_layer_ids": [1, 6, 11, 16, 21],
+            "num_target_layers": 24,
+        });
+        for (k, v) in dflash.as_object().unwrap() {
+            df[k] = v.clone();
+        }
+        json!({ "dflash": df })
+    }
+
+    #[test]
+    fn streams_parse_nested_flat_and_default() {
+        let nested = meta_with(json!({"dflash_config": {"target_streams_per_layer": 4}}));
+        let cfg = DflashConfig::from_metadata(&nested).unwrap();
+        assert_eq!(cfg.target_streams_per_layer, 4);
+        assert_eq!(cfg.feature_width(), 5 * 4 * 2560);
+        assert_eq!(cfg.feature_width(), 51200);
+
+        let flat = meta_with(json!({"target_streams_per_layer": 4}));
+        assert_eq!(
+            DflashConfig::from_metadata(&flat)
+                .unwrap()
+                .target_streams_per_layer,
+            4
+        );
+
+        let legacy = meta_with(json!({}));
+        let cfg = DflashConfig::from_metadata(&legacy).unwrap();
+        assert_eq!(cfg.target_streams_per_layer, 1);
+        assert_eq!(cfg.feature_width(), cfg.num_extract() * cfg.hidden);
     }
 }
 
@@ -4419,6 +4479,7 @@ mod construction_tests {
             conv_kernel_size: Some(2),
             selector_rank: Some(8),
             selector_top_k: Some(2),
+            target_streams_per_layer: 1,
         }
     }
 

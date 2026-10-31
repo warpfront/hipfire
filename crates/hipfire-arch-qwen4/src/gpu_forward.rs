@@ -1833,6 +1833,10 @@ fn slab_codec_tag_bytes(codecs: &[u8]) -> Vec<u8> {
 pub(crate) use cpu_splice::{ColdLayerRefs, ColdLayerSource};
 mod cpu_slab_owner;
 mod cpu_splice;
+pub(crate) mod ep_reserve_forward;
+pub use ep_reserve_forward::ep_reserve_receipt_scope;
+pub(crate) mod ep_reserve_loan;
+pub(crate) mod ep_reserve_scratch;
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     fn len(&self) -> usize {
@@ -2918,6 +2922,7 @@ impl Qwen4TileRoute {
         mode: Qwen4ForwardScratchMode,
         max_chunk: usize,
         flash_next: bool,
+        exchange: Option<&ep_reserve_scratch::EpExchangeCapacity>,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let refuse = |reason: &str| {
             eprintln!(
@@ -2976,8 +2981,22 @@ impl Qwen4TileRoute {
         }
         let word = std::mem::size_of::<i32>();
         let tile_bytes = 16 * config.hidden_size * DType::BF16.size();
-        let tile_capacity = scratch.moe_expert_tile_ids.buf.size() / word;
-        let max_tiles = tile_capacity.min(scratch.moe_y_down_grouped.buf.size() / tile_bytes);
+        let (tile_capacity, max_tiles) = match exchange {
+            // EP reserve: the registered capacity is the 4096-row prompt plan's
+            // (persistent grouped-down root and masked tile ids), never the
+            // selected resident bank's.
+            Some(capacity) => (
+                capacity.tile_ids,
+                ep_reserve_forward::exchange_max_tiles(capacity, config.hidden_size),
+            ),
+            None => {
+                let tile_capacity = scratch.moe_expert_tile_ids.buf.size() / word;
+                (
+                    tile_capacity,
+                    tile_capacity.min(scratch.moe_y_down_grouped.buf.size() / tile_bytes),
+                )
+            }
+        };
         if max_tiles == 0 {
             return refuse("no tile capacity");
         }
@@ -3335,6 +3354,7 @@ impl Qwen4MoeLayerRuntime {
             d2_default,
             crate::expert_tier_owners::ExpertReadView::BorrowPrefill(class),
             false,
+            None,
         )
     }
 
@@ -3360,6 +3380,7 @@ impl Qwen4MoeLayerRuntime {
             d2_default,
             crate::expert_tier_owners::ExpertReadView::Resident,
             false,
+            None,
         )
     }
 
@@ -3385,6 +3406,7 @@ impl Qwen4MoeLayerRuntime {
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
             head_split,
+            None,
         )
     }
 
@@ -3436,6 +3458,50 @@ impl Qwen4MoeLayerRuntime {
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
             false,
+            None,
+        )
+    }
+
+    /// EP reserve borrowed view: the compact runtime of a scratch-donor layer whose
+    /// device bytes are scratch while a borrowed epoch is open. Owned experts name
+    /// the loan's pinned mirror (`gate_up` / `down`: typed host-mapped descriptors of
+    /// the loan-owned allocation), every other expert the zero dummy, exactly as
+    /// [`Self::from_moe_ep`] does over the device tensors (same sealed binding of
+    /// expert group `group`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_moe_ep_mirror(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        dummy: &Qwen4EpDummyExpert,
+        seal: &Qwen4EpRankSeal,
+        group: usize,
+        gate_up: &GpuTensor,
+        down: &GpuTensor,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        let sealed = seal
+            .expert_binding(group, placement, gpu.device_id)
+            .map_err(invalid)?;
+        Self::build(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            Qwen4ExpertTableLayout::Ep {
+                placement,
+                dummy: dummy.source(),
+            },
+            Some(dummy),
+            Some(sealed),
+            true,
+            false,
+            crate::expert_tier_owners::ExpertReadView::Resident,
+            false,
+            Some((gate_up, down)),
         )
     }
 
@@ -3472,6 +3538,7 @@ impl Qwen4MoeLayerRuntime {
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
             false,
+            None,
         )
     }
 
@@ -3494,6 +3561,7 @@ impl Qwen4MoeLayerRuntime {
         d2_default: bool,
         read_view: crate::expert_tier_owners::ExpertReadView,
         head_split: bool,
+        source_override: Option<(&GpuTensor, &GpuTensor)>,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let ep_layout = matches!(
             layout,
@@ -3595,11 +3663,17 @@ impl Qwen4MoeLayerRuntime {
             .map(|(base, bytes)| foreign_packed_source(base, bytes, DType::MQ4G128V2));
         let gate_up_source = match tier_gate_source.as_ref() {
             Some(source) => source,
-            None => weights.resident(&moe.experts_gate_up)?,
+            None => match source_override {
+                Some((gate_up, _)) => gate_up,
+                None => weights.resident(&moe.experts_gate_up)?,
+            },
         };
         let down_source = match tier_down_source.as_ref() {
             Some(source) => source,
-            None => weights.resident(&moe.experts_down)?,
+            None => match source_override {
+                Some((_, down)) => down,
+                None => weights.resident(&moe.experts_down)?,
+            },
         };
         let gate_up_dtype = gate_up_source.dtype;
         let down_dtype = down_source.dtype;
@@ -5091,6 +5165,7 @@ impl Qwen4ExpertStage {
         bundle: &Qwen4Bundle,
         moe: &[Option<Qwen4MoeLayerRuntime>],
         chunk_rows: usize,
+        host_sources: Option<&ep_reserve_forward::EpStageHostSources>,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         if let Some(placement) = bundle.weights.ep_placement() {
             if !rdna_compute::expert_capabilities::stage_policy(&gpu.arch).expert_parallel_stage {
@@ -5246,6 +5321,13 @@ impl Qwen4ExpertStage {
                 ])
             };
         for layer in first_host..moe.len() {
+            if let Some([gate, down]) = host_sources.and_then(|sources| sources.pair(layer)) {
+                // EP reserve: this scratch-donor layer's host source is the loan's mirror.
+                if gate.len() < bytes[0] || down.len() < bytes[1] {
+                    return off("a loan mirror has no pinned host bytes of the stage size");
+                }
+                continue;
+            }
             for (source, bytes, _) in parts(layer)? {
                 let owner = bundle.weights.resident(source)?;
                 // Host addresses come only from owning tensors. Borrowed
@@ -5510,8 +5592,16 @@ impl Qwen4ExpertStage {
         gpu: &Gpu,
         bundle: &Qwen4Bundle,
         layer: usize,
+        host_sources: Option<&ep_reserve_forward::EpStageHostSources>,
     ) -> Result<(), Qwen4GpuForwardError> {
         let parity = layer % 2;
+        if let Some([gate, down]) = host_sources.and_then(|sources| sources.pair(layer)) {
+            // EP reserve: a scratch-donor layer stages from the loan's pinned mirror.
+            gpu.hip
+                .stream_wait_event(&self.copy_stream, &self.free[parity])?;
+            self.set_state(parity, DonorState::Overwritten);
+            return self.copy_into_donor(gpu, parity, [gate, down]);
+        }
         let weights = bundle
             .weights
             .layer(layer)
@@ -5582,6 +5672,7 @@ impl Qwen4ExpertStage {
         bundle: &Qwen4Bundle,
         moe: &[Option<Qwen4MoeLayerRuntime>],
         layer: usize,
+        host_sources: Option<&ep_reserve_forward::EpStageHostSources>,
     ) -> Result<(), Qwen4GpuForwardError> {
         if self.slab.is_some() {
             return self.slab_after_moe(gpu, moe, layer);
@@ -5608,7 +5699,7 @@ impl Qwen4ExpertStage {
                 .as_ref()
                 .is_some_and(RoutedExpertWeights::host_mapped)
         }) {
-            Some(next) => self.enqueue_layer(gpu, bundle, next),
+            Some(next) => self.enqueue_layer(gpu, bundle, next, host_sources),
             None if self.state.get()[parity] == DonorState::Overwritten => {
                 self.enqueue_restore(gpu, parity)
             }
@@ -5705,6 +5796,7 @@ struct StagedMoeHooks<'s, 'c> {
     stage: &'s Qwen4ExpertStage,
     bundle: &'s Qwen4Bundle,
     moe: &'s [Option<Qwen4MoeLayerRuntime>],
+    host_sources: Option<&'s ep_reserve_forward::EpStageHostSources>,
     /// The layer of the next MoE call.
     layer: usize,
     /// The stage error behind a hook failure, returned instead of the
@@ -5750,7 +5842,9 @@ impl MoeStepHooks for StagedMoeHooks<'_, '_> {
     fn after_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         // Down recorded free before combine. Refill this parity for L+2 or
         // restore its donor; no routing results are involved.
-        let result = self.stage.after_moe(gpu, self.bundle, self.moe, self.layer);
+        let result =
+            self.stage
+                .after_moe(gpu, self.bundle, self.moe, self.layer, self.host_sources);
         self.layer += 1;
         self.fail(result)
     }
@@ -8969,6 +9063,17 @@ pub struct Qwen4GpuForward {
     borrow_runtimes_active: bool,
     /// The class view of the running prompt tile.
     borrow_view: usize,
+    /// `Some` on an `HIPFIRE_EP_RESERVE_DECOUPLE=1` load: the 4096-row prompt plan,
+    /// the resident / borrowed scratch banks, the donor loan and the epoch proof
+    /// ([`ep_reserve_forward`]). `scratch` is the resident bank at every call
+    /// boundary; the borrowed runtime view is `moe_borrow[0]`.
+    ep_reserve: Option<ep_reserve_forward::EpReserveForward>,
+    /// `Some` on an ORDINARY EP load under `HIPFIRE_EP_RESERVE_RECEIPT=1` (no
+    /// reserve): the host-only prompt-record state of the gate's off arm.
+    ep_ordinary_receipt: Option<ep_reserve_forward::EpOrdinaryReceipt>,
+    /// Set only across [`Self::share_prompt_begin_mtp_fill`]'s begin: the
+    /// entry it opens is the native-MTP fill (receipt `phase`).
+    receipt_mtp_fill: bool,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -10173,12 +10278,54 @@ impl Qwen4GpuForward {
         mode: Qwen4ForwardScratchMode,
         #[cfg(target_os = "linux")] npu_prepared: Option<Option<npu_forward::PreparedTrunk>>,
     ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::new_inner_with_reserve(
+            gpu,
+            bundle,
+            max_chunk,
+            mode,
+            #[cfg(target_os = "linux")]
+            npu_prepared,
+            None,
+        )
+    }
+
+    /// [`Self::new_inner`] for an `HIPFIRE_EP_RESERVE_DECOUPLE=1` load when
+    /// `ep_reserve_plan` carries the frozen plan: the 512-row resident bank plus
+    /// the persistent 4096-row roots are the only scratch allocations, the 4096-row
+    /// bank is views of donor memory, the loan mirrors the donors, and the borrowed
+    /// compact runtimes and the one borrowed-only S2 stage are built over those
+    /// mirrors. Any failed reserve verdict tears the whole forward down: there is
+    /// no fallback to a full dedicated bank or a smaller chunk.
+    pub(crate) fn new_inner_with_reserve(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        #[cfg(target_os = "linux")] npu_prepared: Option<Option<npu_forward::PreparedTrunk>>,
+        ep_reserve_plan: Option<Arc<crate::ep_reserve::EpReservePlan>>,
+    ) -> Result<Self, Qwen4GpuForwardError> {
         Self::admit_profile(&bundle.config)?;
         let scope = bundle.weights.band_scope().clone();
         let single_scope = scope == Qwen4BandScope::single(&bundle.config);
         check_band_admission(bundle, &scope, single_scope)?;
         let mesh_trunk_ops = mesh_trunk_op_range(&bundle.config, &scope)?;
         let flash_next = bundle.config.profile.is_flash_next();
+        if let Some(plan) = ep_reserve_plan.as_ref() {
+            if !flash_next
+                || !single_scope
+                || bundle.weights.ep_placement().is_none()
+                || bundle.slowlink_profile().is_some()
+                || mode != Qwen4ForwardScratchMode::Full
+                || max_chunk != plan.forward.prompt_rows
+            {
+                return Err(invalid(format!(
+                    "an EP reserve-sharing load needs the Flash-Next EP rank forward on the Full \
+                     scratch plan at exactly the planned {}-row prompt chunk (got {max_chunk} rows, \
+                     {mode:?})",
+                    plan.forward.prompt_rows
+                )));
+            }
+        }
         // Decode-share scratch banks: `bank` over an owned test backing,
         // `fixed` / `on` over the lease's real donor tail (only when the load
         // planned one).
@@ -10222,6 +10369,7 @@ impl Qwen4GpuForward {
         } else {
             false
         };
+        let mut reserve_banks: Option<ep_reserve_scratch::EpReserveBanks> = None;
         let (scratch, host_token_bytes, host_ple_bytes, share) = if share_classes {
             let donor = donor_lease.filter(|_| share_mode.uses_donor_backing());
             let (scratch, share, host_token_bytes, host_ple_bytes) = Self::build_decode_share(
@@ -10247,10 +10395,39 @@ impl Qwen4GpuForward {
                 share.class_spans.iter().copied().max().unwrap_or(0) >> 20
             );
             (scratch, host_token_bytes, host_ple_bytes, Some(share))
+        } else if let Some(plan) = ep_reserve_plan.as_ref() {
+            // EP reserve: the 512-row resident bank plus the two persistent 4096-row roots
+            // are the only device allocations; the 4096-row bank is views of donor memory.
+            // A full dedicated bank is never allocated, not even transiently.
+            let (segments, placements) =
+                ep_reserve_forward::EpReserveForward::layout(bundle, plan)?;
+            let (scratch, mut banks) = ep_reserve_scratch::EpReserveBanks::build(
+                gpu,
+                &bundle.config,
+                mode,
+                plan.forward.prompt_rows,
+                &segments,
+                &placements,
+            )?;
+            let (host_token_bytes, host_ple_bytes) = banks.take_host_staging();
+            reserve_banks = Some(banks);
+            (scratch, host_token_bytes, host_ple_bytes, None)
         } else {
             let (scratch, host_token_bytes, host_ple_bytes) =
                 Qwen4GpuForwardScratch::new_scoped(gpu, &bundle.config, max_chunk, mode, &scope)?;
             (scratch, host_token_bytes, host_ple_bytes, None)
+        };
+        let reserve = match (ep_reserve_plan, reserve_banks) {
+            (Some(plan), Some(banks)) => {
+                match ep_reserve_forward::EpReserveForward::materialize(gpu, bundle, plan, banks) {
+                    Ok(reserve) => Some(reserve),
+                    Err(error) => {
+                        let _ = scratch.free_gpu(gpu);
+                        return Err(error);
+                    }
+                }
+            }
+            _ => None,
         };
         let mut moe: Vec<Option<Qwen4MoeLayerRuntime>> =
             (0..bundle.config.num_hidden_layers).map(|_| None).collect();
@@ -10303,6 +10480,62 @@ impl Qwen4GpuForward {
                         layer,
                     )
                 })?;
+                if let Some(reserve) = reserve.as_ref() {
+                    // EP reserve borrowed compact view (`moe_borrow[0]`): every layer as the
+                    // EP decode runtime, except the scratch donors `[H, R)`, whose owned
+                    // experts name the loan's pinned mirror while their device bytes are scratch.
+                    let donors = reserve.plan.donor_first_layer..reserve.plan.resident_layers;
+                    moe_borrow.push((0..bundle.config.num_hidden_layers).map(|_| None).collect());
+                    populate_moe_runtimes(
+                        moe_borrow.last_mut().expect("pushed above"),
+                        &bundle.weights.layer_refs,
+                        |layer, weights| {
+                            if !donors.contains(&layer) {
+                                return Qwen4MoeLayerRuntime::from_moe_ep(
+                                    gpu,
+                                    &bundle.weights,
+                                    weights,
+                                    layer,
+                                    &bundle.config,
+                                    placement,
+                                    &state.dummy,
+                                    &state.seal,
+                                    layer,
+                                );
+                            }
+                            let typed = |slot: crate::ep_reserve::EpDonorSlot,
+                                         source: &TensorRef|
+                             -> Result<GpuTensor, Qwen4GpuForwardError> {
+                                let dtype = bundle.weights.resident(source)?.dtype;
+                                let mirror = reserve.mirror(layer, slot).ok_or_else(|| {
+                                    invalid(format!(
+                                        "EP reserve loan has no mirror of layer {layer} {slot:?}"
+                                    ))
+                                })?;
+                                Ok(ep_reserve_forward::typed_mirror_source(&mirror, dtype))
+                            };
+                            let gate_up = typed(
+                                crate::ep_reserve::EpDonorSlot::GateUp,
+                                &weights.experts_gate_up,
+                            )?;
+                            let down =
+                                typed(crate::ep_reserve::EpDonorSlot::Down, &weights.experts_down)?;
+                            Qwen4MoeLayerRuntime::from_moe_ep_mirror(
+                                gpu,
+                                &bundle.weights,
+                                weights,
+                                layer,
+                                &bundle.config,
+                                placement,
+                                &state.dummy,
+                                &state.seal,
+                                layer,
+                                &gate_up,
+                                &down,
+                            )
+                        },
+                    )?;
+                }
             } else {
                 // Initial ctor keeps the default 4 until the real need is known;
                 // the loader's post-admission prewarm (`reserve_d2_wide_rows`)
@@ -10594,6 +10827,9 @@ impl Qwen4GpuForward {
             // every peer's experts are mapped.)
             // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): its grouped-row
             // buffer, masked tile ids and sym scratch exist before the mesh enables peers.
+            let exchange = reserve
+                .as_ref()
+                .map(|reserve| reserve.banks.exchange_capacity());
             if let Some(state) = ep.as_mut() {
                 if qwen4_ep_owner_routed_prefill_enabled() {
                     state.tile = Qwen4TileRoute::admit(
@@ -10605,6 +10841,7 @@ impl Qwen4GpuForward {
                         mode,
                         max_chunk,
                         flash_next,
+                        exchange.as_ref(),
                     )?;
                 }
             }
@@ -10730,11 +10967,58 @@ impl Qwen4GpuForward {
                     // no donor or slab stage buffer is created beside it, and a
                     // request S1 declines reads the host-mapped experts in place.
                     if single_scope && bundle.slowlink_profile().is_none() {
-                        expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe, max_chunk)?;
+                        expert_stage = match (reserve.as_ref(), moe_borrow.first()) {
+                            // EP reserve: the one borrowed-only S2 configuration over the borrowed
+                            // view (first host layer H, donors H-2 / H-1, loan-mirror host
+                            // sources for [H, R), the original pinned owners for [R, 48)).
+                            (Some(reserve), Some(view)) => Qwen4ExpertStage::new(
+                                gpu,
+                                bundle,
+                                view,
+                                max_chunk,
+                                Some(&reserve.host_sources),
+                            )?,
+                            _ => Qwen4ExpertStage::new(gpu, bundle, &moe, max_chunk, None)?,
+                        };
                     }
                 }
             } else {
                 gpu.qwen4_trunk_iu4 = false;
+            }
+            if let Some(reserve) = reserve.as_ref() {
+                // Phase two of the reserve admission: the GPU/runtime verdicts a reduced-reserve
+                // load needs on this rank. A shortfall tears the load down; nothing falls back to
+                // the ordinary path with the reduced reserve already spent.
+                let s1 = ep.as_ref().is_some_and(|state| state.tile.is_some());
+                let Some(stage) = expert_stage.as_ref() else {
+                    return Err(invalid(
+                        "EP reserve sharing needs the borrowed-view expert stage (S2) and it was \
+                         not admitted on this rank (needs HIPFIRE_EP_EXPERT_STAGE on, gfx1201, a \
+                         pinned host source for every host layer)",
+                    ));
+                };
+                if !s1 {
+                    return Err(invalid(
+                        "EP reserve sharing needs owner-routed prefill (S1) and it was not admitted \
+                         on this rank (HIPFIRE_EP_OWNER_ROUTED_PREFILL, the symmetric IU4 route)",
+                    ));
+                }
+                if stage.first_host != reserve.plan.donor_first_layer
+                    || stage.donors != reserve.plan.s2_donor_layers
+                    || stage.min_rows <= reserve.banks.resident_rows()
+                {
+                    return Err(invalid(format!(
+                        "EP reserve stage mismatch: first host layer {} / donors {:?} / min rows {} \
+                         against the plan's {} / {:?} (a borrowed-only stage must not serve the \
+                         {}-row resident bank)",
+                        stage.first_host,
+                        stage.donors,
+                        stage.min_rows,
+                        reserve.plan.donor_first_layer,
+                        reserve.plan.s2_donor_layers,
+                        reserve.banks.resident_rows()
+                    )));
+                }
             }
             #[cfg(target_os = "linux")]
             {
@@ -10854,6 +11138,13 @@ impl Qwen4GpuForward {
             if let Some(share) = share {
                 let _ = share.free_gpu(gpu);
             }
+            if let Some(reserve) = reserve {
+                let ep_reserve_forward::EpReserveTeardown { banks, loan } = reserve.teardown(gpu);
+                let _ = banks.release(gpu);
+                if let Some((loan, permit)) = loan {
+                    let _ = loan.release(gpu, permit);
+                }
+            }
             return Err(error);
         }
         Ok(Self {
@@ -10912,6 +11203,14 @@ impl Qwen4GpuForward {
             mesh_trunk_ops,
             slowlink: Default::default(),
             share,
+            ep_ordinary_receipt: (reserve.is_none()
+                && hipfire_config::developer_bool(
+                    ep_reserve_forward::EP_RESERVE_RECEIPT_ENV,
+                    false,
+                ))
+            .then(Default::default),
+            receipt_mtp_fill: false,
+            ep_reserve: reserve,
             #[cfg(target_os = "linux")]
             npu_trunk,
         })
@@ -11200,7 +11499,7 @@ impl Qwen4GpuForward {
             ));
         }
         let layers = self.moe_count();
-        let max_chunk = self.scratch.max_chunk;
+        let max_chunk = self.prompt_chunk_rows();
         // The EP decode runtime's route-selecting properties per MoE ordinal
         // (host-mapped, symmetric, all-MQ4 gate/up): a balanced layer's live
         // runtime must select the same sealed route.
@@ -11418,7 +11717,13 @@ impl Qwen4GpuForward {
     /// exchange is registered for, or `None` when not admitted.
     pub(crate) fn ep_tile_registration(&self) -> Option<(&GpuTensor, usize)> {
         let route = self.ep.as_ref()?.tile.as_ref()?;
-        Some((&self.scratch.moe_y_down_grouped, route.max_tiles))
+        let root = self
+            .ep_reserve
+            .as_ref()
+            .map_or(&self.scratch.moe_y_down_grouped, |reserve| {
+                &reserve.exchange_root
+            });
+        Some((root, route.max_tiles))
     }
 
     /// The per-layer symmetric verdicts taken in `attach_ep` (`None` when not admitted).
@@ -11464,7 +11769,12 @@ impl Qwen4GpuForward {
         let wmma = route.wmma;
         route.hook = Some(hook);
         if !wmma {
-            for layer in self.moe.iter_mut().flatten() {
+            for layer in self
+                .moe
+                .iter_mut()
+                .flatten()
+                .chain(self.moe_borrow.iter_mut().flatten().flatten())
+            {
                 layer.symmetric = true;
             }
         }
@@ -11493,6 +11803,9 @@ impl Qwen4GpuForward {
     /// borrowed prefill bank, so capacity is never the selected bank's
     /// `max_chunk`; everywhere else it is `scratch.max_chunk`.
     pub(crate) fn prompt_chunk_rows(&self) -> usize {
+        if let Some(reserve) = self.ep_reserve.as_ref() {
+            return reserve.banks.prompt_rows();
+        }
         prompt_chunk_rows_of(self.share.as_ref(), &self.scratch)
     }
 
@@ -11752,9 +12065,19 @@ impl Qwen4GpuForward {
     /// and only the outermost one's [`Self::share_prompt_end`] finishes the
     /// prompt. No-op without decode-share.
     pub(crate) fn share_prompt_begin(&mut self) {
+        self.ep_reserve_prompt_begin();
         if let Some(share) = self.share.as_mut() {
             share.prompt_depth += 1;
         }
+    }
+
+    /// [`Self::share_prompt_begin`] for the native-MTP fill: an outermost entry
+    /// it opens is recorded with receipt phase `mtp_fill` (a nested one keeps
+    /// the phase of its outermost entry).
+    pub(crate) fn share_prompt_begin_mtp_fill(&mut self) {
+        self.receipt_mtp_fill = true;
+        self.share_prompt_begin();
+        self.receipt_mtp_fill = false;
     }
 
     /// A whole-prompt entry ends (`ok`: it returned `Ok`); the outermost one
@@ -11764,6 +12087,10 @@ impl Qwen4GpuForward {
         gpu: &mut Gpu,
         ok: bool,
     ) -> Result<(), Qwen4GpuForwardError> {
+        self.ep_ordinary_prompt_end(ok);
+        if self.ep_reserve.is_some() {
+            return self.ep_reserve_prompt_end(gpu, ok);
+        }
         let Some(share) = self.share.as_mut() else {
             return Ok(());
         };
@@ -11802,6 +12129,9 @@ impl Qwen4GpuForward {
     /// persistent token ids and the speculative buffers on a decode-share load
     /// ([`qwen4_decode_share_dedicated_bytes`]); the whole forward otherwise.
     pub(crate) fn forward_device_bytes(&self, config: &Qwen4Config) -> Option<u64> {
+        if let Some(reserve) = self.ep_reserve.as_ref() {
+            return reserve.plan.forward.dedicated_bytes().ok();
+        }
         match self.share.as_ref() {
             Some(share) => {
                 qwen4_decode_share_dedicated_bytes(config, share.max_chunk, self.scratch.mode)
@@ -11925,6 +12255,7 @@ impl Qwen4GpuForward {
         let Qwen4GpuForward {
             mut scratch,
             share,
+            ep_reserve,
             host_ple,
             mesh_tokens,
             lane_tokens,
@@ -11999,14 +12330,36 @@ impl Qwen4GpuForward {
                 }
             }
         }
+        // EP reserve: the swapped-in bank is parked back and every donor restored (the loan's
+        // synchronous teardown) before the scratch is freed. A restore that cannot be proven
+        // complete leaks the loan instead of freeing it under a possibly pending copy.
+        let mut reserve_teardown = None;
+        if let Some(mut reserve) = ep_reserve {
+            if let Err(error) = reserve.banks.swap_out(&mut scratch) {
+                first.get_or_insert(hip_bridge::HipError::new(999, &error.to_string()));
+            }
+            reserve_teardown = Some(reserve.teardown(gpu));
+        }
         if let Some(error) = scratch.free_gpu(gpu) {
             first.get_or_insert(error);
+        }
+        let mut reserve_loan = None;
+        if let Some(ep_reserve_forward::EpReserveTeardown { banks, loan }) = reserve_teardown {
+            if let Some(error) = banks.release(gpu) {
+                first.get_or_insert(error);
+            }
+            reserve_loan = loan;
         }
         if let Some(error) = share.and_then(|share| share.free_gpu(gpu)) {
             first.get_or_insert(error);
         }
         if let Some(stage) = expert_stage {
             if let Some(error) = stage.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some((loan, permit)) = reserve_loan {
+            if let Some(error) = loan.release(gpu, permit) {
                 first.get_or_insert(error);
             }
         }
@@ -12166,6 +12519,14 @@ impl Qwen4GpuForward {
     /// prefill class holding it on a decode-share load (while no bank is
     /// swapped in), else `scratch`.
     fn scratch_for_tile_rows(&self, rows: usize) -> &Qwen4GpuForwardScratch {
+        // EP reserve: a wide tile runs on the parked borrowed bank.
+        if let Some(bank) = self
+            .ep_reserve
+            .as_ref()
+            .and_then(|reserve| reserve.banks.bank_for_rows(rows))
+        {
+            return bank;
+        }
         self.share
             .as_ref()
             .filter(|share| share.active.is_none())
@@ -13111,6 +13472,19 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         self.share_check()?;
+        self.ep_ordinary_note_call(tokens.len());
+        if self.ep_reserve.is_some() {
+            return self.ep_reserve_forward_chunk(
+                bundle,
+                gpu,
+                tokens,
+                argmax_of,
+                logits,
+                top1,
+                wide_hidden_capture,
+                output_policy,
+            );
+        }
         if self.share.is_none() && self.moe_borrow.is_empty() {
             return self.forward_chunk_tile(
                 bundle,
@@ -13581,18 +13955,7 @@ impl Qwen4GpuForward {
             .filter(|_| route_n > 1 && !ep_few_rows)
             .and_then(|ep| ep.tile.as_ref())
             .filter(|route| route.hook.is_some());
-        let tile_active = tile_route.is_some_and(|route| {
-            route_n == n
-                && if route.wmma {
-                    gpu.qwen4_moe_f16_wmma_grouped_applies(
-                        route_n,
-                        config.moe_intermediate_size,
-                        config.hidden_size,
-                    )
-                } else {
-                    gpu.qwen4_moe_sym_iu4_applies(route_n)
-                }
-        });
+        let tile_active = ep_reserve_forward::ep_tile_active(ep, gpu, &config, n, route_n);
         if let Some(route) = tile_route.filter(|_| !tile_active) {
             // A full-table chunk also writes `y_down_grouped`: it may start only after the
             // peer finished pulling this rank's rows of the last exchange.
@@ -13613,8 +13976,11 @@ impl Qwen4GpuForward {
                 .and_then(|route| route.hook.as_ref());
             if let (Some(stage), Some(hook)) = (self.expert_stage.as_ref(), hook) {
                 stage.ep_quiesce(gpu)?;
-                hook.host_barrier()
-                    .map_err(|error| invalid(format!("EP stage quiesce barrier: {error}")))?;
+                hook.host_barrier(
+                    hipfire_runtime::ep_tile_exchange::HOST_STAGE_QUIESCE,
+                    self.ep_reserve_epoch(),
+                )
+                .map_err(|error| invalid(format!("EP stage quiesce barrier: {error}")))?;
             }
         }
         if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
@@ -13635,6 +14001,7 @@ impl Qwen4GpuForward {
             .expert_stage
             .as_ref()
             .filter(|stage| stage.begin_forward(tile_active))
+            .filter(|_| self.ep_reserve.is_none() || self.borrow_runtimes_active)
         {
             Some(stage)
                 if n >= stage.min_rows
@@ -14465,6 +14832,7 @@ impl Qwen4GpuForward {
                         stage,
                         bundle,
                         moe: tile_moe,
+                        host_sources: self.ep_reserve.as_ref().map(|reserve| &reserve.host_sources),
                         layer: 0,
                         error: None,
                         capture: capture_hooks

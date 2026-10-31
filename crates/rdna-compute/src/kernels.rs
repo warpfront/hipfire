@@ -5388,6 +5388,17 @@ pub const GATED_DELTA_VECTOR_PM_GFX1100: &[u8] =
 /// Bare lowercase SHA-256 of [`GATED_DELTA_VECTOR_PM_GFX1100`], without a newline.
 pub const GATED_DELTA_VECTOR_PM_GFX1100_SHA256: &str =
     include_str!("../../../kernels/gated_delta_vector_pm_gfx1100.hxaco.sha256");
+/// gfx1201 PM twins of the same two generic gated-delta ops (same bodies as the gfx1100 module, symbols
+/// `gated_delta_net_vector_serial_f32_pm_gfx1201` / `causal_conv_depthwise_silu_rows_f32_pm_gfx1201`), compiled for
+/// gfx1201 with the runtime JIT argv, card-judged bit-identical on the R9700 (`R2Rda-05-rs-tv8-prio` 0.373x,
+/// `R1Conv-04-rpw32-k4` 0.203x) and sealed by route A (`scripts/pm-hip-twin.sh`). Selected by
+/// `gated_delta_vector_pm` on exact gfx1201 (conv: in-place history only;
+/// `HIPFIRE_GATED_DELTA_VECTOR_PM=0` restores hipcc).
+pub const GATED_DELTA_VECTOR_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/gated_delta_vector_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of [`GATED_DELTA_VECTOR_PM_GFX1201`], without a newline.
+pub const GATED_DELTA_VECTOR_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/gated_delta_vector_pm_gfx1201.hxaco.sha256");
 /// gfx1100 PM twin of `gemm_mq4g256v2_moe_grouped_wmma_k2` (F32 entry):
 /// `gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100`, the card-judged `R1Moe-04-xlds-w4-t2` candidate
 /// (64 rows per 128-lane block, tile_run 2, X through LDS) sealed by route A; same kernargs,

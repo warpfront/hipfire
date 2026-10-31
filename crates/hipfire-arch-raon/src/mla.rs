@@ -218,6 +218,33 @@ impl RaonMlaWork {
         Self::with_policy(gpu, cfg, rows, MlaPolicy::from_env()?)
     }
 
+    /// Device bytes the work holds for `rows` rows once [`Self::pack_absorbed`]
+    /// has run: split-KV workspace, absorbed-route scratch planes and the packed
+    /// expansion weights (one per MLA layer). Reads the route controls like
+    /// [`Self::new`].
+    pub fn required_bytes(cfg: &RaonConfig, rows: usize) -> Result<usize, String> {
+        let policy = MlaPolicy::from_env()?;
+        let v_width = if policy.absorb {
+            cfg.kv_lora.max(cfg.v_head)
+        } else {
+            cfg.v_head
+        };
+        let mut bytes =
+            (latent_attention_decode_workspace_elems(cfg.n_heads, v_width) * 4).max(256);
+        if policy.absorb {
+            bytes += (rows * cfg.n_heads * (cfg.kv_lora + cfg.qk_rope) * 4).max(256);
+            bytes += (rows * cfg.n_heads * cfg.kv_lora * 4).max(256);
+            let packed = latent_attention_absorb_packed_elems(
+                cfg.n_heads,
+                cfg.qk_nope,
+                cfg.v_head,
+                cfg.kv_lora,
+            );
+            bytes += cfg.mla_layers().len() * (packed * 2).max(256);
+        }
+        Ok(bytes)
+    }
+
     pub fn with_policy(
         gpu: &mut Gpu,
         cfg: &RaonConfig,

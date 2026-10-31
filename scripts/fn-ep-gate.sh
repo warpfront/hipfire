@@ -38,7 +38,8 @@
 #                       experts; EP4 on 24 GB cards keeps every expert layer in VRAM). The reference then
 #                       runs EP-R on the first R cards (HIPFIRE_DEVICES = first R entries of the card
 #                       list) as arm `ref-epR`, and the EP-N arm is compared against it byte for byte.
-#   --mode ep|pp        gate to run (default ep). pp = Flash-Next pipeline parallelism, see "PP mode" below.
+#   --mode ep|pp|reserve  gate to run (default ep). pp = Flash-Next pipeline parallelism, see "PP mode" below; reserve =
+#                       the opt-in EP2 reserve-decoupling qualification, see "Reserve mode" below.
 #   --pp-layers COUNTS  (pp) N comma-separated layer counts, band 0 first, exported as HIPFIRE_PP_LAYERS to the PP-N
 #                       arm (default: the uniform split; the PLE layer is pinned to band 0). A PP-R reference
 #                       (--ref-ranks R > 1) always runs the uniform split: independent bands.
@@ -91,6 +92,35 @@
 # `pp` and `loaded.pp` equal to the arm's pipeline degree (1 for the single-card reference), or the cell fails
 # and the gate cannot PASS. Receipt: the EP structure plus mode, pp, bands, transport,
 # per-arm placement metadata, the ranks mapped output-last (PCI id, arch, link speed/width) and host RAM.
+#
+# Reserve mode (--mode reserve): the opt-in EP2 reserve-decoupling qualification (HIPFIRE_EP_RESERVE_DECOUPLE, see
+# docs/multi-gpu.md "EP reserve decoupling"). gfx1201 EP2 only (N defaults to 2, --arch to gfx1201, --max-seq to 16384).
+# One binary, two same-schedule arms with identical devices, model and prompts: `ep2-off` (switch unset) and `ep2-on`
+# (HIPFIRE_EP_RESERVE_DECOUPLE=1); --mtp adds `ep2-off-mtp` / `ep2-on-mtp` (native MTP, greedy, pinned policy as in pp
+# mode); --baseline-repeat adds `ep2-off-repeat` (off vs off repeatability). Every reserve arm clears
+# HIPFIRE_PREFILL_CHUNK_ROWS (the prompt chunk stays 4096, never lowered) and EXTRA_ENV may not set either variable.
+# EVERY reserve arm (off arms ep2-off, ep2-off-mtp, ep2-off-repeat included) sets HIPFIRE_EP_RESERVE_RECEIPT=1, a developer env
+# that only prints host-side `EP_RESERVE_RECEIPT <json>` lines (the on arms add the donor-hash read-back): the oracle's header,
+# ids and end records, and from the forward the per-rank header/rank records (the real resident expert layer count and prompt
+# chunk of an ordinary load) and one `prompt_rank` record per rank per outermost prompt entry, keyed (prompt, phase,
+# ordinal). `fn_ep_compare.py reserve harvest` merges the two ranks' records per key; the off arm's receipts come from the real
+# ordinary load and forward, never from the expected plan.
+#   --boundary-dir DIR     REQUIRED: *.txt / *.ids prompt files of exact token counts (*.ids = whitespace-separated token ids;
+#                          sorted, passed without truncation); the
+#                          oracle's reported token counts must cover --boundary-lengths
+#   --boundary-lengths L   comma list the corpus must cover (default 8,9,511,512,513,2047,2048,4095,4096,4097,4396)
+#   --min-resident N       resident expert layers required on every rank with the switch on (default 33; fewer = kill)
+#   --seed S               oracle --seed, recorded in the receipts (default 1; the arms are greedy)
+#   --baseline-repeat      also run `ep2-off-repeat` and compare it to `ep2-off`
+#   --perf-json FILE       (repeatable) ep-reserve-perf/1 document from the card campaign: the pp32K kill rule (throughput
+#                          ratio < 0.95 or restore-inclusive latency ratio > 1.05); other cells are reported, not judged
+#   --c1-manifest FILE     ep-reserve-c1/1 manifest: the weighted sampled C1 kill rule (gain < +8%)
+# Every arm must print `EP_RESERVE_RECEIPT <json>` lines (kinds header/rank/prompt_rank/ids/end) or leave reserve-receipt.json
+# in its oracle output directory; `fn_ep_compare.py reserve harvest` assembles them. The pair check requires both rank
+# receipts, plan/source/seed agreement, 4096-row chunking, >= --min-resident layers, restore timing, donor hashes, a stable
+# exchange address and equal committed id arrays, on top of the byte-exact logits/mirror/state comparison. Without
+# --perf-json / --c1-manifest only Gate 1 is evaluated and summary.txt says so. Nothing in this mode is a performance
+# claim; the thresholds are kill rules. Outputs: compare-<gate>.txt/.json, perf-*.json, c1.json, receipt.json (reserve).
 
 set -euo pipefail
 
@@ -101,10 +131,14 @@ COMPARE=$SCRIPT_DIR/fn_ep_compare.py
 SHORT_PROMPT=$PROMPT_DIR/short-500.txt
 LONG_PROMPT=$PROMPT_DIR/long-4400.txt
 LONG_PROMPT_TOKENS=4400
+PROMPT_ARGS=(--prompt-file "$SHORT_PROMPT" --prompt-file "$LONG_PROMPT" --truncate-prompt-tokens "$LONG_PROMPT_TOKENS")
 
 MODEL="" N="" OUT="" ARCH=""
 REF_RANKS=1
 MODE=ep PP_LAYERS="" TRANSPORT=host MTP=0 PP_OPTS=""
+BOUNDARY_DIR="" BOUNDARY_LENGTHS=8,9,511,512,513,2047,2048,4095,4096,4097,4396 MIN_RESIDENT=33 SEED=1 BASELINE_REPEAT=0
+PERF_JSONS=() C1_MANIFEST="" RESERVE_OPTS="" RESERVE_ARMS="" MAX_SEQ_SET=0 BOUNDARY_FILES=()
+RESERVE_MIN_TOKENS=128 RES_ANY_FAIL=0 RES_ANY_ERR=0
 TOKENS=128 MAX_SEQ=8192 STATE_STEPS="1,64,128" REPS=3
 SKIP_BUILD=0 SKIP_SPEED=0 SKIP_SHA=0 NO_ISOLATE=0
 ARM_TIMEOUT=${FN_EP_GATE_ARM_TIMEOUT:-7200}
@@ -125,7 +159,7 @@ while (($#)); do
     --arch) [[ $# -ge 2 ]] || die "$1 needs a value"; ARCH=$2; shift 2 ;;
     --devices) [[ $# -ge 2 ]] || die "$1 needs a value"; DEVLIST=${2// /}; shift 2 ;;
     --tokens) [[ $# -ge 2 ]] || die "$1 needs a value"; TOKENS=$2; shift 2 ;;
-    --max-seq) [[ $# -ge 2 ]] || die "$1 needs a value"; MAX_SEQ=$2; shift 2 ;;
+    --max-seq) [[ $# -ge 2 ]] || die "$1 needs a value"; MAX_SEQ=$2; MAX_SEQ_SET=1; shift 2 ;;
     --state-steps) [[ $# -ge 2 ]] || die "$1 needs a value"; STATE_STEPS=$2; shift 2 ;;
     --reps) [[ $# -ge 2 ]] || die "$1 needs a value"; REPS=$2; shift 2 ;;
     --target-dir) [[ $# -ge 2 ]] || die "$1 needs a value"; export CARGO_TARGET_DIR=$2; shift 2 ;;
@@ -138,6 +172,13 @@ while (($#)); do
     --pp-layers) [[ $# -ge 2 ]] || die "$1 needs a value"; PP_LAYERS=${2// /}; PP_OPTS+=" --pp-layers"; shift 2 ;;
     --transport) [[ $# -ge 2 ]] || die "$1 needs a value"; TRANSPORT=$2; PP_OPTS+=" --transport"; shift 2 ;;
     --mtp) MTP=1; PP_OPTS+=" --mtp"; shift ;;
+    --boundary-dir) [[ $# -ge 2 ]] || die "$1 needs a value"; BOUNDARY_DIR=$2; RESERVE_OPTS+=" --boundary-dir"; shift 2 ;;
+    --boundary-lengths) [[ $# -ge 2 ]] || die "$1 needs a value"; BOUNDARY_LENGTHS=${2// /}; RESERVE_OPTS+=" --boundary-lengths"; shift 2 ;;
+    --min-resident) [[ $# -ge 2 ]] || die "$1 needs a value"; MIN_RESIDENT=$2; RESERVE_OPTS+=" --min-resident"; shift 2 ;;
+    --seed) [[ $# -ge 2 ]] || die "$1 needs a value"; SEED=$2; RESERVE_OPTS+=" --seed"; shift 2 ;;
+    --baseline-repeat) BASELINE_REPEAT=1; RESERVE_OPTS+=" --baseline-repeat"; shift ;;
+    --perf-json) [[ $# -ge 2 ]] || die "$1 needs a value"; PERF_JSONS+=("$2"); RESERVE_OPTS+=" --perf-json"; shift 2 ;;
+    --c1-manifest) [[ $# -ge 2 ]] || die "$1 needs a value"; C1_MANIFEST=$2; RESERVE_OPTS+=" --c1-manifest"; shift 2 ;;
     --) shift; POS+=("$@"); break ;;
     -*) die "unknown option $1 (try --help)" ;;
     *) POS+=("$1"); shift ;;
@@ -161,12 +202,38 @@ fi
 [[ $REF_RANKS =~ ^[0-9]+$ ]] || die "--ref-ranks must be an integer"
 [[ $REF_RANKS =~ ^0*([1-7])$ ]] || die "--ref-ranks must be in 1..7 and less than N"
 REF_RANKS=${BASH_REMATCH[1]}
-[[ $MODE == ep || $MODE == pp ]] || die "--mode must be ep or pp"
+[[ $MODE == ep || $MODE == pp || $MODE == reserve ]] || die "--mode must be ep, pp or reserve"
 if [[ $MODE == ep ]]; then
   [[ -z $PP_OPTS ]] || die "${PP_OPTS# } need --mode pp"
+elif [[ $MODE == reserve ]]; then
+  [[ -z ${PP_OPTS// --mtp/} ]] || die "${PP_OPTS# } need --mode pp (only --mtp applies to --mode reserve)"
 else
   [[ $TRANSPORT == auto || $TRANSPORT == host ]] || die "--transport must be auto or host (peer edges are refused by the loader)"
   [[ -z $PP_LAYERS || $PP_LAYERS =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || die "--pp-layers must be comma-separated positive layer counts (for example 9,8,8,8,8,7)"
+fi
+if [[ $MODE != reserve ]]; then
+  [[ -z $RESERVE_OPTS ]] || die "${RESERVE_OPTS# } need --mode reserve"
+else
+  [[ -z $N || $N == 2 ]] || die "--mode reserve is EP2 only (N must be 2)"
+  N=2
+  [[ -n $ARCH ]] || ARCH=gfx1201
+  [[ $ARCH == gfx1201 ]] || die "--mode reserve qualifies gfx1201 EP2 only (--arch $ARCH); other archs and topologies keep today's ordinary path"
+  [[ -n $BOUNDARY_DIR && -d $BOUNDARY_DIR ]] || die "--mode reserve needs --boundary-dir DIR (exact-length *.txt / *.ids prompt files covering --boundary-lengths)"
+  BOUNDARY_DIR=$(readlink -f "$BOUNDARY_DIR")
+  mapfile -t BOUNDARY_FILES < <(find "$BOUNDARY_DIR" -maxdepth 1 -type f \( -name '*.txt' -o -name '*.ids' \) | LC_ALL=C sort)
+  ((${#BOUNDARY_FILES[@]} >= 1)) || die "no *.txt / *.ids prompt files in $BOUNDARY_DIR"
+  [[ $BOUNDARY_LENGTHS =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || die "--boundary-lengths must be a comma list of positive token counts"
+  [[ $MIN_RESIDENT =~ ^[1-9][0-9]*$ && $SEED =~ ^[0-9]+$ ]] || die "--min-resident / --seed must be integers"
+  ((TOKENS >= RESERVE_MIN_TOKENS)) || die "--tokens must be >= $RESERVE_MIN_TOKENS in reserve mode (committed-token requirement)"
+  [[ $EXTRA_ENV != *HIPFIRE_EP_RESERVE_DECOUPLE* && $EXTRA_ENV != *HIPFIRE_PREFILL_CHUNK_ROWS* ]] || die "EXTRA_ENV may not set HIPFIRE_EP_RESERVE_DECOUPLE or HIPFIRE_PREFILL_CHUNK_ROWS in reserve mode"
+  ((MAX_SEQ_SET)) || MAX_SEQ=16384
+  _abs=()
+  for _f in ${PERF_JSONS[@]+"${PERF_JSONS[@]}"}; do
+    [[ -r $_f ]] || die "--perf-json not readable: $_f"
+    _abs+=("$(readlink -f "$_f")")
+  done
+  PERF_JSONS=(${_abs[@]+"${_abs[@]}"})
+  [[ -z $C1_MANIFEST ]] || { [[ -r $C1_MANIFEST ]] || die "--c1-manifest not readable: $C1_MANIFEST"; C1_MANIFEST=$(readlink -f "$C1_MANIFEST"); }
 fi
 ((REPS >= 1)) || die "--reps must be >= 1"
 [[ -f $SHORT_PROMPT && -f $LONG_PROMPT && -f $COMPARE ]] || die "scripts/fn-ep-gate-prompts or fn_ep_compare.py missing next to this script"
@@ -206,7 +273,8 @@ write_receipt() {
     GATE_SKIP_SPEED=$SKIP_SPEED GATE_NO_ISOLATE=$NO_ISOLATE GATE_EXTRA_ENV=$EXTRA_ENV \
     GATE_LONG_TOKENS=$LONG_PROMPT_TOKENS GATE_REF_RANKS=$REF_RANKS GATE_REF_ARM=$REF_ARM \
     GATE_MODE=$MODE GATE_TARGET_ARM=$MODE$N GATE_PP_LAYERS=$PP_LAYERS GATE_TRANSPORT=$TRANSPORT GATE_MTP=$MTP \
-    GATE_MTP_STATE=$MTP_STATE GATE_SPEED_FAIL=$SPEED_FAIL
+    GATE_MTP_STATE=$MTP_STATE GATE_SPEED_FAIL=$SPEED_FAIL \
+    GATE_RESERVE_ARMS=$RESERVE_ARMS GATE_MIN_RESIDENT=$MIN_RESIDENT
   python3 - <<'PY' || echo "fn-ep-gate: WARNING: receipt writer failed" >&2
 import json, os, re, statistics, datetime
 
@@ -219,6 +287,8 @@ mode = E.get("GATE_MODE") or "ep"
 mtp = E.get("GATE_MTP") == "1"
 target_arm = "%s%d" % (mode, n) if n else mode
 arm_names = [ref_arm, target_arm] + ([ref_arm + "-mtp", target_arm + "-mtp"] if mtp else [])
+if mode == "reserve":
+    arm_names = E.get("GATE_RESERVE_ARMS", "").split()
 
 
 def rd(path):
@@ -456,6 +526,27 @@ receipt = {
     "compare": compare,
     "speed": speed,
 }
+if mode == "reserve":
+    evaluations = []
+    for row in (rd(out + "/reserve-eval.jsonl") or "").splitlines():
+        try:
+            item = json.loads(row)
+        except ValueError:
+            continue
+        doc = rdj(out + "/" + item["json"]) if item.get("json") else None
+        if isinstance(doc, dict):
+            item["verdict"] = doc.get("verdict")
+            item["reasons"] = doc.get("reasons") or ([doc["first_mismatch"]["message"]] if doc.get("first_mismatch") else [])
+            item["summary"] = doc.get("summary")
+        evaluations.append(item)
+    receipt["mode"] = "reserve"
+    receipt["reserve"] = {
+        "switch": "HIPFIRE_EP_RESERVE_DECOUPLE", "off_arm": "=0", "on_arm": "=1", "arms": arm_names,
+        "prompt_chunk_rows": 4096, "min_resident_layers": int(E.get("GATE_MIN_RESIDENT", "0") or 0),
+        "gates_evaluated": sorted({i.get("gate") for i in evaluations}), "evaluations": evaluations,
+        "performance_claim": None,
+    }
+    receipt["config"].update({"mode": "reserve", "mtp": mtp})
 if mode == "pp":
     _tmeta = (arms.get(target_arm) or {}).get("meta") or {}
     _counts = _tmeta.get("band_counts") or []
@@ -508,6 +599,13 @@ if mode == "pp":
         E.get("GATE_TRANSPORT"), E.get("GATE_PP_LAYERS") or "uniform",
         "one card (host-mapped experts by default)" if ref_ranks == 1 else "PP%d on the first %d cards, uniform bands" % (ref_ranks, ref_ranks)))
     lines.append("ref_ranks=%d  mtp exactness pair: %s" % (ref_ranks, "on" if mtp else "off"))
+elif mode == "reserve":
+    lines.append("mode=reserve  arch=%s  EP%s  hipfire devices: %s  (off arm: HIPFIRE_EP_RESERVE_DECOUPLE=0; on arm: HIPFIRE_EP_RESERVE_DECOUPLE=1; one binary)" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
+    lines.append("prompt chunk rows 4096 (never lowered)  min resident layers/rank %s  arms: %s" % (E.get("GATE_MIN_RESIDENT"), " ".join(arm_names)))
+    for item in receipt["reserve"]["evaluations"]:
+        lines.append("  %-16s %-10s %s" % (item.get("gate"), item.get("verdict") or item.get("state"), "; ".join(item.get("reasons") or [])[:300]))
+    if not any(str(i.get("gate")).startswith(("perf", "c1")) for i in receipt["reserve"]["evaluations"]):
+        lines.append("  Gate 2 (pp32K) and Gate 3 (weighted C1) were NOT evaluated: no --perf-json / --c1-manifest supplied. No performance claim.")
 else:
     if ref_ranks == 1:
         lines.append("arch=%s  N=%s  hipfire devices (single=first, EP=all): %s" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
@@ -566,7 +664,7 @@ if speed:
             fmt(d), rel(d, base_d) if arm != ref_arm else "", fmt(p), rel(p, base_p) if arm != ref_arm else "",
             "   [%s]" % cells["skipped"] if cells.get("skipped") else ""))
 lines.append("")
-lines.append("Send back: receipt.json, summary.txt, %s, gate.log (and the oracle/*-receipt dirs on a failure)." % ("compare*.txt" if mode == "pp" else "compare.txt"))
+lines.append("Send back: receipt.json, summary.txt, %s, gate.log (and the oracle/*-receipt dirs on a failure)." % ("compare*.txt" if mode in ("pp", "reserve") else "compare.txt"))
 with open(out + "/summary.txt", "w", encoding="utf-8") as handle:
     handle.write("\n".join(lines) + "\n")
 PY
@@ -891,7 +989,7 @@ build_all() {
 # --------------------------------------------------------------- arm helpers
 ARM_ENV=()
 arm_env() {
-  local arm=$1 ep=$2 devs=$3 pp=${4:-0} mtp=${5:-0} layers=${6:-}
+  local arm=$1 ep=$2 devs=$3 pp=${4:-0} mtp=${5:-0} layers=${6:-} reserve=${7:-0}
   # ROCR_VISIBLE_DEVICES: dropped only when the card list came from our own KFD selection; a list the
   # caller supplied (--devices) or inherited (a scheduler's HIPFIRE_DEVICES) leaves ROCR_VISIBLE_DEVICES alone.
   local unset_rocr=() unset_pp=()
@@ -902,6 +1000,11 @@ arm_env() {
     unset_pp=(-u HIPFIRE_PP_LAYERS -u HIPFIRE_MESH_TRANSPORT -u HIPFIRE_TOPOLOGY_PP
       -u HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS -u HIPFIRE_QWEN4_EXPERT_HOTSET -u HIPFIRE_QWEN4_EXPERT_STAGE
       -u HIPFIRE_QWEN4_TURN_SNAPSHOTS -u HIPFIRE_MTP_AR_FLOOR -u HIPFIRE_MTP_INCREMENTAL -u HIPFIRE_MTP_NGRAM)
+  fi
+  if [[ $MODE == reserve ]]; then
+    # Reserve arms: the switch is set last (=0 off, =1 on), the chunk override is cleared so the prompt chunk stays 4096.
+    unset_pp=(-u HIPFIRE_EP_RESERVE_DECOUPLE -u HIPFIRE_EP_RESERVE_RECEIPT -u HIPFIRE_PREFILL_CHUNK_ROWS
+      -u HIPFIRE_MTP_AR_FLOOR -u HIPFIRE_MTP_INCREMENTAL -u HIPFIRE_MTP_NGRAM)
   fi
   ARM_ENV=(env -u HIP_VISIBLE_DEVICES -u HIPFIRE_QWEN4_EP ${unset_rocr[@]+"${unset_rocr[@]}"} ${unset_pp[@]+"${unset_pp[@]}"}
     "HIPFIRE_DEVICES=$devs" "HIPFIRE_TOPOLOGY_EP=$ep" HIPFIRE_NO_REGISTRY_FETCH=1 "HIPFIRE_DAEMON_BIN=$DAEMON")
@@ -930,6 +1033,14 @@ arm_env() {
     local extra=($EXTRA_ENV)
     ARM_ENV+=("${extra[@]}")
   fi
+  # Every reserve arm prints receipts (the off arm's come from its ordinary load); only the on arms switch decoupling on.
+  [[ $MODE != reserve ]] || ARM_ENV+=(HIPFIRE_EP_RESERVE_RECEIPT=1)
+  # The route is default on: a reserve-mode off arm sets the kill switch explicitly.
+  if ((reserve != 0)); then
+    ARM_ENV+=(HIPFIRE_EP_RESERVE_DECOUPLE=1)
+  elif [[ $MODE == reserve ]]; then
+    ARM_ENV+=(HIPFIRE_EP_RESERVE_DECOUPLE=0)
+  fi
   # The native-MTP policy is pinned last so EXTRA_ENV cannot change the window schedule of an exactness arm.
   ((mtp == 0)) || ARM_ENV+=("${PP_PINNED_MTP[@]}")
 }
@@ -954,20 +1065,23 @@ stop_vram_sampler() {
 }
 
 run_oracle_arm() {
-  local arm=$1 ep=$2 devs=$3 count=$4 pp=${5:-0} mtp=${6:-0} layers=${7:-}
+  local arm=$1 ep=$2 devs=$3 count=$4 pp=${5:-0} mtp=${6:-0} layers=${7:-} reserve=${8:-0}
   local rec=$OUT/oracle/$arm-receipt out=$OUT/oracle/$arm rc=0
   rm -rf "$rec" "$out"
   mkdir -p "$rec"
-  arm_env "$arm" "$ep" "$devs" "$pp" "$mtp" "$layers"
+  arm_env "$arm" "$ep" "$devs" "$pp" "$mtp" "$layers" "$reserve"
   local oracle_extra=()
   if [[ $MODE == pp ]]; then
     oracle_extra+=(--canonical-state)
     ((pp <= 1)) || oracle_extra+=(--pp "$pp")
+  fi
+  if [[ $MODE == pp || $MODE == reserve ]]; then
     ((mtp == 0)) || oracle_extra+=(--spec mtp --temp 0 --ngram off)
   fi
+  [[ $MODE != reserve ]] || oracle_extra+=(--seed "$SEED")
   local cmd=("${ARM_ENV[@]}" HIPFIRE_GRAPH=0 timeout -k 30 "$ARM_TIMEOUT" "$ORACLE"
     --model "$MODEL" --max-seq "$MAX_SEQ" --out "$out" --arm "$arm"
-    --prompt-file "$SHORT_PROMPT" --prompt-file "$LONG_PROMPT" --truncate-prompt-tokens "$LONG_PROMPT_TOKENS"
+    "${PROMPT_ARGS[@]}"
     --tokens "$TOKENS" --state-steps "$STATE_STEPS" --skip-model-hash ${oracle_extra[@]+"${oracle_extra[@]}"})
   printf '%q ' "${cmd[@]}" > "$rec/command.txt"
   echo >> "$rec/command.txt"
@@ -1406,6 +1520,94 @@ run_pp_gate() {
   fi
 }
 
+# ---------------------------------------------------------------- reserve mode
+# One exactness pair: assemble both arms' receipts from their logs, then fn_ep_compare.py reserve arms.
+# $1 gate label, $2 off arm, $3 on arm (or the repeat arm), $4 expected mode (ar|mtp), $5 extra comparator flags.
+reserve_eval_pair() {
+  local gate=$1 off=$2 on=$3 mode=$4 extra=${5:-} arm
+  local json=compare-$gate.json
+  PAIR_RC=0
+  if oracle_arm_ok "$off" && oracle_arm_ok "$on"; then
+    local msha
+    msha=$(sed -n 's/^sha256=//p' "$OUT/env/model.txt" 2>/dev/null | head -n 1)
+    [[ $msha != skipped ]] || msha=""
+    for arm in "$off" "$on"; do
+      cat "$OUT/oracle/$arm-receipt/stdout.txt" "$OUT/oracle/$arm-receipt/stderr.txt" > "$OUT/oracle/$arm-receipt/receipt-lines.txt" 2>/dev/null || true
+      python3 "$COMPARE" reserve harvest "$OUT/oracle/$arm-receipt/receipt-lines.txt" "$OUT/oracle/$arm" ${msha:+--model-sha256 "$msha"} > "$OUT/oracle/$arm-receipt/harvest.txt" 2>&1 || true
+    done
+    # shellcheck disable=SC2086
+    python3 "$COMPARE" reserve arms "$OUT/oracle/$off" "$OUT/oracle/$on" --expect-mode "$mode" --min-resident "$MIN_RESIDENT" \
+      --min-tokens "$RESERVE_MIN_TOKENS" --require-lengths "$BOUNDARY_LENGTHS" $extra \
+      --json "$OUT/$json" > "$OUT/compare-$gate.txt" 2>&1 || PAIR_RC=$?
+    sed 's/^/    /' "$OUT/compare-$gate.txt"
+    case $PAIR_RC in
+      0) PAIR_STATE=PASS ;;
+      1) PAIR_STATE=FAIL; RES_ANY_FAIL=1; REASON+="${REASON:+; }$gate: $on differs from $off or its receipts are rejected (compare-$gate.txt)" ;;
+      *) PAIR_STATE="comparator error rc=$PAIR_RC"; RES_ANY_ERR=1; REASON+="${REASON:+; }$gate: fn_ep_compare.py reserve arms failed to run" ;;
+    esac
+  else
+    RES_ANY_ERR=1
+    PAIR_STATE="no comparison"
+    oracle_arm_ok "$off" || PAIR_STATE="$off arm failed"
+    oracle_arm_ok "$on" || PAIR_STATE="$on arm failed (see oracle/$on-receipt/stderr.txt)"
+    REASON+="${REASON:+; }$gate: $PAIR_STATE; no comparison"
+    json=""
+  fi
+  printf '{"gate":"%s","state":"%s","json":"%s"}\n' "$gate" "$PAIR_STATE" "$json" >> "$OUT/reserve-eval.jsonl"
+}
+
+# One supplied document (perf or c1): evaluate it with the kill rules.
+reserve_eval_doc() {
+  local gate=$1 kind=$2 file=$3 rc=0 state
+  python3 "$COMPARE" reserve "$kind" "$file" --min-resident "$MIN_RESIDENT" --json "$OUT/$gate.json" > "$OUT/$gate.txt" 2>&1 || rc=$?
+  sed 's/^/    /' "$OUT/$gate.txt"
+  case $rc in
+    0) state=PASS ;;
+    1) state=FAIL; RES_ANY_FAIL=1; REASON+="${REASON:+; }$gate: kill rule or validation failed ($gate.txt)" ;;
+    *) state="comparator error rc=$rc"; RES_ANY_ERR=1; REASON+="${REASON:+; }$gate: fn_ep_compare.py reserve $kind failed to run" ;;
+  esac
+  printf '{"gate":"%s","state":"%s","json":"%s"}\n' "$gate" "$state" "$gate.json" >> "$OUT/reserve-eval.jsonl"
+}
+
+run_reserve_gate() {
+  local f off=ep2-off on=ep2-on i=0
+  PROMPT_ARGS=()
+  for f in "${BOUNDARY_FILES[@]}"; do PROMPT_ARGS+=(--prompt-file "$f"); done
+  RESERVE_ARMS="$off $on"
+  run_oracle_arm "$off" 2 "$DEVS" 2 0 0 "" 0
+  run_oracle_arm "$on" 2 "$DEVS" 2 0 0 "" 1
+  if ((MTP)); then
+    RESERVE_ARMS+=" $off-mtp $on-mtp"
+    run_oracle_arm "$off-mtp" 2 "$DEVS" 2 0 1 "" 0
+    run_oracle_arm "$on-mtp" 2 "$DEVS" 2 0 1 "" 1
+  fi
+  if ((BASELINE_REPEAT)); then
+    RESERVE_ARMS+=" $off-repeat"
+    run_oracle_arm "$off-repeat" 2 "$DEVS" 2 0 0 "" 0
+  fi
+
+  : > "$OUT/reserve-eval.jsonl"
+  reserve_eval_pair gate1-ar "$off" "$on" ar ""
+  COMPARE_STATE=$PAIR_STATE
+  if ((MTP)); then
+    reserve_eval_pair gate1-mtp "$off-mtp" "$on-mtp" mtp ""
+    MTP_STATE=$PAIR_STATE
+  fi
+  ((BASELINE_REPEAT == 0)) || reserve_eval_pair baseline-repeat "$off" "$off-repeat" ar "--baseline-repeat"
+  for f in ${PERF_JSONS[@]+"${PERF_JSONS[@]}"}; do
+    i=$((i + 1))
+    reserve_eval_doc "perf-$i" perf "$f"
+  done
+  [[ -z $C1_MANIFEST ]] || reserve_eval_doc c1 c1 "$C1_MANIFEST"
+  if ((RES_ANY_ERR)); then
+    VERDICT=ERROR
+  elif ((RES_ANY_FAIL)); then
+    VERDICT=FAIL
+  else
+    VERDICT=PASS
+  fi
+}
+
 # ------------------------------------------------------------------------ run
 log "output directory: $OUT"
 collect_env
@@ -1416,6 +1618,8 @@ build_all
 EPARM=$MODE$N
 if [[ $MODE == pp ]]; then
   run_pp_gate
+elif [[ $MODE == reserve ]]; then
+  run_reserve_gate
 else
   run_oracle_arm "$REF_ARM" "$REF_RANKS" "$REF_DEVS" "$REF_RANKS"
   run_oracle_arm "$EPARM" "$N" "$DEVS" "$N"

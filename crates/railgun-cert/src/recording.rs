@@ -1164,6 +1164,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "raon-dflash-verify-graph-abort",
+        predicates: &[GraphSlotCapturing],
+        condition: "hipfire-arch-raon verify_graph.rs record_verify_graph: a failed DFlash verify-body capture aborts the stream capture and clears `gpu.graphs.verify.capturing` before returning the error",
+        effect: Lifecycle,
+        switches: "failed capture: abort + clear the capturing slot + Err (no eager fallback); success: end_verify_graph_capture",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "capture bookkeeping only: no kernel, shape or argument depends on it; the recorded verify body is the eager body launch for launch (raon_dflash_oracle verifygraph: logits, features, argmax and RDA/conv/seq_len state bit-identical eager vs graph for K = 1..16 on R9700 and 7900 XTX)",
+        reaches: &[],
+    },
+    Decision {
         id: "dspark-capture-safe-verify-body",
         predicates: &[DeclaredCaptureBody, IsRecording, CaptureMode],
         condition: "DS4 DSpark verify body parameter `capture_safe` (spec_impl.rs:155-230; forward.rs forward_prefill_batch_chunk_impl, carried by rows_program.rs RowsWindow into push_attention / compressed_attention_rows and the hipfire-dispatch pipeline/mla/{rows,attention}.rs operations) and dspark_requires_typed_device_copy = is_recording() || capture_mode || force_blob_path (forward.rs)",
@@ -1722,6 +1733,12 @@ pub const SITES: &[Site] = &[
         decisions: &["raon-decode-mode-retained-replay"],
     },
     Site {
+        file: "hipfire-arch-raon/src/verify_graph.rs",
+        function: "record_verify_graph",
+        occurrences: 1,
+        decisions: &["raon-dflash-verify-graph-abort"],
+    },
+    Site {
         file: "rdna-compute/src/mq6_railgun.rs",
         function: "check_gpu",
         occurrences: 3,
@@ -2110,6 +2127,13 @@ pub const SITES: &[Site] = &[
         decisions: &["qwen4-decode-share-loan-capture-guard"],
     },
     Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward/ep_reserve_loan.rs",
+        function: "capturing",
+        occurrences: 4,
+        // The EP reserve loan drives the same LoanController through ExtentLoanOps.
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
         file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
         function: "capturing",
         occurrences: 1,
@@ -2153,7 +2177,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
-        function: "new_inner",
+        function: "new_inner_with_reserve",
         occurrences: 2,
         decisions: &["qwen4-cpu-splice-eager-only"],
     },

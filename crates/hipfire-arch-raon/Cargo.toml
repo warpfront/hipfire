@@ -26,5 +26,12 @@ deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet"]
 name = "raon_oracle"
 required-features = ["lab"]
 
+# Raon DFlash2 oracle: device feature capture vs the tapped reference, draft emit
+# dump for the torch reference, verify row-exactness, AR vs DFlash greedy.
+# Built with --features lab.
+[[example]]
+name = "raon_dflash_oracle"
+required-features = ["lab"]
+
 [dev-dependencies]
 md5 = "0.8"

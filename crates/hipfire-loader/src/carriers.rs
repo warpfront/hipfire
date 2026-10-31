@@ -890,8 +890,11 @@ impl Carrier for Qwen4Carrier {
                 &free,
                 &src,
                 &ctx.batch_request,
+                // The switch, read once; the plan carries it from here.
+                hipfire_arch_qwen4::ep_reserve::ep_reserve_request_from_env(),
             )?;
-            plan.expert_vram_layers = split.layers;
+            plan.expert_vram_layers = split.vram.layers;
+            plan.ep_reserve = split.reserve.clone();
             eprintln!(
                 "qwen4 EP plan: {} ranks on devices {:?} (mesh epoch {}, {} sealed expert groups), free VRAM per rank {:?} MiB, expert VRAM split {} MoE layers on every rank",
                 plan.seal.ranks(),
@@ -905,16 +908,23 @@ impl Carrier for Qwen4Carrier {
             // asked for lanes.
             if let Some(line) = hipfire_arch_qwen4::expert_residency::ep_lane_reservation_line(
                 shared.max_seq,
-                &split,
+                &split.vram,
             ) {
                 eprintln!("{line}");
             }
+            if let Some(note) = &split.reserve_note {
+                eprintln!("{note}");
+            }
+            if let Some(reserve_plan) = &plan.ep_reserve {
+                eprintln!("{}", reserve_plan.describe());
+            }
         }
-        let mut loaded = load_qwen4_rank(
+        let mut loaded = load_qwen4_rank_ep_reserve(
             ctx.gpu,
             ep_plan.as_ref().map(|plan| plan.rank(0)),
             &shared,
             ep_plan.as_ref().map(|plan| plan.expert_vram_layers),
+            ep_plan.as_ref().and_then(|plan| plan.ep_reserve.clone()),
             Some(Qwen4SessionSeed {
                 tokenizer: &meta.tokenizer,
                 chat_template: meta.chat_template.as_deref(),
@@ -1949,6 +1959,10 @@ pub struct Qwen4EpPlan {
     /// applies: the minimum over ranks ([`qwen4_ep_vram_layers`]). Pass it as
     /// `Some(plan.expert_vram_layers)` to every [`load_qwen4_rank`].
     pub expert_vram_layers: usize,
+    /// The frozen EP reserve plan (`HIPFIRE_EP_RESERVE_DECOUPLE=1`) every rank
+    /// loads under, with the split above equal to its resident layers; `None`
+    /// for the ordinary placement. Rank loads and the peers' attach carry it.
+    pub ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
 }
 
 impl Qwen4EpPlan {
@@ -2033,6 +2047,7 @@ fn plan_qwen4_ep(
         seal: std::sync::Arc::new(seal),
         shared: shared.clone(),
         expert_vram_layers: 0,
+        ep_reserve: None,
     }))
 }
 
@@ -2079,11 +2094,12 @@ pub fn attach_qwen4_ep_peers(
             let mut peer_gpu = rdna_compute::Gpu::init_with_device(device)
                 .map_err(|error| format!("init HIP device {device}: {error:?}"))?;
             let loaded = open_qwen4_rank_source(&plan.shared, &peer_gpu.arch).and_then(|source| {
-                load_qwen4_rank(
+                load_qwen4_rank_ep_reserve(
                     &mut peer_gpu,
                     Some(plan.rank(rank)),
                     &plan.shared,
                     Some(plan.expert_vram_layers),
+                    plan.ep_reserve.clone(),
                     None,
                     source,
                 )
@@ -2322,7 +2338,7 @@ fn qwen4_placement_inputs(
     scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
     ranks: usize,
     chunk_rows: usize,
-    share: Option<hipfire_arch_qwen4::expert_residency::DecodeShareForward>,
+    forward: Qwen4PlacementForward<'_>,
 ) -> Result<
     (
         u64,
@@ -2343,26 +2359,34 @@ fn qwen4_placement_inputs(
             &gpu.arch,
             usize::from(routed_experts),
         );
-    let inputs = hipfire_arch_qwen4::expert_residency::placement_inputs_with_forward(
-        &hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
-            gpu,
-            config,
-            weights,
-            bytes_of,
-            backend,
-            use_ranges,
-            max_seq,
-            vmm_granularity,
-            mtp_kept,
-            max_k,
-            routed_experts,
-            state_format,
-            scratch_mode,
-            ranks,
-            chunk_rows,
-        },
-        share,
-    )?;
+    let args = hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
+        gpu,
+        config,
+        weights,
+        bytes_of,
+        backend,
+        use_ranges,
+        max_seq,
+        vmm_granularity,
+        mtp_kept,
+        max_k,
+        routed_experts,
+        state_format,
+        scratch_mode,
+        ranks,
+        chunk_rows,
+    };
+    let inputs = match forward {
+        Qwen4PlacementForward::Ordinary => {
+            hipfire_arch_qwen4::expert_residency::placement_inputs_with_forward(&args, None)?
+        }
+        Qwen4PlacementForward::DecodeShare(share) => {
+            hipfire_arch_qwen4::expert_residency::placement_inputs_with_forward(&args, Some(share))?
+        }
+        Qwen4PlacementForward::EpReserve(plan) => {
+            hipfire_arch_qwen4::expert_residency::placement_inputs_with_ep_reserve(&args, plan)?
+        }
+    };
     Ok((
         inputs.non_expert,
         inputs.layer_experts,
@@ -2798,6 +2822,18 @@ pub fn qwen4_ep_alias_free(devices: &[i32], free: &[u64]) -> Vec<u64> {
 /// layers can only shrink), see
 /// [`hipfire_arch_qwen4::expert_residency::ep_vram_plan`]; a default `batch`
 /// returns exactly the baseline split.
+///
+/// `request` is `HIPFIRE_EP_RESERVE_DECOUPLE`, read once by the caller
+/// (default on; `0` is the kill switch). `Off` returns the ordinary split with no plan and no note (every
+/// receipt byte-identical). `Default` and `Forced` make one frozen
+/// [`hipfire_arch_qwen4::ep_reserve::EpReservePlan`] at the 4096-row chunk
+/// (never lowered) when phase-one admission passes, charging the dedicated
+/// forward in the historical floor AND census, and refuses the load before any
+/// allocation when the smallest rank, the aggregate host/GTT/emulated-host
+/// charge or the metadata floor cannot hold the minimum resident layers.
+/// A phase-one admission refusal (explicit chunk, unsupported mode) keeps the
+/// ordinary placement and the ordinary reserve, with a note; so does a
+/// capacity refusal under `Default` (only `Forced` fails the load).
 pub fn qwen4_ep_vram_layers(
     gpu: &rdna_compute::Gpu,
     shared: &Qwen4RankShared,
@@ -2805,7 +2841,8 @@ pub fn qwen4_ep_vram_layers(
     free_per_rank: &[u64],
     src: &ModelSource,
     batch: &hipfire_runtime::loader_api::BatchLoadRequest,
-) -> Result<hipfire_arch_qwen4::expert_residency::EpVramPlan, String> {
+    request: hipfire_arch_qwen4::ep_reserve::EpReserveRequest,
+) -> Result<Qwen4EpVramSplit, String> {
     let ModelSource::Hfq(hfq) = src else {
         return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
     };
@@ -2860,7 +2897,7 @@ pub fn qwen4_ep_vram_layers(
         scratch_mode,
         ranks,
         chunk_rows,
-        None,
+        Qwen4PlacementForward::Ordinary,
     )?;
     // Same charges as each rank's load applies to an expert-parallel split
     // (no slab stage: `new_slab` has no EP route), so the agreed split never
@@ -2897,14 +2934,122 @@ pub fn qwen4_ep_vram_layers(
             }),
         )
     });
-    let mut plan = hipfire_arch_qwen4::expert_residency::ep_vram_plan(
+    let attempt = if request.attempts() {
+        let geometry = hipfire_arch_qwen4::ep_reserve::EpRankGeometry::flash_next(&config, ranks);
+        let (explicit_chunk, owner_routed_prefill, stage_min_rows) =
+            qwen4_ep_reserve_env(&gpu.arch, chunk_rows);
+        let admission = qwen4_ep_reserve_admission(&Qwen4EpReserveAdmission {
+            arch: &gpu.arch,
+            uma: gpu.is_uma(),
+            flash_next: config.profile.is_flash_next(),
+            packed_recipe: matches!(
+                recipe,
+                hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. }
+            ),
+            slab_recipe: matches!(
+                recipe,
+                hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+            ),
+            expert_bytes_match: geometry.and_then(|geometry| geometry.layer_bytes())
+                == Some(layer_experts),
+            ranks,
+            scratch_mode,
+            prompt_rows: chunk_rows,
+            explicit_chunk,
+            owner_routed_prefill,
+            stage_min_rows,
+            lane_request: batch.lanes().is_some(),
+            continuous_batch: shared.continuous_batch,
+            npu: match hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env() {
+                Ok(npu) => {
+                    hipfire_arch_qwen4::slowlink_admission::npu_trunk_selected(&gpu.arch, npu)
+                }
+                Err(_) => false,
+            },
+            dflash: shared.spec.dflash == Some(true),
+            pipeline_parallel: false,
+        });
+        Some((
+            admission,
+            qwen4_expert_table_bytes(
+                true,
+                (
+                    config.num_hidden_layers,
+                    config.num_experts,
+                    config.expert_keep.is_some(),
+                ),
+            )?,
+        ))
+    } else {
+        None
+    };
+    // The same census every reader of the frozen plan shares: the 4096-row
+    // placement inputs with the dedicated forward charged in BOTH the
+    // historical floor and the bottom-up census.
+    let decoupled_reserve =
+        |forward: &hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan| -> Result<u64, String> {
+            let (_, _, reserve, ..) = qwen4_placement_inputs(
+                gpu,
+                &config,
+                &manifest.weights,
+                &bytes_of,
+                shared.backend,
+                false,
+                shared.max_seq,
+                shared.vmm_granularity,
+                shared.spec,
+                shared.max_k,
+                shared.native_mtp,
+                !config.ffn.is_dense(),
+                state_format,
+                scratch_mode,
+                ranks,
+                chunk_rows,
+                Qwen4PlacementForward::EpReserve(forward),
+            )?;
+            qwen4_shared_charges(layer_experts, false, false, 0)
+                .and_then(|charges| charges.reserve(reserve.bytes()))
+                .map_err(|error| format!("qwen4: {error}"))
+        };
+    // Every rank's host-mapped experts at a resident count, from the agreed
+    // placement applied to a scratch copy of the manifest (nothing is mutated).
+    let host_expert_bytes = |layers: usize| -> Result<u64, String> {
+        let mut placed = manifest.weights.clone();
+        qwen4_shared_apply_placement(&mut placed, layers, None);
+        hipfire_arch_qwen4::expert_residency::host_mapped_bytes_ranks(&placed, &bytes_of, ranks)
+            .map(|per_rank| {
+                per_rank
+                    .iter()
+                    .fold(0u64, |total, bytes| total.saturating_add(*bytes))
+            })
+            .map_err(|error| format!("qwen4: {error}"))
+    };
+    let emu_check = |bytes: u64| -> Result<(), String> {
+        gpu.emu_check_host_allocation(bytes, true)
+            .map_err(|error| format!("qwen4: {error}"))
+    };
+    let attempt = attempt.map(|(admission, fixed_table_bytes)| Qwen4EpReserveAttempt {
+        forced: request == hipfire_arch_qwen4::ep_reserve::EpReserveRequest::Forced,
+        admission,
+        fixed_table_bytes,
+        decoupled_reserve: &decoupled_reserve,
+        host: Qwen4EpReserveHost {
+            mem_available: rdna_compute::kv_slots::mem_available_bytes(),
+            ttm_pool: hipfire_arch_qwen4::expert_residency::ttm_pool_estimate_on(gpu),
+            gtt: hipfire_arch_qwen4::expert_residency::gtt_budget(),
+            host_expert_bytes: &host_expert_bytes,
+            emu_check: &emu_check,
+        },
+    });
+    let mut plan = qwen4_ep_vram_split(
         &config,
         free_per_rank,
         non_expert,
         layer_experts,
         reserve,
         lane,
-    );
+        attempt.as_ref(),
+    )?;
     // Lab measurement knob: cap the resident MoE layers (every rank) to hold a
     // placement fixed across arms with different lane reservations. Never
     // raises the plan; unset in production.
@@ -2912,12 +3057,12 @@ pub fn qwen4_ep_vram_layers(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {
-        if cap < plan.layers {
+        if cap < plan.vram.layers {
             eprintln!(
                 "qwen4 EP lab: resident MoE layers capped {} -> {cap} (HIPFIRE_EP_LAB_RESIDENT_LAYERS)",
-                plan.layers
+                plan.vram.layers
             );
-            plan.layers = cap;
+            plan.vram.layers = cap;
         }
     }
     Ok(plan)
@@ -2948,6 +3093,396 @@ fn qwen4_ep_lane_request(
         row_budget,
         bytes,
     })
+}
+
+// ---------------------------------------------------------------------------
+// EP reserve decoupling (opt-in `HIPFIRE_EP_RESERVE_DECOUPLE=1`)
+//
+// One frozen `EpReservePlan` is made by `qwen4_ep_vram_layers` (the
+// agreed-split owner), carried in `Qwen4EpPlan` to every rank's load, and read
+// by all four reserve readers: the split itself (`qwen4_ep_vram_split`), the
+// rank's placement census (`Qwen4PlacementForward::EpReserve`), the agreed-
+// split check (`qwen4_ep_reserve_rank_terms`) and the fit line. Off (unset or
+// anything but `1`) none of this runs and every receipt is the ordinary one.
+// ---------------------------------------------------------------------------
+
+/// The forward term of one rank's placement reserve (historical floor and
+/// bottom-up census alike).
+#[derive(Clone, Copy)]
+enum Qwen4PlacementForward<'a> {
+    /// The ordinary `qwen4_forward_device_bytes` of the chunk.
+    Ordinary,
+    /// An admitted single-device decode-share load's dedicated forward.
+    DecodeShare(hipfire_arch_qwen4::expert_residency::DecodeShareForward),
+    /// An admitted EP reserve-decoupled load's dedicated forward
+    /// ([`hipfire_arch_qwen4::expert_residency::placement_inputs_with_ep_reserve`]).
+    EpReserve(&'a hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan),
+}
+
+/// Explicit prompt-chunk override knob (`gpu_forward` keeps its constant
+/// crate-private).
+const QWEN4_EP_RESERVE_CHUNK_ROWS_ENV: &str = "HIPFIRE_PREFILL_CHUNK_ROWS";
+/// EP stage (S2) lever: default on, exact `0` off.
+const QWEN4_EP_RESERVE_STAGE_ENV: &str = "HIPFIRE_EP_EXPERT_STAGE";
+
+/// The expert VRAM split of an EP load and, when `HIPFIRE_EP_RESERVE_DECOUPLE=1`
+/// admitted it, the frozen reserve plan every rank loads under.
+pub struct Qwen4EpVramSplit {
+    /// The split every rank applies (and the lane reservation behind it).
+    pub vram: hipfire_arch_qwen4::expert_residency::EpVramPlan,
+    /// `Some` exactly when the opt-in switch asked for the experiment and the
+    /// phase-one candidate was admitted and fit.
+    pub reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
+    /// Why a requested experiment kept the ordinary placement and reserve
+    /// (`None` when off, or when the plan applies).
+    pub reserve_note: Option<String>,
+}
+
+/// The facts of one load [`admit_ep_reserve`](hipfire_arch_qwen4::ep_reserve::admit_ep_reserve)
+/// judges, resolved by the loader.
+struct Qwen4EpReserveAdmission<'a> {
+    arch: &'a str,
+    uma: bool,
+    flash_next: bool,
+    packed_recipe: bool,
+    slab_recipe: bool,
+    /// A rank's routed-expert layer bytes are the pinned QT44/QT53 geometry's.
+    expert_bytes_match: bool,
+    ranks: usize,
+    scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
+    prompt_rows: usize,
+    explicit_chunk: bool,
+    owner_routed_prefill: bool,
+    stage_min_rows: Option<usize>,
+    lane_request: bool,
+    continuous_batch: bool,
+    npu: bool,
+    dflash: bool,
+    pipeline_parallel: bool,
+}
+
+/// Pure phase-one admission. `Err` keeps today's untouched path (and logs the
+/// reason); a plan is never made for it, so an explicit chunk or an
+/// unsupported mode can never receive a smaller reserve.
+fn qwen4_ep_reserve_admission(input: &Qwen4EpReserveAdmission<'_>) -> Result<(), String> {
+    let facts = hipfire_arch_qwen4::ep_reserve::EpReserveFacts {
+        arch: input.arch,
+        uma: input.uma,
+        flash_next: input.flash_next,
+        expert_qt: (input.packed_recipe && input.expert_bytes_match).then_some((44, 53)),
+        ranks: input.ranks,
+        scratch_mode: input.scratch_mode,
+        prompt_rows: input.prompt_rows,
+        explicit_chunk_override: input.explicit_chunk,
+        whole_layer_placement: input.packed_recipe && !input.slab_recipe,
+        owner_routed_s1: input.owner_routed_prefill,
+        s2_min_rows: input.stage_min_rows,
+        lane_request: input.lane_request,
+        // Retained-body replay is excluded under EP by the forward itself.
+        capture: false,
+        // Owner-routed prefill off leaves every wide call on the Full tables.
+        routing_override: !input.owner_routed_prefill,
+        pipeline_parallel: input.pipeline_parallel,
+        // An EP load never takes the hot-set tier, and an S1 profile is refused.
+        expert_tier: false,
+        expert_slab: input.slab_recipe,
+        npu: input.npu,
+        dflash: input.dflash,
+        single_device_slowlink: false,
+        continuous_batch: input.continuous_batch,
+    };
+    hipfire_arch_qwen4::ep_reserve::admit_ep_reserve(&facts).map_err(|refusal| refusal.to_string())
+}
+
+/// `(explicit chunk override, owner-routed prefill on, EP stage min rows)` from
+/// the process environment, read once while the plan is made.
+fn qwen4_ep_reserve_env(arch: &str, prompt_rows: usize) -> (bool, bool, Option<usize>) {
+    let explicit_chunk = hipfire_config::developer_var(QWEN4_EP_RESERVE_CHUNK_ROWS_ENV).is_ok();
+    let owner_routed = hipfire_config::developer_var(
+        hipfire_arch_qwen4::gpu_forward::QWEN4_EP_OWNER_ROUTED_PREFILL_ENV,
+    )
+    .as_deref()
+        != Ok("0");
+    let stage_on = owner_routed
+        && hipfire_config::developer_var(QWEN4_EP_RESERVE_STAGE_ENV).as_deref() != Ok("0");
+    let stage_min_rows = stage_on.then(|| {
+        hipfire_config::developer_var(
+            hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_MIN_ROWS_ENV,
+        )
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&rows| rows >= 2)
+        .unwrap_or_else(|| {
+            rdna_compute::expert_capabilities::stage_default_min_rows(arch, prompt_rows, false)
+        })
+    });
+    (explicit_chunk, owner_routed, stage_min_rows)
+}
+
+/// The host-memory observations the aggregate charge is admitted against.
+struct Qwen4EpReserveHost<'a> {
+    mem_available: Option<u64>,
+    ttm_pool: u64,
+    gtt: Option<hipfire_arch_qwen4::expert_residency::GttBudget>,
+    /// Pinned host bytes of every rank's host-mapped experts TOGETHER at a
+    /// resident layer count.
+    host_expert_bytes: &'a dyn Fn(usize) -> Result<u64, String>,
+    /// The SKU-emulation host ledger check.
+    emu_check: &'a dyn Fn(u64) -> Result<(), String>,
+}
+
+/// One load's opt-in candidate: the phase-one verdict, the table charge and the
+/// census the plan is judged against.
+struct Qwen4EpReserveAttempt<'a> {
+    /// `HIPFIRE_EP_RESERVE_DECOUPLE=1`: a capacity refusal fails the load.
+    /// Unset (the default route) keeps the ordinary placement with a note.
+    forced: bool,
+    admission: Result<(), String>,
+    /// Additional fixed table/metadata bytes the forward is charged.
+    fixed_table_bytes: u64,
+    /// The rank-census reserve (`PlacementCharges` applied) with the plan's
+    /// dedicated forward charged: the value every rank recomputes.
+    decoupled_reserve:
+        &'a dyn Fn(&hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan) -> Result<u64, String>,
+    host: Qwen4EpReserveHost<'a>,
+}
+
+enum Qwen4EpReserveResolution {
+    Plan(hipfire_arch_qwen4::ep_reserve::EpReservePlan),
+    /// Phase one kept the ordinary placement and reserve (no capacity was
+    /// reduced), with the reason.
+    Ordinary(String),
+}
+
+/// Pinned host bytes one rank's scratch-donor mirrors take: the full donor
+/// tensors plus the allocators' per-tensor padding (gate/up and down are
+/// separate pinned allocations).
+fn qwen4_ep_reserve_mirror_host_bytes(plan: &hipfire_arch_qwen4::ep_reserve::EpReservePlan) -> u64 {
+    plan.mirror_bytes_per_rank.saturating_add(
+        (plan.donor_layers.len() as u64)
+            .saturating_mul(2 * hipfire_arch_qwen4::expert_residency::HOST_MAPPED_PAD_BYTES),
+    )
+}
+
+/// The pinned host bytes a rank's load checks: every rank that has not pinned
+/// yet (this one and the later ranks) at its own expert share, each also taking
+/// `reserve_mirror` (0 off: exactly the ordinary fold).
+fn qwen4_ep_host_check_bytes(rank_host_bytes: &[u64], own_rank: usize, reserve_mirror: u64) -> u64 {
+    let experts = rank_host_bytes[own_rank..]
+        .iter()
+        .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+    experts.saturating_add(reserve_mirror.saturating_mul((rank_host_bytes.len() - own_rank) as u64))
+}
+
+/// Phase one and the capacity plan of one requested load. `Ok(Ordinary)` keeps
+/// the untouched path (admission refused, or every trunk layer already fits);
+/// `Err` refuses the load before any allocation (the opt-in contract cannot be
+/// met: fewer than the minimum resident layers per rank on the smallest rank,
+/// host/GTT/emulated-host failure of the aggregate charge, metadata floor).
+fn qwen4_ep_reserve_try(
+    config: &hipfire_arch_qwen4::Qwen4Config,
+    free_per_rank: &[u64],
+    non_expert: u64,
+    layer_experts: u64,
+    attempt: &Qwen4EpReserveAttempt<'_>,
+) -> Result<Qwen4EpReserveResolution, String> {
+    use hipfire_arch_qwen4::ep_reserve as ep;
+    use hipfire_arch_qwen4::expert_residency as residency;
+    if let Err(why) = &attempt.admission {
+        return Ok(Qwen4EpReserveResolution::Ordinary(why.clone()));
+    }
+    let forward = match ep::EpReserveForwardPlan::from_config(
+        config,
+        hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full,
+        attempt.fixed_table_bytes,
+    ) {
+        Ok(forward) => forward,
+        Err(refusal) => return Ok(Qwen4EpReserveResolution::Ordinary(refusal.to_string())),
+    };
+    let ranks = free_per_rank.len();
+    let Some(geometry) = ep::EpRankGeometry::flash_next(config, ranks) else {
+        return Ok(Qwen4EpReserveResolution::Ordinary(
+            "the rank geometry overflows".to_string(),
+        ));
+    };
+    let reserve = (attempt.decoupled_reserve)(&forward)?;
+    let resident =
+        residency::ep_vram_layers(config, free_per_rank, non_expert, layer_experts, reserve);
+    if resident >= config.num_hidden_layers {
+        return Ok(Qwen4EpReserveResolution::Ordinary(format!(
+            "{resident} MoE layers fit per rank with the decoupled reserve, every trunk layer: nothing to decouple"
+        )));
+    }
+    let host = &attempt.host;
+    let host_experts = (host.host_expert_bytes)(resident)?;
+    let available = host.mem_available.ok_or(
+        "qwen4: EP reserve decoupling: MemAvailable is unreadable, so the aggregate pinned-host charge cannot be admitted",
+    )?;
+    let ram_allowance = available
+        .saturating_add(host.ttm_pool)
+        .saturating_sub(residency::HOST_RAM_HEADROOM_BYTES);
+    let allowance = host.gtt.map_or(ram_allowance, |gtt| {
+        ram_allowance.min(gtt.limit_bytes.saturating_sub(gtt.used_bytes))
+    });
+    let capacity = ep::EpReserveCapacity {
+        free_per_rank: free_per_rank.to_vec(),
+        non_expert_bytes: non_expert,
+        reserve_bytes: reserve,
+        lane_bytes: 0,
+        host_budget_bytes: allowance.saturating_sub(host_experts),
+        min_resident_layers: ep::EP_RESERVE_MIN_RESIDENT_LAYERS,
+    };
+    let plan = ep::plan_ep_reserve(&forward, &geometry, &capacity).map_err(|refusal| {
+        format!(
+            "qwen4: {refusal}; set {}=0 for the ordinary placement",
+            ep::EP_RESERVE_DECOUPLE_ENV
+        )
+    })?;
+    if plan.resident_layers != resident {
+        return Err(format!(
+            "qwen4: EP reserve plan resolved {} resident layers but the agreed-split rule gives {resident}",
+            plan.resident_layers
+        ));
+    }
+    // The aggregate over ranks, every pad included, against RAM, GTT and the
+    // emulated host ledger: each rank is never allowed the whole budget.
+    let mirrors = qwen4_ep_reserve_mirror_host_bytes(&plan).saturating_mul(ranks as u64);
+    let total = host_experts.saturating_add(mirrors);
+    let aggregate = |error: String| {
+        format!(
+            "qwen4: EP reserve decoupling: the aggregate pinned host memory of {ranks} ranks ({} MiB: {} MiB host-mapped experts + {} MiB scratch-donor mirrors) is refused: {error}",
+            total >> 20,
+            host_experts >> 20,
+            mirrors >> 20
+        )
+    };
+    residency::check_host_ram(total, host.mem_available, host.ttm_pool).map_err(&aggregate)?;
+    residency::check_gtt_cap(total, host.gtt).map_err(&aggregate)?;
+    (host.emu_check)(total)?;
+    Ok(Qwen4EpReserveResolution::Plan(plan))
+}
+
+/// The expert VRAM split of an EP load: the frozen reserve plan's when the
+/// opt-in `attempt` resolves to one, otherwise exactly the ordinary
+/// [`ep_vram_plan`](hipfire_arch_qwen4::expert_residency::ep_vram_plan) at the
+/// ordinary reserve (off, an explicit chunk, an unsupported mode and a failed
+/// phase-one admission never get a smaller reserve).
+fn qwen4_ep_vram_split(
+    config: &hipfire_arch_qwen4::Qwen4Config,
+    free_per_rank: &[u64],
+    non_expert: u64,
+    layer_experts: u64,
+    ordinary_reserve: u64,
+    lane: Option<hipfire_arch_qwen4::expert_residency::EpLaneRequest>,
+    attempt: Option<&Qwen4EpReserveAttempt<'_>>,
+) -> Result<Qwen4EpVramSplit, String> {
+    let mut reserve_note = None;
+    if let Some(attempt) = attempt {
+        let resolved =
+            match qwen4_ep_reserve_try(config, free_per_rank, non_expert, layer_experts, attempt) {
+                Err(refusal) if !attempt.forced => Qwen4EpReserveResolution::Ordinary(format!(
+                    "{refusal}; set HIPFIRE_EP_RESERVE_DECOUPLE=1 to fail such a load instead"
+                )),
+                other => other?,
+            };
+        match resolved {
+            Qwen4EpReserveResolution::Plan(plan) => {
+                return Ok(Qwen4EpVramSplit {
+                    vram: hipfire_arch_qwen4::expert_residency::EpVramPlan {
+                        layers: plan.resident_layers,
+                        reservation: None,
+                        unreserved: None,
+                    },
+                    reserve: Some(std::sync::Arc::new(plan)),
+                    reserve_note: None,
+                });
+            }
+            Qwen4EpReserveResolution::Ordinary(why) => {
+                reserve_note = Some(format!(
+                    "qwen4 EP reserve decoupling: not applied ({why}); ordinary placement and reserve"
+                ));
+            }
+        }
+    }
+    Ok(Qwen4EpVramSplit {
+        vram: hipfire_arch_qwen4::expert_residency::ep_vram_plan(
+            config,
+            free_per_rank,
+            non_expert,
+            layer_experts,
+            ordinary_reserve,
+            lane,
+        ),
+        reserve: None,
+        reserve_note,
+    })
+}
+
+/// A rank's load must be exactly the load the frozen plan was made for: an EP
+/// rank, no band, the plan's `Full` scratch mode and 4096-row prompt chunk (never
+/// lowered), and the agreed split equal to the plan's resident layers. There is
+/// no ordinary fallback after the reduced reserve was chosen.
+fn qwen4_ep_reserve_rank_match(
+    plan: &hipfire_arch_qwen4::ep_reserve::EpReservePlan,
+    ep_rank: bool,
+    band: bool,
+    scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
+    chunk_rows: usize,
+    agreed_layers: Option<usize>,
+) -> Result<(), String> {
+    let mismatch = if !ep_rank {
+        Some("the load is not an expert-parallel rank".to_string())
+    } else if band {
+        Some("a pipeline band load".to_string())
+    } else if scratch_mode != plan.forward.mode {
+        Some(format!(
+            "the forward scratch plan is {scratch_mode:?}, the plan's is {:?}",
+            plan.forward.mode
+        ))
+    } else if chunk_rows != plan.forward.prompt_rows {
+        Some(format!(
+            "the prompt chunk is {chunk_rows} rows, the plan's is {}",
+            plan.forward.prompt_rows
+        ))
+    } else if agreed_layers != Some(plan.resident_layers) {
+        Some(format!(
+            "the agreed split is {agreed_layers:?} layers, the plan's is {}",
+            plan.resident_layers
+        ))
+    } else {
+        None
+    };
+    match mismatch {
+        Some(why) => Err(format!(
+            "qwen4: the frozen EP reserve plan does not match this rank's load ({why}); the reduced reserve cannot fall back to the ordinary load"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The rank's agreed-split terms against the frozen plan: the split IS the
+/// plan's resident count, and the reserve this rank recomputed from its own
+/// census never exceeds the one the plan was sized from (a larger one means the
+/// plan under-charged this rank).
+fn qwen4_ep_reserve_rank_terms(
+    plan: &hipfire_arch_qwen4::ep_reserve::EpReservePlan,
+    agreed_layers: usize,
+    rank_reserve: u64,
+) -> Result<(), String> {
+    if agreed_layers != plan.resident_layers {
+        return Err(format!(
+            "qwen4: the agreed expert VRAM split of {agreed_layers} layers is not the EP reserve plan's {}",
+            plan.resident_layers
+        ));
+    }
+    if rank_reserve > plan.reserve_bytes {
+        return Err(format!(
+            "qwen4: this rank's reserve of {} MiB exceeds the {} MiB the EP reserve plan was sized from (the ranks' census disagrees)",
+            rank_reserve >> 20,
+            plan.reserve_bytes >> 20
+        ));
+    }
+    Ok(())
 }
 
 /// Metadata-only preload resource plan for one Qwen4 rank (`Unit B`).
@@ -4201,6 +4736,34 @@ pub fn load_qwen4_rank(
         src,
         None,
         None,
+        None,
+    )
+}
+
+/// [`load_qwen4_rank`] of one expert-parallel rank under the load's frozen EP
+/// reserve plan (`HIPFIRE_EP_RESERVE_DECOUPLE=1`, [`qwen4_ep_vram_layers`]):
+/// the rank's reserve, agreed-split check, fit line and host charge all read
+/// `ep_reserve`, and its forward attaches that plan. `None` is
+/// [`load_qwen4_rank`] exactly.
+pub fn load_qwen4_rank_ep_reserve(
+    gpu: &mut rdna_compute::Gpu,
+    ep_seal: Option<hipfire_arch_qwen4::ep_seal::Qwen4EpRankSeal>,
+    shared: &Qwen4RankShared,
+    expert_vram_layers: Option<usize>,
+    ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
+    session: Option<Qwen4SessionSeed<'_>>,
+    src: ModelSource,
+) -> Result<Qwen4RankLoad, String> {
+    load_qwen4_rank_scoped(
+        gpu,
+        ep_seal,
+        shared,
+        expert_vram_layers,
+        session,
+        src,
+        None,
+        None,
+        ep_reserve,
     )
 }
 
@@ -4229,6 +4792,7 @@ fn load_qwen4_rank_scoped(
     src: ModelSource,
     band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
     pp_chunk_rows: Option<usize>,
+    ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
 ) -> Result<Qwen4RankLoad, String> {
     let backend = shared.backend;
     let vmm_granularity = shared.vmm_granularity;
@@ -4674,6 +5238,25 @@ fn load_qwen4_rank_scoped(
             scratch_mode,
         )
     };
+    // The frozen EP reserve plan this rank is loaded under, if any: it must be
+    // exactly this rank's load (never re-derived, never an ordinary fallback).
+    let placement_forward = match &ep_reserve {
+        Some(plan) => {
+            qwen4_ep_reserve_rank_match(
+                plan,
+                ep.is_some(),
+                band.is_some(),
+                scratch_mode,
+                placement_chunk,
+                expert_vram_layers,
+            )?;
+            Qwen4PlacementForward::EpReserve(&plan.forward)
+        }
+        None => Qwen4PlacementForward::Ordinary,
+    };
+    let ep_reserve_mirror_bytes = ep_reserve
+        .as_deref()
+        .map_or(0, qwen4_ep_reserve_mirror_host_bytes);
     // Freeze the original capacity inputs before placement, materialization or
     // capture growth. Pool readings are separate instants, not a free-memory
     // delta and not evidence of an old model's original preload basis.
@@ -4706,7 +5289,7 @@ fn load_qwen4_rank_scoped(
             scratch_mode,
             ep_ranks,
             placement_chunk,
-            None,
+            placement_forward,
         )?)
     } else {
         None
@@ -4797,11 +5380,13 @@ fn load_qwen4_rank_scoped(
                 scratch_mode,
                 ep_ranks,
                 placement_chunk,
-                Some(hipfire_arch_qwen4::expert_residency::DecodeShareForward {
-                    dedicated,
-                    borrowed,
-                    shadows_borrowed: decode_share_shadow_bytes,
-                }),
+                Qwen4PlacementForward::DecodeShare(
+                    hipfire_arch_qwen4::expert_residency::DecodeShareForward {
+                        dedicated,
+                        borrowed,
+                        shadows_borrowed: decode_share_shadow_bytes,
+                    },
+                ),
             )
             .ok(),
             _ => None,
@@ -5504,6 +6089,9 @@ fn load_qwen4_rank_scoped(
         let reserve = charges
             .reserve(reserve.bytes())
             .map_err(|error| format!("qwen4: {error}"))?;
+        if let Some(plan) = &ep_reserve {
+            qwen4_ep_reserve_rank_terms(plan, layers, reserve)?;
+        }
         let own = residency::ep_rank_layers(&config, free, non_expert, layer_experts, reserve);
         if own < layers.min(moe_layers) {
             return Err(format!(
@@ -5687,9 +6275,8 @@ fn load_qwen4_rank_scoped(
                 .map_err(|error| format!("qwen4: {error}"))?;
         let own_rank = ep.map_or(0, |placement| placement.rank);
         let host_bytes = rank_host_bytes[own_rank];
-        let host_check_bytes = rank_host_bytes[own_rank..]
-            .iter()
-            .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+        let host_check_bytes =
+            qwen4_ep_host_check_bytes(&rank_host_bytes, own_rank, ep_reserve_mirror_bytes);
         let mem_available = preallocation_mem_available;
         let ttm_pool = preallocation_ttm_pool;
         residency::check_host_ram(host_check_bytes, mem_available, ttm_pool)
@@ -5839,6 +6426,12 @@ fn load_qwen4_rank_scoped(
             )
         );
     }
+    if let Some(plan) = &ep_reserve {
+        eprintln!("  qwen4 {}", plan.describe());
+        if let Some((_, _, reserve, ..)) = placement_inputs {
+            eprintln!("  qwen4 EP reserve census: {}", reserve.describe());
+        }
+    }
     rdna_compute::load_phases::add(
         "qwen4_placement",
         rdna_compute::load_phases::ns_since(placement_started),
@@ -5885,6 +6478,7 @@ fn load_qwen4_rank_scoped(
         residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
             .map(|per_rank| {
                 per_rank[ep.map_or(0, |placement| placement.rank)]
+                    + ep_reserve_mirror_bytes
                     + hotset_plan.as_ref().map_or(0, |(plan, _)| {
                         plan.owner_bytes(
                             hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped,
@@ -6471,7 +7065,16 @@ fn load_qwen4_rank_scoped(
         bundle.attach_slowlink_profile(profile);
     }
     let overlay_marker_was_set = bundle.config.trunk_iu4_default.is_some();
-    if let Err(error) = bundle.attach_forward(ctx.gpu, placement_chunk, scratch_mode) {
+    let attached = match &ep_reserve {
+        // A reserve-sharing rank attaches the frozen plan or fails: never the
+        // ordinary forward (a full dedicated bank the reduced reserve did not
+        // charge) and never a smaller chunk rung.
+        Some(plan) => {
+            bundle.attach_forward_ep_reserve(ctx.gpu, placement_chunk, scratch_mode, plan.clone())
+        }
+        None => bundle.attach_forward(ctx.gpu, placement_chunk, scratch_mode),
+    };
+    if let Err(error) = attached {
         let detail = error.to_string();
         let _ = bundle.free_gpu(ctx.gpu);
         return Err(format!("qwen4: forward setup failed: {detail}"));
@@ -7798,6 +8401,7 @@ fn load_qwen4_pp_bundle(
                 source,
                 Some(&scopes[stage]),
                 Some(chunk_rows),
+                None,
             )
         });
         match loaded {
@@ -9947,12 +10551,70 @@ impl Carrier for RaonCarrier {
         }
         Some(true)
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::RaonBundle>())
+        {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("raon1_mini: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        mut ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        // The Raon AR producer (`generate_ar_with_forward`) runs the shared
+        // think router, XML `<tool_call>` router, stop matcher and the
+        // template's own think close on a spent budget, with no tool-call
+        // grammar: the same emitter recipe as Qwen4, grammar forced off so a
+        // post-acceptance reject can never end a speculative turn the AR
+        // route continues. Greedy tool turns then commit the AR stream.
+        ctx.enable_grammar = false;
+        Ok(Qwen35Emit::from_ctx_template_think_close(ctx))
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-        let bundle = hipfire_arch_raon::load_raon_bundle(src, ctx)?;
+        // `load_raon_bundle` refuses every speculation request this arch
+        // cannot serve before allocating; only a DFlash2 draft under
+        // `speculation.dflash = on` reaches the builder below.
+        let mut bundle = hipfire_arch_raon::load_raon_bundle(src, ctx)?;
+        let speculator = match hipfire_arch_raon::carrier::dflash_draft(ctx.draft_path, ctx.spec)? {
+            Some(draft) => match hipfire_arch_raon::carrier::build_raon_dflash2_speculator(
+                ctx.gpu,
+                draft,
+                &mut bundle,
+                ctx.max_seq,
+                ctx.spec,
+            ) {
+                Ok(speculator) => {
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOn,
+                        format!(
+                            "dflash (draft {})",
+                            std::path::Path::new(draft)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| draft.to_string())
+                        ),
+                    );
+                    Some(speculator)
+                }
+                Err(error) => {
+                    bundle.free_all(ctx.gpu);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -13718,5 +14380,668 @@ mod qwen4_preload_plan_tests {
         assert_eq!(moved, 1);
         let (whole, _, _) = qwen4_shared_auto_whole_layers(&inputs, &charges).expect("auto count");
         assert_eq!(whole, 1);
+    }
+}
+
+/// P5 LoaderFit: mock-capacity fixtures for the EP reserve-decoupling readers
+/// (planner, rank check, fit line, host aggregate, admission). CPU only.
+#[cfg(test)]
+mod qwen4_ep_reserve_loader_tests {
+    use super::*;
+    use hipfire_arch_qwen4::ep_reserve as ep;
+    use hipfire_arch_qwen4::expert_residency as residency;
+    use hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode as Mode;
+    use hipfire_arch_qwen4::Qwen4Config;
+
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    const NON_EXPERT: u64 = 6 * GIB;
+    const BASE_RESERVE: u64 = 3 * GIB;
+    const TABLES: u64 = 400 << 10;
+
+    fn config() -> Qwen4Config {
+        let layers: Vec<_> = (0..48)
+            .map(|idx| {
+                if idx % 4 == 3 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            })
+            .collect();
+        let mut text = serde_json::json!({
+            "model_type": hipfire_arch_qwen4::config::TEXT_MODEL_TYPE,
+            "dtype": "bfloat16",
+            "hidden_size": 2560,
+            "vocab_size": 248320,
+            "num_hidden_layers": 48,
+            "max_position_embeddings": 262144,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "partial_rotary_factor": 0.25,
+            "rope_parameters": {"rope_theta": 10000000.0},
+            "attention_bias": false,
+            "layer_types": layers,
+            "full_attention_interval": 4,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "mamba_ssm_dtype": "float32",
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+            "moe_intermediate_size": 640,
+            "shared_expert_intermediate_size": 640
+        });
+        let extra = serde_json::json!({
+            "norm_topk_prob": true,
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [2],
+            "ple_conv_kernel_size": 4,
+            "ple_embed_dim": 2560,
+            "split_ngram_parts": 128,
+            "heads_per_ngram": 8,
+            "ngram_size": 3,
+            "ngram_vocab_size_base": 20000000,
+            "make_ngram_vocab_size_divisible_by": 128,
+            "eos_token_id": 248044,
+            "tie_word_embeddings": false,
+            "mtp_num_hidden_layers": 1,
+            "mtp_use_dedicated_embeddings": false,
+            "output_gate_type": "sigmoid",
+            "mtp": {
+                "hybrid": true,
+                "layer_types": ["full_attention"],
+                "num_hidden_layers": 1,
+                "rope_theta": 10000000.0
+            }
+        });
+        if let (Some(dst), serde_json::Value::Object(src)) = (text.as_object_mut(), extra) {
+            dst.extend(src);
+        }
+        let value = serde_json::json!({
+            "architectures": [hipfire_arch_qwen4::config::ARCHITECTURE_NAME],
+            "model_type": hipfire_arch_qwen4::config::MODEL_TYPE,
+            "text_config": text
+        });
+        Qwen4Config::from_value(&value).expect("pinned Flash-Next fixture config")
+    }
+
+    fn layer_bytes(config: &Qwen4Config) -> u64 {
+        ep::EpRankGeometry::flash_next(config, 2)
+            .and_then(|geometry| geometry.layer_bytes())
+            .expect("pinned QT44/QT53 layer bytes")
+    }
+
+    fn forward(config: &Qwen4Config, tables: u64) -> ep::EpReserveForwardPlan {
+        ep::EpReserveForwardPlan::from_config(config, Mode::Full, tables).expect("forward plan")
+    }
+
+    /// The rank-census reserve the mock capacity input carries for `tables`.
+    fn reserve_of(config: &Qwen4Config, tables: u64) -> u64 {
+        BASE_RESERVE + forward(config, tables).charged_forward_bytes().unwrap()
+    }
+
+    /// Free VRAM that keeps exactly `layers` resident layers at `reserve`.
+    fn free_for(config: &Qwen4Config, layers: usize, reserve: u64) -> u64 {
+        NON_EXPERT + reserve + layers as u64 * layer_bytes(config) + layer_bytes(config) / 2
+    }
+
+    struct Mock {
+        mem_available: Option<u64>,
+        gtt: Option<residency::GttBudget>,
+        emu_fails: bool,
+    }
+
+    fn roomy() -> Mock {
+        Mock {
+            mem_available: Some(512 * GIB),
+            gtt: None,
+            emu_fails: false,
+        }
+    }
+
+    fn admitted() -> Qwen4EpReserveAdmission<'static> {
+        Qwen4EpReserveAdmission {
+            arch: "gfx1201",
+            uma: false,
+            flash_next: true,
+            packed_recipe: true,
+            slab_recipe: false,
+            expert_bytes_match: true,
+            ranks: 2,
+            scratch_mode: Mode::Full,
+            prompt_rows: 4096,
+            explicit_chunk: false,
+            owner_routed_prefill: true,
+            stage_min_rows: Some(2048),
+            lane_request: false,
+            continuous_batch: false,
+            npu: false,
+            dflash: false,
+            pipeline_parallel: false,
+        }
+    }
+
+    fn split_with(
+        config: &Qwen4Config,
+        free: &[u64],
+        admission: Result<(), String>,
+        tables: u64,
+        mock: &Mock,
+        ordinary_reserve: u64,
+    ) -> Result<Qwen4EpVramSplit, String> {
+        split_with_mode(
+            config,
+            free,
+            admission,
+            tables,
+            mock,
+            ordinary_reserve,
+            true,
+        )
+    }
+
+    fn split_with_mode(
+        config: &Qwen4Config,
+        free: &[u64],
+        admission: Result<(), String>,
+        tables: u64,
+        mock: &Mock,
+        ordinary_reserve: u64,
+        forced: bool,
+    ) -> Result<Qwen4EpVramSplit, String> {
+        let layer = layer_bytes(config);
+        let decoupled = |forward: &ep::EpReserveForwardPlan| -> Result<u64, String> {
+            Ok(BASE_RESERVE + forward.charged_forward_bytes().unwrap())
+        };
+        let hosts = |layers: usize| -> Result<u64, String> { Ok((49 - layers) as u64 * layer * 2) };
+        let emu = |_: u64| -> Result<(), String> {
+            if mock.emu_fails {
+                Err("emulated host ledger is full".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let attempt = Qwen4EpReserveAttempt {
+            forced,
+            admission,
+            fixed_table_bytes: tables,
+            decoupled_reserve: &decoupled,
+            host: Qwen4EpReserveHost {
+                mem_available: mock.mem_available,
+                ttm_pool: 0,
+                gtt: mock.gtt,
+                host_expert_bytes: &hosts,
+                emu_check: &emu,
+            },
+        };
+        qwen4_ep_vram_split(
+            config,
+            free,
+            NON_EXPERT,
+            layer,
+            ordinary_reserve,
+            None,
+            Some(&attempt),
+        )
+    }
+
+    /// A plan with exactly 33 resident layers on both ranks.
+    fn plan33() -> (Qwen4Config, std::sync::Arc<ep::EpReservePlan>, u64, u64) {
+        let config = config();
+        let reserve = reserve_of(&config, TABLES);
+        let free = free_for(&config, 33, reserve);
+        let split = split_with(
+            &config,
+            &[free, free],
+            Ok(()),
+            TABLES,
+            &roomy(),
+            reserve + 10 * GIB,
+        )
+        .expect("33 layers fit");
+        let plan = split.reserve.expect("a frozen plan");
+        (config, plan, reserve, free)
+    }
+
+    #[test]
+    fn planner_rank_check_and_fit_line_share_one_reserve() {
+        let (config, plan, reserve, free) = plan33();
+        let layer = layer_bytes(&config);
+        // The planner: 33 resident layers at the 4096-row chunk, never lowered.
+        assert_eq!(plan.resident_layers, 33);
+        assert_eq!(plan.forward.prompt_rows, 4096);
+        assert_eq!(plan.forward.resident_rows, 512);
+        assert_eq!(plan.reserve_bytes, reserve);
+        assert_eq!(
+            plan.forward.charged_forward_bytes().unwrap(),
+            forward(&config, TABLES).charged_forward_bytes().unwrap()
+        );
+        // The rank check: the agreed split equals the plan's and the rank's own
+        // reserve (the same term) keeps it.
+        qwen4_ep_reserve_rank_terms(&plan, plan.resident_layers, reserve).unwrap();
+        assert_eq!(
+            residency::ep_rank_layers(&config, free, NON_EXPERT, layer, reserve),
+            plan.resident_layers
+        );
+        // The fit line: the same reserve, the same split, on either rank.
+        for rank in 0..2 {
+            let line = residency::ep_fit_rank_line(
+                &config,
+                rank,
+                2,
+                free,
+                NON_EXPERT,
+                layer,
+                reserve,
+                plan.resident_layers,
+            );
+            assert!(line.contains("resident expert layers 33 of 49"), "{line}");
+            assert!(line.contains("this rank alone fits 33"), "{line}");
+            assert!(
+                line.contains(&format!("reserve {:.2} GiB", reserve as f64 / GIB as f64)),
+                "{line}"
+            );
+        }
+        // The ordinary reserve is larger, so the ordinary split is smaller:
+        // the decoupled terms are not the ordinary ones.
+        assert!(
+            residency::ep_vram_layers(
+                &config,
+                &[free, free],
+                NON_EXPERT,
+                layer,
+                reserve + 10 * GIB
+            ) < 33
+        );
+    }
+
+    #[test]
+    fn off_is_the_ordinary_split_with_no_plan_and_no_note() {
+        let config = config();
+        let layer = layer_bytes(&config);
+        let ordinary_reserve = reserve_of(&config, TABLES) + 10 * GIB;
+        let free = free_for(&config, 33, reserve_of(&config, TABLES));
+        let baseline = residency::ep_vram_plan(
+            &config,
+            &[free, free],
+            NON_EXPERT,
+            layer,
+            ordinary_reserve,
+            None,
+        );
+        let split = qwen4_ep_vram_split(
+            &config,
+            &[free, free],
+            NON_EXPERT,
+            layer,
+            ordinary_reserve,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(split.vram, baseline);
+        assert!(split.reserve.is_none() && split.reserve_note.is_none());
+        // Host charge and placement-forward term off: exactly the ordinary fold.
+        assert_eq!(qwen4_ep_host_check_bytes(&[7, 11, 13], 1, 0), 24);
+    }
+
+    #[test]
+    fn refused_admission_keeps_the_ordinary_reserve_and_never_a_smaller_one() {
+        let config = config();
+        let layer = layer_bytes(&config);
+        let ordinary_reserve = reserve_of(&config, TABLES) + 10 * GIB;
+        let free = free_for(&config, 33, reserve_of(&config, TABLES));
+        let baseline = residency::ep_vram_plan(
+            &config,
+            &[free, free],
+            NON_EXPERT,
+            layer,
+            ordinary_reserve,
+            None,
+        );
+        let unreachable = |_: &ep::EpReserveForwardPlan| -> Result<u64, String> {
+            panic!("a refused admission never charges the decoupled reserve")
+        };
+        let hosts = |_: usize| -> Result<u64, String> { panic!("no host census") };
+        let emu = |_: u64| -> Result<(), String> { panic!("no emulated host check") };
+        let mut input = admitted();
+        input.explicit_chunk = true;
+        let admission = qwen4_ep_reserve_admission(&input);
+        assert!(admission.is_err());
+        let attempt = Qwen4EpReserveAttempt {
+            forced: true,
+            admission,
+            fixed_table_bytes: TABLES,
+            decoupled_reserve: &unreachable,
+            host: Qwen4EpReserveHost {
+                mem_available: Some(512 * GIB),
+                ttm_pool: 0,
+                gtt: None,
+                host_expert_bytes: &hosts,
+                emu_check: &emu,
+            },
+        };
+        let split = qwen4_ep_vram_split(
+            &config,
+            &[free, free],
+            NON_EXPERT,
+            layer,
+            ordinary_reserve,
+            None,
+            Some(&attempt),
+        )
+        .unwrap();
+        assert_eq!(split.vram, baseline);
+        assert!(split.vram.layers < 33, "{}", split.vram.layers);
+        assert!(split.reserve.is_none());
+        let note = split.reserve_note.expect("the refusal is logged");
+        assert!(note.contains("ordinary placement and reserve"), "{note}");
+    }
+
+    #[test]
+    fn unsupported_modes_are_refused_before_a_plan_exists() {
+        assert_eq!(qwen4_ep_reserve_admission(&admitted()), Ok(()));
+        let cases: Vec<(&str, Box<dyn Fn(&mut Qwen4EpReserveAdmission<'static>)>)> = vec![
+            ("explicit chunk", Box::new(|i| i.explicit_chunk = true)),
+            ("1024-row chunk", Box::new(|i| i.prompt_rows = 1024)),
+            ("gfx1100", Box::new(|i| i.arch = "gfx1100")),
+            ("uma", Box::new(|i| i.uma = true)),
+            ("profile", Box::new(|i| i.flash_next = false)),
+            ("expert bytes", Box::new(|i| i.expert_bytes_match = false)),
+            ("not packed", Box::new(|i| i.packed_recipe = false)),
+            ("slab", Box::new(|i| i.slab_recipe = true)),
+            ("ranks 4", Box::new(|i| i.ranks = 4)),
+            ("ranks 1", Box::new(|i| i.ranks = 1)),
+            ("mode", Box::new(|i| i.scratch_mode = Mode::FnSymGfx1201)),
+            (
+                "owner-routed prefill off",
+                Box::new(|i| i.owner_routed_prefill = false),
+            ),
+            (
+                "stage on resident calls",
+                Box::new(|i| i.stage_min_rows = Some(512)),
+            ),
+            ("lanes", Box::new(|i| i.lane_request = true)),
+            ("continuous batch", Box::new(|i| i.continuous_batch = true)),
+            ("npu", Box::new(|i| i.npu = true)),
+            ("dflash", Box::new(|i| i.dflash = true)),
+            ("pp", Box::new(|i| i.pipeline_parallel = true)),
+        ];
+        for (name, mutate) in cases {
+            let mut input = admitted();
+            mutate(&mut input);
+            assert!(
+                qwen4_ep_reserve_admission(&input).is_err(),
+                "{name} must keep the ordinary path"
+            );
+        }
+        // Stage off is an admitted choice, not a refusal.
+        let mut input = admitted();
+        input.stage_min_rows = None;
+        assert_eq!(qwen4_ep_reserve_admission(&input), Ok(()));
+    }
+
+    #[test]
+    fn smallest_rank_sets_the_split_and_insufficient_memory_refuses() {
+        let config = config();
+        let reserve = reserve_of(&config, TABLES);
+        let roomy_rank = free_for(&config, 36, reserve);
+        let tight_rank = free_for(&config, 33, reserve);
+        let split = split_with(
+            &config,
+            &[roomy_rank, tight_rank],
+            Ok(()),
+            TABLES,
+            &roomy(),
+            reserve,
+        )
+        .unwrap();
+        assert_eq!(split.reserve.unwrap().resident_layers, 33);
+        // The smallest rank cannot reach the minimum: refuse, naming the count.
+        let starved = free_for(&config, 30, reserve);
+        let error = match split_with(
+            &config,
+            &[roomy_rank, starved],
+            Ok(()),
+            TABLES,
+            &roomy(),
+            reserve,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("30 resident layers must refuse"),
+        };
+        assert!(
+            error.contains("only 30") && error.contains("minimum 33"),
+            "{error}"
+        );
+        assert!(error.contains(ep::EP_RESERVE_DECOUPLE_ENV), "{error}");
+    }
+
+    #[test]
+    fn default_route_keeps_the_ordinary_placement_where_forced_refuses() {
+        let config = config();
+        let reserve = reserve_of(&config, TABLES);
+        let starved = free_for(&config, 30, reserve);
+        let free = [free_for(&config, 36, reserve), starved];
+        assert!(split_with_mode(&config, &free, Ok(()), TABLES, &roomy(), reserve, true).is_err());
+        let split = split_with_mode(&config, &free, Ok(()), TABLES, &roomy(), reserve, false)
+            .expect("the default route falls back, it does not fail the load");
+        assert!(split.reserve.is_none());
+        let note = split.reserve_note.expect("the fallback is noted");
+        assert!(
+            note.contains("not applied") && note.contains("minimum 33"),
+            "{note}"
+        );
+        // An admitted, fitting load still takes the plan under the default route.
+        let fit = [
+            free_for(&config, 36, reserve),
+            free_for(&config, 33, reserve),
+        ];
+        let split =
+            split_with_mode(&config, &fit, Ok(()), TABLES, &roomy(), reserve, false).unwrap();
+        assert_eq!(split.reserve.expect("plan").resident_layers, 33);
+    }
+
+    #[test]
+    fn metadata_floor_refuses_when_the_tables_cost_the_minimum() {
+        let config = config();
+        let free = free_for(&config, 33, reserve_of(&config, TABLES));
+        assert!(split_with(&config, &[free, free], Ok(()), TABLES, &roomy(), 0).is_ok());
+        // Metadata that costs a whole resident layer and more refuses: the
+        // table charge is in the reserve every reader shares.
+        let error = match split_with(&config, &[free, free], Ok(()), 3 * GIB, &roomy(), 0) {
+            Err(error) => error,
+            Ok(_) => panic!("the metadata floor must refuse"),
+        };
+        assert!(error.contains("minimum 33"), "{error}");
+    }
+
+    #[test]
+    fn host_gtt_and_emulated_host_failures_refuse_before_publication() {
+        let config = config();
+        let layer = layer_bytes(&config);
+        let reserve = reserve_of(&config, TABLES);
+        let free = free_for(&config, 33, reserve);
+        let run = |mock: &Mock| split_with(&config, &[free, free], Ok(()), TABLES, mock, reserve);
+        // Roomy: the plan applies (7 donor layers, 33 resident).
+        let plan = run(&roomy()).unwrap().reserve.unwrap();
+        assert_eq!(plan.donor_layers.len(), 7);
+        let host_experts = (49 - 33) as u64 * layer * 2;
+        // Aggregate over ranks: the allowance leaves room for ONE rank's
+        // mirrors (7 layers) but not both ranks' (14 layers).
+        let one_rank_only = Mock {
+            mem_available: Some(residency::HOST_RAM_HEADROOM_BYTES + host_experts + 10 * layer),
+            gtt: None,
+            emu_fails: false,
+        };
+        let error = match run(&one_rank_only) {
+            Err(error) => error,
+            Ok(_) => panic!("the aggregate mirror charge must refuse"),
+        };
+        assert!(error.contains("scratch-donor mirrors need"), "{error}");
+        // The planner's allowance passes by the raw mirror bytes but the pads
+        // of the real allocations refuse in the exact aggregate check.
+        let pads_only = Mock {
+            mem_available: Some(residency::HOST_RAM_HEADROOM_BYTES + host_experts + 14 * layer),
+            gtt: None,
+            emu_fails: false,
+        };
+        let error = match run(&pads_only) {
+            Err(error) => error,
+            Ok(_) => panic!("the pads must refuse"),
+        };
+        assert!(error.contains("aggregate pinned host memory"), "{error}");
+        // Unreadable MemAvailable cannot admit a pinned charge.
+        let unreadable = Mock {
+            mem_available: None,
+            gtt: None,
+            emu_fails: false,
+        };
+        let error = match run(&unreadable) {
+            Err(error) => error,
+            Ok(_) => panic!("unreadable MemAvailable must refuse"),
+        };
+        assert!(error.contains("MemAvailable"), "{error}");
+        // GTT cap: little room beside what amdgpu already holds.
+        let gtt = Mock {
+            mem_available: Some(512 * GIB),
+            gtt: Some(residency::GttBudget {
+                limit_bytes: 100 * GIB,
+                used_bytes: 95 * GIB,
+            }),
+            emu_fails: false,
+        };
+        assert!(run(&gtt).is_err());
+        // Emulated host ledger.
+        let emu = Mock {
+            mem_available: Some(512 * GIB),
+            gtt: None,
+            emu_fails: true,
+        };
+        let error = match run(&emu) {
+            Err(error) => error,
+            Ok(_) => panic!("the emulated host ledger must refuse"),
+        };
+        assert!(error.contains("emulated host ledger"), "{error}");
+    }
+
+    #[test]
+    fn a_load_that_fits_every_trunk_layer_keeps_the_ordinary_path() {
+        let config = config();
+        let layer = layer_bytes(&config);
+        let reserve = reserve_of(&config, TABLES);
+        let free = free_for(&config, 49, reserve);
+        let ordinary_reserve = reserve + 10 * GIB;
+        let baseline = residency::ep_vram_plan(
+            &config,
+            &[free, free],
+            NON_EXPERT,
+            layer,
+            ordinary_reserve,
+            None,
+        );
+        let split = split_with(
+            &config,
+            &[free, free],
+            Ok(()),
+            TABLES,
+            &roomy(),
+            ordinary_reserve,
+        )
+        .unwrap();
+        assert!(split.reserve.is_none());
+        assert_eq!(split.vram, baseline);
+        assert!(split.reserve_note.unwrap().contains("nothing to decouple"));
+    }
+
+    #[test]
+    fn a_rank_load_is_exactly_the_load_the_plan_froze() {
+        let (_, plan, reserve, _) = plan33();
+        qwen4_ep_reserve_rank_terms(&plan, 33, reserve).unwrap();
+        // A rank whose own census is smaller is still inside the plan.
+        qwen4_ep_reserve_rank_terms(&plan, 33, reserve - MIB).unwrap();
+        assert!(qwen4_ep_reserve_rank_terms(&plan, 32, reserve).is_err());
+        assert!(qwen4_ep_reserve_rank_terms(&plan, 34, reserve).is_err());
+        assert!(qwen4_ep_reserve_rank_terms(&plan, 33, reserve + 1).is_err());
+        let ok = |ep_rank, band, mode, chunk, agreed| {
+            qwen4_ep_reserve_rank_match(&plan, ep_rank, band, mode, chunk, agreed)
+        };
+        assert_eq!(ok(true, false, Mode::Full, 4096, Some(33)), Ok(()));
+        // The second phase can never continue ordinary or at another chunk.
+        for result in [
+            ok(false, false, Mode::Full, 4096, Some(33)),
+            ok(true, true, Mode::Full, 4096, Some(33)),
+            ok(true, false, Mode::FnSymGfx1201, 4096, Some(33)),
+            ok(true, false, Mode::Full, 1024, Some(33)),
+            ok(true, false, Mode::Full, 4096, None),
+            ok(true, false, Mode::Full, 4096, Some(34)),
+        ] {
+            let error = result.expect_err("a mismatched rank load refuses");
+            assert!(
+                error.contains("cannot fall back to the ordinary load"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_mirrors_aggregate_across_the_ranks_that_have_not_pinned() {
+        let (_, plan, _, _) = plan33();
+        let per_rank = qwen4_ep_reserve_mirror_host_bytes(&plan);
+        // Gate/up and down are separate pinned allocations: two pads a layer.
+        assert_eq!(
+            per_rank,
+            plan.mirror_bytes_per_rank
+                + plan.donor_layers.len() as u64 * 2 * residency::HOST_MAPPED_PAD_BYTES
+        );
+        // Rank 0 charges both ranks' mirrors, rank 1 only its own.
+        let experts = [100u64, 200];
+        assert_eq!(
+            qwen4_ep_host_check_bytes(&experts, 0, per_rank),
+            300 + 2 * per_rank
+        );
+        assert_eq!(
+            qwen4_ep_host_check_bytes(&experts, 1, per_rank),
+            200 + per_rank
+        );
+        assert_eq!(plan.mirror_bytes_total, plan.mirror_bytes_per_rank * 2);
+    }
+}
+
+#[cfg(test)]
+mod raon_carrier_tests {
+    use super::RaonCarrier;
+    use crate::Carrier;
+
+    #[test]
+    fn spec_target_guard_refuses_a_state_that_is_not_a_raon_bundle() {
+        let mut empty: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>> = None;
+        let error = RaonCarrier
+            .spec_target_guard(&mut empty, "raon.hfq")
+            .err()
+            .expect("an empty state is not a Raon bundle");
+        assert!(error.contains("raon1_mini"), "{error}");
+    }
+
+    /// DFlash2 is carried by the speculator (route `RaonSpec` reads
+    /// `speculator_is_dflash2`), not by a legacy Qwen/Llama DFlash kind, and
+    /// Raon never batches.
+    #[test]
+    fn caps_declare_no_legacy_dflash_kind_and_no_batching() {
+        let caps = RaonCarrier.caps();
+        assert!(caps.dflash.is_none());
+        assert!(!caps.supports_continuous_batch);
+        assert!(!caps.supports_mtp);
+        assert_eq!(caps.semantic_contract_version, Some(2));
     }
 }

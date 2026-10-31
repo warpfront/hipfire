@@ -144,6 +144,16 @@ impl RaonMhcWork {
         })
     }
 
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows (pool allocations
+    /// are exact, minimum 256 B each).
+    pub fn required_bytes(shape: &RaonMhcShape, max_rows: usize) -> usize {
+        let (n, z) = (shape.streams, shape.selector_rows());
+        [max_rows * z, max_rows * n, max_rows * n, max_rows * n * n]
+            .into_iter()
+            .map(|elems| (elems * 4).max(256))
+            .sum()
+    }
+
     pub fn max_rows(&self) -> usize {
         self.max_rows
     }

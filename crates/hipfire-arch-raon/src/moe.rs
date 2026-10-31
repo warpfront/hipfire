@@ -256,6 +256,46 @@ fn alloc_words(gpu: &mut Gpu, words: usize) -> Result<GpuTensor, String> {
         .map_err(|e| format!("raon moe scratch alloc: {e}"))
 }
 
+/// Bytes of one `alloc_words` tensor (exact size, 256 B minimum).
+fn word_bytes(words: usize) -> usize {
+    (words.max(1) * 4).max(256)
+}
+
+impl RaonMoeScratch {
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows.
+    pub fn required_bytes(dims: &RaonMoeDims, max_rows: usize) -> Result<usize, String> {
+        dims.validate()?;
+        let p = GroupedMoeScratchPlan::for_rows(&dims.geometry(), max_rows.max(1))
+            .map_err(|e| e.to_string())?;
+        Ok([
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.x_rot,
+            p.act,
+            p.rot,
+            p.down_rows,
+            p.indexed_gate,
+            p.indexed_up,
+            p.gate_up_rows,
+            p.expert_token_counts,
+            p.expert_offsets,
+            p.sorted_slot_index,
+            p.expert_tile_ids,
+            p.inverse_perm,
+            p.shared_gate,
+            p.shared_up,
+            p.shared_act,
+            p.shared_rot,
+            p.shared_out,
+            p.shared_tables,
+        ]
+        .into_iter()
+        .map(word_bytes)
+        .sum())
+    }
+}
+
 impl RaonMoeScratch {
     pub fn new(gpu: &mut Gpu, dims: &RaonMoeDims, max_rows: usize) -> Result<Self, String> {
         dims.validate()?;
@@ -363,6 +403,23 @@ pub struct RaonDenseScratch {
 }
 
 impl RaonDenseScratch {
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows.
+    pub fn required_bytes(dims: &RaonMoeDims, max_rows: usize) -> Result<usize, String> {
+        dims.validate()?;
+        let rows = max_rows.max(1);
+        Ok([
+            rows * dims.hidden,
+            rows * dims.dense_mi,
+            rows * dims.dense_mi,
+            rows * dims.dense_mi,
+            rows * dims.dense_mi,
+            single_expert_table_words(rows),
+        ]
+        .into_iter()
+        .map(word_bytes)
+        .sum())
+    }
+
     pub fn new(gpu: &mut Gpu, dims: &RaonMoeDims, max_rows: usize) -> Result<Self, String> {
         dims.validate()?;
         let rows = max_rows.max(1);

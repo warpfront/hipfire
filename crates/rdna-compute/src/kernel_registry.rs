@@ -8036,6 +8036,7 @@ fn walked_arch_images(arch: &str) -> &'static [&'static [u8]] {
             kernels::EP_TILE_MASK_PM_GFX1201,
             kernels::EP_TILE_PULL_PM_GFX1201,
             kernels::EP_TILE_PULL_N8_PM_GFX1201,
+            kernels::GATED_DELTA_VECTOR_PM_GFX1201,
         ],
         _ => &[],
     }

@@ -318,6 +318,18 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             },
         ),
         (
+            // Raon with the shared DFlash2 drafter loaded: a greedy request
+            // takes the spec route (an unrelated speculator would not).
+            GenerationRoute::RaonSpec,
+            GenerationRouteInputs {
+                arch_id: 19,
+                has_speculator: true,
+                speculator_is_dflash2: true,
+                temp: 0.0,
+                ..base()
+            },
+        ),
+        (
             GenerationRoute::Unknown,
             GenerationRouteInputs {
                 arch_id: 99,
@@ -356,6 +368,9 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // producer: XML `<tool_call><function=..>` through the strict
     // `ToolOutputRouter`, semantic contract v2 via the carrier caps.
     GenerationRoute::RaonAr,
+    // Arch 19 with the shared DFlash2 drafter: the same router over committed
+    // tokens (`Qwen35Emit` via the Raon carrier, grammar off).
+    GenerationRoute::RaonSpec,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -1182,7 +1197,7 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 12);
+    assert_eq!(from_all.len(), 13);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
@@ -1244,7 +1259,8 @@ fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
             "qwen4_spec",
             "qwen_ar",
             "qwen_dflash",
-            "raon_ar"
+            "raon_ar",
+            "raon_spec"
         ]
     );
     // Both Qwen4 routes a Flash-Next load can select carry tools AND stop, so

@@ -2091,6 +2091,9 @@ pub struct AutoReserve {
     /// of resident VRAM (their census terms are not charged); 0 when the
     /// shadows stay resident ([`DecodeShareForward::shadows_borrowed`]).
     pub decode_share_shadows: u64,
+    /// `Some(bytes)` when an EP reserve-decoupled load charged its dedicated
+    /// forward (`bytes` includes the fixed table charges); `None` otherwise.
+    pub ep_reserve_forward: Option<u64>,
 }
 
 impl AutoReserve {
@@ -2102,6 +2105,7 @@ impl AutoReserve {
             census_total,
             decode_share_borrowed: None,
             decode_share_shadows: 0,
+            ep_reserve_forward: None,
         })
     }
 
@@ -2119,9 +2123,23 @@ impl AutoReserve {
         self
     }
 
+    /// Mark the forward term as the EP reserve-decoupled dedicated charge
+    /// ([`crate::ep_reserve::EpReserveForwardPlan::charged_forward_bytes`]).
+    /// Distinct from decode-share: no donor tail, no tier lease.
+    pub fn with_ep_reserve(mut self, charged_forward: u64) -> Self {
+        self.ep_reserve_forward = Some(charged_forward);
+        self
+    }
+
     /// The census with its `forward` term annotated when decode-share charged
     /// the dedicated forward.
     fn census_text(&self) -> String {
+        if let Some(charged) = self.ep_reserve_forward {
+            return self.census.describe_with(Some(&format!(
+                "EP reserve-decoupled dedicated forward; {} MiB charged",
+                charged >> 20
+            )));
+        }
         match self.decode_share_borrowed {
             Some(borrowed) => {
                 let shadows = if self.decode_share_shadows == 0 {
@@ -3770,11 +3788,74 @@ pub struct DecodeShareForward {
     pub shadows_borrowed: u64,
 }
 
+/// What replaces the ordinary `qwen4_forward_device_bytes` forward term of the
+/// reserve (historical floor AND bottom-up census) of one load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardCharge {
+    Ordinary,
+    DecodeShare(DecodeShareForward),
+    /// EP reserve decoupling: `charged` is
+    /// [`crate::ep_reserve::EpReserveForwardPlan::charged_forward_bytes`].
+    EpReserve {
+        charged: u64,
+    },
+}
+
+impl ForwardCharge {
+    fn forward_override(self) -> Option<u64> {
+        match self {
+            Self::Ordinary => None,
+            Self::DecodeShare(share) => Some(share.dedicated),
+            Self::EpReserve { charged } => Some(charged),
+        }
+    }
+
+    /// Weight-shadow bytes lent to a donor tail; EP reserve sharing never
+    /// borrows shadows (`shadows_borrowed = 0`).
+    fn shadows_borrowed(self) -> u64 {
+        match self {
+            Self::DecodeShare(share) => share.shadows_borrowed,
+            Self::Ordinary | Self::EpReserve { .. } => 0,
+        }
+    }
+}
+
 /// [`placement_inputs`] charging `share` as the forward term (`None` is
 /// byte-identical to [`placement_inputs`]).
 pub fn placement_inputs_with_forward(
     args: &PlacementInputsArgs<'_>,
     share: Option<DecodeShareForward>,
+) -> Result<PlacementInputs, String> {
+    placement_inputs_charged(
+        args,
+        share.map_or(ForwardCharge::Ordinary, ForwardCharge::DecodeShare),
+    )
+}
+
+/// [`placement_inputs`] charging an EP reserve-decoupled load's dedicated
+/// forward ([`crate::ep_reserve::EpReserveForwardPlan`]) in BOTH the historical
+/// floor and the census; every other term (context, MTP, shadows, workspace,
+/// gather, runtime) is the ordinary 4096-row-chunk charge. `args.chunk_rows`
+/// MUST be the plan's prompt rows: the reserve never shrinks the chunk.
+pub fn placement_inputs_with_ep_reserve(
+    args: &PlacementInputsArgs<'_>,
+    plan: &crate::ep_reserve::EpReserveForwardPlan,
+) -> Result<PlacementInputs, String> {
+    if args.chunk_rows != plan.prompt_rows || args.scratch_mode != plan.mode {
+        return Err(format!(
+            "qwen4: EP reserve plan is for {} rows in {:?} mode, not {} rows in {:?} mode",
+            plan.prompt_rows, plan.mode, args.chunk_rows, args.scratch_mode
+        ));
+    }
+    let charged = plan
+        .charged_forward_bytes()
+        .map_err(|error| format!("qwen4: {error}"))?;
+    placement_inputs_charged(args, ForwardCharge::EpReserve { charged })
+}
+
+fn placement_inputs_charged(
+    args: &PlacementInputsArgs<'_>,
+    charge: ForwardCharge,
 ) -> Result<PlacementInputs, String> {
     let PlacementInputsArgs {
         gpu,
@@ -3868,7 +3949,7 @@ pub fn placement_inputs_with_forward(
                 state_format.layout(),
                 mtp_bytes,
                 gather_bytes,
-                share.map(|share| share.dedicated),
+                charge.forward_override(),
             )
             .map_err(|error| format!("qwen4: {error}"))?,
         )
@@ -3880,7 +3961,7 @@ pub fn placement_inputs_with_forward(
         &census_context,
         chunk_rows,
         scratch_mode,
-        share.map(|share| share.dedicated),
+        charge.forward_override(),
     )
     .map_err(|error| format!("qwen4: {error}"))?;
     // Lazy BF16 -> F16 weight shadows of the owners the long-prefill F16 WMMA
@@ -3910,7 +3991,7 @@ pub fn placement_inputs_with_forward(
     // ([`DecodeShareForward::shadows_borrowed`]) never holds them resident:
     // they are rebuilt into the donor tail per borrow epoch, so neither term
     // is charged (the hot budget grows by that much).
-    let shadows_borrowed = share.map_or(0, |share| share.shadows_borrowed);
+    let shadows_borrowed = charge.shadows_borrowed();
     let (f16_shadows, shared_i8_shadows) =
         census_shadow_terms(f16_shadows, shared_i8_shadows, shadows_borrowed);
     // The kernels' pool workspaces at the largest requested chunk, exactly
@@ -3973,11 +4054,12 @@ pub fn placement_inputs_with_forward(
     };
     let reserve =
         AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
-    let reserve = match share {
-        Some(share) => reserve
+    let reserve = match charge {
+        ForwardCharge::Ordinary => reserve,
+        ForwardCharge::DecodeShare(share) => reserve
             .with_decode_share(share.borrowed)
             .with_decode_share_shadows(share.shadows_borrowed),
-        None => reserve,
+        ForwardCharge::EpReserve { charged } => reserve.with_ep_reserve(charged),
     };
     Ok(PlacementInputs {
         non_expert,

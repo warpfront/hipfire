@@ -522,7 +522,9 @@ pub struct Qwen4SpecScratch {
 }
 
 /// [`SpecTarget::spec_advance`] on one rank inside an EP fan-out (mesh
-/// detached, never aborting): the final row's argmax.
+/// detached, never aborting): the final row's argmax. This rank's prompt
+/// nesting spans the whole advance, so a borrowed EP reserve restores once, at
+/// its completion, on every rank (`spec_advance_from` nests inside).
 fn replica_spec_advance(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -530,10 +532,57 @@ fn replica_spec_advance(
     start_pos: usize,
     reset: bool,
 ) -> Result<u32, String> {
-    match bundle.spec_advance(gpu, tokens, start_pos, reset, &|| false, None)? {
-        SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
-        SpecAdvance::Aborted => Err("Qwen4 spec_advance aborted inside an EP fan-out".to_string()),
-    }
+    crate::ep::bracket_prompt(
+        (bundle, gpu),
+        |(bundle, _)| bundle.share_prompt_begin(),
+        |(bundle, gpu)| match bundle.spec_advance(gpu, tokens, start_pos, reset, &|| false, None)? {
+            SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
+            SpecAdvance::Aborted => {
+                Err("Qwen4 spec_advance aborted inside an EP fan-out".to_string())
+            }
+        },
+        |(bundle, gpu), ok| {
+            bundle
+                .share_prompt_end(gpu, ok)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+/// [`MtpDrafter::mtp_prefill`] on one rank inside an EP fan-out: the native-MTP
+/// fill is one whole-prompt entry on this rank, so the borrowed reserve is
+/// restored once, at its completion, after the last head continuation consumed
+/// the wide capture (`mtp_prefill_ops` nests inside).
+#[allow(clippy::too_many_arguments)]
+fn replica_mtp_prefill(
+    drafter: &mut Qwen4MtpDrafter,
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    prompt_tokens: &[u32],
+    fill_tokens: &[u32],
+    start_pos: usize,
+    cache_hit: bool,
+) -> Result<PrefillOutcome, String> {
+    crate::ep::bracket_prompt(
+        (drafter, (bundle, gpu)),
+        |(_, (bundle, _))| bundle.share_prompt_begin_mtp_fill(),
+        |(drafter, (bundle, gpu))| {
+            drafter.mtp_prefill(
+                &mut **gpu,
+                &mut **bundle,
+                prompt_tokens,
+                fill_tokens,
+                start_pos,
+                cache_hit,
+                &|| false,
+            )
+        },
+        |(_, (bundle, gpu)), ok| {
+            bundle
+                .share_prompt_end(gpu, ok)
+                .map_err(|error| error.to_string())
+        },
+    )
 }
 
 impl SpecScratch for Qwen4SpecScratch {
@@ -9198,12 +9247,22 @@ impl Qwen4MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
-        // The whole prompt is one decode-share prompt: the donor tail is
-        // restored once, after its last tile (`share_finish_prompt`). A mesh
-        // never takes decode-share.
+        // The whole prompt is one decode-share / EP-reserve prompt: the donor
+        // tail is restored once, after its last tile (`share_finish_prompt`).
+        // `!ops.is_mesh()` names the single-context route; it does not exclude
+        // per-rank EP execution (each EP rank runs this body on a `Single` context
+        // inside the fan-out). A PP mesh never takes decode-share or the EP
+        // reserve, and fails closed if one is somehow loaded.
         let single = !ops.is_mesh();
+        if !single && Self::bundle(target)?.ep_reserve_active() {
+            return Err(
+                "Qwen4 native-MTP prefill over a PP mesh cannot run on an EP \
+                        reserve-sharing load"
+                    .to_string(),
+            );
+        }
         if single {
-            Self::bundle(target)?.share_prompt_begin();
+            Self::bundle(target)?.share_prompt_begin_mtp_fill();
         }
         let result =
             self.mtp_prefill_tiles(ops, target, prompt_tokens, start_pos, cache_hit, abort);
@@ -9964,31 +10023,31 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 target.reset_recurrent(gpu)?;
                 return Ok(PrefillOutcome::Aborted);
             }
-            let never = || false;
+            // Inside the fan-out every rank runs never-abort (`replica_mtp_prefill`).
             return Self::bundle(target)?.ep_drafter_fanout(
                 "mtp_prefill",
                 gpu,
                 self,
                 |drafter, bundle, gpu| {
-                    drafter.mtp_prefill(
-                        gpu,
+                    replica_mtp_prefill(
+                        drafter,
                         bundle,
+                        gpu,
                         prompt_tokens,
                         fill_tokens,
                         start_pos,
                         cache_hit,
-                        &never,
                     )
                 },
                 &|drafter, bundle, gpu| {
-                    drafter.mtp_prefill(
-                        gpu,
+                    replica_mtp_prefill(
+                        drafter,
                         bundle,
+                        gpu,
                         prompt_tokens,
                         fill_tokens,
                         start_pos,
                         cache_hit,
-                        &never,
                     )
                 },
             );

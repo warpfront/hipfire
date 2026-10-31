@@ -15,7 +15,10 @@ pub mod moe;
 pub mod prefill;
 pub mod projection;
 pub mod rda;
+pub mod rollback;
+pub mod spec_impl;
 pub mod state;
+mod verify_graph;
 pub mod weights;
 
 /// Architecture id for Raon-1-mini.
@@ -25,10 +28,12 @@ pub use bundle::{DecodeMode, PrefillMode, RaonBundle, PREFILL_SCRATCH_ROWS};
 pub use carrier::load_raon_bundle;
 pub use config::{FfnKind, GenerationDefaults, LayerKind, RaonConfig};
 pub use forward::{
-    forward_rows, forward_rows_tapped, forward_token, forward_token_tapped, readout_logits,
-    LayerTap, RaonWork, TapSite,
+    forward_rows, forward_rows_captured, forward_rows_tapped, forward_token, forward_token_tapped,
+    readout_logits, validate_extract_layers, DflashCapture, LayerTap, RaonWork, TapSite,
 };
 pub use projection::{project, project_row, project_rows, round_bf16_rows, OutRound};
+pub use rollback::{RollbackMode, ROLLBACK_ENV};
+pub use spec_impl::RaonSpecScratch;
 pub use weights::{
     check_inventory, load_raon_weights, tensor_inventory, ExpertWeights, GatedFfnWeights,
     MhcSiteWeights, MlaWeights, MoeFfnWeights, RaonFfn, RaonLayerWeights, RaonMixer, RaonWeights,

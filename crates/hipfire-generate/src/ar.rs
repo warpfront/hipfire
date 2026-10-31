@@ -852,6 +852,7 @@ pub enum GenerationRoute {
     LfmAr,
     LfmSpec,
     RaonAr,
+    RaonSpec,
     LlamaAr,
     LlamaSpec,
     GlimmerAr,
@@ -884,6 +885,7 @@ impl GenerationRoute {
         Self::LfmAr,
         Self::LfmSpec,
         Self::RaonAr,
+        Self::RaonSpec,
         Self::LlamaAr,
         Self::LlamaSpec,
         Self::GlimmerAr,
@@ -896,7 +898,10 @@ impl GenerationRoute {
     /// Proven semantic-safe producers for non-empty tools.
     /// Exactly: Qwen AR, Qwen4 AR, Qwen4 native MTP, Qwen DFlash/spec, DS4 AR,
     /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR, Gemma 4, Raon AR
-    /// (`generate_raon`: shared `QwenArSemanticProducer` XML tool router).
+    /// and Raon spec (`generate_raon` / `generate_raon_spec`: the shared
+    /// `QwenArSemanticProducer` XML tool router, and the same router over the
+    /// committed tokens of the DFlash2 spec loop through the Raon carrier's
+    /// `SpecEmit`, tool-call grammar off).
     ///
     /// `Qwen4Spec` runs the same `<tool_call>` router (`Qwen35Emit` via the
     /// Qwen4 carrier) over committed tokens that `Qwen4Ar` runs through
@@ -936,6 +941,7 @@ impl GenerationRoute {
                 | Self::GlimmerSpec
                 | Self::MapleAr
                 | Self::RaonAr
+                | Self::RaonSpec
                 | Self::Gemma4Ar
         )
     }
@@ -946,12 +952,18 @@ impl GenerationRoute {
     /// `generate_ar_with_forward`'s `QwenArSemanticProducer`, native MTP via
     /// `Qwen35Emit`). Each matches only the answer channel, holds a possible
     /// stop prefix back, and never emits the stop text. `RaonAr` rides the
-    /// same `generate_ar_with_forward` producer as Qwen4 AR. Every other route
+    /// same `generate_ar_with_forward` producer as Qwen4 AR, and `RaonSpec`
+    /// the `Qwen35Emit` matcher like `Qwen4Spec`. Every other route
     /// would ignore `stop` or leak it, so `generate` refuses it.
     pub const fn supports_stop(self) -> bool {
         matches!(
             self,
-            Self::QwenAr | Self::Qwen4Ar | Self::Qwen4Spec | Self::QwenDflash | Self::RaonAr
+            Self::QwenAr
+                | Self::Qwen4Ar
+                | Self::Qwen4Spec
+                | Self::QwenDflash
+                | Self::RaonAr
+                | Self::RaonSpec
         )
     }
 
@@ -988,6 +1000,7 @@ impl GenerationRoute {
             Self::LfmSpec => "lfm_spec",
             Self::LlamaAr => "llama_ar",
             Self::RaonAr => "raon_ar",
+            Self::RaonSpec => "raon_spec",
             Self::LlamaSpec => "llama_spec",
             Self::GlimmerAr => "glimmer_ar",
             Self::GlimmerSpec => "glimmer_spec",
@@ -1365,6 +1378,7 @@ define_route_start!(minimax_spec_route_start, 10);
 define_route_start!(lfm_ar_route_start, 11);
 define_route_start!(lfm_spec_route_start, 11);
 define_route_start!(raon_ar_route_start, 19);
+define_route_start!(raon_spec_route_start, 19);
 define_route_start!(llama_ar_route_start, 0);
 define_route_start!(llama_spec_route_start, 0);
 define_route_start!(glimmer_ar_route_start, 14);
@@ -1396,6 +1410,7 @@ define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec
 define_route_terminal!(lfm_ar_route_terminal, GenerationRoute::LfmAr);
 define_route_terminal!(lfm_spec_route_terminal, GenerationRoute::LfmSpec);
 define_route_terminal!(raon_ar_route_terminal, GenerationRoute::RaonAr);
+define_route_terminal!(raon_spec_route_terminal, GenerationRoute::RaonSpec);
 define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
 define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
 define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
@@ -1506,6 +1521,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: raon_ar_route_start,
             terminal: raon_ar_route_terminal,
+        },
+        GenerationRoute::RaonSpec => GenerationRouteAdapter {
+            route,
+            start: raon_spec_route_start,
+            terminal: raon_spec_route_terminal,
         },
         GenerationRoute::LlamaAr => GenerationRouteAdapter {
             route,
@@ -1830,10 +1850,30 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         // speculator built by the carrier must NOT change the route — an
         // arch-15 turn is always plain AR.
         15 => return GenerationRoute::MapleAr,
-        // Raon-1-mini (arch 19). Single-GPU AR only: the carrier declares no
-        // speculator, no PP/TP/EP and no continuous batching, so a speculator
-        // can never change this route.
-        19 => return GenerationRoute::RaonAr,
+        // Raon-1-mini (arch 19). Single-GPU only (no PP/TP/EP, no continuous
+        // batching), so the choice is the AR producer or the DFlash2 spec
+        // route. The shared DFlash2 drafter (`--spec dflash`, opt-in) verifies
+        // greedy picks, or sampled rows with the selector-chain nucleus law,
+        // and applies no token penalties: `nonneutral_penalties` already
+        // counts the card's presence default that the AR producer adds to an
+        // unset sampled request (`RaonSampling::penalized_after_defaults`).
+        // Any other speculator keeps the request on AR.
+        19 => {
+            let dflash2_ok = i.speculator_is_dflash2
+                && i.pp <= 1
+                && !i.nonneutral_penalties
+                && (i.temp <= 1e-6 || (i.supports_temp_swor && i.supports_chain_nucleus_verify));
+            let spec_ok = i.has_speculator
+                && dflash2_ok
+                && !i.force_ar_chat
+                && !i.temp_spec_env_off
+                && !i.kv_adaptive;
+            return if spec_ok {
+                GenerationRoute::RaonSpec
+            } else {
+                GenerationRoute::RaonAr
+            };
+        }
         // Gemma 4. One route: the EAGLE speculator is a developer opt-in
         // (`HIPFIRE_GEMMA4_EAGLE=1`) decided inside `generate_gemma4` after
         // tokenization, and it never takes a tools request, so a tool turn is
@@ -2567,9 +2607,26 @@ pub fn generate(
         temp,
         user_explicit_sampling,
         min_p,
+        // Raon: the AR producer adds the card's presence default to an unset
+        // sampled request, so those are penalized as far as route selection
+        // (DFlash2 verifiers implement no penalties) is concerned.
         nonneutral_penalties: repeat_penalty != 1.0
             || presence_penalty != 0.0
-            || frequency_penalty != 0.0,
+            || frequency_penalty != 0.0
+            || m.raon().is_some_and(|b| {
+                crate::raon::RaonSampling {
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    user_explicit: user_explicit_sampling,
+                }
+                .penalized_after_defaults(&b.config.generation)
+            }),
         force_ar_chat: hipfire_config::developer_var("HIPFIRE_DFLASH_CHAT")
             .ok()
             .as_deref()
@@ -3127,6 +3184,50 @@ pub fn generate(
                     frequency_penalty,
                     user_explicit: user_explicit_sampling,
                 },
+                max_tokens,
+                max_think_tokens,
+                stop,
+                enable_thinking,
+            );
+            return;
+        }
+        GenerationRoute::RaonSpec => {
+            // Arch 19 (Raon-1-mini) with the shared DFlash2 drafter. The
+            // shared spec body drives the turn; the adapter renders the same
+            // prompt and samples with the same resolved controls as
+            // `RaonAr`, and a speculative capacity miss falls through to it.
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                think_mode,
+                logprobs_top_k,
+                reasoning_effort,
+            );
+            crate::raon::generate_raon_spec(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                messages_history,
+                tools,
+                crate::raon::RaonSampling {
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    user_explicit: user_explicit_sampling,
+                },
+                cactus_delta,
+                request_seed as u64,
                 max_tokens,
                 max_think_tokens,
                 stop,

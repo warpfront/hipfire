@@ -635,6 +635,118 @@ for 0.4.2; moving that adapter onto the generic engine is separate work.
 The EP2 pull retains its 48-byte kernarg specialization behind the same API;
 EP3..EP8 take the eight-source launch.
 
+### Flash-Next EP: barrier diagnostics (always on)
+
+Every EP host barrier crossing is tagged and every rank's tag is compared right after the barrier, so a rank-local
+divergence (an extra or skipped gather, another buffer, layer, row count or call kind, an extra or missing host
+rendezvous) fails at once naming both ranks instead of timing out 30 s later. The row gather tags
+`(kind, buffer, layer, slots, per-rank gather sequence number)`; the tile transport tags both exchange barriers
+`(kind, layer, tiles, exchange counter k)` and the host rendezvous the EP reserve loan and the stage quiesce use
+`(what, epoch, rendezvous count)`. The cost is an atomic store plus one load per rank and call, no device work.
+
+A barrier wait that passes 5 s prints one line per transport on stderr (`ep_row_gather: rank R still waiting ...` /
+`ep_tile_exchange: ...`), and a barrier timeout carries the same line in its error: for each rank the last tag it
+entered and crossed, how long ago it crossed and what its host thread is doing. Read it as:
+
+- `rank q is between crossings` and a last crossing seconds ago: rank q is stalled outside the gather (host or its own
+  stream), not diverged.
+- `rank q is between crossings ... now host-waiting for rank p's producer event of buffer b`: rank p's stream has not
+  reached the record rank q waits on (rank p's GPU is stalled while its host ran ahead).
+- `rank q is inside a crossing` with another tag than the waiting rank: the ranks run different gathers (a
+  divergence the tag comparison reports at once when both reach a crossing).
+- A rank that waits at the gather barrier while a peer waits at the tile barrier (or the reverse) shows as the other
+  transport's line in the peer's own timeout message.
+
+A rank failure aborts the row-gather, tile-exchange and trunk-split barriers together (`RankPool::set_abort`
+keeps every registered callback and runs all of them; it once kept only the first).
+
+### Flash-Next EP: EP reserve decoupling (default on, `=0` kill switch)
+
+**Status: default for the admitted configuration; `HIPFIRE_EP_RESERVE_DECOUPLE=0` is the kill switch.** Measured on the C1
+driver (Gate 3, `release-0.4.3/r9700x2-par/RESULT.md` lever 3): +5.9% median, +7.4% to +8.5% paired. Unset or `1`
+asks an EP2 load to stop sizing its whole forward scratch for the 4096-row prompt chunk, so the freed reserve can
+hold more resident expert layers per rank (the qualification target is at least 33; fewer is a kill, and the
+reserve estimate behind it is source-derived). `0` is today's path, byte for byte. Unset keeps the ordinary placement
+(with a logged note) when the load is not admitted or the capacity plan cannot be met; `=1` fails the latter load before
+any allocation. The gates below are the qualification record. The design, its frozen interfaces and the abandonment gates are
+`mgfn/ep-reserve/DECISION.md` of the release-0.4.3 campaign.
+
+What the switch does when it is admitted:
+
+- The prompt chunk stays **4096 rows**; it is never lowered. Calls of at most 512 rows use a small resident scratch
+  bank; a forward of 513..=4096 actual rows uses one fixed borrowed 4096-row bank placed in the VRAM of a fixed suffix of
+  whole-layer donors. The 4096-row grouped-down exchange buffer is owned permanently, at one address, by both banks, so
+  the address registered with the tile exchange never moves.
+- Placement stays whole-layer and agreed across ranks (one plan digest, one resident/donor boundary). Donor expert bytes
+  are mirrored in pinned host memory when the load is built and restored from there.
+- **Restore is synchronous and counted.** A global restore (all ranks, through the mesh's abortable rendezvous) happens
+  once when the outer prompt completes, or earlier when a borrowed epoch is followed by a call that needs the resident
+  bank or Full peer tables (a 1..=512-row tail after full tiles). It is inside the prompt's elapsed time; nothing is
+  deferred to the second token. Clean decode and verify add no per-token barrier.
+- A reduced-reserve load never falls back to a full dedicated bank. A GPU or runtime confirmation that fails after the
+  CPU plan was admitted tears that load down with an error; a rank error poisons the mesh and the process must be
+  drained and reloaded, because a locally successful restore is not a successful request.
+
+Scope. The admitted configuration is discrete gfx1201 EP2, the pinned Flash-Next QT44/QT53 recipe, prompt chunk 4096,
+whole-layer placement and ordinary routing, for both AR and native MTP. Every other configuration takes today's
+**ordinary** path with the switch ignored (the load logs the opt-in refusal): other arches (gfx1100, gfx1151,
+gfx942), EP counts other than two, a single card, PP, tier / slab placements, the NPU trunk, DFlash, the
+single-device slow-link prefill, continuous batching or dynamic lane staging, an explicit different chunk, and a
+lower `max_seq`. They are not broken by the switch, and an EP2 result implies nothing about them.
+
+Qualification is `scripts/fn-ep-gate.sh --mode reserve` plus the card campaign's timing documents. Every threshold
+below is a **kill rule**, evaluated by `scripts/fn_ep_compare.py reserve ...`; passing one is not a performance claim.
+
+| Gate | Evidence required | Kill when |
+|---|---|---|
+| 1: EP2 load and boundaries | one binary, switch unset vs `1`, same ranks, model, prompts and seed; per-rank plan receipts; prompts of 8, 9, 511, 512, 513, 2047, 2048, 4095, 4096, 4097 and 4396 tokens; AR and, with `--mtp`, greedy native MTP; at least 128 committed ids | any id mismatch where identity is expected, a logits / mirror / state digest difference, donor bytes or the exchange address changed, a restore per full tile, an omitted restore time, **fewer than 33 resident layers on either rank**, a plan / source / seed disagreement between ranks or arms, a chunk other than 4096 |
+| 2: pp32K | `ep-reserve-perf/1`: three fresh processes per arm (interleaved off/on), three timed requests each, warm-up excluded, restore and the slowest rank inside the interval, AR and MTP separately | throughput ratio on/off **< 0.95** or restore-inclusive latency ratio **> 1.05** (exactly 0.95 / 1.05 pass); a noisy pair crossing the ceiling earns no pass; < 33 resident layers |
+| 3: weighted sampled C1 | `ep-reserve-c1/1`: fresh-server off/on pairs interleaved, six weighted categories, 3 warm-ups + 20 timed, max_seq 16384, native MTP, T=0.7 / top_p=0.95 / top_k=20, tau recorded | weighted gain **< +8%** (exactly +8% passes); < 33 resident layers; an incomplete or unsuccessful request set. A category below 0.95 on/off goes to reviewer (`REVIEW`; a provisional guard, not a frozen threshold); a tau shift above 3% is noted |
+| 4: long-prompt identity and cost | 8K / 32K / 64K greedy AR and MTP pairs, exact-chunk and small-tail variants, restore-inclusive timing | reported (`REPORTED`, no threshold), but every id must match. A 64K, 8K or medium-prompt cell is judged only against an off arm measured in the same schedule; a hand-entered or historical reference is rejected |
+
+Gate 1 receipt contract (`reserve-receipt.json`, schema `ep-reserve-receipt/1`, in each arm's oracle output
+directory, or `EP_RESERVE_RECEIPT <json>` log lines that `fn_ep_compare.py reserve harvest` assembles): per rank the
+resident layer count, scratch-donor boundary and the two parity S2 donors, as the `EpReserveMeshReceipt` fields (`source_generation`,
+`plan_digest`, `resident_layers`, `donor_first_layer`, `donor_count`, `s2_donor_layers`, `prompt_rows` and `exchange_rows` (4096), `s1_admitted`, `s2_admitted`) plus the registered `exchange_address`; per prompt the forward row sequence, the bank of every forward, the
+restore events (position, bytes, restore ms, per-rank barrier wait and S2 DMA tail), donor hashes before and after,
+the exchange address before and after, and the elapsed time including restore; plus the committed id arrays. The
+comparer rejects absent rank receipts, mismatched plan / source / seed, a wrong chunk, a wrong resident count, omitted
+restore timing, missing id arrays and truncated runs. It also proves the expected bank and restore positions
+(`[4096, 4096]` stays borrowed until completion, `[4096, 512]` restores before the resident call,
+`[4096, 4096, 12]` restores before the Full tail) and that a prompt of 512 rows or fewer never borrows. Results of a
+failed gate close this route; they do not authorize a tier migration or a kernel campaign.
+
+All receipt lines are printed only under the developer variable `HIPFIRE_EP_RESERVE_RECEIPT=1`, which the gate sets on
+EVERY reserve arm (the off arms included); it adds no device work to an ordinary load (the on arms additionally read
+the donors back for the hashes). Every line is `EP_RESERVE_RECEIPT <json>`. The oracle (`fn_ep_oracle`) prints the
+`header` (`binary_id`, `model_sha256`, `seed`, `mode`, `max_seq`: the values it writes to `meta.json`; no `ple_sha256`,
+which the oracle does not know, in any arm), one `ids` record per prompt (the committed generated ids) and the closing
+`end` record, and brackets each prompt with `ep_reserve_receipt_scope(Some(i))` / `None`. The forward prints, per
+rank, a `header` (`decouple`, `prompt_chunk_rows`) and a `rank` record once the mesh is serviceable and one
+`prompt_rank` record per outermost prompt entry. An ordinary EP load (the off arm) prints the same records from its own
+load and forward: the real resident expert layer count of the rank, the real prompt chunk, the real forward row
+sequence (every bank `resident`, no restores, no borrowed epochs), the real host elapsed time and the exchange address
+when the owner-routed route is admitted, but no donor hashes.
+
+Mapping rule. One oracle prompt runs several outermost prompt entries per rank. In AR mode: the target prefill, then
+the decode entries. In MTP mode there is no target prefill entry: the native-MTP prefill (`mtp_fill`) is ONE outermost
+entry that carries the whole prompt (for example rows 4097, forward row sequence `[4096, 1]`), and the target entries
+that follow are the decode / verify windows (2..8 rows each, the first of them `(target, 0)`). A `prompt_rank` record is
+therefore keyed `(prompt, phase, ordinal)`: `prompt` is the scope the oracle set (the rank's own entry counter when no
+scope is set), `phase` is `mtp_fill` when the outermost entry is the native-MTP fill and `target` otherwise, and
+`ordinal` is the rank's count of outermost entries within the same `(prompt, phase)`, from 0.
+`fn_ep_compare.py reserve harvest` merges the two ranks' records per key (shared facts must agree, per-rank scalars
+become per-rank lists, restore and elapsed time take the slowest rank). `prompts[i]` is the whole-prompt entry:
+`(i, target, 0)` in AR mode, `(i, mtp_fill, 0)` in MTP mode (the header's `mode`); it carries the boundary rules above
+against the oracle prompt's token count. Every other key is a merged record in `prompts[i]["entries"]`. A rank
+disagreement, a missing rank, a record without phase and ordinal, a missing whole-prompt entry, or a repeated
+`(prompt, phase, ordinal, rank)` is a harvest error, which the arm check rejects. The checker applies the generic entry
+rules (each call 1..4096 rows summing to the entry's rows, the expected bank, restore and epoch rules, restore timing,
+the exchange address and, for an entry that opens on the borrowed bank, a donor hash that does not move) to every entry,
+and rejects an `mtp_fill` entry in `entries` (a second fill in MTP mode, any in AR mode). In MTP mode the oracle's
+`logits.jsonl` holds `window` and `tokens` records and no `logits` records, so the arms are compared record for record
+(the first differing record is reported) and the committed ids are checked against the `tokens` record.
+
 ### Flash-Next EP: community gate
 
 `scripts/fn-ep-gate.sh [options] MODEL.mq4 [N] [OUT_DIR]` is a one-command
@@ -678,6 +790,9 @@ usage problem. It is supporting manual evidence, not a
 
 `--mode pp` runs the same gate for Flash-Next pipeline parallelism; see
 [Qualify a box](#qualify-a-box-fn-ep-gate-mode-pp).
+
+`--mode reserve` runs the EP2 reserve-decoupling pair instead; see
+[EP reserve decoupling](#flash-next-ep-ep-reserve-decoupling-default-on-0-kill-switch).
 
 `crates/hipfire-runtime/examples/ep_transport_oracle.rs` (feature `lab`) is a
 separate no-model synthetic oracle for the row-gather and tile launchers. Without

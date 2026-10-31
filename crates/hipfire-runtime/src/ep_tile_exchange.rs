@@ -90,19 +90,97 @@
 //! [`EpTileExchange::release`], one call per rank after every wait on them has
 //! drained.
 
-use crate::ep_row_gather::{SpinBarrier, DEFAULT_BARRIER_TIMEOUT};
+use crate::ep_row_gather::{
+    describe_rank, SpinBarrier, DEFAULT_BARRIER_TIMEOUT, SLOW_BARRIER_REPORT,
+};
 use hip_bridge::{
     Event, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_EVENT_DISABLE_TIMING,
     HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{Gpu, GpuTensor};
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Largest supported rank count: the pull kernel takes an eight-slot source
 /// table. Supported counts are 2 through this.
 pub const MAX_RANKS: usize = 8;
+
+/// Host rendezvous kinds ([`EpTileExchange::host_barrier`]'s `what`). A rank
+/// that crosses the shared barrier at another kind, another epoch or another
+/// count than its peers fails at once, naming both crossings.
+pub const HOST_RESERVE_ACQUIRE: u8 = 1;
+pub const HOST_RESERVE_RESTORE: u8 = 2;
+pub const HOST_STAGE_QUIESCE: u8 = 3;
+
+/// The layer of an exchange whose caller did not name one.
+pub const NO_LAYER: usize = u16::MAX as usize;
+
+/// Tag slots per rank: one for each of an exchange's two barriers, two for host
+/// rendezvous (alternating by the rank's rendezvous count, so two in a row never
+/// share a slot; a peer may not have compared the earlier one yet).
+const SLOT_PUBLISH: usize = 0;
+const SLOT_COMPLETION: usize = 1;
+const SLOT_HOST: usize = 2;
+const TAG_SLOTS: usize = 4;
+
+/// Identity of one crossing of the tile transport's single host barrier, packed
+/// into one word: bits 0..4 kind (1 publish barrier, 2 completion barrier, 3 host
+/// rendezvous), 4..12 rendezvous `what`, 12..28 layer (exchange) or epoch
+/// (rendezvous, low 16 bits), 28..40 tiles, 40..64 sequence (the rank's exchange
+/// counter `k`, or its rendezvous count). `0` is "none".
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TileCrossing(u64);
+
+impl TileCrossing {
+    const PUBLISH: u64 = 1;
+    const COMPLETION: u64 = 2;
+    const HOST: u64 = 3;
+
+    fn exchange(kind: u64, layer: usize, tiles: usize, k: u64) -> Self {
+        Self(
+            kind | ((layer.min(NO_LAYER) as u64) << 12)
+                | ((tiles.min(0xFFF) as u64) << 28)
+                | ((k & 0xFF_FFFF) << 40),
+        )
+    }
+
+    fn host(what: u8, epoch: u32, n: u64) -> Self {
+        Self(
+            Self::HOST
+                | ((what as u64) << 4)
+                | ((epoch as u64 & 0xFFFF) << 12)
+                | ((n & 0xFF_FFFF) << 40),
+        )
+    }
+}
+
+impl fmt::Display for TileCrossing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let layer = (self.0 >> 12) & 0xFFFF;
+        let seq = self.0 >> 40;
+        match self.0 & 0xF {
+            0 => f.write_str("none"),
+            kind @ (1 | 2) => {
+                let name = if kind == 1 { "publish" } else { "completion" };
+                write!(f, "exchange {name} ")?;
+                if layer == NO_LAYER as u64 {
+                    f.write_str("layer ?")?;
+                } else {
+                    write!(f, "layer {layer}")?;
+                }
+                write!(f, " tiles {} k {seq}", (self.0 >> 28) & 0xFFF)
+            }
+            3 => write!(
+                f,
+                "host rendezvous what {} epoch {layer} n {seq}",
+                (self.0 >> 4) & 0xFF
+            ),
+            _ => f.write_str("unknown crossing"),
+        }
+    }
+}
 
 /// Shape of the exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,12 +418,18 @@ impl EpTileExchangeBuilder {
                 exchanged: AtomicU64::new(0),
                 waited: AtomicU64::new(0),
                 peers_enabled: AtomicBool::new(false),
+                tags: std::array::from_fn(|_| AtomicU64::new(0)),
+                entered: AtomicU64::new(0),
+                crossed: AtomicU64::new(0),
+                crossed_at_ms: AtomicU64::new(0),
+                host_calls: AtomicU64::new(0),
             })
             .collect();
         Ok(Arc::new(EpTileExchange {
             spec: self.spec,
             barrier: SpinBarrier::new(self.spec.ranks, self.barrier_timeout),
             ranks: states,
+            started: Instant::now(),
         }))
     }
 }
@@ -366,6 +450,17 @@ struct RankState {
     exchanged: AtomicU64,
     /// Exchanges whose peer completions this rank already waited for (all peers).
     waited: AtomicU64,
+    /// Crossing tag slots (see [`TileCrossing`]); a rank rewrites a slot only at
+    /// its next crossing of the same kind, after the barrier in between.
+    tags: [AtomicU64; TAG_SLOTS],
+    /// Tag of the last crossing this rank entered (`0` = none).
+    entered: AtomicU64,
+    /// Tag of the last crossing this rank completed (`0` = none).
+    crossed: AtomicU64,
+    /// When `crossed` happened, in milliseconds since the transport was built.
+    crossed_at_ms: AtomicU64,
+    /// Host rendezvous this rank has entered.
+    host_calls: AtomicU64,
     peers_enabled: AtomicBool,
 }
 
@@ -375,6 +470,8 @@ pub struct EpTileExchange {
     spec: EpTileExchangeSpec,
     ranks: Vec<RankState>,
     barrier: SpinBarrier,
+    /// Transport build time: the origin of `RankState::crossed_at_ms`.
+    started: Instant,
 }
 
 impl EpTileExchange {
@@ -514,13 +611,49 @@ impl EpTileExchange {
         y_down_grouped: &GpuTensor,
         tiles: usize,
     ) -> HipResult<()> {
-        let result = self.exchange_inner(gpu, rank, owner_table, tile_ids, y_down_grouped, tiles);
+        self.exchange_layer(
+            gpu,
+            rank,
+            owner_table,
+            tile_ids,
+            y_down_grouped,
+            tiles,
+            NO_LAYER,
+        )
+    }
+
+    /// [`Self::exchange`] for the exchange of `layer`: both barriers of the
+    /// exchange are tagged (kind, `layer`, `tiles`, exchange counter `k`) and
+    /// every rank's tag is compared after each barrier, so a rank that crossed
+    /// at another exchange, another layer or into a host rendezvous
+    /// ([`Self::host_barrier`]) fails at once naming both crossings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exchange_layer(
+        &self,
+        gpu: &mut Gpu,
+        rank: usize,
+        owner_table: &GpuTensor,
+        tile_ids: &GpuTensor,
+        y_down_grouped: &GpuTensor,
+        tiles: usize,
+        layer: usize,
+    ) -> HipResult<()> {
+        let result = self.exchange_inner(
+            gpu,
+            rank,
+            owner_table,
+            tile_ids,
+            y_down_grouped,
+            tiles,
+            layer,
+        );
         if result.is_err() {
             self.abort();
         }
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn exchange_inner(
         &self,
         gpu: &mut Gpu,
@@ -529,6 +662,7 @@ impl EpTileExchange {
         tile_ids: &GpuTensor,
         y_down_grouped: &GpuTensor,
         tiles: usize,
+        layer: usize,
     ) -> HipResult<()> {
         self.check(gpu, rank)?;
         self.spec.check_call(tiles)?;
@@ -548,7 +682,11 @@ impl EpTileExchange {
         let k = me.exchanged.load(Ordering::Acquire);
         let p = parity(k);
         self.record(gpu, &me.ready[p], "publish")?;
-        self.barrier.wait().map_err(|m| err(m.into()))?;
+        self.cross(
+            rank,
+            TileCrossing::exchange(TileCrossing::PUBLISH, layer, tiles, k),
+            SLOT_PUBLISH,
+        )?;
         for q in peers(ranks, rank) {
             self.wait_peer(gpu, &self.ranks[q].ready[p], "ready wait")?;
         }
@@ -567,15 +705,106 @@ impl EpTileExchange {
             self.spec.row_u4,
         )?;
         self.record(gpu, &me.done[p], "completion")?;
-        self.barrier.wait().map_err(|m| err(m.into()))?;
+        self.cross(
+            rank,
+            TileCrossing::exchange(TileCrossing::COMPLETION, layer, tiles, k),
+            SLOT_COMPLETION,
+        )?;
         me.exchanged.store(k + 1, Ordering::Release);
         Ok(())
     }
 
-    /// One cross-rank host barrier (every rank calls it at the same point). A timeout or an
-    /// abort returns Err and poisons the transport.
-    pub fn host_barrier(&self) -> HipResult<()> {
-        self.barrier.wait().map_err(|m| err(m.into()))
+    /// One cross-rank host rendezvous of `rank` (every rank calls it at the same
+    /// point; `what` is one of the `HOST_*` kinds, `epoch` the caller's epoch
+    /// counter). It crosses the exchange's barrier, so a rank that calls it while
+    /// a peer is inside an exchange, or a peer that calls another kind, epoch or
+    /// count, fails at once naming both crossings. A timeout or an abort returns
+    /// Err and poisons the transport.
+    pub fn host_barrier(&self, rank: usize, what: u8, epoch: u32) -> HipResult<()> {
+        let Some(me) = self.ranks.get(rank) else {
+            return Err(err(format!(
+                "ep_tile_exchange: host barrier of rank {rank} out of range (ranks={})",
+                self.spec.ranks
+            )));
+        };
+        let n = me.host_calls.fetch_add(1, Ordering::Relaxed);
+        let slot = SLOT_HOST + (n as usize & 1);
+        self.cross(rank, TileCrossing::host(what, epoch, n), slot)
+    }
+
+    /// One crossing of the shared barrier: publish `tag` in `slot`, wait, then
+    /// require every rank's `slot` to hold the same tag (a peer rewrites a slot
+    /// only at its next crossing of that kind, which needs the barrier in
+    /// between, which this rank enters only after this check). A timeout
+    /// reports every rank's progress, a disagreement names both crossings.
+    fn cross(&self, rank: usize, tag: TileCrossing, slot: usize) -> HipResult<()> {
+        let me = &self.ranks[rank];
+        me.tags[slot].store(tag.0, Ordering::Release);
+        me.entered.store(tag.0, Ordering::Release);
+        let slow_after = SLOW_BARRIER_REPORT.min(self.barrier.timeout() / 2);
+        let waited = self.barrier.wait_reporting(slow_after, &|waited| {
+            eprintln!(
+                "ep_tile_exchange: rank {rank} still waiting after {waited:.1?} at [{tag}]; {}",
+                self.progress_report()
+            );
+        });
+        if let Err(message) = waited {
+            if message.contains("timed out") {
+                let text = format!(
+                    "ep_tile_exchange: {message}: rank {rank} waited {:.1?} at [{tag}]; {}",
+                    self.barrier.timeout(),
+                    self.progress_report()
+                );
+                eprintln!("{text}");
+                return Err(err(text));
+            }
+            return Err(err(message.into()));
+        }
+        for (peer, state) in self.ranks.iter().enumerate() {
+            let theirs = TileCrossing(state.tags[slot].load(Ordering::Acquire));
+            if theirs != tag {
+                self.abort();
+                let text = format!(
+                    "ep_tile_exchange: ranks crossed the barrier at different points: rank \
+                     {rank} entered [{tag}] but rank {peer}'s slot {slot} holds [{theirs}] \
+                     (rank {peer} last entered [{}]; {})",
+                    TileCrossing(state.entered.load(Ordering::Acquire)),
+                    self.progress_report()
+                );
+                eprintln!("{text}");
+                return Err(err(text));
+            }
+        }
+        me.crossed_at_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        me.crossed.store(tag.0, Ordering::Release);
+        Ok(())
+    }
+
+    /// Every rank's last entered / last crossed tag, how long ago it last
+    /// crossed and its exchange counter (one line).
+    fn progress_report(&self) -> String {
+        let now = self.started.elapsed().as_millis() as u64;
+        let show = |tag: u64| TileCrossing(tag).to_string();
+        self.ranks
+            .iter()
+            .enumerate()
+            .map(|(rank, state)| {
+                format!(
+                    "{}, exchanged {}",
+                    describe_rank(
+                        rank,
+                        state.entered.load(Ordering::Acquire),
+                        state.crossed.load(Ordering::Acquire),
+                        now.saturating_sub(state.crossed_at_ms.load(Ordering::Relaxed)),
+                        "",
+                        &show,
+                    ),
+                    state.exchanged.load(Ordering::Acquire)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// Poison the barriers: every current/future waiter returns Err (a rank
@@ -632,7 +861,7 @@ impl Drop for EpTileExchange {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn spec(max_tiles: usize) -> EpTileExchangeSpec {
@@ -830,5 +1059,172 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<EpTileExchange>();
         assert_send_sync::<Arc<EpTileExchange>>();
+    }
+
+    // ── crossing tags: the barrier protocol half of the transport, no device ──
+
+    /// A transport with no device state: only the barrier and tag protocol runs.
+    pub(crate) fn bare(ranks: usize, timeout: Duration) -> Arc<EpTileExchange> {
+        let states = (0..ranks)
+            .map(|rank| RankState {
+                device_id: rank as i32,
+                base: 0,
+                len: 0,
+                ready: std::array::from_fn(|_| Mutex::new(None)),
+                done: std::array::from_fn(|_| Mutex::new(None)),
+                exchanged: AtomicU64::new(0),
+                waited: AtomicU64::new(0),
+                tags: std::array::from_fn(|_| AtomicU64::new(0)),
+                entered: AtomicU64::new(0),
+                crossed: AtomicU64::new(0),
+                crossed_at_ms: AtomicU64::new(0),
+                host_calls: AtomicU64::new(0),
+                peers_enabled: AtomicBool::new(true),
+            })
+            .collect();
+        Arc::new(EpTileExchange {
+            spec: spec(64),
+            ranks: states,
+            barrier: SpinBarrier::new(ranks, timeout),
+            started: Instant::now(),
+        })
+    }
+
+    /// The two barriers of rank `rank`'s exchange `k` of `layer`, without the
+    /// device half in between.
+    pub(crate) fn exchange_barriers(
+        t: &EpTileExchange,
+        rank: usize,
+        k: u64,
+        layer: usize,
+    ) -> HipResult<()> {
+        t.cross(
+            rank,
+            TileCrossing::exchange(TileCrossing::PUBLISH, layer, 40, k),
+            SLOT_PUBLISH,
+        )?;
+        t.cross(
+            rank,
+            TileCrossing::exchange(TileCrossing::COMPLETION, layer, 40, k),
+            SLOT_COMPLETION,
+        )?;
+        t.ranks[rank].exchanged.store(k + 1, Ordering::Release);
+        Ok(())
+    }
+
+    #[test]
+    fn crossing_tags_format_every_kind() {
+        let publish = TileCrossing::exchange(TileCrossing::PUBLISH, 5, 40, 12);
+        assert_eq!(
+            publish.to_string(),
+            "exchange publish layer 5 tiles 40 k 12"
+        );
+        let completion = TileCrossing::exchange(TileCrossing::COMPLETION, NO_LAYER, 40, 12);
+        assert_eq!(
+            completion.to_string(),
+            "exchange completion layer ? tiles 40 k 12"
+        );
+        let host = TileCrossing::host(HOST_RESERVE_RESTORE, 6, 41);
+        assert_eq!(host.to_string(), "host rendezvous what 2 epoch 6 n 41");
+        assert_eq!(TileCrossing(0).to_string(), "none");
+    }
+
+    #[test]
+    fn lockstep_exchanges_and_rendezvous_agree() {
+        let t = bare(2, Duration::from_secs(10));
+        let handles: Vec<_> = (0..2)
+            .map(|rank| {
+                let t = t.clone();
+                std::thread::spawn(move || {
+                    let mut k = 0u64;
+                    for round in 0..500u64 {
+                        // Back-to-back rendezvous (restore then acquire) must not
+                        // share a tag slot.
+                        t.host_barrier(rank, HOST_RESERVE_RESTORE, round as u32)
+                            .expect("restore");
+                        t.host_barrier(rank, HOST_RESERVE_ACQUIRE, round as u32)
+                            .expect("acquire");
+                        for layer in 0..3usize {
+                            exchange_barriers(&t, rank, k, layer).expect("exchange");
+                            k += 1;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        assert!(!t.is_aborted());
+    }
+
+    #[test]
+    fn a_rank_that_skips_a_rendezvous_is_named_against_the_peers_exchange() {
+        // Rank 0 crosses a restore rendezvous that rank 1 never takes; rank 1's
+        // next crossing is the publish barrier of an exchange. The shared
+        // barrier pairs them: without tags the ranks would continue one barrier
+        // out of phase and time out later.
+        let t = bare(2, Duration::from_secs(30));
+        let started = Instant::now();
+        let other = t.clone();
+        let peer = std::thread::spawn(move || exchange_barriers(&other, 1, 0, 3));
+        let mine = t.host_barrier(0, HOST_RESERVE_RESTORE, 6);
+        let theirs = peer.join().expect("peer");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        for result in [mine, theirs] {
+            let text = result.expect_err("disagreement").to_string();
+            assert!(text.contains("different points"), "{text}");
+            assert!(
+                text.contains("host rendezvous what 2 epoch 6")
+                    && text.contains("exchange publish layer 3"),
+                "names both crossings: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rendezvous_kind_or_epoch_disagreement_is_named() {
+        for (what_b, epoch_b, expect) in [
+            (HOST_RESERVE_ACQUIRE, 6, "what 1 epoch 6"),
+            (HOST_RESERVE_RESTORE, 7, "what 2 epoch 7"),
+        ] {
+            let t = bare(2, Duration::from_secs(30));
+            let other = t.clone();
+            let peer = std::thread::spawn(move || other.host_barrier(1, what_b, epoch_b));
+            let mine = t.host_barrier(0, HOST_RESERVE_RESTORE, 6);
+            let theirs = peer.join().expect("peer");
+            for result in [mine, theirs] {
+                let text = result.expect_err("disagreement").to_string();
+                assert!(text.contains(expect), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_timeout_reports_every_ranks_last_crossing_and_exchange_counter() {
+        let t = bare(2, Duration::from_millis(300));
+        let other = t.clone();
+        let peer = std::thread::spawn(move || {
+            exchange_barriers(&other, 1, 0, 0).expect("rank 1");
+            std::thread::sleep(Duration::from_millis(800));
+        });
+        exchange_barriers(&t, 0, 0, 0).expect("rank 0");
+        let error = t
+            .host_barrier(0, HOST_RESERVE_ACQUIRE, 1)
+            .expect_err("rank 1 never arrives")
+            .to_string();
+        peer.join().expect("peer");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            error.contains("at [host rendezvous what 1 epoch 1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("rank 1 is between crossings")
+                && error.contains("last crossed [exchange completion layer 0"),
+            "{error}"
+        );
+        assert!(error.contains("exchanged 1"), "{error}");
+        assert!(t.is_aborted());
     }
 }

@@ -7566,6 +7566,10 @@ fn open_bench_engine(
     apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
+        // Final effective selector wins, as on `run`: re-project the inherited
+        // `developer.dflash_draft` when `--spec` turned DFlash on over a
+        // config-off load.
+        project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
     }
     // Registry sidecar for a final auto/on selector the config-time
     // load_params could not see (config-off + `bench --spec dflash`).

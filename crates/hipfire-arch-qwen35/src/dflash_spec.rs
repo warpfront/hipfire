@@ -385,6 +385,12 @@ pub fn load_dflash_state(
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    if draft_config.target_streams_per_layer != 1 {
+        return Err(format!(
+            "DFlash draft expects {} target streams per layer; this target captures one",
+            draft_config.target_streams_per_layer
+        ));
+    }
 
     // Windowed draft context:
     //   - Legacy DFlash (n−1 sliding + last full): layers 0..n−2 attend over
@@ -4085,6 +4091,12 @@ pub fn load_dflash_speculator_dense_tp2(
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("draft open: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    if draft_config.target_streams_per_layer != 1 {
+        return Err(format!(
+            "DFlash draft expects {} target streams per layer; this target captures one",
+            draft_config.target_streams_per_layer
+        ));
+    }
     if !draft_config.all_layers_sliding {
         return Err("dense TP DFlash requires a DFlash2 all-sliding draft".into());
     }

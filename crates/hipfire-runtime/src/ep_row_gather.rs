@@ -54,6 +54,23 @@
 //! all ranks, checked after the barrier, so ranks that disagree on the layout
 //! fail instead of copying mismatched bands.
 //!
+//! # Crossing tags and hang diagnostics
+//!
+//! Every [`EpRowGather::exchange_layer`] crossing carries a [`CrossingTag`]: the
+//! call kind ([`GatherKind`]), buffer index, layer, slot count and a per-rank
+//! monotonically increasing gather sequence number. The rank stores it in the
+//! buffer's tag slot before it publishes and every rank compares all ranks'
+//! slots right after the barrier (an atomic store plus `ranks` loads per call,
+//! no device work). Ranks that cross the barrier at different gathers (a rank
+//! that ran an extra or skipped gather, took another route, used another buffer
+//! or disagrees on the layer or row count) therefore fail at once, naming both
+//! tags, instead of timing out after 30 s one gather later. A barrier that does
+//! time out reports each rank's last entered and last crossed tag and how long
+//! ago it last crossed (a rank stalled outside the barrier reads "is between
+//! crossings", a rank in another gather reads "is inside a crossing" with its own tag); a wait
+//! that passes five seconds prints the same line once while it is still
+//! waiting, so a stall that later resolves is still visible.
+//!
 //! # Lifetime
 //!
 //! `hip_bridge::Event` has no `Drop`. The producer events are created on each
@@ -68,6 +85,7 @@ use hip_bridge::{
     HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{Gpu, GpuTensor};
+use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -202,10 +220,26 @@ impl SpinBarrier {
         self.aborted.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Block until all `parties` arrive. Err when aborted (before or while
     /// waiting) or on timeout; a timeout also aborts the barrier so every other
     /// waiter fails promptly instead of timing out on its own.
     pub(crate) fn wait(&self) -> Result<(), &'static str> {
+        self.wait_reporting(self.timeout, &|_| {})
+    }
+
+    /// [`Self::wait`] that calls `on_slow(waited)` once when the wait has passed
+    /// `slow_after` without the barrier completing (a stalled peer, reported
+    /// while it is still stalled). The fast path is unchanged: the clock is only
+    /// read after the spin phase.
+    pub(crate) fn wait_reporting(
+        &self,
+        slow_after: Duration,
+        on_slow: &dyn Fn(Duration),
+    ) -> Result<(), &'static str> {
         if self.is_aborted() {
             return Err("ep_row_gather barrier aborted");
         }
@@ -217,6 +251,7 @@ impl SpinBarrier {
         }
         let start = Instant::now();
         let mut spins = 0u32;
+        let mut reported = false;
         loop {
             if self.generation.load(Ordering::Acquire) != generation {
                 return Ok(());
@@ -229,12 +264,181 @@ impl SpinBarrier {
                 std::hint::spin_loop();
                 continue;
             }
-            if start.elapsed() >= self.timeout {
+            let waited = start.elapsed();
+            if waited >= self.timeout {
                 self.abort();
                 return Err("ep_row_gather barrier timed out");
             }
+            if !reported && waited >= slow_after {
+                reported = true;
+                on_slow(waited);
+            }
             std::thread::yield_now();
         }
+    }
+}
+
+// ───────────────────────────── crossing tags ─────────────────────────────
+
+/// A wait that passes this long prints the peers' progress once (capped at half
+/// the barrier timeout so short test timeouts report too).
+pub(crate) const SLOW_BARRIER_REPORT: Duration = Duration::from_secs(5);
+
+/// One rank's line of a barrier progress report: where it is relative to its
+/// last crossing and the tags it last entered and crossed (`0` = none). Shared by
+/// the row gather and the tile exchange; `show` renders a transport's tags.
+pub(crate) fn describe_rank(
+    rank: usize,
+    entered: u64,
+    crossed: u64,
+    crossed_ago_ms: u64,
+    doing: &str,
+    show: &dyn Fn(u64) -> String,
+) -> String {
+    let place = if entered == 0 {
+        "has entered no crossing"
+    } else if entered == crossed {
+        "is between crossings"
+    } else {
+        "is inside a crossing"
+    };
+    let mut out = format!(
+        "rank {rank} {place} (last entered [{}], last crossed [{}]",
+        show(entered),
+        show(crossed)
+    );
+    if crossed != 0 {
+        let _ = write!(out, " {crossed_ago_ms} ms ago");
+    }
+    if !doing.is_empty() {
+        let _ = write!(out, "; now {doing}");
+    }
+    out.push(')');
+    out
+}
+
+/// What a rank's host thread is doing inside a gather (`RankState::phase`): a
+/// store per transition, no clock. `PHASE_OUTSIDE` is "not inside a gather".
+const PHASE_OUTSIDE: u64 = 0;
+const PHASE_PUBLISH: u64 = 1;
+const PHASE_BARRIER: u64 = 2;
+/// Host-waiting (`event_synchronize`) for a peer's producer event; the peer is
+/// in bits 8..16 and the buffer in bits 16..24.
+const PHASE_PEER_WAIT: u64 = 3;
+const PHASE_COPY: u64 = 4;
+
+fn peer_wait_phase(peer: usize, buffer: usize) -> u64 {
+    PHASE_PEER_WAIT | ((peer as u64 & 0xFF) << 8) | ((buffer as u64 & 0xFF) << 16)
+}
+
+fn describe_phase(phase: u64) -> String {
+    match phase & 0xFF {
+        PHASE_PUBLISH => "recording its producer event".to_string(),
+        PHASE_BARRIER => "waiting at the barrier".to_string(),
+        PHASE_PEER_WAIT => format!(
+            "host-waiting for rank {}'s producer event of buffer {} (that rank's stream has \
+             not reached the record)",
+            (phase >> 8) & 0xFF,
+            (phase >> 16) & 0xFF
+        ),
+        PHASE_COPY => "launching the gather copy".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The layer of a crossing whose caller did not name one.
+pub const NO_LAYER: usize = u16::MAX as usize;
+
+/// The call kind of a [`CrossingTag`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatherKind {
+    /// [`EpSlotOwners::ExpertModulo`]: the static `e % ranks` placement.
+    ExpertModulo = 1,
+    /// [`EpSlotOwners::Explicit`]: per-call assigned (balanced) owners.
+    Explicit = 2,
+}
+
+impl GatherKind {
+    fn of(owners: &EpSlotOwners<'_>) -> Self {
+        match owners {
+            EpSlotOwners::ExpertModulo(..) => Self::ExpertModulo,
+            EpSlotOwners::Explicit(..) => Self::Explicit,
+        }
+    }
+}
+
+/// Identity of one [`EpRowGather::exchange_layer`] crossing, packed into one
+/// word so a rank publishes it with a single atomic store: bits 0..4 call kind,
+/// 4..8 buffer index, 8..24 layer, 24..40 slots, 40..64 the rank's gather
+/// sequence number (modulo 2^24; both ranks wrap together). `0` is "none": no
+/// valid crossing has kind 0.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CrossingTag(u64);
+
+impl CrossingTag {
+    /// No crossing (never entered).
+    pub const NONE: Self = Self(0);
+
+    /// The tag of crossing number `seq` of a rank.
+    pub fn new(kind: GatherKind, buffer: usize, layer: usize, slots: usize, seq: u64) -> Self {
+        Self(
+            (kind as u64)
+                | ((buffer as u64 & 0xF) << 4)
+                | ((layer.min(NO_LAYER) as u64) << 8)
+                | ((slots.min(0xFFFF) as u64) << 24)
+                | ((seq & 0xFF_FFFF) << 40),
+        )
+    }
+
+    pub fn kind(self) -> u8 {
+        (self.0 & 0xF) as u8
+    }
+
+    pub fn buffer(self) -> usize {
+        ((self.0 >> 4) & 0xF) as usize
+    }
+
+    pub fn layer(self) -> usize {
+        ((self.0 >> 8) & 0xFFFF) as usize
+    }
+
+    pub fn slots(self) -> usize {
+        ((self.0 >> 24) & 0xFFFF) as usize
+    }
+
+    /// The rank's gather sequence number (24 bits).
+    pub fn seq(self) -> u64 {
+        self.0 >> 40
+    }
+}
+
+impl fmt::Display for CrossingTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind() {
+            0 => return f.write_str("none"),
+            1 => "expert_modulo",
+            2 => "explicit_owners",
+            _ => "unknown_kind",
+        };
+        write!(f, "{kind} ")?;
+        if self.layer() == NO_LAYER {
+            f.write_str("layer ?")?;
+        } else {
+            write!(f, "layer {}", self.layer())?;
+        }
+        write!(
+            f,
+            " buffer {} slots {} seq {}",
+            self.buffer(),
+            self.slots(),
+            self.seq()
+        )
+    }
+}
+
+impl fmt::Debug for CrossingTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CrossingTag({self})")
     }
 }
 
@@ -382,6 +586,11 @@ impl EpRowGatherBuilder {
                 sizes: r.sizes,
                 events: r.events.into_iter().map(|e| Mutex::new(Some(e))).collect(),
                 peers_enabled: AtomicBool::new(false),
+                calls: AtomicU64::new(0),
+                entered: AtomicU64::new(0),
+                crossed: AtomicU64::new(0),
+                crossed_at_ms: AtomicU64::new(0),
+                phase: AtomicU64::new(PHASE_OUTSIDE),
             })
             .collect();
         Ok(Arc::new(EpRowGather {
@@ -390,6 +599,7 @@ impl EpRowGatherBuilder {
             barrier: SpinBarrier::new(self.spec.ranks, self.barrier_timeout),
             ranks: states,
             device_waits: self.device_waits,
+            started: Instant::now(),
         }))
     }
 }
@@ -412,6 +622,16 @@ struct RankState {
     /// uncontended by protocol (record and wait of one index never overlap).
     events: Vec<Mutex<Option<Event>>>,
     peers_enabled: AtomicBool,
+    /// Crossings this rank has entered (its next gather sequence number).
+    calls: AtomicU64,
+    /// Tag of the last crossing this rank entered ([`CrossingTag::NONE`] before the first).
+    entered: AtomicU64,
+    /// Tag of the last crossing this rank completed (barrier passed, tags agreed).
+    crossed: AtomicU64,
+    /// When `crossed` happened, in milliseconds since the transport was built.
+    crossed_at_ms: AtomicU64,
+    /// What this rank's host thread is doing inside a gather (`PHASE_*`).
+    phase: AtomicU64,
 }
 
 /// One output of [`EpRowGather::exchange_bands`]: every rank's band of `rows`
@@ -432,6 +652,8 @@ pub struct EpRowGather {
     ranks: Vec<RankState>,
     barrier: SpinBarrier,
     device_waits: bool,
+    /// Transport build time: the origin of `RankState::crossed_at_ms`.
+    started: Instant,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -539,11 +761,12 @@ impl EpRowGather {
         self.check(gpu, rank, buffer)?;
         self.spec.check_call_slots(slots)?;
         self.wait_peers(gpu, rank, buffer)?;
+        self.ranks[rank].phase.store(PHASE_COPY, Ordering::Relaxed);
         let mut src = [0usize; MAX_RANKS];
         for (peer, state) in self.ranks.iter().enumerate() {
             src[peer] = state.ptrs[buffer];
         }
-        match slot_owners {
+        let launched = match slot_owners {
             EpSlotOwners::ExpertModulo(slot_experts, n_experts) => gpu.ep_gather_rows_by_owner(
                 slot_experts,
                 src,
@@ -563,12 +786,17 @@ impl EpRowGather {
                 rank,
                 self.spec.row_bytes / 16,
             ),
-        }
+        };
+        self.ranks[rank]
+            .phase
+            .store(PHASE_OUTSIDE, Ordering::Relaxed);
+        launched
     }
 
     /// `publish` → host barrier over all ranks (same round) → `gather`. One host
     /// thread per rank. A failure on this rank poisons the barrier so peers
-    /// return Err instead of waiting out the timeout.
+    /// return Err instead of waiting out the timeout. The crossing carries no
+    /// layer ([`NO_LAYER`]); production callers use [`Self::exchange_layer`].
     pub fn exchange(
         &self,
         gpu: &mut Gpu,
@@ -577,17 +805,130 @@ impl EpRowGather {
         slot_owners: EpSlotOwners<'_>,
         slots: usize,
     ) -> HipResult<()> {
+        self.exchange_layer(gpu, rank, buffer, slot_owners, slots, NO_LAYER)
+    }
+
+    /// [`Self::exchange`] for the gather of `layer`: the crossing is tagged
+    /// (call kind, buffer, `layer`, `slots`, this rank's gather sequence number)
+    /// and the tags of all ranks must be equal after the barrier (see the module
+    /// docs); a disagreement aborts the transport and names both tags.
+    pub fn exchange_layer(
+        &self,
+        gpu: &mut Gpu,
+        rank: usize,
+        buffer: usize,
+        slot_owners: EpSlotOwners<'_>,
+        slots: usize,
+        layer: usize,
+    ) -> HipResult<()> {
         self.spec.check_call_slots(slots)?;
+        if let Err(e) = self.check(gpu, rank, buffer) {
+            self.abort();
+            return Err(e);
+        }
+        let tag = self.enter(rank, GatherKind::of(&slot_owners), buffer, layer, slots);
         if let Err(e) = self.publish(gpu, rank, buffer) {
             self.abort();
             return Err(e);
         }
-        self.barrier.wait().map_err(|m| err(m.into()))?;
+        self.cross(rank, tag)?;
         if let Err(e) = self.gather(gpu, rank, buffer, slot_owners, slots) {
             self.abort();
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Open this rank's next crossing: take its gather sequence number and
+    /// publish the tag (buffer slot for the post-barrier comparison, `entered`
+    /// for the progress report). `buffer` is validated by the caller.
+    fn enter(
+        &self,
+        rank: usize,
+        kind: GatherKind,
+        buffer: usize,
+        layer: usize,
+        slots: usize,
+    ) -> CrossingTag {
+        let state = &self.ranks[rank];
+        let seq = state.calls.fetch_add(1, Ordering::Relaxed);
+        let tag = CrossingTag::new(kind, buffer, layer, slots, seq);
+        state.tags[buffer].store(tag.0, Ordering::Release);
+        state.entered.store(tag.0, Ordering::Release);
+        state.phase.store(PHASE_PUBLISH, Ordering::Relaxed);
+        tag
+    }
+
+    /// The barrier of crossing `tag`, then the tag comparison. A peer's slot of
+    /// this buffer is rewritten only at that peer's next invocation on the same
+    /// buffer, which needs the barrier of the invocation in between, which this
+    /// rank enters only after this check, so a mismatch is a real divergence.
+    fn cross(&self, rank: usize, tag: CrossingTag) -> HipResult<()> {
+        self.ranks[rank]
+            .phase
+            .store(PHASE_BARRIER, Ordering::Relaxed);
+        let slow_after = SLOW_BARRIER_REPORT.min(self.barrier.timeout() / 2);
+        let waited = self.barrier.wait_reporting(slow_after, &|waited| {
+            eprintln!(
+                "ep_row_gather: rank {rank} still waiting after {waited:.1?} at [{tag}]; {}",
+                self.progress_report()
+            );
+        });
+        if let Err(message) = waited {
+            if message.contains("timed out") {
+                let text = format!(
+                    "{message}: rank {rank} waited {:.1?} at [{tag}]; {}",
+                    self.barrier.timeout(),
+                    self.progress_report()
+                );
+                eprintln!("ep_row_gather: {text}");
+                return Err(err(text));
+            }
+            return Err(err(message.into()));
+        }
+        let buffer = tag.buffer();
+        for (peer, state) in self.ranks.iter().enumerate() {
+            let theirs = CrossingTag(state.tags[buffer].load(Ordering::Acquire));
+            if theirs != tag {
+                self.abort();
+                let text = format!(
+                    "ep_row_gather: ranks crossed the barrier at different gathers: rank {rank} \
+                     entered [{tag}] but rank {peer}'s slot for buffer {buffer} holds [{theirs}] \
+                     (rank {peer} last entered [{}]; {})",
+                    CrossingTag(state.entered.load(Ordering::Acquire)),
+                    self.progress_report()
+                );
+                eprintln!("{text}");
+                return Err(err(text));
+            }
+        }
+        let mine = &self.ranks[rank];
+        mine.crossed_at_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        mine.crossed.store(tag.0, Ordering::Release);
+        Ok(())
+    }
+
+    /// Every rank's last entered / last crossed tag and how long ago it last
+    /// crossed (one line; a rank not inside a crossing is "between crossings").
+    fn progress_report(&self) -> String {
+        let now = self.started.elapsed().as_millis() as u64;
+        let show = |tag: u64| CrossingTag(tag).to_string();
+        self.ranks
+            .iter()
+            .enumerate()
+            .map(|(rank, state)| {
+                describe_rank(
+                    rank,
+                    state.entered.load(Ordering::Acquire),
+                    state.crossed.load(Ordering::Acquire),
+                    now.saturating_sub(state.crossed_at_ms.load(Ordering::Relaxed)),
+                    &describe_phase(state.phase.load(Ordering::Relaxed)),
+                    &show,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// Wait every peer's producer event of `buffer` (host waits unless the
@@ -603,6 +944,9 @@ impl EpRowGather {
             if peer == rank {
                 continue;
             }
+            self.ranks[rank]
+                .phase
+                .store(peer_wait_phase(peer, buffer), Ordering::Relaxed);
             let guard = lock(&state.events[buffer]);
             let event = guard
                 .as_ref()
@@ -765,7 +1109,7 @@ impl Drop for EpRowGather {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn spec(ranks: usize, slots: usize, row_bytes: usize) -> EpRowGatherSpec {
@@ -894,5 +1238,238 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(barrier.is_aborted());
         assert!(barrier.wait().is_err());
+    }
+
+    // ── crossing tags: the protocol half of `exchange_layer`, no device ──
+
+    /// A transport with no device state: only the barrier and tag protocol runs.
+    pub(crate) fn bare(ranks: usize, timeout: Duration) -> Arc<EpRowGather> {
+        let states = (0..ranks)
+            .map(|rank| RankState {
+                device_id: rank as i32,
+                ptrs: Vec::new(),
+                sizes: Vec::new(),
+                tags: (0..MAX_BUFFERS).map(|_| AtomicU64::new(0)).collect(),
+                events: Vec::new(),
+                peers_enabled: AtomicBool::new(true),
+                calls: AtomicU64::new(0),
+                entered: AtomicU64::new(0),
+                crossed: AtomicU64::new(0),
+                crossed_at_ms: AtomicU64::new(0),
+                phase: AtomicU64::new(PHASE_OUTSIDE),
+            })
+            .collect();
+        Arc::new(EpRowGather {
+            spec: spec(ranks, 80, 10240),
+            buffers: MAX_BUFFERS,
+            ranks: states,
+            barrier: SpinBarrier::new(ranks, timeout),
+            device_waits: false,
+            started: Instant::now(),
+        })
+    }
+
+    /// One rank's crossing of `exchange_layer` without its device half.
+    pub(crate) fn cross_once(
+        gather: &EpRowGather,
+        rank: usize,
+        kind: GatherKind,
+        layer: usize,
+        slots: usize,
+    ) -> HipResult<()> {
+        let tag = gather.enter(rank, kind, layer % 2, layer, slots);
+        gather.cross(rank, tag)
+    }
+
+    #[test]
+    fn crossing_tag_packs_and_formats_every_field() {
+        let tag = CrossingTag::new(GatherKind::Explicit, 3, 47, 80, 0x12_3456);
+        assert_eq!(tag.kind(), 2);
+        assert_eq!(tag.buffer(), 3);
+        assert_eq!(tag.layer(), 47);
+        assert_eq!(tag.slots(), 80);
+        assert_eq!(tag.seq(), 0x12_3456);
+        assert_eq!(
+            tag.to_string(),
+            "explicit_owners layer 47 buffer 3 slots 80 seq 1193046"
+        );
+        // The sequence wraps at 24 bits without disturbing the other fields.
+        let wrapped = CrossingTag::new(GatherKind::ExpertModulo, 1, 5, 10, (1 << 24) + 7);
+        assert_eq!(wrapped.seq(), 7);
+        assert_eq!(
+            (wrapped.kind(), wrapped.buffer(), wrapped.layer()),
+            (1, 1, 5)
+        );
+        assert_eq!(CrossingTag::NONE.to_string(), "none");
+        assert_ne!(CrossingTag::NONE, tag);
+        let unnamed = CrossingTag::new(GatherKind::ExpertModulo, 0, NO_LAYER, 10, 0);
+        assert!(unnamed.to_string().contains("layer ?"), "{unnamed}");
+    }
+
+    #[test]
+    fn lockstep_crossings_agree_and_progress_is_recorded() {
+        let gather = bare(2, Duration::from_secs(10));
+        let handles: Vec<_> = (0..2)
+            .map(|rank| {
+                let gather = gather.clone();
+                std::thread::spawn(move || {
+                    for round in 0..2000usize {
+                        // Trunk-like alternation plus a dedicated head buffer.
+                        let layer = round % 48;
+                        let kind = if layer % 3 == 0 {
+                            GatherKind::Explicit
+                        } else {
+                            GatherKind::ExpertModulo
+                        };
+                        cross_once(&gather, rank, kind, layer, 1 + round % 80).expect("crossing");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        for state in &gather.ranks {
+            assert_eq!(state.calls.load(Ordering::SeqCst), 2000);
+            assert_eq!(
+                state.entered.load(Ordering::SeqCst),
+                state.crossed.load(Ordering::SeqCst)
+            );
+        }
+        assert!(!gather.is_aborted());
+    }
+
+    #[test]
+    fn a_skipped_gather_fails_at_once_naming_both_tags() {
+        let gather = bare(2, Duration::from_secs(30));
+        let started = Instant::now();
+        let run = |rank: usize, skip: Option<usize>| {
+            let gather = gather.clone();
+            std::thread::spawn(move || {
+                for layer in 0..8usize {
+                    if skip == Some(layer) {
+                        continue;
+                    }
+                    cross_once(&gather, rank, GatherKind::ExpertModulo, layer, 50)?;
+                }
+                Ok::<(), HipError>(())
+            })
+        };
+        // Rank 1 skips layer 3: both ranks cross the barrier of their 4th
+        // gather together (seq 3 each) but at layers 3 and 4.
+        let (a, b) = (run(0, None), run(1, Some(3)));
+        let (a, b) = (a.join().expect("rank 0"), b.join().expect("rank 1"));
+        let (a, b) = (a.expect_err("rank 0 fails"), b.expect_err("rank 1 fails"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "failed after {:?}, not after the 30 s barrier timeout",
+            started.elapsed()
+        );
+        // The skipped gather desynchronises the ranks by one crossing, so which
+        // layers meet at the barrier depends on scheduling. Whichever rank
+        // compares first names both ranks' tags and aborts; the other may see
+        // that abort before its own comparison, so it fails either way.
+        let texts = [a.to_string(), b.to_string()];
+        for text in &texts {
+            assert!(!text.contains("timed out"), "{text}");
+            assert!(
+                text.contains("different gathers") || text.contains("aborted"),
+                "{text}"
+            );
+        }
+        assert!(
+            texts.iter().any(|text| text.contains("different gathers")
+                && text.contains("entered [expert_modulo layer")
+                && text.contains("slot for buffer")),
+            "one rank names both tags: {texts:?}"
+        );
+        assert!(gather.is_aborted());
+    }
+
+    #[test]
+    fn a_different_call_kind_or_row_count_is_named() {
+        for (kind_b, slots_b, expect) in [
+            (GatherKind::Explicit, 50, "explicit_owners"),
+            (GatherKind::ExpertModulo, 60, "slots 60"),
+        ] {
+            let gather = bare(2, Duration::from_secs(30));
+            let other = gather.clone();
+            let peer = std::thread::spawn(move || cross_once(&other, 1, kind_b, 7, slots_b));
+            let mine = cross_once(&gather, 0, GatherKind::ExpertModulo, 7, 50);
+            let theirs = peer.join().expect("peer");
+            for result in [mine, theirs] {
+                let text = result.expect_err("disagreement").to_string();
+                assert!(text.contains("different gathers"), "{text}");
+                assert!(text.contains(expect) && text.contains("layer 7"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_peer_stalled_between_gathers_is_reported_at_the_timeout() {
+        let gather = bare(2, Duration::from_millis(300));
+        // Rank 1 completes three gathers, then goes quiet (a stall outside the
+        // gather, e.g. in a host wait); rank 0 enters a fourth.
+        let other = gather.clone();
+        let peer = std::thread::spawn(move || {
+            for layer in 0..3usize {
+                cross_once(&other, 1, GatherKind::ExpertModulo, layer, 50).expect("rank 1");
+            }
+            std::thread::sleep(Duration::from_millis(800));
+        });
+        for layer in 0..3usize {
+            cross_once(&gather, 0, GatherKind::ExpertModulo, layer, 50).expect("rank 0");
+        }
+        let error = cross_once(&gather, 0, GatherKind::ExpertModulo, 3, 50)
+            .expect_err("rank 1 never arrives")
+            .to_string();
+        peer.join().expect("peer");
+        assert!(error.contains("barrier timed out"), "{error}");
+        assert!(error.contains("waited"), "{error}");
+        assert!(error.contains("at [expert_modulo layer 3"), "{error}");
+        assert!(
+            error.contains("rank 1 is between crossings")
+                && error.contains("last crossed [expert_modulo layer 2"),
+            "names the stalled peer's last crossing: {error}"
+        );
+        assert!(
+            error.contains("rank 0 is inside a crossing"),
+            "names the waiting rank: {error}"
+        );
+        assert!(gather.is_aborted());
+    }
+
+    #[test]
+    fn the_report_names_what_a_stalled_peer_is_host_waiting_for() {
+        // A peer blocked in `event_synchronize` of rank 0's event (rank 0's
+        // stream stuck behind a device stall) is the signature of a GPU-side
+        // hang: its crossing record says "between crossings", its phase says
+        // which event it is waiting on.
+        let gather = bare(2, Duration::from_millis(200));
+        gather.ranks[1]
+            .phase
+            .store(peer_wait_phase(0, 1), Ordering::Relaxed);
+        let report = gather.progress_report();
+        assert!(
+            report.contains(
+                "rank 1 has entered no crossing (last entered [none], last crossed [none]; \
+                 now host-waiting for rank 0's producer event of buffer 1"
+            ),
+            "{report}"
+        );
+        assert!(
+            !report.contains(
+                "rank 0 has entered no crossing (last entered [none], last crossed [none]; now"
+            ),
+            "an idle rank reports no phase: {report}"
+        );
+        for (phase, text) in [
+            (PHASE_PUBLISH, "recording its producer event"),
+            (PHASE_BARRIER, "waiting at the barrier"),
+            (PHASE_COPY, "launching the gather copy"),
+        ] {
+            assert_eq!(describe_phase(phase), text);
+        }
+        assert_eq!(describe_phase(PHASE_OUTSIDE), "");
     }
 }

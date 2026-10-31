@@ -41,7 +41,7 @@ use rdna_compute::Gpu;
 use std::path::Path;
 
 /// Target-generic DFlash2 chain speculator. Owns the draft, its scratch, the
-/// cumulative committed feature rows (`[rows × num_extract × hidden]` F32,
+/// cumulative committed feature rows (`[rows × feature_width]` F32,
 /// the draft's context) and the target-minted verify scratch.
 pub struct Dflash2Speculator {
     weights: DflashWeights,
@@ -70,7 +70,7 @@ pub struct Dflash2Speculator {
 
 impl Dflash2Speculator {
     fn row_elems(&self) -> usize {
-        self.config.num_extract() * self.config.hidden
+        self.config.feature_width()
     }
 
     fn sampled(&self) -> bool {
@@ -679,6 +679,14 @@ pub fn build_dflash2_speculator(
     if !(2..=DFLASH_BLOCK_MAX).contains(&block) {
         return Err(format!(
             "DFlash2 block {block} is outside 2..={DFLASH_BLOCK_MAX}"
+        ));
+    }
+    let target_streams = target.dflash_streams_per_layer();
+    if target_streams != config.target_streams_per_layer {
+        return Err(format!(
+            "DFlash2 draft '{draft_hfq_path}' expects target_streams_per_layer {} but the target \
+             captures {target_streams} stream(s) per extract layer",
+            config.target_streams_per_layer
         ));
     }
     let weights = DflashWeights::load(gpu, &draft_hfq, &config).map_err(|e| format!("{e}"))?;

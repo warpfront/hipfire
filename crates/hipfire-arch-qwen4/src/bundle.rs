@@ -1873,12 +1873,59 @@ impl Qwen4Bundle {
         }
     }
 
+    /// [`Self::share_prompt_begin`] for the native-MTP fill (receipt phase
+    /// `mtp_fill`; see [`Qwen4GpuForward::share_prompt_begin_mtp_fill`]).
+    pub(crate) fn share_prompt_begin_mtp_fill(&mut self) {
+        if let Some(forward) = self.execution.as_mut() {
+            forward.share_prompt_begin_mtp_fill();
+        }
+    }
+
+    /// Print this rank's header/rank receipt records (developer env
+    /// `HIPFIRE_EP_RESERVE_RECEIPT=1`; host-only, a no-op otherwise).
+    pub(crate) fn ep_receipt_log_rank(&self) {
+        if let Some(forward) = self.execution.as_ref() {
+            forward.ep_receipt_log_rank();
+        }
+    }
+
     /// The whole-prompt entry [`Self::share_prompt_begin`] opened ends (`ok`:
     /// it returned `Ok`); the outermost one finishes the prompt.
     pub(crate) fn share_prompt_end(&mut self, gpu: &mut Gpu, ok: bool) -> Result<(), BundleError> {
         match self.execution.as_mut() {
             Some(forward) => forward
                 .share_prompt_end(gpu, ok)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether this load shares the EP reserve (this rank's forward carries a
+    /// plan receipt, or the attached mesh agreed one). Dynamic lane staging
+    /// and any consumer needing the resident scratch bank refuse on it.
+    pub(crate) fn ep_reserve_active(&self) -> bool {
+        self.execution
+            .as_ref()
+            .is_some_and(|forward| forward.ep_reserve_plan_receipt().is_some())
+            || self
+                .ep
+                .as_ref()
+                .is_some_and(|mesh| mesh.reserve_receipt().is_some())
+    }
+
+    /// Require this rank's donors resident before a reset, state restore or
+    /// state handoff: the forward's local drain/restore followed by the mesh's
+    /// abortable rendezvous (a proven clean epoch, and any load that does not
+    /// share the EP reserve, is a checked no-op). Every rank of a fan-out must
+    /// reach this together; the callers are the replicated entries.
+    pub(crate) fn ep_reserve_require_resident(
+        &mut self,
+        gpu: &mut Gpu,
+        reason: &str,
+    ) -> Result<(), BundleError> {
+        match self.execution.as_mut() {
+            Some(forward) => forward
+                .ep_reserve_require_resident(gpu, reason)
                 .map_err(|error| BundleError::Forward(error.to_string())),
             None => Ok(()),
         }
@@ -3843,6 +3890,7 @@ impl Qwen4Bundle {
         if self.ep.is_some() {
             return self.ep_reset(gpu);
         }
+        self.ep_reserve_require_resident(gpu, "reset")?;
         // A new request starts with a clear router fault word. Only here, never
         // mid-pipeline: a clear would drop an earlier row's pending report.
         gpu.clear_router_fault();
@@ -4168,6 +4216,7 @@ impl Qwen4Bundle {
         route: SessionRoute,
     ) -> Result<(), BundleError> {
         self.ep_refuse("session_begin outside a replicated call")?;
+        self.ep_reserve_require_resident(gpu, "session_begin")?;
         self.begin_npu_trunk_request(gpu)?;
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
@@ -4519,6 +4568,13 @@ impl Qwen4Bundle {
         copy: Option<crate::lane::LaneCopyConfig>,
     ) -> Result<(), BundleError> {
         self.pp_refuse("continuous-batch lanes")?;
+        if self.ep_reserve_active() {
+            return Err(BundleError::Forward(
+                "Qwen4 lanes cannot be staged on an EP reserve-sharing load: lane steps and \
+                 lane prefill waves need the resident scratch bank (not supported)"
+                    .to_string(),
+            ));
+        }
         if self.ep.is_some() {
             return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec, copy);
         }
@@ -5198,6 +5254,7 @@ impl Qwen4Bundle {
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
         self.ep_refuse("state snapshots")?;
+        self.ep_reserve_require_resident(gpu, "state snapshot")?;
         self.quiesce_ple()?;
         self.state.snapshot(gpu).map_err(BundleError::State)
     }
@@ -5208,6 +5265,7 @@ impl Qwen4Bundle {
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
         self.ep_refuse("state restore")?;
+        self.ep_reserve_require_resident(gpu, "state restore")?;
         self.invalidate_ple_epoch()?;
         self.state
             .restore(gpu, snapshot)
@@ -5219,6 +5277,7 @@ impl Qwen4Bundle {
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
         self.ep_refuse("state restore")?;
+        self.ep_reserve_require_resident(gpu, "state restore")?;
         self.quiesce_ple()?;
         self.state
             .restore_retain(gpu, snapshot)
@@ -6237,6 +6296,135 @@ fn full_fallback_rows(config: &Qwen4Config, requested: usize, free: u64) -> usiz
                 .is_some_and(|bytes| bytes <= free)
         })
         .unwrap_or_else(|| requested.min(1536))
+}
+
+impl Qwen4Bundle {
+    /// Attach the forward of an `HIPFIRE_EP_RESERVE_DECOUPLE=1` EP load
+    /// (`ep-reserve/DECISION.md` §7): [`Self::attach_forward`]'s preparation
+    /// against the frozen reserve `plan` and NOTHING else of its policy.
+    ///
+    /// The chunk is the plan's (4096 rows) and nothing is searched or shrunk
+    /// (no rung downshift: a rank that cannot hold the planned chunk fails the
+    /// load), the scratch plan is `Full`, and the forward builds the 512-row
+    /// resident bank plus views of donor memory, never a full dedicated bank.
+    /// The forward retains `plan`; its mesh receipt is compared by
+    /// `ep_attach_steps`. Any shortfall frees what it allocated and returns the
+    /// error: there is no fallback to the ordinary forward.
+    pub fn attach_forward_ep_reserve(
+        &mut self,
+        gpu: &mut Gpu,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        plan: std::sync::Arc<crate::ep_reserve::EpReservePlan>,
+    ) -> Result<(), BundleError> {
+        let fail = |message: String| BundleError::Forward(format!("EP reserve attach: {message}"));
+        if self.execution.is_some() {
+            return Err(fail(
+                "Qwen4 forward resources are already attached".to_string(),
+            ));
+        }
+        let rows = plan.forward.prompt_rows;
+        if max_chunk != rows
+            || mode != Qwen4ForwardScratchMode::Full
+            || plan.forward.mode != Qwen4ForwardScratchMode::Full
+        {
+            return Err(fail(format!(
+                "needs the Full scratch plan at the planned {rows}-row chunk, got {max_chunk} rows \
+                 in {mode:?} mode"
+            )));
+        }
+        // The planned chunk must also be what the ordinary request resolves to (no
+        // `HIPFIRE_PREFILL_CHUNK_ROWS` override) and what the PLE row store can stage.
+        let ple_rows_cap = match (&self.ple, &self.config.ple) {
+            (Some(ple), Some(ple_config)) => {
+                ple.rows.max_rows_per_prefetch() / ple_config.head_count
+            }
+            _ => usize::MAX,
+        };
+        let requested = session_pair::attach_chunk_request(None, max_chunk, ple_rows_cap, || {
+            qwen4_prefill_chunk_requested(gpu, max_chunk, mode)
+        })
+        .map_err(BundleError::Forward)?;
+        if requested != rows {
+            return Err(fail(format!(
+                "the {rows}-row chunk the reserve was planned for resolves to {requested} rows \
+                 (explicit chunk override or PLE row store capacity); the chunk is never lowered"
+            )));
+        }
+        // The QSA gathered-prefill workspace and the BF16 split selector scratch are reserved
+        // before any capture, exactly as `attach_forward` does.
+        if let Some(qsa) = self.state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
+            let heads = self.config.num_key_value_heads;
+            match self.state.qsa_backend() {
+                Qwen4KvBackend::Legacy => {
+                    rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
+                        gpu,
+                        qsa.format,
+                        heads,
+                        qsa.full_capacity,
+                    )
+                }
+                Qwen4KvBackend::Vmm => {
+                    rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_workspace(
+                        gpu,
+                        qsa.format,
+                        heads,
+                        qsa.full_capacity,
+                    )
+                }
+            }
+            .map_err(BundleError::Hip)?;
+        }
+        if let Some(qsa) = self.state.qsa.first() {
+            rdna_compute::tensor_ops::reserve_qsa_bf16_split_scratch(gpu, qsa.pooled_keys.dtype)
+                .map_err(BundleError::Hip)?;
+        }
+        // The overlay and requantization the ordinary attach applies before the forward is built.
+        let _overlay_route = self.apply_pending_trunk_overlay(gpu)?;
+        self.weights
+            .requant_from_env(gpu)
+            .map_err(BundleError::Forward)?;
+        eprintln!("  qwen4 prefill chunk: {rows} rows (EP reserve plan; no rung search)");
+        let forward = Qwen4GpuForward::new_inner_with_reserve(
+            gpu,
+            self,
+            rows,
+            mode,
+            #[cfg(target_os = "linux")]
+            Some(None),
+            Some(plan),
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))?;
+        let spec_rows = qwen4_spec_logit_rows(rows);
+        let Some(logits_len) = spec_rows.checked_mul(self.config.vocab_size) else {
+            let _ = forward.free_gpu(gpu);
+            return Err(fail("spec logit scratch overflow".to_string()));
+        };
+        let Some(top1_len) = spec_rows.checked_mul(std::mem::size_of::<i32>()) else {
+            let _ = forward.free_gpu(gpu);
+            return Err(fail("spec argmax scratch overflow".to_string()));
+        };
+        let spec_logits = match gpu.zeros(&[logits_len], rdna_compute::DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = forward.free_gpu(gpu);
+                return Err(BundleError::Hip(error));
+            }
+        };
+        let spec_top1 = match gpu.zeros(&[top1_len], rdna_compute::DType::Raw) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(spec_logits);
+                let _ = forward.free_gpu(gpu);
+                return Err(BundleError::Hip(error));
+            }
+        };
+        self.execution = Some(forward);
+        self.spec_logits = Some(spec_logits);
+        self.spec_top1 = Some(spec_top1);
+        self.spec_host_top1 = vec![0; top1_len];
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -36,6 +36,9 @@ pub(crate) mod dflash_target;
 pub mod ep;
 pub mod ep_mesh_lanes;
 pub mod ep_mesh_serve;
+/// EP2 reserve decoupling (opt-in `HIPFIRE_EP_RESERVE_DECOUPLE=1`): pure
+/// admission, plan, packing and receipt types.
+pub mod ep_reserve;
 pub mod ep_seal;
 pub mod ep_trunk_split;
 pub mod expert_keep;
@@ -128,8 +131,9 @@ pub use config::{
     TEXT_MODEL_TYPE,
 };
 pub use gpu_forward::{
-    qwen4_compact_scratch_possible, qwen4_forward_device_bytes, qwen4_forward_scratch_mode,
-    Qwen4ForwardScratchMode, QWEN4_COMPACT_FALLBACK_ROWS, QWEN4_COMPACT_SCRATCH_ENV,
+    ep_reserve_receipt_scope, qwen4_compact_scratch_possible, qwen4_forward_device_bytes,
+    qwen4_forward_scratch_mode, Qwen4ForwardScratchMode, QWEN4_COMPACT_FALLBACK_ROWS,
+    QWEN4_COMPACT_SCRATCH_ENV,
 };
 pub use gpu_forward_lanes::{WaveHead, WaveLane};
 pub use kv_backend::{qwen4_vmm_refusal, qwen4_vmm_supported, Qwen4ContextCommit, Qwen4KvBackend};

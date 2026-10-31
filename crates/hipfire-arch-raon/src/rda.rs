@@ -150,6 +150,83 @@ impl RdaScratch {
             y: plane(gpu, p)?,
         })
     }
+
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows (pool allocations
+    /// are exact, minimum 256 B each).
+    pub fn required_bytes(geom: &RdaGeometry, max_rows: usize) -> usize {
+        let p = geom.proj();
+        // qconv, kconv, vconv, q, k, vprime, log_alpha, y: `[rows, P]`; beta: `[rows, heads]`.
+        let mut elems = [max_rows * p; 8].to_vec();
+        elems.push(max_rows * geom.n_heads);
+        elems.into_iter().map(|e| (e * 4).max(256)).sum()
+    }
+}
+
+/// Per-layer recurrence-input tape: non-owning `[max_rows, *]` plane views the
+/// verify forward writes INSTEAD of the scratch planes, so a partial accept can
+/// rerun the recurrence of the kept prefix ([`crate::rollback`]). `q`, `k`,
+/// `vprime`, `log_alpha` are `raon_rda_prepare`'s outputs (`[rows, P]`) and
+/// `beta` its `[rows, H]` output, exactly what [`execute_gated_delta`] consumes;
+/// `q_raw`/`k_raw`/`v_raw` are the pre-conv projections (`[rows, P]`) whose last
+/// rows rebuild the conv history. Every plane is row-contiguous with a row
+/// stride equal to its width.
+pub struct RdaTape {
+    pub q_raw: GpuTensor,
+    pub k_raw: GpuTensor,
+    pub v_raw: GpuTensor,
+    pub q: GpuTensor,
+    pub k: GpuTensor,
+    pub vprime: GpuTensor,
+    pub log_alpha: GpuTensor,
+    pub beta: GpuTensor,
+}
+
+/// The recurrence of one RDA layer: [`execute_gated_delta`] over `n` rows of
+/// `q, k, vprime, log_alpha, beta` (contiguous planes, row stride = plane
+/// width) from and into `st.state`, `output` receiving the BF16-rounded
+/// `[n, P]` result. The ONE launch shared by [`rda_forward_rows_taped`] and the
+/// rollback replay, so both run the same geometry, strides and slot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rda_recurrence(
+    gpu: &mut Gpu,
+    geom: &RdaGeometry,
+    st: &RdaLayerState<'_>,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    vprime: &GpuTensor,
+    log_alpha: &GpuTensor,
+    beta: &GpuTensor,
+    output: &GpuTensor,
+    n: usize,
+) -> Result<(), String> {
+    let h = geom.n_heads;
+    let kd = geom.head_dim;
+    let mut strides = GatedDeltaStrides::contiguous(h, 1, kd, kd, DecayAxis::PerKeyChannel);
+    strides.state_slot = st.state_slot_stride;
+    execute_gated_delta(
+        gpu,
+        &GatedDeltaOp {
+            query: q,
+            key: k,
+            value: vprime,
+            log_decay: log_alpha,
+            beta,
+            state: st.state,
+            output,
+            slot_idx: None,
+            n_dev: None,
+            n_tokens: n,
+            n_heads: h,
+            qk_group: 1,
+            key_dim: kd,
+            value_dim: kd,
+            decay_axis: DecayAxis::PerKeyChannel,
+            round_output_bf16: geom.round_bf16,
+            slot: st.slot,
+            strides,
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Run one RDA layer over `n` rows. Writes `gated [N, P]` (input of the output
@@ -165,6 +242,26 @@ pub fn rda_forward_rows(
     scratch: &RdaScratch,
     gated: &GpuTensor,
     n: usize,
+) -> Result<(), String> {
+    rda_forward_rows_taped(gpu, geom, layer, st, x, scratch, gated, n, None)
+}
+
+/// [`rda_forward_rows`] with an optional [`RdaTape`]: when present,
+/// `raon_rda_prepare` writes `q, k, vprime, log_alpha, beta` into the tape's
+/// planes and the recurrence reads them from there (the launch sequence is
+/// identical, only the pointers differ). The caller supplies the tape's
+/// `q_raw`/`k_raw`/`v_raw` planes as `x.q_raw`/`x.k_raw`/`x.v_raw`.
+#[allow(clippy::too_many_arguments)]
+pub fn rda_forward_rows_taped(
+    gpu: &mut Gpu,
+    geom: &RdaGeometry,
+    layer: &RaonRdaLayer<'_>,
+    st: &RdaLayerState<'_>,
+    x: &RdaProjected<'_>,
+    scratch: &RdaScratch,
+    gated: &GpuTensor,
+    n: usize,
+    tape: Option<&RdaTape>,
 ) -> Result<(), String> {
     if n == 0 {
         return Ok(());
@@ -202,12 +299,22 @@ pub fn rda_forward_rows(
             .map_err(|e| err(what, format!("{e:?}")))?;
     }
 
+    let (q, k, vprime, log_alpha, beta) = match tape {
+        Some(t) => (&t.q, &t.k, &t.vprime, &t.log_alpha, &t.beta),
+        None => (
+            &scratch.q,
+            &scratch.k,
+            &scratch.vprime,
+            &scratch.log_alpha,
+            &scratch.beta,
+        ),
+    };
     gpu.raon_rda_prepare_f32(&RdaPrepareLaunch {
-        q_out: &scratch.q,
-        k_out: &scratch.k,
-        vprime_out: &scratch.vprime,
-        log_alpha_out: &scratch.log_alpha,
-        beta_out: &scratch.beta,
+        q_out: q,
+        k_out: k,
+        vprime_out: vprime,
+        log_alpha_out: log_alpha,
+        beta_out: beta,
         qconv: &scratch.qconv,
         kconv: &scratch.kconv,
         vconv: &scratch.vconv,
@@ -231,32 +338,8 @@ pub fn rda_forward_rows(
     })
     .map_err(|e| err("prepare", format!("{e:?}")))?;
 
-    let mut strides = GatedDeltaStrides::contiguous(h, 1, kd, kd, DecayAxis::PerKeyChannel);
-    strides.state_slot = st.state_slot_stride;
-    execute_gated_delta(
-        gpu,
-        &GatedDeltaOp {
-            query: &scratch.q,
-            key: &scratch.k,
-            value: &scratch.vprime,
-            log_decay: &scratch.log_alpha,
-            beta: &scratch.beta,
-            state: st.state,
-            output: &scratch.y,
-            slot_idx: None,
-            n_dev: None,
-            n_tokens: n,
-            n_heads: h,
-            qk_group: 1,
-            key_dim: kd,
-            value_dim: kd,
-            decay_axis: DecayAxis::PerKeyChannel,
-            round_output_bf16: geom.round_bf16,
-            slot: st.slot,
-            strides,
-        },
-    )
-    .map_err(|e| err("recurrence", e.to_string()))?;
+    rda_recurrence(gpu, geom, st, q, k, vprime, log_alpha, beta, &scratch.y, n)
+        .map_err(|e| err("recurrence", e))?;
 
     gpu.gated_rmsnorm_sigmoid_rows_f32(
         gated,
