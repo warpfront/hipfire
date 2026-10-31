@@ -22077,8 +22077,9 @@ impl Gpu {
 
     /// `gemv_q8_0` over `rows` (1..=[`FEW_ROW_ROUTE_ROWS`]) activation rows
     /// (x `[rows, k]`, y `[rows, m]`) in one launch: each weight row is read
-    /// once and every output row is bitwise the single-row kernel's. Admission
-    /// is [`Gpu::gemv_q8_0_rows_supported`].
+    /// once and every output row is bitwise the single-row kernel's. One row
+    /// is `gemv_q8_0` itself (~10% faster than the tile). Admission is
+    /// [`Gpu::gemv_q8_0_rows_supported`].
     pub fn gemv_q8_0_rows(
         &mut self,
         a_raw: &GpuTensor,
@@ -22090,6 +22091,9 @@ impl Gpu {
     ) -> HipResult<()> {
         if !self.gemv_q8_0_rows_supported(k, rows) {
             return Err(hip_bridge::HipError::new(1, "gemv_q8_0_rows shape"));
+        }
+        if rows == 1 {
+            return self.gemv_q8_0(a_raw, x, y, m, k);
         }
         self.bind_thread()?;
         const FUNC: &str = "gemv_q8_0_rows";
@@ -27087,8 +27091,9 @@ mod gemv_q8_0_rows_tests {
         };
         // Not a multiple of the kernel's 4 weight rows per wave.
         const M: usize = 602;
-        // 1600: 50 blocks, a two-block tail after the 8-block chunks.
-        for k in [1600usize, 2816, 3840, 4096, 8192] {
+        // 1600: 50 blocks, a two-block tail after the 8-block chunks; 6144:
+        // the Qwen4 MTP verify Q8 projection.
+        for k in [1600usize, 2816, 3840, 4096, 6144, 8192] {
             let mut bytes = vec![0u8; M * k / 32 * 34];
             for block in bytes.chunks_exact_mut(34) {
                 let scale = 0x1C00u16 + (next() % 0x0800) as u16;
@@ -27098,7 +27103,7 @@ mod gemv_q8_0_rows_tests {
                 }
             }
             let a = gpu.upload_raw(&bytes, &[bytes.len()]).expect("q8 matrix");
-            for rows in 1..=FEW_ROW_ROUTE_ROWS {
+            for rows in 2..=FEW_ROW_ROUTE_ROWS {
                 let x: Vec<f32> = (0..rows * k)
                     .map(|_| (next() % 8191) as f32 / 4096.0 - 1.0)
                     .collect();
