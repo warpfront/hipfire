@@ -418,6 +418,7 @@ pub fn rda_forward_rows_taped(
     Ok(())
 }
 
+// selector-receipt: receipts/selectors/rda_wave_min_rows.json
 /// Smallest row count the wave-per-tile conv+prepare and gated-norm kernels are used for (ordinary prefill;
 /// decode and verify rows keep the incumbent launches).
 pub const RDA_WAVE_MIN_ROWS: usize = 64;
