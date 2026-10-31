@@ -353,7 +353,7 @@
 //! every shard on executor, topology, model artifact hash, lane count, route,
 //! sampling/cohort settings, GDN state format and trial range, requires one key
 //! per arm and one cross-arm key, ranges that tile `0..trials` exactly once, and
-//! all four arms. `sampled_mtp_matches_ar_distribution_on_flash_next` under
+//! every arm of its topology's cohort (all four, or the three `ep2` arms). `sampled_mtp_matches_ar_distribution_on_flash_next` under
 //! `lanes` never launches an arm: it judges the merged files (>= 2000 trials)
 //! pooled and per lane against `lane_ar`, plus route coverage from each arm's
 //! evidence. The host-only logic and its CPU tests are `common/lane_suite.rs`
@@ -361,7 +361,10 @@
 //!
 //! # EP2 lane arms (`lane_ep.rs`)
 //!
-//! Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2` a lane arm process (cards C,B under
+//! Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2` the cohort is `lane_ar`,
+//! `lane_batched` and `lane_adaptive` (`lane_suite::EP2_ARMS`: the copy lane is
+//! off by default on EP serve, so `lane_copy` is refused under `ep2` and its
+//! shards are foreign to an `ep2` merge). A lane arm process (cards C,B under
 //! `HIPFIRE_TOPOLOGY_EP=2`, one fresh process per arm and shard) loads the
 //! artifact once through the product loader with the serve's `serve.vmm_batch`
 //! lane reservation, stages one lane store and runs its `START..END` trials
@@ -369,18 +372,20 @@
 //! executor AR rows, host draws from each lane's RNG: the reference);
 //! `lane_batched` and `lane_adaptive` are native-MTP mesh lanes
 //! (`Qwen4Bundle::ep_mesh_decode_step`, root Leviathan acceptance, every lane
-//! MTP, no copy lane) and `lane_copy` adds the copy lane (use a fixture the pool
-//! hits, `HIPFIRE_SAMPLED_MTP_PROMPT=repeat`, for every arm of that cohort). The
-//! MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so even the 8-lane arm runs
-//! native windows (the step switch would otherwise run AR windows above four
-//! lanes). Request seeds are the lane suite's `lane_request_seed` truncated to
-//! the lane RNG's 32 bits. Each shard writes `<arm>.<START>-<END>.ids.json`
+//! MTP, no copy lane). The MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so
+//! even the 8-lane arm runs native windows (the step switch would otherwise run
+//! AR windows above four lanes). The mesh router calibrates inline, so the
+//! `ep2` adaptive coverage needs native windows and a floor-on route class
+//! (`adaptive-floor` in its recorded config), not a zero-draft first window.
+//! Request seeds are the lane suite's `lane_request_seed` truncated to the lane
+//! RNG's 32 bits. Each shard writes `<arm>.<START>-<END>.ids.json`
 //! (`(END - START) * lanes` lane-minor rows), `.ids.config.json`,
 //! `.ids.receipt.json`, `.evidence.json` (window counters classified per window
 //! from the lanes' own counters and cross-checked against the mesh step facts)
 //! and `.text.txt`. The model artifact's identity needs a verified-artifact
-//! cache under `HIPFIRE_HOME` (the test never hashes artifacts). Single-card and
-//! PP2 lane arms validate their configuration and refuse explicitly.
+//! cache under `HIPFIRE_HOME` (the test never hashes artifacts) and
+//! `HIPFIRE_FABRIC_ADMISSION` is excluded from the compared identity. Single-card
+//! and PP2 lane arms validate their configuration and refuse explicitly.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::expert_residency as residency;

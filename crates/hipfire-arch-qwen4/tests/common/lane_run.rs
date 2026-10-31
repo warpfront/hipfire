@@ -157,7 +157,7 @@ pub(super) fn merge_lane_suite(
     placement: lane_suite::Placement,
 ) -> Result<(), String> {
     let names = dir_file_names(dir)?;
-    lane_suite::reject_foreign_shards(&names)?;
+    lane_suite::reject_foreign_shards(&names, placement.topology)?;
     let mut rows: BTreeMap<(String, (usize, usize)), Vec<Vec<u32>>> = BTreeMap::new();
     let mut by_arm: BTreeMap<String, Vec<lane_suite::LaneShard>> = BTreeMap::new();
     for (arm, range) in lane_suite::shard_files(&names) {
@@ -173,7 +173,7 @@ pub(super) fn merge_lane_suite(
             });
         rows.insert((arm, range), part);
     }
-    let plan = lane_suite::plan_lane_merge(&by_arm, trials)?;
+    let plan = lane_suite::plan_lane_merge(&by_arm, trials, placement.topology)?;
     if plan.topology != placement.topology.as_str()
         || plan.lanes != placement.lanes
         || plan.state_format != lane_state_format()?
@@ -244,8 +244,9 @@ pub(super) fn lane_verdict(
     }
     let trials = settings.trials;
     let model_id = hw_identity::model_identity(model, dir)?;
+    let cohort = lane_suite::cohort_arms(placement.topology);
     let mut samples: BTreeMap<&str, Vec<Vec<u32>>> = BTreeMap::new();
-    for arm in lane_suite::LANE_ARMS {
+    for &arm in cohort {
         let ids_path = dir.join(format!("{arm}.ids.json"));
         if !ids_path.exists() {
             return Err(format!(
@@ -271,11 +272,18 @@ pub(super) fn lane_verdict(
         }
         samples.insert(arm, rows);
     }
-    let evidence = lane_suite::LANE_ARMS
+    let evidence = cohort
         .iter()
         .map(|arm| Ok((*arm, read_json(&dir.join(format!("{arm}.evidence.json")))?)))
         .collect::<Result<BTreeMap<&str, Value>, String>>()?;
-    let judged = judge_lane_samples(&samples, &evidence, placement, trials, lane_state_format()?)?;
+    let mut judged =
+        judge_lane_samples(&samples, &evidence, placement, trials, lane_state_format()?)?;
+    // The adaptive arm's floor-on route, from its recorded config (the identity
+    // check above already compared it with this environment's).
+    let adaptive_config = read_json(&dir.join("lane_adaptive.ids.config.json"))?;
+    if let Some(failure) = lane_suite::adaptive_floor_failure(&adaptive_config) {
+        judged.coverage.push(format!("{failure}\n"));
+    }
     fs::write(dir.join("report.txt"), &judged.report).map_err(|e| e.to_string())?;
     eprint!("{}", judged.report);
     if judged.failures.is_empty() && judged.coverage.is_empty() {
@@ -318,11 +326,11 @@ fn judge_lane_samples(
     };
     let reference = get(lane_suite::LANE_REFERENCE_ARM)?;
     let reference_lanes = lane_suite::per_lane_rows(reference, placement.lanes)?;
-    for arm in lane_suite::LANE_ARMS {
+    for &arm in lane_suite::cohort_arms(placement.topology) {
         let arm_evidence = evidence
             .get(arm)
             .ok_or_else(|| format!("no evidence for {arm}"))?;
-        for line in lane_suite::lane_coverage(arm, placement.lanes, trials, arm_evidence) {
+        for line in lane_suite::lane_coverage(placement.topology, arm, placement.lanes, trials, arm_evidence) {
             coverage.push(format!("{line}\n"));
         }
         if arm == lane_suite::LANE_REFERENCE_ARM {
@@ -447,7 +455,7 @@ mod tests {
     ) {
         let mut samples = BTreeMap::new();
         let mut evidence_by_arm = BTreeMap::new();
-        for (index, arm) in lane_suite::LANE_ARMS.iter().enumerate() {
+        for (index, arm) in lane_suite::EP2_ARMS.iter().enumerate() {
             samples.insert(*arm, rows(trials * lanes, weights(arm), 11 + index as u64));
             evidence_by_arm.insert(*arm, evidence(arm, trials as u64, lanes as u64));
         }
@@ -460,7 +468,7 @@ mod tests {
         let judged = judge_lane_samples(&samples, &evidence, placement(8), 600, "q8").unwrap();
         assert!(judged.failures.is_empty(), "{}", judged.failures.concat());
         assert!(judged.coverage.is_empty(), "{}", judged.coverage.concat());
-        for arm in ["lane_batched", "lane_adaptive", "lane_copy"] {
+        for arm in ["lane_batched", "lane_adaptive"] {
             assert!(
                 judged.report.contains(&format!("{arm}[lane 0]")),
                 "{arm} pooled only"
@@ -502,16 +510,15 @@ mod tests {
     #[test]
     fn judge_reports_coverage_failures_separately_from_the_law() {
         let (samples, mut by_arm) = cohort(1, 600, |_| [5, 3, 2]);
-        by_arm.insert("lane_copy", {
-            let mut value = evidence("lane_copy", 600, 1);
-            value["copy_windows"] = json!(0);
-            value["copy_point_mass_windows"] = json!(0);
+        by_arm.insert("lane_batched", {
+            let mut value = evidence("lane_batched", 600, 1);
+            value["ar_windows"] = json!(3);
             value
         });
         let judged = judge_lane_samples(&samples, &by_arm, placement(1), 600, "q8").unwrap();
         assert!(judged.failures.is_empty());
         assert!(
-            judged.coverage.iter().any(|c| c.contains("lane_copy")),
+            judged.coverage.iter().any(|c| c.contains("lane_batched")),
             "{:?}",
             judged.coverage
         );
@@ -591,7 +598,7 @@ mod tests {
     }
 
     fn write_all(dir: &Path) {
-        for arm in lane_suite::LANE_ARMS {
+        for arm in lane_suite::EP2_ARMS {
             write_shard(dir, arm, (0, 2), "ep2", "eafaff94");
             write_shard(dir, arm, (2, 4), "ep2", "eafaff94");
         }
@@ -602,7 +609,7 @@ mod tests {
         let dir = scratch("merge-ok");
         write_all(&dir);
         merge_lane_suite(&dir, TRIALS_FIXTURE, placement(8)).unwrap();
-        for arm in lane_suite::LANE_ARMS {
+        for arm in lane_suite::EP2_ARMS {
             let ids = read_rows(&dir.join(format!("{arm}.ids.json"))).unwrap();
             assert_eq!(ids.len(), TRIALS_FIXTURE * 8, "{arm}");
             // Shards concatenated in trial order.
@@ -619,7 +626,8 @@ mod tests {
             assert!(text.starts_with(&format!("{arm} (0, 2)")), "{text}");
             // The merged evidence is a coverage-clean cohort for its arm.
             assert!(
-                lane_suite::lane_coverage(arm, 8, TRIALS_FIXTURE, &merged).is_empty(),
+                lane_suite::lane_coverage(lane_suite::Topology::Ep2, arm, 8, TRIALS_FIXTURE, &merged)
+                    .is_empty(),
                 "{arm}"
             );
         }
@@ -627,7 +635,7 @@ mod tests {
     }
 
     fn assert_nothing_merged(dir: &Path) {
-        for arm in lane_suite::LANE_ARMS {
+        for arm in lane_suite::EP2_ARMS {
             assert!(
                 !dir.join(format!("{arm}.ids.json")).exists(),
                 "{arm}: a refused merge must write nothing"
@@ -646,14 +654,14 @@ mod tests {
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("lane_copy.")
+                .starts_with("lane_adaptive.")
             {
                 fs::remove_file(path).unwrap();
             }
         }
         let error = merge_lane_suite(&dir, TRIALS_FIXTURE, placement(8)).unwrap_err();
         assert!(
-            error.contains("incomplete arm set") && error.contains("lane_copy"),
+            error.contains("incomplete arm set") && error.contains("lane_adaptive"),
             "{error}"
         );
         assert_nothing_merged(&dir);
@@ -694,14 +702,32 @@ mod tests {
         assert_nothing_merged(&dir);
         fs::remove_dir_all(&dir).unwrap();
 
+        // The copy lane has no ep2 cohort: its shard is foreign under ep2.
+        let dir = scratch("merge-copy");
+        write_all(&dir);
+        write_shard(&dir, "lane_copy", (0, 4), "ep2", "eafaff94");
+        let error = merge_lane_suite(&dir, TRIALS_FIXTURE, placement(8)).unwrap_err();
+        assert!(
+            error.contains("mixed shard set") && error.contains("lane_copy"),
+            "{error}"
+        );
+        assert_nothing_merged(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+
         // The process environment names another topology / lane count than the shards.
         let dir = scratch("merge-env");
         write_all(&dir);
         let wrong_lanes = merge_lane_suite(&dir, TRIALS_FIXTURE, placement(1)).unwrap_err();
         assert!(wrong_lanes.contains("environment"), "{wrong_lanes}");
-        let mut wrong_topology = placement(8);
-        wrong_topology.topology = lane_suite::Topology::Pp2;
-        let error = merge_lane_suite(&dir, TRIALS_FIXTURE, wrong_topology).unwrap_err();
+        assert_nothing_merged(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+        // Shards recorded under pp2 are a valid ep2-cohort set by arm name, but
+        // not this ep2 process's.
+        let dir = scratch("merge-topology");
+        for arm in lane_suite::EP2_ARMS {
+            write_shard(&dir, arm, (0, 4), "pp2", "eafaff94");
+        }
+        let error = merge_lane_suite(&dir, TRIALS_FIXTURE, placement(8)).unwrap_err();
         assert!(error.contains("environment"), "{error}");
         assert_nothing_merged(&dir);
         fs::remove_dir_all(&dir).unwrap();

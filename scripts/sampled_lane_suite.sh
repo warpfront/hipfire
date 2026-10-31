@@ -36,10 +36,10 @@
 # trials. HIPFIRE_TOPOLOGY_EP=2 is exported here, the native-MTP arms pin
 # HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 (the 8-lane arm would otherwise run AR
 # windows); give `merge` and `verdict` the same job environment as the shards
-# (the config identity compares every HIPFIRE_* variable). `lane_copy` needs a
-# fixture the copy pool hits: set PROMPT=repeat for the whole cohort. The single
-# and pp2 topologies validate their configuration and refuse ("ep2 only");
-# `selftest` is the host-only part.
+# (the config identity compares every HIPFIRE_* variable). The ep2 cohort is
+# lane_ar lane_batched lane_adaptive (`lane_copy` is refused under ep2). The
+# single and pp2 topologies validate their configuration and refuse ("ep2
+# only"); `selftest` is the host-only part.
 
 set -euo pipefail
 

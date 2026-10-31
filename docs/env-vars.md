@@ -611,9 +611,9 @@ the lane suite of the same test (arms `lane_ar`, `lane_batched`, `lane_adaptive`
 separate output directory per executor). Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2`
 (`HIPFIRE_TOPOLOGY_EP=2`, two visible cards) each arm process runs the EP2 lane
 executor over a `HIPFIRE_SAMPLED_MTP_SHARD=START..END` trial shard: `lane_ar` is
-sampled AR lanes (the reference), `lane_batched` / `lane_adaptive` / `lane_copy`
-are native-MTP mesh lanes with root Leviathan acceptance (`lane_copy` adds the
-copy lane). The native-MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so the
+sampled AR lanes (the reference), `lane_batched` / `lane_adaptive` are
+native-MTP mesh lanes with root Leviathan acceptance (the `ep2` cohort has no
+`lane_copy`: the copy lane is off by default on EP serve). The native-MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so the
 8-lane arm runs native windows. The test never hashes artifacts: the model, its
 `.ple-q4` and `.expert-hotset` need records in `<HIPFIRE_HOME>/cache/verified-artifacts.json`,
 and `HIPFIRE_FABRIC_ADMISSION` is excluded from the compared identity (it names

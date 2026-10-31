@@ -54,7 +54,7 @@ DRY=${EPLANE_DRY:-0}
 specs=()
 for spec in "$@"; do
   [[ $MODE != shard ]] && { specs+=("$spec"); continue; }
-  [[ $spec =~ ^(lane_ar|lane_batched|lane_adaptive|lane_copy):(1|8):[0-9]+\.\.[0-9]+$ ]] || { echo "bad SPEC '$spec' (ARM:LANES:START..END)" >&2; exit 2; }
+  [[ $spec =~ ^(lane_ar|lane_batched|lane_adaptive):(1|8):[0-9]+\.\.[0-9]+$ ]] || { echo "bad SPEC '$spec' (ARM:LANES:START..END)" >&2; exit 2; }
   specs+=("$spec")
 done
 O=$RUNROOT/$TAG

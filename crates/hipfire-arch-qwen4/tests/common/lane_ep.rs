@@ -16,7 +16,6 @@
 //! |---|---|---|
 //! | `lane_ar` | AR lanes (no spec), sampled | lane executor AR rows, host draw from the lane's own RNG |
 //! | `lane_batched` / `lane_adaptive` | native-MTP lanes, every lane MTP (`spec_lanes: None`), no copy lane | `Qwen4Bundle::ep_mesh_decode_step` (root Leviathan) |
-//! | `lane_copy` | native-MTP lanes with the copy lane | same; copy proposals are one-hot |
 //!
 //! A trial is `lanes` concurrent requests of the same fixture prompt, admitted
 //! together and kept in lockstep (all prefill tiles of a tick, then one mesh
@@ -34,7 +33,7 @@
 
 use super::*;
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
-use hipfire_arch_qwen4::lane::{LaneCopyConfig, LaneSampling, LaneSpecConfig, LaneSpecStats};
+use hipfire_arch_qwen4::lane::{LaneSampling, LaneSpecConfig, LaneSpecStats};
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch,
 };
@@ -50,22 +49,25 @@ const EP_DEGREE: usize = 2;
 pub(super) enum ArmKind {
     /// Target-only AR lanes (the reference).
     Ar,
-    /// Native-MTP mesh lanes, with or without the copy lane.
-    Mtp { copy: bool },
+    /// Native-MTP mesh lanes (no copy lane: it is off by default on EP serve).
+    Mtp,
 }
 
 impl ArmKind {
     pub(super) fn of(arm: &str) -> Result<Self, String> {
         match arm {
             "lane_ar" => Ok(Self::Ar),
-            "lane_batched" | "lane_adaptive" => Ok(Self::Mtp { copy: false }),
-            "lane_copy" => Ok(Self::Mtp { copy: true }),
+            "lane_batched" | "lane_adaptive" => Ok(Self::Mtp),
+            "lane_copy" => Err(
+                "lane_copy has no ep2 executor: the copy lane is off by default on EP serve and no ep2 cohort covers it"
+                    .to_string(),
+            ),
             other => Err(format!("{other} is not a lane arm")),
         }
     }
 
     fn mesh(self) -> bool {
-        matches!(self, Self::Mtp { .. })
+        matches!(self, Self::Mtp)
     }
 }
 
@@ -613,7 +615,7 @@ struct EpLanes {
 
 /// `load_model`'s admitted route (the oracle's, `fn_mesh_lane_oracle`) with
 /// the serve's per-load lane reservation: `lanes` lanes at `row_budget` rows,
-/// native-MTP lanes of depth `spec_k` (with the copy lane when `copy`) or AR
+/// native-MTP lanes of depth `spec_k` or AR
 /// lanes (`spec_k: None`), so the loader's EP expert placement reserves what
 /// the staging below will commit. Planner capacity only; numerics are the
 /// plain load's.
@@ -673,7 +675,7 @@ fn load_ep(
         continuous_batch_size: store_lanes,
         row_budget: store_lanes,
         spec_k: kind.mesh().then_some(spec_k),
-        spec_copy: matches!(kind, ArmKind::Mtp { copy: true }),
+        spec_copy: false,
     };
     let warning = legacy_warning(admission.kv_backend, admission.kv_backend_reason.as_deref());
     let loaded = hipfire_loader::load_admitted_with_gemma4_drafter(
@@ -774,18 +776,9 @@ impl EpLanes {
             end_of_turn: None,
             spec_lanes: None,
         });
-        let copy = match kind {
-            ArmKind::Mtp { copy: true } => Some(LaneCopyConfig {
-                ngram: hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
-                    hipfire_config::ngram_mod_copy_triple(),
-                )?,
-                head_lag_rows: 8,
-            }),
-            _ => None,
-        };
         let before = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
         bundle
-            .stage_lanes_with_copy(gpu, store_lanes, store_lanes, spec, copy)
+            .stage_lanes(gpu, store_lanes, store_lanes, spec)
             .map_err(|e| e.to_string())?;
         let after = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
         eprintln!(
@@ -1317,15 +1310,12 @@ mod tests {
 
     #[test]
     fn arm_kinds_cover_the_declared_arms() {
-        for arm in lane_suite::LANE_ARMS {
+        for arm in lane_suite::EP2_ARMS {
             assert!(ArmKind::of(arm).is_ok(), "{arm}");
         }
         assert_eq!(ArmKind::of("lane_ar"), Ok(ArmKind::Ar));
-        assert_eq!(ArmKind::of("lane_copy"), Ok(ArmKind::Mtp { copy: true }));
-        assert_eq!(
-            ArmKind::of("lane_adaptive"),
-            Ok(ArmKind::Mtp { copy: false })
-        );
+        assert_eq!(ArmKind::of("lane_adaptive"), Ok(ArmKind::Mtp));
+        assert!(ArmKind::of("lane_copy").unwrap_err().contains("no ep2 executor"));
         assert!(ArmKind::of("ar").is_err());
         assert!(ArmKind::of("lane_interleaved").is_err());
     }
@@ -1338,7 +1328,7 @@ mod tests {
 
     #[test]
     fn the_env_check_pins_the_topology_native_windows_and_depth() {
-        let mtp = ArmKind::Mtp { copy: false };
+        let mtp = ArmKind::Mtp;
         assert!(check_ep_env(mtp, 8, 8, 2, MTP_K).is_ok());
         assert!(check_ep_env(mtp, 1, 8, 2, MTP_K).is_ok());
         assert!(check_ep_env(ArmKind::Ar, 8, 1, 2, 1).is_ok(), "the AR store never switches windows");
@@ -1351,7 +1341,7 @@ mod tests {
     #[test]
     fn lane_seeds_are_request_functions_distinct_per_arm_trial_and_lane() {
         let mut seen = BTreeSet::new();
-        for arm in lane_suite::LANE_ARMS {
+        for arm in lane_suite::EP2_ARMS {
             for trial in 0..50 {
                 for lane in 0..8 {
                     let seed = lane_seed(arm, 8, trial, lane).unwrap();
@@ -1518,12 +1508,12 @@ mod tests {
         assert_eq!(json["probe_budget"], 3);
         assert_eq!(json["per_trial"].as_array().unwrap().len(), 2);
         assert!(evidence.texts().contains("trial 0 lane 1"));
-        assert!(lane_suite::lane_coverage("lane_adaptive", 2, 1, &json).is_empty());
+        assert!(lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_adaptive", 2, 1, &json).is_empty());
         // The batched arm passes on the same counters; the AR reference and the
         // copy arm do not.
-        assert!(lane_suite::lane_coverage("lane_batched", 2, 1, &json).is_empty());
-        assert!(!lane_suite::lane_coverage("lane_ar", 2, 1, &json).is_empty());
-        assert!(!lane_suite::lane_coverage("lane_copy", 2, 1, &json).is_empty());
+        assert!(lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_batched", 2, 1, &json).is_empty());
+        assert!(!lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_ar", 2, 1, &json).is_empty());
+        assert!(!lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_copy", 2, 1, &json).is_empty());
     }
 
     #[test]
@@ -1540,8 +1530,8 @@ mod tests {
         let json = evidence.to_json("lane_ar", placement(2), (0, 1), 3);
         assert_eq!(json["ar_windows"], 6);
         assert_eq!(json["mtp_windows"], 0);
-        assert!(lane_suite::lane_coverage("lane_ar", 2, 1, &json).is_empty());
-        assert!(!lane_suite::lane_coverage("lane_batched", 2, 1, &json).is_empty());
+        assert!(lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_ar", 2, 1, &json).is_empty());
+        assert!(!lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_batched", 2, 1, &json).is_empty());
         assert!(json["per_trial"].as_array().unwrap().is_empty(), "no samples requested");
     }
 
@@ -1562,7 +1552,7 @@ mod tests {
         assert_eq!(json["copy_point_mass_windows"], 2);
         assert_eq!(json["retired_trials"], 1);
         assert_eq!(json["retire_steps"], serde_json::json!([2]));
-        assert!(lane_suite::lane_coverage("lane_copy", 1, 1, &json).is_empty());
+        assert!(lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_copy", 1, 1, &json).is_empty());
     }
 
     #[test]
@@ -1573,7 +1563,7 @@ mod tests {
         assert_eq!(json["no_window_trials"], 1);
         assert_eq!(json["calibration_ok_trials"], 0);
         // calibrated + no_window == requests: the adaptive rule is met.
-        assert!(!lane_suite::lane_coverage("lane_adaptive", 1, 1, &json)
+        assert!(!lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_adaptive", 1, 1, &json)
             .iter()
             .any(|line| line.contains("calibration token")));
     }
@@ -1593,7 +1583,7 @@ mod tests {
         assert_eq!(merged["trials"], 2);
         assert_eq!(merged["requests"], 4);
         assert_eq!(merged["per_trial"].as_array().unwrap().len(), 4);
-        assert!(lane_suite::lane_coverage("lane_adaptive", 2, 2, &merged).is_empty());
+        assert!(lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_adaptive", 2, 2, &merged).is_empty());
     }
 
     #[test]

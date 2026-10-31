@@ -62,6 +62,19 @@ pub const LANE_COUNTS: [usize; 2] = [1, 8];
 pub const LANE_ARMS: [&str; 4] = ["lane_ar", "lane_batched", "lane_adaptive", "lane_copy"];
 /// The arm every other lane arm is compared against.
 pub const LANE_REFERENCE_ARM: &str = "lane_ar";
+/// The arms of an `ep2` cohort: the copy lane is off by default on EP serve
+/// (`HIPFIRE_EP_MTP_LANE_COPY`), so no `ep2` cohort or verdict covers it and
+/// `lane_copy` is refused under `ep2`.
+pub const EP2_ARMS: [&str; 3] = ["lane_ar", "lane_batched", "lane_adaptive"];
+
+/// The arms a cohort of `topology` must hold (reference first): the whole
+/// declared set, except under `ep2` ([`EP2_ARMS`]).
+pub fn cohort_arms(topology: Topology) -> &'static [&'static str] {
+    match topology {
+        Topology::Ep2 => &EP2_ARMS,
+        Topology::Single | Topology::Pp2 => &LANE_ARMS,
+    }
+}
 
 /// The sidecar/config schema version of the `lane_suite` block.
 pub const SCHEMA: u64 = 1;
@@ -210,6 +223,13 @@ pub fn validate_arm(
                     "lane arm {arm} runs the leviathan verifier only (mode {mode})"
                 ));
             }
+            if !cohort_arms(placement.topology).contains(&arm) {
+                return Err(format!(
+                    "lane arm {arm} is not part of the {} cohort {:?}: the copy lane is off by default on EP serve and no ep2 verdict covers it",
+                    placement.topology.as_str(),
+                    cohort_arms(placement.topology)
+                ));
+            }
             Ok(())
         }
         Executor::Singleton => {
@@ -347,20 +367,22 @@ pub fn shard_files(names: &[String]) -> Vec<(String, (usize, usize))> {
     found
 }
 
-/// Refuses a directory holding shards of any arm outside the declared lane set
-/// (singleton arms, an interleaved lane arm, a typo): a lane merge never
-/// silently ignores foreign shards.
-pub fn reject_foreign_shards(names: &[String]) -> Result<(), String> {
+/// Refuses a directory holding shards of any arm outside the cohort of
+/// `topology` (singleton arms, an interleaved lane arm, `lane_copy` under
+/// `ep2`, a typo): a lane merge never silently ignores foreign shards.
+pub fn reject_foreign_shards(names: &[String], topology: Topology) -> Result<(), String> {
+    let cohort = cohort_arms(topology);
     let foreign: BTreeSet<String> = shard_files(names)
         .into_iter()
         .map(|(arm, _)| arm)
-        .filter(|arm| !is_lane_arm(arm))
+        .filter(|arm| !cohort.contains(&arm.as_str()))
         .collect();
     if foreign.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "mixed shard set: the lane output directory also holds shards of {foreign:?}, outside the lane arm set {LANE_ARMS:?}; use a separate HIPFIRE_SAMPLED_MTP_OUT directory per executor"
+            "mixed shard set: the lane output directory also holds shards of {foreign:?}, outside the {} lane arm set {cohort:?}; use a separate HIPFIRE_SAMPLED_MTP_OUT directory per executor",
+            topology.as_str()
         ))
     }
 }
@@ -627,32 +649,37 @@ fn key_difference(a: &LaneShardKey, b: &LaneShardKey, cross_arm: bool) -> Option
     None
 }
 
-/// Validates `shards` (arm -> its shards) against the declared lane arm set and
-/// the `trials` cohort. See the module docs for the exact rules.
+/// Validates `shards` (arm -> its shards) against the lane arm set of the
+/// `topology` cohort ([`cohort_arms`]) and the `trials` cohort. See the module
+/// docs for the exact rules.
 pub fn plan_lane_merge(
     shards: &BTreeMap<String, Vec<LaneShard>>,
     trials: usize,
+    topology: Topology,
 ) -> Result<LaneMergePlan, String> {
+    let cohort = cohort_arms(topology);
     for arm in shards.keys() {
-        if !is_lane_arm(arm) {
+        if !cohort.contains(&arm.as_str()) {
             return Err(format!(
-                "mixed shard set: arm {arm} is not in the lane arm set {LANE_ARMS:?}"
+                "mixed shard set: arm {arm} is not in the {} lane arm set {cohort:?}",
+                topology.as_str()
             ));
         }
     }
-    let missing: Vec<&str> = LANE_ARMS
+    let missing: Vec<&str> = cohort
         .iter()
         .copied()
         .filter(|arm| shards.get(*arm).is_none_or(|parts| parts.is_empty()))
         .collect();
     if !missing.is_empty() {
         return Err(format!(
-            "incomplete arm set: no shards for {missing:?}; the lane suite needs all of {LANE_ARMS:?}"
+            "incomplete arm set: no shards for {missing:?}; the {} lane suite needs all of {cohort:?}",
+            topology.as_str()
         ));
     }
     let mut first: Option<LaneShardKey> = None;
     let mut arms = BTreeMap::new();
-    for arm in LANE_ARMS {
+    for &arm in cohort {
         let parts = &shards[arm];
         let mut arm_key: Option<LaneShardKey> = None;
         let mut ranges = Vec::new();
@@ -840,7 +867,18 @@ pub fn merge_evidence(parts: &[Value]) -> Result<Value, String> {
 ///
 /// Returns one message per coverage failure; empty = the arm exercised what
 /// its name claims. A missing counter is a failure, never a zero.
-pub fn lane_coverage(arm: &str, lanes: usize, trials: usize, evidence: &Value) -> Vec<String> {
+///
+/// Under `ep2` the mesh lanes calibrate inline (the per-lane router prices at
+/// `ar_us = 1.0`; there is no zero-draft calibration window), so the adaptive
+/// arm is required to run native windows only; its floor-on route is checked
+/// from the recorded config ([`adaptive_floor_failure`]).
+pub fn lane_coverage(
+    topology: Topology,
+    arm: &str,
+    lanes: usize,
+    trials: usize,
+    evidence: &Value,
+) -> Vec<String> {
     let mut failures = Vec::new();
     let mut get = |key: &str| -> u64 {
         match evidence[key].as_u64() {
@@ -899,10 +937,12 @@ pub fn lane_coverage(arm: &str, lanes: usize, trials: usize, evidence: &Value) -
         }
         "lane_adaptive" => {
             need(mtp > 0, "the adaptive arm must run native windows");
-            need(
-                calibrated + no_window == requests,
-                "the adaptive arm's first window must be the calibration token in every request",
-            );
+            if topology != Topology::Ep2 {
+                need(
+                    calibrated + no_window == requests,
+                    "the adaptive arm's first window must be the calibration token in every request",
+                );
+            }
         }
         "lane_copy" => {
             need(copy > 0, "the copy arm must run copy-proposal windows");
@@ -914,6 +954,18 @@ pub fn lane_coverage(arm: &str, lanes: usize, trials: usize, evidence: &Value) -
         other => failures.push(format!("{other} is not a lane arm")),
     }
     failures
+}
+
+/// The failure of a `lane_adaptive` result whose recorded config is not the
+/// floor-on, no-forced-route class (`HIPFIRE_MTP_AR_FLOOR` and
+/// `HIPFIRE_MTP_INCREMENTAL` unset): `None` when it is.
+pub fn adaptive_floor_failure(config: &Value) -> Option<String> {
+    let class = config["identity"]["floor"]["route_class"].as_str();
+    (class != Some("adaptive-floor")).then(|| {
+        format!(
+            "lane_adaptive: the recorded route class is {class:?}, not \"adaptive-floor\" (floor on, no forced route)"
+        )
+    })
 }
 
 // ------------------------------------------------------------------- tests
@@ -962,7 +1014,7 @@ mod tests {
     #[test]
     fn arm_validation_separates_executors() {
         for topology in [Topology::Single, Topology::Pp2, Topology::Ep2] {
-            for arm in LANE_ARMS {
+            for &arm in cohort_arms(topology) {
                 validate_arm(arm, "leviathan", placement(topology, 8), &SHORT).unwrap();
                 assert!(validate_arm(arm, "naive", placement(topology, 8), &SHORT).is_err());
             }
@@ -973,6 +1025,11 @@ mod tests {
                 );
             }
         }
+        // The copy lane is off by default on EP serve: no ep2 cohort covers it.
+        let refused = validate_arm("lane_copy", "leviathan", placement(Topology::Ep2, 8), &SHORT)
+            .unwrap_err();
+        assert!(refused.contains("lane_copy") && refused.contains("ep2"), "{refused}");
+        validate_arm("lane_copy", "leviathan", placement(Topology::Pp2, 8), &SHORT).unwrap();
         assert!(validate_arm(
             "lane_interleaved",
             "leviathan",
@@ -1115,16 +1172,16 @@ mod tests {
                 ("lane_copy".to_string(), (0, 100)),
             ]
         );
-        reject_foreign_shards(&names).unwrap();
+        reject_foreign_shards(&names, Topology::Pp2).unwrap();
         let mut mixed = names.clone();
         mixed.push("ar.0-100.ids.json".into());
-        let error = reject_foreign_shards(&mixed).unwrap_err();
+        let error = reject_foreign_shards(&mixed, Topology::Pp2).unwrap_err();
         assert!(
             error.contains("mixed") && error.contains("\"ar\""),
             "{error}"
         );
         mixed.push("lane_interleaved.0-5.ids.json".into());
-        assert!(reject_foreign_shards(&mixed)
+        assert!(reject_foreign_shards(&mixed, Topology::Pp2)
             .unwrap_err()
             .contains("lane_interleaved"));
     }
@@ -1144,6 +1201,8 @@ mod tests {
     // ---- merger fixtures
 
     const TRIALS: usize = 300;
+    /// The four-arm cohort topology the merger fixtures use.
+    const FIXTURE_TOPOLOGY: Topology = Topology::Pp2;
 
     fn base_config(arm: &str) -> Value {
         json!({
@@ -1167,7 +1226,7 @@ mod tests {
                 "env": {
                     EXECUTOR_ENV: "lanes",
                     LANES_ENV: "8",
-                    TOPOLOGY_ENV: "ep2",
+                    TOPOLOGY_ENV: "pp2",
                 },
             },
         })
@@ -1175,7 +1234,7 @@ mod tests {
 
     fn shard(arm: &str, range: (usize, usize)) -> LaneShard {
         let base = base_config(arm);
-        let config = lane_config(base, arm, placement(Topology::Ep2, 8), "q8", range).unwrap();
+        let config = lane_config(base, arm, placement(FIXTURE_TOPOLOGY, 8), "q8", range).unwrap();
         LaneShard {
             file_range: range,
             config,
@@ -1210,9 +1269,9 @@ mod tests {
 
     #[test]
     fn merge_accepts_a_complete_consistent_set() {
-        let plan = plan_lane_merge(&full_set(), TRIALS).unwrap();
+        let plan = plan_lane_merge(&full_set(), TRIALS, FIXTURE_TOPOLOGY).unwrap();
         assert_eq!(plan.lanes, 8);
-        assert_eq!(plan.topology, "ep2");
+        assert_eq!(plan.topology, "pp2");
         assert_eq!(plan.state_format, "q8");
         assert_eq!(plan.artifact, "eafaff94");
         assert_eq!(plan.arms.len(), 4);
@@ -1223,7 +1282,7 @@ mod tests {
         // Shard order in the input does not matter.
         let mut shuffled = full_set();
         shuffled.get_mut("lane_ar").unwrap().reverse();
-        assert_eq!(plan_lane_merge(&shuffled, TRIALS).unwrap(), plan);
+        assert_eq!(plan_lane_merge(&shuffled, TRIALS, FIXTURE_TOPOLOGY).unwrap(), plan);
         let whole = merged_config(&full_set()["lane_ar"][1].config, TRIALS);
         assert_eq!(whole["lane_suite"]["range"], json!([0, TRIALS]));
     }
@@ -1232,7 +1291,7 @@ mod tests {
     fn merge_rejects_incomplete_sets() {
         let mut set = full_set();
         set.remove("lane_copy");
-        let error = plan_lane_merge(&set, TRIALS).unwrap_err();
+        let error = plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err();
         assert!(
             error.contains("incomplete arm set") && error.contains("lane_copy"),
             "{error}"
@@ -1240,7 +1299,7 @@ mod tests {
 
         let mut set = full_set();
         set.get_mut("lane_batched").unwrap().remove(1);
-        let error = plan_lane_merge(&set, TRIALS).unwrap_err();
+        let error = plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err();
         assert!(
             error.contains("incomplete shard set") && error.contains("(100, 200)"),
             "{error}"
@@ -1248,7 +1307,7 @@ mod tests {
 
         let mut set = full_set();
         set.get_mut("lane_ar").unwrap().pop();
-        assert!(plan_lane_merge(&set, TRIALS)
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
             .contains("(200, 300)"));
 
@@ -1256,11 +1315,11 @@ mod tests {
         set.get_mut("lane_ar")
             .unwrap()
             .push(shard("lane_ar", (100, 200)));
-        assert!(plan_lane_merge(&set, TRIALS)
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
             .contains("overlaps"));
 
-        assert!(plan_lane_merge(&BTreeMap::new(), TRIALS)
+        assert!(plan_lane_merge(&BTreeMap::new(), TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
             .contains("incomplete arm set"));
     }
@@ -1273,8 +1332,8 @@ mod tests {
                 c["lane_suite"]["executor"] = json!("singleton");
             }),
             ("topology", |c| {
-                c["lane_suite"]["topology"] = json!("pp2");
-                c["identity"]["env"][TOPOLOGY_ENV] = json!("pp2");
+                c["lane_suite"]["topology"] = json!("single");
+                c["identity"]["env"][TOPOLOGY_ENV] = json!("single");
             }),
             ("artifact", |c| {
                 c["identity"]["model"]["sha256"] = json!("541cfb55");
@@ -1301,7 +1360,7 @@ mod tests {
             // Mutate ONE shard of ONE non-first arm: the set must be refused.
             let mut set = full_set();
             edit(&mut set, "lane_adaptive", 1, |s| mutate(&mut s.config));
-            let error = plan_lane_merge(&set, TRIALS).unwrap_err();
+            let error = plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err();
             assert!(
                 error.contains(field) || error.contains("lane_suite") || error.contains("disagree"),
                 "{field}: {error}"
@@ -1319,14 +1378,14 @@ mod tests {
             lane_config(
                 config,
                 "lane_ar",
-                placement(Topology::Ep2, 8),
+                placement(FIXTURE_TOPOLOGY, 8),
                 "q8",
                 (100, 200),
             )
             .unwrap()
         };
         edit(&mut set, "lane_ar", 1, |s| s.config = foreign);
-        let error = plan_lane_merge(&set, TRIALS).unwrap_err();
+        let error = plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err();
         assert!(
             error.contains("mixed") && error.contains("artifact"),
             "{error}"
@@ -1335,18 +1394,18 @@ mod tests {
         let mut set = full_set();
         let foreign = {
             let mut config = base_config("lane_copy");
-            config["identity"]["env"][TOPOLOGY_ENV] = json!("pp2");
+            config["identity"]["env"][TOPOLOGY_ENV] = json!("single");
             lane_config(
                 config,
                 "lane_copy",
-                placement(Topology::Pp2, 8),
+                placement(Topology::Single, 8),
                 "q8",
                 (0, 100),
             )
             .unwrap()
         };
         edit(&mut set, "lane_copy", 0, |s| s.config = foreign);
-        let error = plan_lane_merge(&set, TRIALS).unwrap_err();
+        let error = plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err();
         assert!(
             error.contains("mixed") && error.contains("topology"),
             "{error}"
@@ -1364,7 +1423,7 @@ mod tests {
                     config: lane_config(
                         config,
                         "lane_batched",
-                        placement(Topology::Ep2, 8),
+                        placement(FIXTURE_TOPOLOGY, 8),
                         "q8",
                         range,
                     )
@@ -1374,7 +1433,7 @@ mod tests {
             })
             .collect();
         set.insert("lane_batched".into(), other);
-        let error = plan_lane_merge(&set, TRIALS).unwrap_err();
+        let error = plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err();
         assert!(
             error.contains("mixed") && error.contains("sampling"),
             "{error}"
@@ -1385,25 +1444,25 @@ mod tests {
     fn merge_rejects_wrong_arms_rows_and_trials() {
         let mut set = full_set();
         set.insert("lane_interleaved".into(), vec![shard("lane_ar", (0, 300))]);
-        assert!(plan_lane_merge(&set, TRIALS)
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
             .contains("lane_interleaved"));
 
         let mut set = full_set();
         set.insert("ar".into(), vec![]);
-        assert!(plan_lane_merge(&set, TRIALS)
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
-            .contains("not in the lane arm set"));
+            .contains("lane arm set"));
 
         let mut set = full_set();
         edit(&mut set, "lane_ar", 0, |s| s.rows = 99);
-        assert!(plan_lane_merge(&set, TRIALS).unwrap_err().contains("rows"));
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err().contains("rows"));
 
         let mut set = full_set();
         edit(&mut set, "lane_copy", 2, |s| {
             s.config["trials"] = json!(2000)
         });
-        assert!(plan_lane_merge(&set, TRIALS)
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
             .contains("2000 trials"));
 
@@ -1412,14 +1471,14 @@ mod tests {
         edit(&mut set, "lane_ar", 0, |s| {
             s.config = shard("lane_copy", (0, 100)).config
         });
-        assert!(plan_lane_merge(&set, TRIALS)
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
             .contains("belongs to arm"));
 
         // File name and recorded range disagree.
         let mut set = full_set();
         edit(&mut set, "lane_ar", 0, |s| s.file_range = (0, 50));
-        assert!(plan_lane_merge(&set, TRIALS)
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
             .contains("disagree"));
 
@@ -1428,7 +1487,7 @@ mod tests {
         edit(&mut set, "lane_ar", 0, |s| {
             s.config = base_config("lane_ar")
         });
-        assert!(plan_lane_merge(&set, TRIALS)
+        assert!(plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY)
             .unwrap_err()
             .contains("not a lane shard"));
     }
@@ -1438,7 +1497,7 @@ mod tests {
         let ok = lane_config(
             base_config("lane_ar"),
             "lane_ar",
-            placement(Topology::Ep2, 8),
+            placement(FIXTURE_TOPOLOGY, 8),
             "q8",
             (0, 10),
         )
@@ -1451,7 +1510,7 @@ mod tests {
                     as fn(&mut Value),
             ),
             ("topology env", |c| {
-                c["identity"]["env"][TOPOLOGY_ENV] = json!("pp2")
+                c["identity"]["env"][TOPOLOGY_ENV] = json!("single")
             }),
             ("lanes env", |c| {
                 c["identity"]["env"][LANES_ENV] = json!("1")
@@ -1560,46 +1619,131 @@ mod tests {
         assert!(merge_evidence(&[]).is_err());
     }
 
+    fn ep2_shard(arm: &str, range: (usize, usize)) -> LaneShard {
+        let mut base = base_config(arm);
+        base["identity"]["env"][TOPOLOGY_ENV] = json!("ep2");
+        let config = lane_config(base, arm, placement(Topology::Ep2, 8), "q8", range).unwrap();
+        LaneShard {
+            file_range: range,
+            config,
+            rows: (range.1 - range.0) * 8,
+        }
+    }
+
+    fn ep2_set() -> BTreeMap<String, Vec<LaneShard>> {
+        EP2_ARMS
+            .iter()
+            .map(|arm| {
+                (
+                    arm.to_string(),
+                    vec![ep2_shard(arm, (0, 150)), ep2_shard(arm, (150, 300))],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_ep2_cohort_is_the_three_mesh_arms() {
+        assert_eq!(cohort_arms(Topology::Ep2), &EP2_ARMS[..]);
+        assert_eq!(cohort_arms(Topology::Pp2), &LANE_ARMS[..]);
+        assert_eq!(cohort_arms(Topology::Single), &LANE_ARMS[..]);
+        assert_eq!(EP2_ARMS[0], LANE_REFERENCE_ARM);
+        let plan = plan_lane_merge(&ep2_set(), TRIALS, Topology::Ep2).unwrap();
+        assert_eq!(plan.topology, "ep2");
+        assert_eq!(plan.arms.len(), 3);
+        assert!(!plan.arms.contains_key("lane_copy"));
+        // The same shards are an incomplete set of the four-arm cohort.
+        assert!(plan_lane_merge(&ep2_set(), TRIALS, Topology::Pp2)
+            .unwrap_err()
+            .contains("lane_copy"));
+        // A missing ep2 arm and a copy shard under ep2 are both refused.
+        let mut set = ep2_set();
+        set.remove("lane_adaptive");
+        assert!(plan_lane_merge(&set, TRIALS, Topology::Ep2)
+            .unwrap_err()
+            .contains("lane_adaptive"));
+        let mut set = ep2_set();
+        set.insert("lane_copy".into(), vec![ep2_shard("lane_copy", (0, 300))]);
+        let error = plan_lane_merge(&set, TRIALS, Topology::Ep2).unwrap_err();
+        assert!(error.contains("lane_copy") && error.contains("ep2"), "{error}");
+        let names: Vec<String> = vec![
+            "lane_ar.0-150.ids.json".into(),
+            "lane_copy.0-150.ids.json".into(),
+        ];
+        assert!(reject_foreign_shards(&names, Topology::Ep2)
+            .unwrap_err()
+            .contains("lane_copy"));
+        reject_foreign_shards(&names, Topology::Pp2).unwrap();
+    }
+
+    #[test]
+    fn ep2_adaptive_coverage_needs_native_windows_but_no_calibration_window() {
+        let t = 10u64;
+        // No request starts with a zero-draft calibration window (the mesh
+        // router calibrates inline): met under ep2, a failure on the other
+        // topologies.
+        let evidence = ev(t, 80, 300, 0, 0, 0, 0, 0, 0);
+        assert!(lane_coverage(Topology::Ep2, "lane_adaptive", 8, 10, &evidence).is_empty());
+        assert!(!lane_coverage(Topology::Pp2, "lane_adaptive", 8, 10, &evidence).is_empty());
+        // Still needs native windows, and the counter schema.
+        let silent = ev(t, 80, 0, 0, 0, 0, 0, 0, 0);
+        assert!(!lane_coverage(Topology::Ep2, "lane_adaptive", 8, 10, &silent).is_empty());
+        assert!(!lane_coverage(Topology::Ep2, "lane_adaptive", 8, 11, &evidence).is_empty());
+        // The other ep2 arms keep their rules.
+        assert!(lane_coverage(Topology::Ep2, "lane_batched", 8, 10, &ev(t, 80, 400, 0, 0, 0, 0, 0, 0)).is_empty());
+        assert!(!lane_coverage(Topology::Ep2, "lane_batched", 8, 10, &ev(t, 80, 400, 1, 0, 0, 0, 0, 0)).is_empty());
+        assert!(lane_coverage(Topology::Ep2, "lane_ar", 8, 10, &ev(t, 80, 0, 500, 0, 0, 80, 0, 0)).is_empty());
+    }
+
+    #[test]
+    fn the_adaptive_arm_must_have_run_floor_on_with_no_forced_route() {
+        let config = |class: Value| json!({"identity": {"floor": {"route_class": class}}});
+        assert_eq!(adaptive_floor_failure(&config(json!("adaptive-floor"))), None);
+        let forced = adaptive_floor_failure(&config(json!("forced-batched-floor-off"))).unwrap();
+        assert!(forced.contains("forced-batched-floor-off"), "{forced}");
+        assert!(adaptive_floor_failure(&json!({})).is_some());
+    }
+
     #[test]
     fn lane_coverage_rules() {
         let t = 10u64;
         // Healthy evidence per arm (8 lanes => 80 requests).
-        assert!(lane_coverage("lane_ar", 8, 10, &ev(t, 80, 0, 500, 0, 0, 80, 0, 0)).is_empty());
-        assert!(lane_coverage("lane_batched", 8, 10, &ev(t, 80, 400, 0, 0, 0, 0, 0, 0)).is_empty());
+        assert!(lane_coverage(Topology::Pp2, "lane_ar", 8, 10, &ev(t, 80, 0, 500, 0, 0, 80, 0, 0)).is_empty());
+        assert!(lane_coverage(Topology::Pp2, "lane_batched", 8, 10, &ev(t, 80, 400, 0, 0, 0, 0, 0, 0)).is_empty());
         assert!(
-            lane_coverage("lane_adaptive", 8, 10, &ev(t, 80, 300, 40, 5, 78, 2, 0, 0)).is_empty()
+            lane_coverage(Topology::Pp2, "lane_adaptive", 8, 10, &ev(t, 80, 300, 40, 5, 78, 2, 0, 0)).is_empty()
         );
-        assert!(lane_coverage("lane_copy", 8, 10, &ev(t, 80, 100, 0, 0, 0, 0, 60, 60)).is_empty());
+        assert!(lane_coverage(Topology::Pp2, "lane_copy", 8, 10, &ev(t, 80, 100, 0, 0, 0, 0, 60, 60)).is_empty());
         // Violations.
-        assert!(!lane_coverage("lane_ar", 8, 10, &ev(t, 80, 3, 500, 0, 0, 80, 0, 0)).is_empty());
-        assert!(!lane_coverage("lane_ar", 8, 10, &ev(t, 80, 0, 0, 0, 0, 80, 0, 0)).is_empty());
+        assert!(!lane_coverage(Topology::Pp2, "lane_ar", 8, 10, &ev(t, 80, 3, 500, 0, 0, 80, 0, 0)).is_empty());
+        assert!(!lane_coverage(Topology::Pp2, "lane_ar", 8, 10, &ev(t, 80, 0, 0, 0, 0, 80, 0, 0)).is_empty());
         assert!(
-            !lane_coverage("lane_batched", 8, 10, &ev(t, 80, 400, 1, 0, 0, 0, 0, 0)).is_empty()
+            !lane_coverage(Topology::Pp2, "lane_batched", 8, 10, &ev(t, 80, 400, 1, 0, 0, 0, 0, 0)).is_empty()
         );
-        assert!(!lane_coverage("lane_batched", 8, 10, &ev(t, 80, 0, 0, 0, 0, 0, 0, 0)).is_empty());
+        assert!(!lane_coverage(Topology::Pp2, "lane_batched", 8, 10, &ev(t, 80, 0, 0, 0, 0, 0, 0, 0)).is_empty());
         assert!(
-            !lane_coverage("lane_adaptive", 8, 10, &ev(t, 80, 300, 40, 5, 70, 2, 0, 0)).is_empty()
+            !lane_coverage(Topology::Pp2, "lane_adaptive", 8, 10, &ev(t, 80, 300, 40, 5, 70, 2, 0, 0)).is_empty()
         );
-        assert!(!lane_coverage("lane_copy", 8, 10, &ev(t, 80, 100, 0, 0, 0, 0, 0, 0)).is_empty());
-        assert!(!lane_coverage("lane_copy", 8, 10, &ev(t, 80, 100, 0, 0, 0, 0, 60, 59)).is_empty());
+        assert!(!lane_coverage(Topology::Pp2, "lane_copy", 8, 10, &ev(t, 80, 100, 0, 0, 0, 0, 0, 0)).is_empty());
+        assert!(!lane_coverage(Topology::Pp2, "lane_copy", 8, 10, &ev(t, 80, 100, 0, 0, 0, 0, 60, 59)).is_empty());
         // Cohort size is checked against trials x lanes.
         assert!(
-            !lane_coverage("lane_batched", 8, 10, &ev(t, 10, 400, 0, 0, 0, 0, 0, 0)).is_empty()
+            !lane_coverage(Topology::Pp2, "lane_batched", 8, 10, &ev(t, 10, 400, 0, 0, 0, 0, 0, 0)).is_empty()
         );
-        assert!(lane_coverage("lane_batched", 1, 10, &ev(t, 10, 400, 0, 0, 0, 0, 0, 0)).is_empty());
+        assert!(lane_coverage(Topology::Pp2, "lane_batched", 1, 10, &ev(t, 10, 400, 0, 0, 0, 0, 0, 0)).is_empty());
         assert!(
-            !lane_coverage("lane_batched", 1, 11, &ev(t, 10, 400, 0, 0, 0, 0, 0, 0)).is_empty()
+            !lane_coverage(Topology::Pp2, "lane_batched", 1, 11, &ev(t, 10, 400, 0, 0, 0, 0, 0, 0)).is_empty()
         );
         // A missing counter is a failure, not zero.
         let mut missing = ev(t, 80, 400, 0, 0, 0, 0, 0, 0);
         missing.as_object_mut().unwrap().remove("ar_windows");
-        let failures = lane_coverage("lane_batched", 8, 10, &missing);
+        let failures = lane_coverage(Topology::Pp2, "lane_batched", 8, 10, &missing);
         assert!(
             failures.iter().any(|f| f.contains("ar_windows")),
             "{failures:?}"
         );
         assert!(
-            !lane_coverage("lane_interleaved", 8, 10, &ev(t, 80, 1, 0, 0, 0, 0, 0, 0)).is_empty()
+            !lane_coverage(Topology::Pp2, "lane_interleaved", 8, 10, &ev(t, 80, 1, 0, 0, 0, 0, 0, 0)).is_empty()
         );
     }
 }
