@@ -2269,7 +2269,10 @@ impl Gpu {
 
     /// Capacity an auto admission may plan against: device total minus this
     /// process's own live device allocations ([`hip_bridge::HipRuntime::own_device_bytes`])
-    /// minus the fixed [`PLANNED_CAPACITY_RESERVE_BYTES`]. Unlike
+    /// minus this process's MEASURED unledgered residency (code objects, PM4/
+    /// graph pools, driver state: the process's own `drm-memory-vram` from
+    /// `/proc/self/fdinfo` less the ledger; [`own_vram_from_fdinfo`]) minus a
+    /// small fixed [`PLANNED_CAPACITY_RESERVE_BYTES`] margin. Unlike
     /// [`Self::device_mem_info`]'s free figure it does not move when a foreign
     /// process transiently allocates, so a route chosen from it is stable
     /// across loads. Callers MUST still verify the real allocation and fall to
@@ -2280,7 +2283,23 @@ impl Gpu {
         let (free, total) = self.device_mem_info()?;
         let own = self.hip.own_device_bytes();
         let stable = !self.is_uma() && self.emu.is_none();
-        Ok(PlannedCapacity::new(free, total, own, stable))
+        let cap = PlannedCapacity::new(free, total, own, stable);
+        if !stable {
+            return Ok(cap);
+        }
+        // The process's own footprint is read from the kernel's per-client
+        // accounting, so a foreign process's allocation never enters it. When
+        // the accounting is unreadable, fall back to the conservative measured
+        // post-load residency.
+        let measured = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .ok()
+            .and_then(|bdf| own_vram_from_fdinfo(&bdf));
+        Ok(match measured {
+            Some(vram) => cap.with_unledgered(vram.saturating_sub(own), true),
+            None => cap.with_unledgered(PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES, false),
+        })
     }
 
     /// Install a real stream if launches are still going to the null stream.
@@ -12600,11 +12619,62 @@ mod tests {
     }
 }
 
-/// Fixed device reserve a planned admission leaves for driver/runtime state
-/// that is not in the allocation ledger (code objects, queues, context, graph
-/// pools). Measured unledgered residency after load: ~3.5 GiB (A3B R9700),
-/// ~4.0 GiB (Raon R9700), ~4.9 GiB (Raon 7900 XTX).
-pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 4 << 30;
+/// Fixed margin a planned admission leaves on top of the measured own
+/// footprint (lazy kernel/code-object loads and graph pools that appear after
+/// the admission, allocator rounding).
+pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 512 << 20;
+
+/// Unledgered residency assumed when the kernel's per-process VRAM accounting
+/// cannot be read. Measured after load: ~3.5 GiB (A3B R9700), ~4.0 GiB (Raon
+/// R9700), ~4.9 GiB (Raon 7900 XTX); the smallest is used so the fallback is not
+/// itself the cause of a placement regression.
+pub const PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES: usize = 3584 << 20;
+
+/// This process's VRAM on the device at PCI address `bdf`, in bytes: the sum of
+/// `drm-memory-vram` over its distinct DRM clients for that device
+/// (`/proc/self/fdinfo`). It counts everything the process holds, ledgered or
+/// not, and nothing a foreign process holds. `None` when no client for the
+/// device reports it.
+pub fn own_vram_from_fdinfo(bdf: &str) -> Option<usize> {
+    let entries = std::fs::read_dir("/proc/self/fdinfo").ok()?;
+    let mut clients: std::collections::HashMap<String, usize> = Default::default();
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some((id, kib)) = parse_drm_fdinfo(&text, bdf) {
+            clients.insert(id, kib);
+        }
+    }
+    if clients.is_empty() {
+        return None;
+    }
+    Some(clients.values().sum::<usize>().saturating_mul(1024))
+}
+
+/// `(drm-client-id, drm-memory-vram KiB)` of one fdinfo text when it belongs to
+/// the device at `bdf`.
+fn parse_drm_fdinfo(text: &str, bdf: &str) -> Option<(String, usize)> {
+    let (mut pdev, mut id, mut vram) = (None, None, None);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "drm-pdev" => pdev = Some(value),
+            "drm-client-id" => id = Some(value),
+            "drm-memory-vram" => {
+                vram = value.split_whitespace().next().and_then(|v| v.parse().ok())
+            }
+            _ => {}
+        }
+    }
+    if !pdev?.eq_ignore_ascii_case(bdf) {
+        return None;
+    }
+    Some((id?.to_string(), vram?))
+}
 
 /// Result of [`Gpu::planned_capacity`]; `Display` is the load-log input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12612,30 +12682,53 @@ pub struct PlannedCapacity {
     /// Bytes the admission plans against.
     pub bytes: usize,
     pub total: usize,
+    /// Live device bytes in this process's allocation ledger.
     pub own: usize,
+    /// Residency this process holds outside the ledger (measured, or the
+    /// conservative fallback).
+    pub unledgered: usize,
+    /// The unledgered figure was measured from the kernel accounting.
+    pub unledgered_measured: bool,
     pub reserve: usize,
     /// Instantaneous free at query time (observation only when `planned`).
     pub free_now: usize,
-    /// `bytes` is `total - own - reserve`; false = free figure used (UMA/emu).
+    /// `bytes` is `total - own - unledgered - reserve`; false = free figure
+    /// used (UMA/emu).
     pub planned: bool,
 }
 
 impl PlannedCapacity {
     pub fn new(free_now: usize, total: usize, own: usize, planned: bool) -> Self {
-        let reserve = PLANNED_CAPACITY_RESERVE_BYTES;
-        let bytes = if planned {
-            total.saturating_sub(own).saturating_sub(reserve)
-        } else {
-            free_now
-        };
         Self {
-            bytes,
+            bytes: 0,
             total,
             own,
-            reserve,
+            unledgered: 0,
+            unledgered_measured: false,
+            reserve: PLANNED_CAPACITY_RESERVE_BYTES,
             free_now,
             planned,
         }
+        .recomputed()
+    }
+
+    /// Account `bytes` of this process's residency outside the ledger.
+    pub fn with_unledgered(mut self, bytes: usize, measured: bool) -> Self {
+        self.unledgered = bytes;
+        self.unledgered_measured = measured;
+        self.recomputed()
+    }
+
+    fn recomputed(mut self) -> Self {
+        self.bytes = if self.planned {
+            self.total
+                .saturating_sub(self.own)
+                .saturating_sub(self.unledgered)
+                .saturating_sub(self.reserve)
+        } else {
+            self.free_now
+        };
+        self
     }
 }
 
@@ -12645,8 +12738,14 @@ impl std::fmt::Display for PlannedCapacity {
         if self.planned {
             write!(
                 f,
-                "planned={:.0} MiB (total {:.0} - own {:.0} - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
-                m(self.bytes), m(self.total), m(self.own), m(self.reserve), m(self.free_now)
+                "planned={:.0} MiB (total {:.0} - own {:.0} - unledgered {:.0} ({}) - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
+                m(self.bytes),
+                m(self.total),
+                m(self.own),
+                m(self.unledgered),
+                if self.unledgered_measured { "measured, fdinfo" } else { "fallback" },
+                m(self.reserve),
+                m(self.free_now)
             )
         } else {
             write!(
@@ -12668,6 +12767,21 @@ mod planned_capacity_tests {
         let b = PlannedCapacity::new(6 * G, 32 * G, 8 * G, true); // 14 GiB foreign
         assert_eq!(a.bytes, b.bytes);
         assert_eq!(a.bytes, 24 * G - PLANNED_CAPACITY_RESERVE_BYTES);
+        // Measured unledgered residency is charged once, and is foreign-proof too.
+        let a = a.with_unledgered(4 * G, true);
+        let b = b.with_unledgered(4 * G, true);
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.bytes, 20 * G - PLANNED_CAPACITY_RESERVE_BYTES);
+    }
+    #[test]
+    fn fdinfo_parse_counts_only_the_named_device() {
+        let t = "pos:\t0\ndrm-driver:\tamdgpu\ndrm-pdev:\t0000:C3:00.0\ndrm-client-id:\t7\ndrm-memory-vram:\t1192100 KiB\ndrm-memory-gtt: 8240 KiB\n";
+        assert_eq!(
+            parse_drm_fdinfo(t, "0000:c3:00.0"),
+            Some(("7".to_string(), 1192100))
+        );
+        assert_eq!(parse_drm_fdinfo(t, "0000:03:00.0"), None);
+        assert_eq!(parse_drm_fdinfo("pos: 0\n", "0000:c3:00.0"), None);
     }
     #[test]
     fn uma_uses_free() {
