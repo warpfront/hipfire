@@ -2011,13 +2011,6 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<LaneSpecConfig>,
     ) -> Result<(), BundleError> {
-        if self.ep_reserve_active() {
-            return Err(ep_err(
-                "lane staging is refused on an EP reserve-sharing load: lane steps and lane \
-                 prefill waves need the resident scratch bank and Full-table routes the borrowed \
-                 reserve does not provide",
-            ));
-        }
         if spec.is_some() {
             return Err(ep_err(
                 "native-MTP lanes are not supported yet; stage AR lanes (serve.batch_spec = false)",

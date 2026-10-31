@@ -1663,6 +1663,10 @@ fn forward_lanes_scoped(
             )
         }));
     }
+    // An EP reserve-sharing load: a dirty borrow epoch (a lane prefill tile on
+    // the borrowed bank) is restored and the resident bank checked before any
+    // launch; a no-op on every other load.
+    fwd.ep_reserve_lane_step_enter(gpu, n)?;
     fwd.scratch.note_forward_rows(n);
     match out {
         StepOutputs::Ar(out) => {
