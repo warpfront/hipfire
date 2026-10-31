@@ -19412,6 +19412,7 @@ fn generate_lfm3_audio(
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let audio_pad_id = {
         let ids = tokenizer.encode("<|audio|>");
+        eprintln!("[lfm3-audio] <|audio|> encodes to {:?} (using {})", ids, if ids.len()==1 {ids[0].to_string()} else {"125031 (fallback)".to_string()});
         if ids.len() == 1 {
             ids[0]
         } else {
@@ -19478,6 +19479,11 @@ fn generate_lfm3_audio(
         write_error(stdout, id, "lfm3-audio: empty prompt after tokenize");
         return;
     }
+    let n_pad_in_prompt = prompt_tokens.iter().filter(|&&t| t == audio_pad_id).count();
+    eprintln!(
+        "[lfm3-audio] prompt_tokens={} (audio_pad {n_pad_in_prompt} expected {n_audio_tokens}, audio_pad_id={audio_pad_id})",
+        prompt_tokens.len()
+    );
 
     let eos_tok = m.lfm3().unwrap().eos_tok;
     let stop_toks: Vec<u32> = {
@@ -19549,6 +19555,7 @@ fn generate_lfm3_audio(
     for &tok in &prompt_tokens {
         m.conversation_tokens.push(tok);
     }
+    eprintln!("[lfm3-audio] prefill spliced {audio_idx}/{n_audio_tokens} audio embeddings");
     let prefill_ms = t0.elapsed().as_millis();
 
     // ── Decode loop (host-side sampling, same as generate_lfm3_vl). ──
