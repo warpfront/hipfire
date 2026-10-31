@@ -1891,8 +1891,8 @@ impl Qwen4Bundle {
     }
 
     /// Whether this load shares the EP reserve (this rank's forward carries a
-    /// plan receipt, or the attached mesh agreed one). Dynamic lane staging
-    /// and any consumer needing the resident scratch bank refuse on it.
+    /// plan receipt, or the attached mesh agreed one). Consumers that need the
+    /// 4096-row scratch bank resident at every call refuse on it.
     pub(crate) fn ep_reserve_active(&self) -> bool {
         self.execution
             .as_ref()
@@ -4530,12 +4530,20 @@ impl Qwen4Bundle {
         spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
         self.pp_refuse("continuous-batch lanes")?;
-        if self.ep_reserve_active() {
-            return Err(BundleError::Forward(
-                "Qwen4 lanes cannot be staged on an EP reserve-sharing load: lane steps and \
-                 lane prefill waves need the resident scratch bank (not supported)"
-                    .to_string(),
-            ));
+        // An EP reserve-sharing load runs lane decode steps on the 512-row
+        // resident bank (prefill tiles borrow like a singleton prompt), so a
+        // store with more lanes than resident rows cannot step.
+        if let Some(rows) = self
+            .execution
+            .as_ref()
+            .and_then(|forward| forward.ep_reserve_resident_rows())
+        {
+            if max_lanes > rows {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 lanes on an EP reserve-sharing load step on the {rows}-row resident \
+                     scratch bank; {max_lanes} lanes do not fit"
+                )));
+            }
         }
         if self.ep.is_some() {
             return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec);

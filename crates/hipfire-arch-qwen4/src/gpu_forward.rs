@@ -164,15 +164,40 @@ pub fn qwen4_prefill_chunk_requested(
     max_seq: usize,
     mode: Qwen4ForwardScratchMode,
 ) -> usize {
-    prefill_chunk_requested_from(
-        &gpu.arch,
-        hipfire_config::developer_var(QWEN4_PREFILL_CHUNK_ROWS_ENV)
-            .ok()
-            .as_deref(),
-        max_seq,
-        mode,
-        || crate::host_link::host_link(gpu),
-    )
+    let env = hipfire_config::developer_var(QWEN4_PREFILL_CHUNK_ROWS_ENV).ok();
+    if explicit_prefill_chunk_rows(env.as_deref()).is_none() {
+        if let Some(rows) = qwen4_ep_auto_prefill_chunk() {
+            return rows.min(max_seq);
+        }
+    }
+    prefill_chunk_requested_from(&gpu.arch, env.as_deref(), max_seq, mode, || {
+        crate::host_link::host_link(gpu)
+    })
+}
+
+/// The prefill chunk the current expert-parallel load's auto-fit chose
+/// (`0` = none). One expert-parallel load decides it once, before any rank
+/// allocates ([`qwen4_set_ep_auto_prefill_chunk`]); every later reader of the
+/// requested chunk (each rank's placement and forward, the lane staging, the
+/// loader's census) then sees the same value an explicit
+/// `HIPFIRE_PREFILL_CHUNK_ROWS` would give, without the operator pinning it.
+/// An explicit env value always wins over it.
+static EP_AUTO_PREFILL_CHUNK_ROWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set (`Some(rows)`) or clear (`None`) the expert-parallel auto-fit chunk.
+/// Every Qwen4 load clears it before planning, so a chunk chosen for one
+/// model never leaks into the next load of the process.
+pub fn qwen4_set_ep_auto_prefill_chunk(rows: Option<usize>) {
+    EP_AUTO_PREFILL_CHUNK_ROWS.store(rows.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The expert-parallel auto-fit chunk, if the load chose one.
+pub fn qwen4_ep_auto_prefill_chunk() -> Option<usize> {
+    match EP_AUTO_PREFILL_CHUNK_ROWS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        rows => Some(rows),
+    }
 }
 
 /// The explicit `HIPFIRE_PREFILL_CHUNK_ROWS` value rounded down to whole

@@ -3496,6 +3496,62 @@ pub fn ep_lane_reservation_line(max_seq: usize, plan: &EpVramPlan) -> Option<Str
     })
 }
 
+/// Prefill chunk rungs the EP auto-fit steps down through below the requested
+/// chunk, largest first (every rung is a whole 256-row GEMM tile multiple).
+/// A smaller chunk buys resident layers and costs prefill: measured on EP2
+/// mq4-xts, 2x R9700, no lanes (`mgmtp/epfit`), pp16384 / pp65536 tok/s at
+/// 4096 (the decoupled reserve) / 2048 / 1024 / 512 rows are 5133 / 4911,
+/// 4191 / 4056, 3010 / 2763, 2173 / 1994 (-18% / -41% / -58%) for 34 / 32 /
+/// 33 / 34 resident layers, which is why the auto-fit is opt-in
+/// (`HIPFIRE_EP_CHUNK_AUTOFIT=1`).
+pub const EP_CHUNK_FIT_RUNGS: [usize; 4] = [4096, 2048, 1024, 512];
+
+/// Resident layers a smaller chunk must buy, over the placement it replaces,
+/// before the auto-fit moves the chunk: a single layer is inside the noise of
+/// the prefill cost of a smaller tile.
+pub const EP_CHUNK_FIT_MIN_GAIN_LAYERS: usize = 2;
+
+/// The rungs one EP auto-fit tries: every [`EP_CHUNK_FIT_RUNGS`] entry strictly
+/// below `requested`, largest first. Empty when `requested` is already at or
+/// below the floor.
+pub fn ep_chunk_fit_rungs(requested: usize) -> Vec<usize> {
+    EP_CHUNK_FIT_RUNGS
+        .into_iter()
+        .filter(|&rows| rows < requested)
+        .collect()
+}
+
+/// The auto-fit's choice among `candidates` (`(chunk rows, split at that
+/// chunk)`, largest chunk first, every split already carrying the lane store
+/// of that chunk): the candidate with the most resident layers, the largest
+/// chunk on a tie, and only when it holds at least
+/// [`EP_CHUNK_FIT_MIN_GAIN_LAYERS`] more than `current_layers`. `None` keeps
+/// the placement being compared against.
+pub fn ep_chunk_fit_pick(
+    current_layers: usize,
+    candidates: Vec<(usize, EpVramPlan)>,
+) -> Option<(usize, EpVramPlan)> {
+    let mut best: Option<(usize, EpVramPlan)> = None;
+    for (rows, plan) in candidates {
+        if best.as_ref().map_or(true, |(_, held)| plan.layers > held.layers) {
+            best = Some((rows, plan));
+        }
+    }
+    best.filter(|(_, plan)| plan.layers >= current_layers + EP_CHUNK_FIT_MIN_GAIN_LAYERS)
+}
+
+/// The one load line of an auto-fit that moved the chunk.
+pub fn ep_chunk_fit_line(
+    requested: usize,
+    chosen: usize,
+    from_layers: usize,
+    to_layers: usize,
+) -> String {
+    format!(
+        "qwen4 EP auto-fit: prefill chunk {chosen} rows (requested {requested}); resident expert layers {from_layers} -> {to_layers}"
+    )
+}
+
 /// One rank's line of the expert-parallel fit table: free VRAM, the
 /// replicated trunk, the rank's routed-expert bytes (`MoE layers` of
 /// `layer_expert_bytes_per_rank` each), the split applied (`applied_layers`
@@ -7489,6 +7545,49 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    fn fit_plan(layers: usize) -> EpVramPlan {
+        EpVramPlan {
+            layers,
+            reservation: None,
+            unreserved: None,
+        }
+    }
+
+    #[test]
+    fn ep_chunk_fit_rungs_are_the_ladder_below_the_requested_chunk() {
+        assert_eq!(ep_chunk_fit_rungs(8192), vec![4096, 2048, 1024, 512]);
+        assert_eq!(ep_chunk_fit_rungs(4096), vec![2048, 1024, 512]);
+        assert_eq!(ep_chunk_fit_rungs(2048), vec![1024, 512]);
+        assert_eq!(ep_chunk_fit_rungs(512), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn ep_chunk_fit_pick_needs_the_minimum_gain_and_prefers_the_larger_chunk() {
+        // No candidate: keep the placement.
+        assert_eq!(ep_chunk_fit_pick(27, Vec::new()), None);
+        // One layer is inside the noise: keep.
+        assert_eq!(ep_chunk_fit_pick(27, vec![(2048, fit_plan(28))]), None);
+        // The minimum gain moves the chunk.
+        assert_eq!(
+            ep_chunk_fit_pick(27, vec![(2048, fit_plan(29))]),
+            Some((2048, fit_plan(29)))
+        );
+        // The most layers wins; a tie keeps the larger chunk (listed first).
+        let picked = ep_chunk_fit_pick(
+            20,
+            vec![
+                (4096, fit_plan(24)),
+                (2048, fit_plan(26)),
+                (1024, fit_plan(26)),
+            ],
+        );
+        assert_eq!(picked, Some((2048, fit_plan(26))));
+        assert_eq!(
+            ep_chunk_fit_line(4096, 2048, 27, 30),
+            "qwen4 EP auto-fit: prefill chunk 2048 rows (requested 4096); resident expert layers 27 -> 30"
+        );
     }
 
     fn band_scopes(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
