@@ -116,6 +116,12 @@ pub fn project_rows(
         return project_row(gpu, w, x, y, round);
     }
     match w.gpu_dtype {
+        // Row-exact verify: qt44 and F32 have no multi-row kernel with the decode
+        // reduction order (WMMA F16 x for qt44, a 32-lane tree for F32 vs the 256-thread
+        // `gemv_f32`), so each row runs the decode projection itself.
+        DType::MQ4G256V2 | DType::F32 if rows <= ROWS_EXACT_MAX && rows_exact() => {
+            per_row_decode(gpu, w, x, y, rows)
+        }
         DType::MQ4G256V2 => weight_gemm(gpu, w, x, y, rows).map_err(|e| format!("{e:?}")),
         DType::Q8_0 if rows <= ROWS_EXACT_MAX && rows_exact() => gpu
             .gemv_q8_0_rows_exact(&w.buf, x, y, w.m, w.k, rows)
@@ -131,6 +137,23 @@ pub fn project_rows(
     .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;
     if round == OutRound::Bf16 {
         round_bf16_rows(gpu, y, rows, w.m)?;
+    }
+    Ok(())
+}
+
+/// `rows` launches of the decode projection (`weight_gemv`) on row views: exact by
+/// construction, the weight re-read per row.
+fn per_row_decode(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+) -> Result<(), String> {
+    for r in 0..rows {
+        let x_row = x.sub_offset(r * w.k, w.k);
+        let y_row = y.sub_offset(r * w.m, w.m);
+        weight_gemv(gpu, w, &x_row, &y_row).map_err(|e| format!("{e:?}"))?;
     }
     Ok(())
 }
