@@ -1287,6 +1287,13 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
         // `K % 128 != 0`; per-row kernels read past such a buffer. A conv1d
         // `[C, 1, W]` is packed flat.
         DType::HFQ4G128 if shape.len() == 2 => 1,
+        // Floor-stride codecs: the kernels read `K / group` groups per row and
+        // support no ragged tail, so a `[rows, K]` matrix needs K aligned.
+        // Older quantizers packed ragged-K matrices flat across rows. A conv1d
+        // `[C, 1, W]` is packed flat.
+        DType::HFQ6G256 | DType::HFQ4G256 if shape.len() == 2 => 256,
+        DType::HFQ2G128 | DType::HFQ3G128 if shape.len() == 2 => 128,
+        DType::Q4F16G64 if shape.len() == 2 => 64,
         // qt=55 is expert-blocked, not row-strided: `[E, R, K]` (or `[R, K]`)
         // is E blocks of `b128_block_stride(R, K)` bytes.
         DType::FP8E4M3B128 => {
@@ -1328,6 +1335,9 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
     let row_bytes = match dtype {
         // `DType::row_bytes` has no HFQ4G128 arm; ParoQ4G128 is its layout.
         DType::HFQ4G128 => DType::ParoQ4G128.row_bytes(k),
+        DType::HFQ2G128 | DType::HFQ3G128 | DType::Q4F16G64 => {
+            (k / k_alignment).checked_mul(quant_block_bytes(dtype))
+        }
         _ => dtype.row_bytes(k),
     };
     row_bytes
@@ -4292,6 +4302,43 @@ mod tests {
         assert_eq!(
             expected_payload_bytes(&[64, 1, 4], DType::HFQ4G128).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn floor_stride_extent_refuses_ragged_k() {
+        // K=1000 is not a whole number of 64-, 128- or 256-element groups.
+        for dtype in [
+            DType::HFQ6G256,
+            DType::HFQ4G256,
+            DType::HFQ2G128,
+            DType::HFQ3G128,
+            DType::Q4F16G64,
+        ] {
+            assert!(
+                expected_payload_bytes(&[2560, 1000], dtype).is_err(),
+                "{dtype:?}"
+            );
+            // A flat-packed conv1d `[C, 1, 4]` has no row extent.
+            assert_eq!(expected_payload_bytes(&[64, 1, 4], dtype).unwrap(), None);
+        }
+        // The flat SmolLM2 HFQ6 gate_proj [2560, 960]: 9600 groups of 200 B.
+        assert!(validate_payload_extent(&[2560, 960], DType::HFQ6G256, 1_920_000).is_err());
+        assert_eq!(
+            expected_payload_bytes(&[960, 2560], DType::HFQ6G256).unwrap(),
+            Some(960 * 10 * 200)
+        );
+        assert_eq!(
+            expected_payload_bytes(&[960, 2560], DType::HFQ2G128).unwrap(),
+            Some(960 * 20 * 40)
+        );
+        assert_eq!(
+            expected_payload_bytes(&[960, 2560], DType::HFQ3G128).unwrap(),
+            Some(960 * 20 * 56)
+        );
+        assert_eq!(
+            expected_payload_bytes(&[960, 2560], DType::Q4F16G64).unwrap(),
+            Some(960 * 40 * 36)
         );
     }
 

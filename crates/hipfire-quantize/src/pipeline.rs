@@ -8543,6 +8543,38 @@ fn handle_main_quant(
                     std::process::exit(1);
                 }
             }
+            // These encoders pack groups flat across rows, but their kernels
+            // read `K / group` groups per row, so a `[rows, K]` matrix with a
+            // ragged K would decode as garbage. Re-encode it in a row-padded
+            // format: Q8 keeps HFQ6's precision and is the embedding format,
+            // HFQ4-G128 pads each row. Higher ranks (conv1d) stay flat.
+            let floor_stride_group = match qt {
+                QuantType::HFQ6G256 | QuantType::HFQ4G256 => 256,
+                QuantType::HFQ2G128 | QuantType::HFQ3G128 => 128,
+                QuantType::Q4F16G64 => 64,
+                _ => 0,
+            };
+            let (quantized, qt, gs, label) = if meta.shape.len() == 2
+                && floor_stride_group != 0
+                && !meta.shape[1].is_multiple_of(floor_stride_group)
+            {
+                awq_sidecar_scales = None;
+                let (m, k) = (meta.shape[0], meta.shape[1]);
+                if qt == QuantType::HFQ6G256 || name.contains("embed_tokens") {
+                    eprintln!("  {name}: K={k} % {floor_stride_group} != 0, {label} -> Q8_F16");
+                    (quantize_q8f16(&f32_data), QuantType::Q8F16, 32u32, "Q8_F16")
+                } else {
+                    eprintln!("  {name}: K={k} % {floor_stride_group} != 0, {label} -> HFQ4G128");
+                    (
+                        quantize_hfq4g128_2d(&f32_data, m, k),
+                        QuantType::HFQ4G128,
+                        128u32,
+                        "HFQ4G128",
+                    )
+                }
+            } else {
+                (quantized, qt, gs, label)
+            };
 
             // Compute quantization error (skip for Q8 embeddings — always negligible)
             let block_size = gs as usize;
