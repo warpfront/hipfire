@@ -9,6 +9,10 @@
 //!   rows with explicit raw history, optional SiLU, optional BF16 rounding.
 //! * `gated_rmsnorm_sigmoid_rows_f32`: per-head RMSNorm times sigmoid(gate).
 //! * `raon_rda_prepare_f32`: checkpoint-specific RDA gate/normalization prep.
+//! * `raon_rda_conv_prepare_w128_f32`: the three RDA convs and `raon_rda_prepare_f32` in one launch
+//!   (gfx1201, head_dim 128, conv K=4), bit-identical, no materialized conv planes.
+//! * `gated_rmsnorm_sigmoid_rows_w128_f32`: `gated_rmsnorm_sigmoid_rows_f32` for head_dim 128 as one wave
+//!   per (row, head), bit-identical.
 //!
 //! Operand planes are FP32; "BF16 rounding" means the stored FP32 value is
 //! rounded to the nearest-even BF16 value (the planes stay FP32).
@@ -25,6 +29,10 @@ pub const CAUSAL_CONV_DEPTHWISE_ROWS_SRC: &str =
 pub const GATED_RMSNORM_SIGMOID_ROWS_SRC: &str =
     include_str!("../../../kernels/src/gated_rmsnorm_sigmoid_rows.hip");
 pub const RAON_RDA_PREPARE_SRC: &str = include_str!("../../../kernels/src/raon_rda_prepare.hip");
+pub const RAON_RDA_CONV_PREPARE_SRC: &str =
+    include_str!("../../../kernels/src/raon_rda_conv_prepare.hip");
+pub const GATED_RMSNORM_SIGMOID_ROWS_W128_SRC: &str =
+    include_str!("../../../kernels/src/gated_rmsnorm_sigmoid_rows_w128.hip");
 
 /// Head dimension (K == V) the serial kernel is specialized for.
 pub const GATED_DELTA_VECTOR_HEAD_DIM: usize = 128;
@@ -659,6 +667,334 @@ impl Gpu {
                 for v in floats {
                     b.push_f32(v);
                 }
+                b.push_i32(round);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+}
+
+/// Waves per workgroup of the wave-per-tile kernels below (block 256, wave32).
+const WAVES_PER_BLOCK: usize = 8;
+
+/// Rows one wave walks in [`Gpu::raon_rda_conv_prepare_w128_f32`] for a launch of `n_rows` rows (any value `>= 3`
+/// is correct; this only sets the wave count, `n_heads * ceil(n_rows / rows_per_wave)`). R9700 sweep
+/// (256-row segments, 40 heads): 16 rows per wave (640 waves) and 6-8 (1,000-1,300 waves) tie; 32 (320 waves)
+/// loses 3-8%. Each extra wave re-reads 3 halo rows of the raw planes, so launches under 256 rows use 8.
+pub fn rda_conv_prepare_rows_per_wave(n_rows: usize) -> usize {
+    if n_rows >= 256 {
+        16
+    } else {
+        8
+    }
+}
+
+/// Operands + geometry of `raon_rda_conv_prepare_w128_f32` (f32 elements). `conv_w_*` are `[H*128, 4]`
+/// (channel stride 4, tap stride 1) and `hist_*` the raw `[3, H*128]` histories, updated in place.
+pub struct RdaConvPrepareLaunch<'a> {
+    pub q_out: &'a GpuTensor,
+    pub k_out: &'a GpuTensor,
+    pub vprime_out: &'a GpuTensor,
+    pub log_alpha_out: &'a GpuTensor,
+    pub beta_out: &'a GpuTensor,
+    pub q_raw: &'a GpuTensor,
+    pub k_raw: &'a GpuTensor,
+    pub v_raw: &'a GpuTensor,
+    pub conv_w_q: &'a GpuTensor,
+    pub conv_w_k: &'a GpuTensor,
+    pub conv_w_v: &'a GpuTensor,
+    pub hist_q: &'a GpuTensor,
+    pub hist_k: &'a GpuTensor,
+    pub hist_v: &'a GpuTensor,
+    pub f: &'a GpuTensor,
+    pub b: &'a GpuTensor,
+    pub delta: &'a GpuTensor,
+    pub a_log: &'a GpuTensor,
+    pub dt_bias: &'a GpuTensor,
+    pub n_rows: usize,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub conv_kernel: usize,
+    pub rows_per_wave: usize,
+    pub raw_row_stride: usize,
+    pub f_row_stride: usize,
+    pub bd_row_stride: usize,
+    pub out_row_stride: usize,
+    pub beta_row_stride: usize,
+    pub hist_tap_stride: usize,
+    pub q_scale: f32,
+    pub norm_eps: f32,
+    pub lower_bound: f32,
+    pub round_bf16: bool,
+}
+
+impl Gpu {
+    /// Whether the wave-per-tile RDA kernels (`raon_rda_conv_prepare_w128_f32`,
+    /// `gated_rmsnorm_sigmoid_rows_w128_f32`) are valid on this device: wave32 and verified on exact gfx1201.
+    pub fn rda_wave_kernels_arch_supported(&self) -> bool {
+        self.arch == "gfx1201"
+    }
+
+    /// The conv(q,k,v) + `raon_rda_prepare_f32` chain in one launch over `n_rows` rows; outputs and the
+    /// in-place history update are bit-identical to the two-step chain. Kernel args: see the kernel header.
+    pub fn raon_rda_conv_prepare_w128_f32(
+        &mut self,
+        p: &RdaConvPrepareLaunch<'_>,
+    ) -> HipResult<()> {
+        if p.head_dim != GATED_DELTA_VECTOR_HEAD_DIM || p.conv_kernel != 4 {
+            return Err(refuse(format!(
+                "raon_rda_conv_prepare_w128_f32: head_dim {} / conv kernel {} must be 128 / 4",
+                p.head_dim, p.conv_kernel
+            )));
+        }
+        if !self.rda_wave_kernels_arch_supported() {
+            return Err(refuse(format!(
+                "raon_rda_conv_prepare_w128_f32: arch {} is not gfx1201",
+                self.arch
+            )));
+        }
+        if p.rows_per_wave < 3 {
+            return Err(refuse(format!(
+                "raon_rda_conv_prepare_w128_f32: rows_per_wave {} < 3 (the history is read by one wave)",
+                p.rows_per_wave
+            )));
+        }
+        if p.n_rows == 0 {
+            return Ok(());
+        }
+        let ext = p.n_heads * p.head_dim;
+        let n = p.n_rows;
+        need(p.q_raw, "q_raw", n, p.raw_row_stride, ext)?;
+        need(p.k_raw, "k_raw", n, p.raw_row_stride, ext)?;
+        need(p.v_raw, "v_raw", n, p.raw_row_stride, ext)?;
+        for (t, what) in [
+            (p.conv_w_q, "conv_w_q"),
+            (p.conv_w_k, "conv_w_k"),
+            (p.conv_w_v, "conv_w_v"),
+        ] {
+            need(t, what, ext, 4, 4)?;
+        }
+        for (t, what) in [
+            (p.hist_q, "hist_q"),
+            (p.hist_k, "hist_k"),
+            (p.hist_v, "hist_v"),
+        ] {
+            need(t, what, 3, p.hist_tap_stride, ext)?;
+        }
+        need(p.f, "f", n, p.f_row_stride, ext)?;
+        need(p.b, "b", n, p.bd_row_stride, p.n_heads)?;
+        need(p.delta, "delta", n, p.bd_row_stride, p.n_heads)?;
+        need(p.a_log, "a_log", 1, 0, p.n_heads)?;
+        need(p.dt_bias, "dt_bias", 1, 0, ext)?;
+        need(p.q_out, "q_out", n, p.out_row_stride, ext)?;
+        need(p.k_out, "k_out", n, p.out_row_stride, ext)?;
+        need(p.vprime_out, "vprime_out", n, p.out_row_stride, ext)?;
+        need(p.log_alpha_out, "log_alpha_out", n, p.out_row_stride, ext)?;
+        need(p.beta_out, "beta_out", n, p.beta_row_stride, p.n_heads)?;
+        // The kernel issues float4 accesses: every stride must keep 16-byte alignment.
+        for (v, what) in [
+            (p.raw_row_stride, "raw_row_stride"),
+            (p.f_row_stride, "f_row_stride"),
+            (p.out_row_stride, "out_row_stride"),
+            (p.hist_tap_stride, "hist_tap_stride"),
+        ] {
+            if v % 4 != 0 {
+                return Err(refuse(format!(
+                    "raon_rda_conv_prepare_w128_f32: {what} {v} is not a multiple of 4"
+                )));
+            }
+        }
+
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "raon_rda_conv_prepare",
+            RAON_RDA_CONV_PREPARE_SRC,
+            "raon_rda_conv_prepare_w128_f32",
+        )?;
+        let ptrs = [
+            p.q_out.buf.as_ptr(),
+            p.k_out.buf.as_ptr(),
+            p.vprime_out.buf.as_ptr(),
+            p.log_alpha_out.buf.as_ptr(),
+            p.beta_out.buf.as_ptr(),
+            p.q_raw.buf.as_ptr(),
+            p.k_raw.buf.as_ptr(),
+            p.v_raw.buf.as_ptr(),
+            p.conv_w_q.buf.as_ptr(),
+            p.conv_w_k.buf.as_ptr(),
+            p.conv_w_v.buf.as_ptr(),
+            p.hist_q.buf.as_ptr(),
+            p.hist_k.buf.as_ptr(),
+            p.hist_v.buf.as_ptr(),
+            p.f.buf.as_ptr(),
+            p.b.buf.as_ptr(),
+            p.delta.buf.as_ptr(),
+            p.a_log.buf.as_ptr(),
+            p.dt_bias.buf.as_ptr(),
+        ];
+        let ints = [
+            i32_of(p.head_dim, "head_dim")?,
+            i32_of(p.n_heads, "n_heads")?,
+            i32_of(p.n_rows, "n_rows")?,
+            i32_of(p.rows_per_wave, "rows_per_wave")?,
+            i32_of(p.raw_row_stride, "raw_row_stride")?,
+            i32_of(p.f_row_stride, "f_row_stride")?,
+            i32_of(p.bd_row_stride, "bd_row_stride")?,
+            i32_of(p.out_row_stride, "out_row_stride")?,
+            i32_of(p.beta_row_stride, "beta_row_stride")?,
+            i32_of(p.hist_tap_stride, "hist_tap_stride")?,
+        ];
+        let floats = [p.q_scale, p.norm_eps, p.lower_bound];
+        let round = p.round_bf16 as i32;
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(33);
+        for v in &ptrs {
+            params.push(v as *const _ as *mut c_void);
+        }
+        for v in &ints {
+            params.push(v as *const _ as *mut c_void);
+        }
+        for v in &floats {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&round as *const _ as *mut c_void);
+        let waves = p.n_heads * p.n_rows.div_ceil(p.rows_per_wave);
+        let grid = [waves.div_ceil(WAVES_PER_BLOCK) as u32, 1, 1];
+        // 4 planes read + 4 planes written per row (history/weights negligible).
+        let bytes = p.n_rows * ext * 4 * 8;
+        let timer = profile::begin_timer(
+            &self.hip,
+            "gated_delta",
+            "raon_rda_conv_prepare_w128_f32",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "raon_rda_conv_prepare_w128_f32",
+            grid,
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                for v in ptrs {
+                    b.push_ptr(v);
+                }
+                for v in ints {
+                    b.push_i32(v);
+                }
+                for v in floats {
+                    b.push_f32(v);
+                }
+                b.push_i32(round);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// [`Gpu::gated_rmsnorm_sigmoid_rows_f32`] for `head_dim == 128` as one wave per (row, head); the
+    /// output is bit-identical.
+    pub fn gated_rmsnorm_sigmoid_rows_w128_f32(
+        &mut self,
+        out: &GpuTensor,
+        x: &GpuTensor,
+        gate: &GpuTensor,
+        gamma: &GpuTensor,
+        g: &GatedRmsnormRowsGeom,
+    ) -> HipResult<()> {
+        if g.head_dim != GATED_DELTA_VECTOR_HEAD_DIM {
+            return Err(refuse(format!(
+                "gated_rmsnorm_sigmoid_rows_w128_f32: head_dim {} must be 128",
+                g.head_dim
+            )));
+        }
+        if !self.rda_wave_kernels_arch_supported() {
+            return Err(refuse(format!(
+                "gated_rmsnorm_sigmoid_rows_w128_f32: arch {} is not gfx1201",
+                self.arch
+            )));
+        }
+        if g.n_rows == 0 {
+            return Ok(());
+        }
+        let ext = g.n_heads * g.head_dim;
+        need(x, "rmsnorm x", g.n_rows, g.x_row_stride, ext)?;
+        need(gate, "rmsnorm gate", g.n_rows, g.gate_row_stride, ext)?;
+        need(out, "rmsnorm out", g.n_rows, g.out_row_stride, ext)?;
+        need(gamma, "rmsnorm gamma", 1, 0, g.head_dim)?;
+        for (v, what) in [
+            (g.x_row_stride, "x_row_stride"),
+            (g.gate_row_stride, "gate_row_stride"),
+            (g.out_row_stride, "out_row_stride"),
+        ] {
+            if v % 4 != 0 {
+                return Err(refuse(format!(
+                    "gated_rmsnorm_sigmoid_rows_w128_f32: {what} {v} is not a multiple of 4"
+                )));
+            }
+        }
+
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_rmsnorm_sigmoid_rows_w128",
+            GATED_RMSNORM_SIGMOID_ROWS_W128_SRC,
+            "gated_rmsnorm_sigmoid_rows_w128_f32",
+        )?;
+        let op = out.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let mp = gamma.buf.as_ptr();
+        let ints = [
+            i32_of(g.head_dim, "head_dim")?,
+            i32_of(g.n_heads, "n_heads")?,
+            i32_of(g.n_rows, "n_rows")?,
+            i32_of(g.x_row_stride, "x_row_stride")?,
+            i32_of(g.gate_row_stride, "gate_row_stride")?,
+            i32_of(g.out_row_stride, "out_row_stride")?,
+        ];
+        let eps = g.eps;
+        let round = g.round_bf16 as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &mp as *const _ as *mut c_void,
+        ];
+        for v in &ints {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&eps as *const _ as *mut c_void);
+        params.push(&round as *const _ as *mut c_void);
+        let waves = g.n_rows * g.n_heads;
+        let bytes = g.n_rows * ext * 4 * 3;
+        let timer = profile::begin_timer(
+            &self.hip,
+            "norm",
+            "gated_rmsnorm_sigmoid_rows_w128_f32",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gated_rmsnorm_sigmoid_rows_w128_f32",
+            [waves.div_ceil(WAVES_PER_BLOCK) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(op);
+                b.push_ptr(xp);
+                b.push_ptr(gp);
+                b.push_ptr(mp);
+                for v in ints {
+                    b.push_i32(v);
+                }
+                b.push_f32(eps);
                 b.push_i32(round);
                 b
             },
