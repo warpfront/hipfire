@@ -12730,6 +12730,21 @@ impl PlannedCapacity {
         };
         self
     }
+
+    /// The capacity before the fixed reserve: device total minus this
+    /// process's own live allocations when planned, the free figure under
+    /// UMA/emu. For a caller that carries its own measured runtime reserve in
+    /// its census (the Qwen4 expert-parallel plan: historical floor, 1408 MiB
+    /// of it HIP runtime residency), where [`Self::bytes`] would count the
+    /// runtime residency twice. Stable against a foreign process's transient
+    /// allocation like [`Self::bytes`].
+    pub fn before_reserve(&self) -> usize {
+        if self.planned {
+            self.total.saturating_sub(self.own)
+        } else {
+            self.bytes
+        }
+    }
 }
 
 impl std::fmt::Display for PlannedCapacity {
@@ -12787,6 +12802,19 @@ mod planned_capacity_tests {
     fn uma_uses_free() {
         assert_eq!(
             PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).bytes,
+            5 * G
+        );
+    }
+    #[test]
+    fn before_reserve_is_total_minus_own_and_ignores_foreign_allocations() {
+        let a = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);
+        let b = PlannedCapacity::new(6 * G, 32 * G, 8 * G, true); // 14 GiB foreign
+        assert_eq!(a.before_reserve(), 24 * G);
+        assert_eq!(a.before_reserve(), b.before_reserve());
+        assert_eq!(a.before_reserve(), a.bytes + PLANNED_CAPACITY_RESERVE_BYTES);
+        // UMA / emu: the free figure stays authoritative.
+        assert_eq!(
+            PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).before_reserve(),
             5 * G
         );
     }

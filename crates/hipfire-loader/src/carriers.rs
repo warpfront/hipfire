@@ -2782,7 +2782,7 @@ fn qwen4_settled_charges(
 }
 
 /// Planned capacity of every device in `devices` (HIP logical ids), in order, as
-/// [`rdna_compute::Gpu::planned_capacity_for`] reports it before any rank of
+/// [`rdna_compute::Gpu::planned_capacity_for`] reports it (`before_reserve`) before any rank of
 /// the load allocates. Run on the thread that owns `gpu` (the daemon thread):
 /// other devices are queried by `device_mem_info_for`, which switches the
 /// thread's current device with raw HIP setters and restores the previous
@@ -2805,14 +2805,25 @@ pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Ve
     let mut free = Vec::with_capacity(devices.len());
     for &device in devices {
         // Planned capacity (device total minus this process's own live
-        // allocations minus the fixed reserve), not the instantaneous free
-        // figure: a foreign process's transient allocation must not move the
-        // agreed split. UMA parts keep the free figure.
+        // allocations), not the instantaneous free figure: a foreign
+        // process's transient allocation must not move the agreed split. The
+        // fixed planned reserve is NOT deducted here: the EP reserve census
+        // keeps the historical floor (`runtime_overhead_bytes` is `None` for
+        // ranks > 1), which stands in for the HIP runtime residency
+        // (`QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES`, 929-1,383 MiB measured on
+        // an R9700 beyond live allocations), so deducting the planned
+        // reserve as well would count it twice: one resident layer per rank
+        // lost, measured on both the default and the chunk-512 placement.
+        // UMA parts keep the free figure.
         let capacity = gpu
             .planned_capacity_for(device)
             .map_err(|error| format!("qwen4: device {device} memory query: {error}"))?;
-        eprintln!("  qwen4 EP device {device}: {capacity}");
-        free.push(capacity.bytes as u64);
+        let plan_bytes = capacity.before_reserve();
+        eprintln!(
+            "  qwen4 EP device {device}: {capacity}; EP plans against {} MiB (before the fixed reserve: its census carries the runtime reserve)",
+            plan_bytes >> 20
+        );
+        free.push(plan_bytes as u64);
     }
     Ok(qwen4_ep_alias_free(devices, &free))
 }
