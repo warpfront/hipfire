@@ -583,8 +583,8 @@ pub fn ep_spec_lane_reservation(
 /// - `single`: one-device budget check here, then `stage_lanes`.
 /// - `ep`: replicated rank stores (the arch fans staging out and budgets
 ///   every rank against its own free memory). With `serve.batch_spec`, the MTP
-///   head loaded and neither kill switch (`HIPFIRE_EP_MTP_LANES=0`) nor
-///   `serve.batch_sampled` set, native-MTP lanes are staged with the default
+///   head loaded and no kill switch (`HIPFIRE_EP_MTP_LANES=0`) set, native-MTP
+///   lanes are staged with the default
 ///   copy lane ([`hipfire_arch_qwen4::ep::ep_default_copy_config`]) and the
 ///   mesh lane transaction is armed
 ///   ([`hipfire_arch_qwen4::bundle::Qwen4Bundle::ep_mesh_lanes_arm`]): decode

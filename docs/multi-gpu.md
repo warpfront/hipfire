@@ -1257,8 +1257,10 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   the experts. The stage line reports `spec=mtp K=.. executor=ep-mesh
   copy=on|off`; a store that does not fit is a labeled refusal and AR lanes
   (`spec=off (...)`), never a narrower MTP store. `HIPFIRE_EP_MTP_LANES=0` is
-  the kill switch (EP lanes are AR lanes, as before) and `serve.batch_sampled`
-  keeps EP on AR lanes until the lane sampled oracle (>= 2000 trials) passes.
+  the kill switch (EP lanes are AR lanes, as before). Sampled requests
+  (`serve.batch_sampled`, neutral penalties) run on the same lanes: rank 0
+  reads the head's exact candidates and its target logits rows, and the root
+  alone draws every proposal and every Leviathan accept/residual/bonus.
   A lone request keeps the singleton MTP route; the floor retires a lane to AR
   windows when native drafts do not pay (high concurrency). The daemon logs
   each lane drive's route mix by step concurrency (`[fn-lane-mesh-mix]`).

@@ -63,7 +63,7 @@
 //! halves fail independently: an error in one errors only its own lanes and
 //! the other half's committed tokens are still emitted. Route mix by step
 //! concurrency is logged once per drive (`[fn-lane-mesh-mix]`). An AR EP store
-//! (kill switch `HIPFIRE_EP_MTP_LANES=0`, sampled lanes) keeps the executor
+//! (kill switch `HIPFIRE_EP_MTP_LANES=0`) keeps the executor
 //! path unchanged.
 
 use crate::ar::*;
