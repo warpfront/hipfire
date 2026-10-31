@@ -681,7 +681,6 @@ pub enum ArchPredicate {
     /// builtins are gfx1201-guarded: no other arch may resolve them, so an
     /// fp8 cache fails closed at dispatch outside the admitted target.
     IsGfx1201,
-    HasSdot4,
     /// HFQ3-G256 plain GEMV admission: RDNA1.1/RDNA2 via the sdot4 generic
     /// kernel, plus gfx1100/1101/1102 where `gemv_hfq3g256_for_arch` selects
     /// the RDNA3 wave32 scalar variant (`gemv_hfq3g256_rdna3`, the MQ3
@@ -1040,7 +1039,9 @@ impl KernelKey {
             // required for the match to compile.
             | BQ1G128 => ArchPredicate::Always,
             HFQ3G256 => ArchPredicate::HasHfq3G256Gemv,
-            HFQ3G128 => ArchPredicate::HasSdot4,
+            // gemv_hfq3g128 is a generic [32,1,1] scalar kernel (no sdot4); its
+            // shuffle offsets stay within 32 lanes, so wave64 runs it too.
+            HFQ3G128 => ArchPredicate::Always,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline
             // `_=>` arms) and ALREADY run on RDNA1/2 via the qwen35 direct path.
