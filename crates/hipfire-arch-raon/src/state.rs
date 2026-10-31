@@ -140,6 +140,9 @@ pub struct RaonStateDims {
     /// Expanded K/V mirror stored as INT8 codes + one F16 scale per (row, head,
     /// plane) instead of BF16 ([`crate::mla::MlaPolicy::mirror_q8`]).
     pub mirror_q8: bool,
+    /// Keep Q8 even when a BF16 mirror would cover the reserved context
+    /// ([`crate::mla::MlaPolicy::mirror_q8_forced`]).
+    pub mirror_q8_forced: bool,
 }
 
 impl RaonStateDims {
@@ -173,6 +176,7 @@ impl RaonStateDims {
             mhc_controls: 17,
             decay_bottleneck: 128,
             mirror_q8: true,
+            mirror_q8_forced: false,
         }
     }
 
@@ -1298,7 +1302,7 @@ impl RaonState {
     /// `(mirror is Q8, budget rows)` for `usable` bytes.
     fn plan_mirror(&self, usable: usize) -> (bool, usize) {
         let mut q8 = self.dims.mirror_q8;
-        if q8 && self.mirror.is_none() {
+        if q8 && !self.dims.mirror_q8_forced && self.mirror.is_none() {
             let bf16 = RaonStateDims {
                 mirror_q8: false,
                 ..self.dims.clone()
