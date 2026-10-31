@@ -27,8 +27,8 @@
 use crate::types::DispatchError;
 pub use rdna_compute::stream_mix::StreamRounding;
 use rdna_compute::stream_mix::{
-    StreamAggregate, StreamGamma, StreamMean, StreamPostmix, StreamRouteHelmert,
-    STREAM_MIX_MAX_STREAMS, STREAM_MIX_MAX_WIDTH,
+    StreamAggregate, StreamGamma, StreamMean, StreamPostmix, StreamRouteAggregate,
+    StreamRouteHelmert, STREAM_MIX_MAX_STREAMS, STREAM_MIX_MAX_WIDTH,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -102,6 +102,24 @@ pub enum StreamMixStage<'a> {
         /// Controls (all three written).
         controls: StreamControls<'a>,
     },
+    /// [`Route`](Self::Route) followed by [`Aggregate`](Self::Aggregate) of the same
+    /// site, outputs bit-identical to running the two stages in order. With
+    /// `HIPFIRE_RAON_MHC_FUSED=1` (gfx-independent, prefill rows >=
+    /// [`MHC_FUSED_MIN_ROWS`], supported geometry) the old streams are read once for
+    /// both the weightless RMS and the aggregate instead of twice; otherwise it
+    /// launches the two stages.
+    RouteAggregate {
+        /// Old streams `[rows, n, width]` (read).
+        streams: &'a GpuTensor,
+        chart: StreamChart<'a>,
+        /// Scratch `[rows, selector rows]` F32 for the raw selector output.
+        selector_out: &'a GpuTensor,
+        /// Controls (all three written).
+        controls: StreamControls<'a>,
+        norm: Option<StreamNorm<'a>>,
+        /// `[rows, width]` (written).
+        out: &'a GpuTensor,
+    },
     /// `out = [norm](round(sum_s pre[s] * streams[s]))`.
     Aggregate {
         streams: &'a GpuTensor,
@@ -162,7 +180,9 @@ impl StreamMixOp<'_> {
                 quant: "f32-plane",
             });
         }
-        if let StreamMixStage::Route { chart, .. } = &self.stage {
+        if let StreamMixStage::Route { chart, .. } | StreamMixStage::RouteAggregate { chart, .. } =
+            &self.stage
+        {
             match chart {
                 StreamChart::HelmertBounded { .. } if self.streams < 2 => {
                     return Err(geometry("HelmertBounded chart needs at least 2 streams"));
@@ -270,6 +290,54 @@ pub fn preload_stream_mix(gpu: &mut Gpu) -> Result<(), DispatchError> {
     .map_err(|e| hip_err("stream_mix selector f32 gemm preload", e))
 }
 
+/// Smallest row count that takes the fused route+aggregate kernel. Decode and
+/// speculative verify (rows <= 16) keep the two-stage chain.
+pub const MHC_FUSED_MIN_ROWS: usize = 64;
+
+/// `HIPFIRE_RAON_MHC_FUSED`: default ON (bit-identical); `0` kills; `1` fuses the Helmert route finalize into
+/// the aggregate (one pass over the old streams), `0` is the kill switch.
+fn mhc_fused_admitted(n: usize, width: usize, rows: usize) -> bool {
+    rows >= MHC_FUSED_MIN_ROWS
+        && Gpu::stream_mix_route_aggregate_supported(n, width)
+        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", false)
+}
+
+/// Selector projection `selector_out[r, :] = selector . streams[r, :]` of a
+/// Helmert chart; the finalize kernel applies the model-dtype round and the
+/// inverse-RMS scale.
+fn helmert_selector_gemm(
+    gpu: &mut Gpu,
+    selector: &GpuTensor,
+    streams: &GpuTensor,
+    selector_out: &GpuTensor,
+    n: usize,
+    width: usize,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    let zdim = StreamMixOp::helmert_selector_rows(n);
+    let x_dim = n * width;
+    if !rows_gemm_weight_ok(selector) || selector.numel() < zdim * x_dim {
+        return Err(geometry(format!(
+            "HelmertBounded selector must be BF16 (or F32) [{zdim}, {x_dim}]"
+        )));
+    }
+    if streams.dtype == DType::BF16 {
+        // BF16 streams: the selector is read by the BF16-activation twin of the
+        // same lane-strided/shuffle-tree kernels (bit-identical outputs).
+        if selector.dtype != DType::BF16 {
+            return Err(geometry("BF16 streams need a BF16 selector weight"));
+        }
+        let tiled = rows >= BF16_TILED_ROWS_MIN_N
+            && gpu.arch == "gfx1201"
+            && hipfire_config::developer_bool("HIPFIRE_BF16W_TILED_ROWS", true);
+        return gpu
+            .gemm_bf16_xbf16_rows(selector, streams, selector_out, zdim, x_dim, rows, tiled)
+            .map_err(|e| hip_err("stream_mix selector gemm (BF16 streams)", e));
+    }
+    rows_gemm(gpu, selector, streams, selector_out, zdim, x_dim, rows)
+        .map_err(|e| hip_err("stream_mix selector gemm", e))
+}
+
 /// Validates and launches one stream-mix stage.
 pub fn execute_stream_mix(gpu: &mut Gpu, op: &StreamMixOp<'_>) -> Result<(), DispatchError> {
     op.validate()?;
@@ -294,18 +362,7 @@ pub fn execute_stream_mix(gpu: &mut Gpu, op: &StreamMixOp<'_>) -> Result<(), Dis
                 post_factor,
                 selector_eps,
             } => {
-                let zdim = StreamMixOp::helmert_selector_rows(n);
-                let x_dim = n * width;
-                if !rows_gemm_weight_ok(selector) || selector.numel() < zdim * x_dim {
-                    return Err(geometry(format!(
-                        "HelmertBounded selector must be BF16 (or F32) [{zdim}, {x_dim}]"
-                    )));
-                }
-                // Selector projection: selector_out[r, :] = selector . streams[r, :].
-                // The kernel below applies the model-dtype round and the inverse-RMS
-                // scale.
-                rows_gemm(gpu, selector, streams, selector_out, zdim, x_dim, rows)
-                    .map_err(|e| hip_err("stream_mix selector gemm", e))?;
+                helmert_selector_gemm(gpu, selector, streams, selector_out, n, width, rows)?;
                 gpu.stream_mix_route_helmert(&StreamRouteHelmert {
                     streams,
                     z_raw: selector_out,
@@ -321,6 +378,69 @@ pub fn execute_stream_mix(gpu: &mut Gpu, op: &StreamMixOp<'_>) -> Result<(), Dis
                     rounding,
                 })
                 .map_err(|e| hip_err("stream_mix route_helmert", e))
+            }
+        },
+        StreamMixStage::RouteAggregate {
+            streams,
+            chart,
+            selector_out,
+            controls,
+            norm,
+            out,
+        } => match chart {
+            StreamChart::HelmertBounded {
+                selector,
+                params,
+                post_factor,
+                selector_eps,
+            } => {
+                helmert_selector_gemm(gpu, selector, streams, selector_out, n, width, rows)?;
+                if streams.dtype == DType::BF16 || mhc_fused_admitted(n, width, rows) {
+                    return gpu
+                        .stream_mix_route_aggregate(&StreamRouteAggregate {
+                            streams,
+                            z_raw: selector_out,
+                            params,
+                            pre: controls.pre,
+                            post: controls.post,
+                            res: controls.res,
+                            norm: gamma(*norm),
+                            out,
+                            rows,
+                            n,
+                            width,
+                            post_factor: *post_factor,
+                            selector_eps: *selector_eps,
+                            rounding,
+                        })
+                        .map_err(|e| hip_err("stream_mix route_aggregate", e));
+                }
+                gpu.stream_mix_route_helmert(&StreamRouteHelmert {
+                    streams,
+                    z_raw: selector_out,
+                    params,
+                    pre: controls.pre,
+                    post: controls.post,
+                    res: controls.res,
+                    rows,
+                    n,
+                    width,
+                    post_factor: *post_factor,
+                    selector_eps: *selector_eps,
+                    rounding,
+                })
+                .map_err(|e| hip_err("stream_mix route_helmert", e))?;
+                gpu.stream_mix_aggregate(&StreamAggregate {
+                    streams,
+                    pre: controls.pre,
+                    norm: gamma(*norm),
+                    out,
+                    rows,
+                    n,
+                    width,
+                    rounding,
+                })
+                .map_err(|e| hip_err("stream_mix aggregate", e))
             }
         },
         StreamMixStage::Aggregate {
