@@ -434,7 +434,8 @@ fn assemble_raon_bundle(
             return Err(e);
         }
     };
-    let (scratch, rows) = match alloc_scratch_descending(gpu, config, &dims, rows, state.max_seq()) {
+    let (scratch, rows) = match alloc_scratch_descending(gpu, config, &dims, rows, state.max_seq())
+    {
         Ok(s) => s,
         Err(e) => {
             if let Err(fe) = state.free_gpu(gpu) {
