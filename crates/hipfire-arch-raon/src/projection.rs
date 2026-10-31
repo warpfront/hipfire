@@ -102,7 +102,7 @@ pub fn project_row(
 ///
 /// `tier` is the site's resolved activation precision (`precision::RaonPrecisionPlan`): Q8_0
 /// weights take [`q8_0_prefill_gemm`] (which runs the F16 batched GEMM whenever the quantized
-/// tier is not admitted: rows < 64, graph capture, non-gfx1201); qt44 and F32 weights ignore it
+/// tier is not admitted: rows < 64, graph capture, an arch without a W8A8 Q8_0 route); qt44 and F32 weights ignore it
 /// and keep their F16/F32 routes. Pass `F16` for sites that are never tiered.
 pub fn project_rows(
     gpu: &mut Gpu,
