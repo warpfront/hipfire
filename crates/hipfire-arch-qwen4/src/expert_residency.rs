@@ -3533,7 +3533,10 @@ pub fn ep_chunk_fit_pick(
 ) -> Option<(usize, EpVramPlan)> {
     let mut best: Option<(usize, EpVramPlan)> = None;
     for (rows, plan) in candidates {
-        if best.as_ref().map_or(true, |(_, held)| plan.layers > held.layers) {
+        if best
+            .as_ref()
+            .map_or(true, |(_, held)| plan.layers > held.layers)
+        {
             best = Some((rows, plan));
         }
     }
