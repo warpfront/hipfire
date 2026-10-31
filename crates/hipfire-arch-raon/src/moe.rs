@@ -24,8 +24,8 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{GroupedMoeGeometry, MOE_GROUPED_MAX_TOP_K};
 use hipfire_dispatch::pipeline::{
     execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
-    GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
-    GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
+    GroupedMoeActTier, GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp,
+    GroupedMoePolicy, GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
     GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, RouterKind,
     SharedExpertPolicy,
 };
@@ -52,6 +52,9 @@ pub struct RaonMoeDims {
     pub value_beta: f32,
     pub router_eps: f32,
     pub router_scale: f32,
+    /// Activation tier of the grouped routed-expert GEMMs (`HIPFIRE_RAON_PREFILL_PRECISION`, set by the
+    /// bundle at load; `F16` = the F16 WMMA core).
+    pub routed_tier: GroupedMoeActTier,
 }
 
 impl RaonMoeDims {
@@ -70,6 +73,7 @@ impl RaonMoeDims {
             value_beta: 25.0,
             router_eps: 1e-20,
             router_scale: 1.0,
+            routed_tier: GroupedMoeActTier::F16,
         }
     }
 
@@ -148,6 +152,9 @@ pub struct RaonMoeLayerRefs<'a> {
     /// Shared expert projections (qt44): gate/up `[logical_mi, hidden]`, down
     /// `[hidden, down_k]`. Gate/up `awq_scale` equals `gate_up_awq`.
     pub shared: GroupedMoeShared<'a>,
+    /// Every routed gate/up and down header is loader-verified symmetric
+    /// (`zp == -8 * sc`); with a quantized routed tier selected, admits the grouped W4A8/W4A4 core.
+    pub iu4_symmetric: bool,
 }
 
 impl<'a> RaonMoeLayerRefs<'a> {
@@ -169,8 +176,14 @@ impl<'a> RaonMoeLayerRefs<'a> {
     ) -> Self {
         let mut gate = shared_gate.dispatch_ref();
         let mut up = shared_up.dispatch_ref();
-        gate.awq_scale = gate_up_awq;
-        up.awq_scale = gate_up_awq;
+        // Only a qt44 shared gate/up consumes the rotated, AWQ-divided basis;
+        // Q8_0/F16/F32 projections read the plain activation and take no scale.
+        if gate.dtype == DType::MQ4G256V2 {
+            gate.awq_scale = gate_up_awq;
+        }
+        if up.dtype == DType::MQ4G256V2 {
+            up.awq_scale = gate_up_awq;
+        }
         Self {
             router_weight: &router.buf,
             correction_bias,
@@ -183,7 +196,14 @@ impl<'a> RaonMoeLayerRefs<'a> {
                 up,
                 down: shared_down.dispatch_ref(),
             },
+            iu4_symmetric: false,
         }
+    }
+
+    /// Bind the loader's symmetric-header verdict ([`MoeFfnWeights::iu4_symmetric`](crate::weights::MoeFfnWeights)).
+    pub fn with_iu4_symmetric(mut self, verified: bool) -> Self {
+        self.iu4_symmetric = verified;
+        self
     }
 }
 
@@ -479,6 +499,8 @@ pub fn raon_moe_op<'a>(
             down_ptrs: layer.down_ptrs,
             input_awq: layer.gate_up_awq,
             down_awq_ptrs: layer.down_awq_ptrs,
+            iu4_symmetric_verified: layer.iu4_symmetric,
+            act_tier: dims.routed_tier,
         },
         shared: Some(layer.shared),
         scratch: scratch.view(),

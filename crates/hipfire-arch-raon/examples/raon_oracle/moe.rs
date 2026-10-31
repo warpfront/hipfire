@@ -1744,6 +1744,7 @@ fn dims_of(c: &CaseData) -> RaonMoeDims {
         value_beta,
         router_eps: ROUTER_EPS,
         router_scale: ROUTER_SCALE,
+        routed_tier: hipfire_dispatch::pipeline::GroupedMoeActTier::F16,
     }
 }
 
@@ -1898,6 +1899,7 @@ fn gpu_moe_run_inner(
         gate_up_awq: wd.awq_gu.as_ref(),
         down_awq_ptrs: wd.awq_down_ptrs.as_ref(),
         shared: shared_refs,
+        iu4_symmetric: false,
     };
     let mut op = raon_moe_op(
         ctx,

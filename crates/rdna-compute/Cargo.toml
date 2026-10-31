@@ -37,6 +37,9 @@ peacemaker-ir = { path = "../peacemaker-ir" }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-rip = { path = "../peacemaker-rip" }
 [[example]]
+name = "bench_moe_grouped_qt44_iu4"
+required-features = ["lab"]
+[[example]]
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
 [[example]]

@@ -14,9 +14,12 @@
 //! FFN `hc_post` (the input of layer `l + 1`), exactly the tensor KRAFTON's
 //! vLLM fork appends as `s.flatten(1)` ("tap-major, stream-major") and their
 //! llama.cpp port exposes as `t_layer_inp` (see [`crate::forward::DflashCapture`]
-//! and `raon/dflash2/PLAN.md` §2.1). The forward captures it on the device
-//! with one strided copy per layer; the verify and prefill paths only download
-//! the rows the drafter keeps.
+//! and `raon/dflash2/PLAN.md` §2.1). The verify forward captures it on the
+//! device with one strided copy per layer into a buffer of verify-block height.
+//! Prefill and forced advances (`spec_advance`) run the AR prefill launch
+//! sequence and download only the rows the drafter keeps, layer by layer,
+//! through a stream tap: no device buffer of the prefill's chunk height (it
+//! would cost `chunk x 200 KB`, 0.4-0.8 GB at 2048-4096-row chunks).
 //!
 //! # Verify and rollback
 //!
@@ -263,14 +266,15 @@ impl RaonBundle {
         Ok(())
     }
 
-    /// Validate the armed extract layers and size the capture buffer for
-    /// `max(rows, prefill chunk)` rows. No-op while disarmed.
+    /// Validate the armed extract layers and size the capture buffer for a
+    /// verify block of `rows` rows (prefill never uses it). No-op while
+    /// disarmed.
     fn ensure_capture(&mut self, gpu: &mut Gpu, rows: usize) -> Result<(), String> {
         if self.spec.layers.is_empty() {
             return Ok(());
         }
         validate_extract_layers(&self.spec.layers, self.config.n_layers)?;
-        let elems = rows.max(self.prefill_step_rows()) * self.feature_row_width();
+        let elems = rows * self.feature_row_width();
         if self
             .spec
             .capture
@@ -363,63 +367,94 @@ impl RaonBundle {
         Ok((rows, graphed))
     }
 
-    /// The target's feature rows for `tokens` through the oracle download tap
-    /// ([`forward_rows_tapped`]): the byte-exact reference of the device
-    /// capture. Advances the live state over `tokens` from its current length
-    /// and returns `tokens.len()` feature rows in the capture layout (layer-major
-    /// in `set_dflash_extract_layers` order, then stream-major, then hidden;
-    /// `layers x 4 x hidden` F32 each), each layer's rows being the
+    /// One prefill step over `piece` that also appends the feature rows
+    /// `skip..skip + count` of the step to `out` (capture layout: layer-major
+    /// in `set_dflash_extract_layers` order, then stream-major, then hidden).
+    /// The launch sequence is the AR prefill step's ([`Self::forward_chunk`]
+    /// without capture), observed by a stream tap: after the FFN site of each
+    /// extract layer the device is drained and that layer's kept rows (the
+    /// `TapSite::Ffn(l)` buffer) are downloaded. `want_logits` as in
+    /// `forward_chunk`. On error `out` is left as it was.
+    fn forward_chunk_features(
+        &mut self,
+        gpu: &mut Gpu,
+        piece: &[u32],
+        want_logits: bool,
+        skip: usize,
+        count: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let layers = self.spec.layers.clone();
+        validate_extract_layers(&layers, self.config.n_layers)?;
+        if skip + count > piece.len() {
+            return Err(format!(
+                "raon1_mini: feature rows {skip}..{} outside a {}-row step",
+                skip + count,
+                piece.len()
+            ));
+        }
+        let width = self.stream_width();
+        let row_width = self.feature_row_width();
+        let base = out.len();
+        out.resize(base + count * row_width, 0.0);
+        let dst = &mut out[base..];
+        let pos = self.state.n_tokens() as u32;
+        let mut tap = |gpu: &mut Gpu,
+                       site: TapSite,
+                       streams: &GpuTensor,
+                       _rows: usize|
+         -> Result<(), String> {
+            let TapSite::Ffn(l) = site else {
+                return Ok(());
+            };
+            let Some(k) = layers.iter().position(|&id| id == l) else {
+                return Ok(());
+            };
+            gpu.hip
+                .device_synchronize()
+                .map_err(|e| format!("raon1_mini: feature tap synchronize L{l}: {e:?}"))?;
+            let host = gpu
+                .download_f32(&streams.sub_offset(skip * width, count * width))
+                .map_err(|e| format!("raon1_mini: feature tap download L{l}: {e:?}"))?;
+            for (r, row) in host.chunks_exact(width).enumerate() {
+                let at = r * row_width + k * width;
+                dst[at..at + width].copy_from_slice(row);
+            }
+            Ok(())
+        };
+        let result = forward_rows_tapped(
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            &mut self.scratch,
+            &mut self.work,
+            gpu,
+            piece,
+            pos,
+            want_logits,
+            Some(&mut tap),
+        );
+        if result.is_err() {
+            out.truncate(base);
+        }
+        result
+    }
+
+    /// The target's feature rows for `tokens` through the download tap
+    /// ([`forward_rows_tapped`]): the byte-exact reference of the verify's
+    /// device capture. Advances the live state over `tokens` from its current
+    /// length and returns `tokens.len()` feature rows in the capture layout
+    /// (layer-major in `set_dflash_extract_layers` order, then stream-major,
+    /// then hidden; `layers x 4 x hidden` F32 each), each layer's rows being the
     /// `TapSite::Ffn(l)` buffer. Needs armed extract layers.
     pub fn dflash_tap_reference(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<Vec<f32>, String> {
-        let layers = self.spec.layers.clone();
-        validate_extract_layers(&layers, self.config.n_layers)?;
-        let width = self.stream_width();
-        let row_width = self.feature_row_width();
-        let mut out = vec![0.0f32; tokens.len() * row_width];
-        let chunk = self.prefill_step_rows();
-        let mut base = 0usize;
-        for piece in tokens.chunks(chunk) {
-            let pos = self.state.n_tokens() as u32;
-            let mut tap = |gpu: &mut Gpu,
-                           site: TapSite,
-                           streams: &GpuTensor,
-                           rows: usize|
-             -> Result<(), String> {
-                let TapSite::Ffn(l) = site else {
-                    return Ok(());
-                };
-                let Some(k) = layers.iter().position(|&id| id == l) else {
-                    return Ok(());
-                };
-                gpu.hip
-                    .device_synchronize()
-                    .map_err(|e| format!("raon1_mini: tap synchronize L{l}: {e:?}"))?;
-                let host = gpu
-                    .download_f32(&streams.sub_offset(0, rows * width))
-                    .map_err(|e| format!("raon1_mini: tap download L{l}: {e:?}"))?;
-                for r in 0..rows {
-                    let dst = (base + r) * row_width + k * width;
-                    out[dst..dst + width].copy_from_slice(&host[r * width..(r + 1) * width]);
-                }
-                Ok(())
-            };
-            forward_rows_tapped(
-                &self.config,
-                &self.weights,
-                &mut self.state,
-                &mut self.scratch,
-                &mut self.work,
-                gpu,
-                piece,
-                pos,
-                false,
-                Some(&mut tap),
-            )?;
-            base += piece.len();
+        let mut out = Vec::with_capacity(tokens.len() * self.feature_row_width());
+        for piece in tokens.chunks(self.prefill_step_rows()) {
+            self.forward_chunk_features(gpu, piece, false, 0, piece.len(), &mut out)?;
         }
         Ok(out)
     }
@@ -495,7 +530,6 @@ impl SpecTarget for RaonBundle {
         let row_width = self.feature_row_width();
         let chunk = self.prefill_step_rows();
         let first_kept = if hidden_out.is_some() {
-            self.ensure_capture(gpu, 1)?;
             let first = keep_from(tokens.len(), self.spec.window);
             if first > 0 {
                 // Rows below the kept tail are never downloaded, so the rows
@@ -518,16 +552,18 @@ impl SpecTarget for RaonBundle {
                 }
                 return Ok(SpecAdvance::Aborted);
             }
+            let last = ci + 1 == n_chunks;
             let span = hidden_out
                 .as_ref()
                 .and_then(|_| chunk_span(off, piece.len(), first_kept));
-            self.forward_chunk(gpu, piece, ci + 1 == n_chunks, span.map(|_| 0))?;
-            if let (Some((skip, count)), Some(out)) = (span, hidden_out.as_deref_mut()) {
-                let capture = self.spec.capture.as_ref().expect("capture just ensured");
-                append_capture_rows(gpu, capture, row_width, skip, skip + count, out)?;
-                if let Some(window) = self.spec.window {
-                    trim_feature_rows(out, row_width, window);
+            match (span, hidden_out.as_deref_mut()) {
+                (Some((skip, count)), Some(out)) => {
+                    self.forward_chunk_features(gpu, piece, last, skip, count, out)?;
+                    if let Some(window) = self.spec.window {
+                        trim_feature_rows(out, row_width, window);
+                    }
                 }
+                _ => self.forward_chunk(gpu, piece, last)?,
             }
             off += piece.len();
         }
@@ -633,7 +669,7 @@ impl SpecTarget for RaonBundle {
                     // same batched forward.
                     self.state
                         .restore(gpu, &ss.snapshot)
-                        .and_then(|()| self.forward_chunk(gpu, &block[..committed], false, None))
+                        .and_then(|()| self.forward_chunk(gpu, &block[..committed], false))
                 }
                 Err(e) => Err(e),
             }

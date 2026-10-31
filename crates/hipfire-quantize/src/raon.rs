@@ -21,8 +21,17 @@
 //! the full physical input width. The routed-expert source is MXFP8: E4M3
 //! `[N,K]` plus raw E8M0 exponent bytes `[N,K/32]` in `.weight_scale_inv`;
 //! `value = float32(E4M3) * 2^(u8-127)` (modeling `M:496-511`).
+//!
+//! `HIPFIRE_RAON_SHARED_FFN` (`qt44` default | `q8f16` | `bf16`) selects the storage of the
+//! always-active FFN weights (shared expert gate/up/down of every MoE layer and the dense
+//! layer-0 gate/up/down). `q8f16` (qt3, group 32) and `bf16` (qt16, source-exact) carry no AWQ
+//! sidecar; the shared `down_proj` keeps the 1280 physical K (zero-padded columns) for both.
+//! `--raon-shared-ffn <q8f16|bf16>` builds such a variant from a shipped qt44 artifact
+//! without re-running calibration (see [`swap_shared_ffn`] / [`raon_hfq_diff`]).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
@@ -31,7 +40,7 @@ use hipfire_runtime::hfq::HfqFile as RuntimeHfqFile;
 use rayon::prelude::*;
 
 use crate::dequant::{dequantize_mxfp8_e8m0_strict, to_f32};
-use crate::hfq::{write_hfq, HfqTensor, QuantType, TensorSpill};
+use crate::hfq::{write_hfq, write_hfq_streamed, HfqIndexEntry, HfqTensor, QuantType, TensorSpill};
 use crate::quant_fwht::{gen_fwht_signs, quantize_mq4g256v2_symmetric, MQ4V2_GROUP_BYTES};
 use crate::quant_q4::quantize_q8f16;
 
@@ -45,6 +54,10 @@ pub(crate) const MXFP8_BLOCK_K: usize = 32;
 const GROUP: usize = 256;
 /// Rows per rayon work unit inside one tensor.
 const ROWS_PER_UNIT: usize = 32;
+/// Bytes per Q8F16 block of 32 weights: F16 scale + 32 × i8.
+const Q8F16_BLOCK_BYTES: usize = 34;
+/// Streaming window for pass-through copy and payload comparison.
+const COPY_CHUNK: usize = 4 * 1024 * 1024;
 
 // ─── class map ──────────────────────────────────────────────────────────────
 
@@ -52,10 +65,16 @@ const ROWS_PER_UNIT: usize = 32;
 pub(crate) enum Storage {
     /// Q8F16 (qt3), 32-element blocks.
     Q8F16,
+    /// Q8F16 with natural K zero-padded to a multiple of 256 (1088→1280).
+    Q8F16Padded,
     /// Symmetric qt44, natural K already divisible by 256.
     Qt44,
     /// Symmetric qt44 with natural K zero-padded to a multiple of 256 (1088→1280).
     Qt44Padded,
+    /// BF16 (qt16): raw little-endian bfloat16 of the source values.
+    Bf16,
+    /// BF16 with natural K zero-padded to a multiple of 256 (1088→1280).
+    Bf16Padded,
     /// F16 when exactly representable, else F32.
     Lossless,
     /// Always F32.
@@ -65,6 +84,55 @@ pub(crate) enum Storage {
 impl Storage {
     pub(crate) fn is_qt44(self) -> bool {
         matches!(self, Storage::Qt44 | Storage::Qt44Padded)
+    }
+
+    pub(crate) fn is_padded(self) -> bool {
+        matches!(
+            self,
+            Storage::Qt44Padded | Storage::Q8F16Padded | Storage::Bf16Padded
+        )
+    }
+}
+
+/// Storage of the always-active FFN weights (shared expert gate/up/down and the
+/// dense layer-0 gate/up/down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedFfn {
+    Qt44,
+    Q8F16,
+    Bf16,
+}
+
+impl SharedFfn {
+    pub(crate) fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "qt44" => Ok(SharedFfn::Qt44),
+            "q8f16" => Ok(SharedFfn::Q8F16),
+            "bf16" => Ok(SharedFfn::Bf16),
+            other => Err(format!(
+                "unknown shared-FFN storage `{other}` (expected qt44|q8f16|bf16)"
+            )),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SharedFfn::Qt44 => "qt44",
+            SharedFfn::Q8F16 => "q8f16",
+            SharedFfn::Bf16 => "bf16",
+        }
+    }
+
+    /// Class of one always-active FFN weight; `padded` for the shared `down_proj`.
+    fn storage(self, padded: bool) -> Storage {
+        match (self, padded) {
+            (SharedFfn::Qt44, false) => Storage::Qt44,
+            (SharedFfn::Qt44, true) => Storage::Qt44Padded,
+            (SharedFfn::Q8F16, false) => Storage::Q8F16,
+            (SharedFfn::Q8F16, true) => Storage::Q8F16Padded,
+            (SharedFfn::Bf16, false) => Storage::Bf16,
+            (SharedFfn::Bf16, true) => Storage::Bf16Padded,
+        }
     }
 }
 
@@ -101,12 +169,108 @@ pub(crate) fn lm_head_storage() -> Storage {
     }
 }
 
+/// Always-active FFN storage: `HIPFIRE_RAON_SHARED_FFN=qt44` (default, unset) | `q8f16` |
+/// `bf16`. An unknown value is an error, never a silent default.
+pub(crate) fn shared_ffn_storage() -> Result<SharedFfn, String> {
+    match hipfire_config::developer_var("HIPFIRE_RAON_SHARED_FFN") {
+        Ok(v) => SharedFfn::parse(&v).map_err(|e| format!("HIPFIRE_RAON_SHARED_FFN: {e}")),
+        Err(_) => Ok(SharedFfn::Qt44),
+    }
+}
+
+/// Which always-active FFN tensors a swap covers: both classes, only the shared experts
+/// of the MoE layers, or only the dense layer-0 MLP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    All,
+    Shared,
+    /// Only the shared experts' gate/up weights; shared down and the dense MLP stay qt44.
+    SharedGateUp,
+    Dense,
+}
+
+impl Scope {
+    pub(crate) fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "all" => Ok(Scope::All),
+            "shared" => Ok(Scope::Shared),
+            "shared-gateup" => Ok(Scope::SharedGateUp),
+            "dense" => Ok(Scope::Dense),
+            other => Err(format!(
+                "unknown shared-FFN scope `{other}` (expected all|shared|shared-gateup|dense)"
+            )),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Scope::All => "all",
+            Scope::Shared => "shared",
+            Scope::SharedGateUp => "shared-gateup",
+            Scope::Dense => "dense",
+        }
+    }
+
+    /// Is `name` an always-active FFN weight inside this scope?
+    pub(crate) fn covers(self, name: &str) -> bool {
+        match ffn_class_index(name) {
+            Some(CLASS_DENSE) => matches!(self, Scope::All | Scope::Dense),
+            Some(CLASS_GATE_UP) => self != Scope::Dense,
+            Some(CLASS_DOWN) => matches!(self, Scope::All | Scope::Shared),
+            _ => false,
+        }
+    }
+}
+
+/// `hipfire_raon.shared_ffn` value: `qt44`, `q8f16`, `bf16` (scope all) or
+/// `<storage>:<scope>` for a mixed file.
+fn storage_tag(shared: SharedFfn, scope: Scope) -> String {
+    if shared == SharedFfn::Qt44 || scope == Scope::All {
+        shared.as_str().to_string()
+    } else {
+        format!("{}:{}", shared.as_str(), scope.as_str())
+    }
+}
+
+/// Recipe string of an artifact whose always-active FFN carries `tag` ([`storage_tag`]).
+fn recipe_with_shared(base: &str, tag: &str) -> String {
+    if tag == "qt44" {
+        base.to_string()
+    } else {
+        format!("{base}+shared-ffn={tag}")
+    }
+}
+
+/// [`classify_with`] for an artifact whose swap covers only `scope`.
+fn classify_scoped(
+    name: &str,
+    lm_head: Storage,
+    shared: SharedFfn,
+    scope: Scope,
+) -> Result<Storage, String> {
+    let eff = if scope.covers(name) {
+        shared
+    } else {
+        SharedFfn::Qt44
+    };
+    classify_with(name, lm_head, eff)
+}
+
 /// Storage class for a source tensor name; unknown names are an error, never
 /// a silent default.
 pub(crate) fn classify(name: &str) -> Result<Storage, String> {
+    classify_with(name, lm_head_storage(), shared_ffn_storage()?)
+}
+
+/// [`classify`] with the two developer choices passed in (pure).
+pub(crate) fn classify_with(
+    name: &str,
+    lm_head: Storage,
+    shared: SharedFfn,
+) -> Result<Storage, String> {
     match name {
         "model.embed_tokens.weight" => return Ok(Storage::Q8F16),
-        "lm_head.weight" => return Ok(lm_head_storage()),
+        "lm_head.weight" => return Ok(lm_head),
         "model.norm.weight" => return Ok(Storage::Lossless),
         _ => {}
     }
@@ -131,12 +295,14 @@ pub(crate) fn classify(name: &str) -> Result<Storage, String> {
     }
     let class = match rest {
         "input_layernorm.weight" | "post_attention_layernorm.weight" => Storage::Lossless,
-        "mlp.gate_proj.weight" | "mlp.up_proj.weight" | "mlp.down_proj.weight" => Storage::Qt44,
+        "mlp.gate_proj.weight" | "mlp.up_proj.weight" | "mlp.down_proj.weight" => {
+            shared.storage(false)
+        }
         "moe.gate.weight" | "moe.gate.e_score_correction_bias" => Storage::F32,
         "moe.shared_experts.gate_proj.weight" | "moe.shared_experts.up_proj.weight" => {
-            Storage::Qt44
+            shared.storage(false)
         }
-        "moe.shared_experts.down_proj.weight" => Storage::Qt44Padded,
+        "moe.shared_experts.down_proj.weight" => shared.storage(true),
         "self_attn.q_proj.weight"
         | "self_attn.k_proj.weight"
         | "self_attn.v_proj.weight"
@@ -162,6 +328,28 @@ pub(crate) fn classify(name: &str) -> Result<Storage, String> {
     Ok(class)
 }
 
+/// True for the always-active FFN weights: shared expert gate/up/down of a MoE layer and
+/// the dense layer gate/up/down.
+pub(crate) fn is_shared_ffn_weight(name: &str) -> bool {
+    layer_rest(name).is_some_and(|(_, rest)| {
+        matches!(
+            rest,
+            "moe.shared_experts.gate_proj.weight"
+                | "moe.shared_experts.up_proj.weight"
+                | "moe.shared_experts.down_proj.weight"
+                | "mlp.gate_proj.weight"
+                | "mlp.up_proj.weight"
+                | "mlp.down_proj.weight"
+        )
+    })
+}
+
+/// `<stem>.awq_scale.weight` → `<stem>.weight` when that is an always-active FFN weight.
+fn shared_ffn_sidecar_parent(name: &str) -> Option<String> {
+    let weight = format!("{}.weight", name.strip_suffix(".awq_scale.weight")?);
+    is_shared_ffn_weight(&weight).then_some(weight)
+}
+
 pub(crate) fn awq_sidecar_name(weight_name: &str) -> String {
     match weight_name.strip_suffix(".weight") {
         Some(stem) => format!("{stem}.awq_scale.weight"),
@@ -169,11 +357,12 @@ pub(crate) fn awq_sidecar_name(weight_name: &str) -> String {
     }
 }
 
-/// Physical input width of a qt44 tensor with natural width `k`.
+/// Physical input width of a tensor with natural width `k`.
 pub(crate) fn physical_k(storage: Storage, k: usize) -> usize {
-    match storage {
-        Storage::Qt44Padded => k.div_ceil(GROUP) * GROUP,
-        _ => k,
+    if storage.is_padded() {
+        k.div_ceil(GROUP) * GROUP
+    } else {
+        k
     }
 }
 
@@ -496,6 +685,22 @@ struct JobOut {
     padded: Option<(String, usize, usize)>,
 }
 
+/// bfloat16 bits of `v`, round-to-nearest-even; exact for values that are already bf16.
+/// `v` must be finite (the source loader rejects non-finite values).
+fn f32_to_bf16_bits(v: f32) -> u16 {
+    let b = v.to_bits();
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
+}
+
+/// `[rows, k]` → `[rows, phys]` with zero tail columns.
+fn pad_rows(data: &[f32], rows: usize, k: usize, phys: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; rows * phys];
+    v.par_chunks_mut(phys)
+        .zip(data.par_chunks(k))
+        .for_each(|(dst, src)| dst[..k].copy_from_slice(src));
+    v
+}
+
 fn f16_bytes_unit(n: usize) -> Vec<u8> {
     let one = f32_to_f16(1.0).to_le_bytes();
     let mut v = Vec::with_capacity(2 * n);
@@ -605,24 +810,65 @@ fn convert(src: &SourceIndex, name: &str, storage: Storage) -> Result<JobOut, St
                 out.padded = Some((name.to_string(), k, phys));
             }
         }
-        Storage::Q8F16 => {
-            if shape.len() != 2 || shape[1] % 32 != 0 {
+        Storage::Q8F16 | Storage::Q8F16Padded => {
+            if shape.len() != 2 {
+                return Err(format!("{name}: Q8F16 needs a 2-D weight, got {shape:?}"));
+            }
+            let (rows, k) = (shape[0], shape[1]);
+            let phys = physical_k(storage, k);
+            if phys == 0 || phys % 32 != 0 {
                 return Err(format!("{name}: Q8F16 needs [N, K%32==0], got {shape:?}"));
             }
-            let k = shape[1];
-            let bytes: Vec<u8> = data
-                .par_chunks(ROWS_PER_UNIT * k)
+            let padded;
+            let flat: &[f32] = if phys == k {
+                &data
+            } else {
+                padded = pad_rows(&data, rows, k, phys);
+                &padded
+            };
+            let bytes: Vec<u8> = flat
+                .par_chunks(ROWS_PER_UNIT * phys)
                 .map(quantize_q8f16)
                 .collect::<Vec<_>>()
                 .concat();
             out.tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: QuantType::Q8F16,
-                shape: shape_u32,
+                shape: vec![rows as u32, phys as u32],
                 group_size: 32,
                 data: bytes,
                 spilled_len: 0,
             });
+            if phys != k {
+                out.padded = Some((name.to_string(), k, phys));
+            }
+        }
+        Storage::Bf16 | Storage::Bf16Padded => {
+            if shape.len() != 2 || shape[1] == 0 {
+                return Err(format!("{name}: BF16 needs a 2-D weight, got {shape:?}"));
+            }
+            let (rows, k) = (shape[0], shape[1]);
+            let phys = physical_k(storage, k);
+            let mut bytes = vec![0u8; rows * phys * 2];
+            bytes
+                .par_chunks_mut(phys * 2)
+                .zip(data.par_chunks(k))
+                .for_each(|(dst, src)| {
+                    for (d, &v) in dst.chunks_exact_mut(2).zip(src) {
+                        d.copy_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
+                    }
+                });
+            out.tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::BF16,
+                shape: vec![rows as u32, phys as u32],
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+            if phys != k {
+                out.padded = Some((name.to_string(), k, phys));
+            }
         }
         Storage::Lossless => {
             let exact = data
@@ -675,6 +921,8 @@ pub(crate) struct RaonSummary {
     pub(crate) halves_verified: usize,
     pub(crate) by_qt: BTreeMap<String, usize>,
     pub(crate) bytes: u64,
+    /// Storage of the always-active FFN weights recorded in the artifact metadata.
+    pub(crate) shared_ffn: String,
 }
 
 fn sha256_hex(path: &Path) -> Result<String, String> {
@@ -712,6 +960,8 @@ pub(crate) fn run_recipe(
 /// Convert the official Raon-1-mini checkpoint in `input` into the symmetric
 /// qt44 control artifact at `output`, then read the artifact back and verify it.
 pub(crate) fn run_cli(input: &Path, output: &Path) -> Result<RaonSummary, String> {
+    let shared = shared_ffn_storage()?;
+    let recipe = recipe_with_shared(RECIPE, shared.as_str());
     let cfg_path = input.join("config.json");
     let cfg = read_json(&cfg_path)?.ok_or_else(|| format!("{} not found", cfg_path.display()))?;
     let src = SourceIndex::open(input)?;
@@ -818,7 +1068,7 @@ pub(crate) fn run_cli(input: &Path, output: &Path) -> Result<RaonSummary, String
         "hipfire_product_tier": "xt",
         "hipfire_base_format": "mq4v2",
         "hipfire_symmetric_verified": true,
-        "hipfire_quant_recipe": RECIPE,
+        "hipfire_quant_recipe": recipe,
         "hipfire_lm_head": if lm_head_storage() == Storage::Q8F16 { "q8f16" } else { "qt44" },
         "hipfire_source_revision": SOURCE_REVISION,
         "hipfire_recipe_census": census,
@@ -826,7 +1076,8 @@ pub(crate) fn run_cli(input: &Path, output: &Path) -> Result<RaonSummary, String
             "arch_id": RAON_ARCH_ID,
             "model_type": RAON_MODEL_TYPE,
             "source_revision": SOURCE_REVISION,
-            "quant_recipe": RECIPE,
+            "quant_recipe": recipe,
+            "shared_ffn": shared.as_str(),
             "symmetric_verified": true,
             "awq_sidecars": "unit-f16-physical-width",
             "mxfp8": {"block": [1, MXFP8_BLOCK_K], "scale": "e8m0-raw-u8", "applies_to": "routed experts"},
@@ -903,6 +1154,7 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
     {
         return Err("artifact metadata lacks the chat template".to_string());
     }
+    let (shared, scope) = shared_ffn_of_metadata(&meta)?;
     let padding = meta
         .pointer("/hipfire_raon/padded_tensors")
         .and_then(|v| v.as_object())
@@ -946,11 +1198,12 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
             // The head is admitted at either codec; the producer records its choice.
             ("lm_head.weight", 3) => Storage::Q8F16,
             ("lm_head.weight", 44) => Storage::Qt44,
-            _ => classify(&t.name)?,
+            _ => classify_scoped(&t.name, Storage::Q8F16, shared, scope)?,
         };
         let ok_qt = match storage {
-            Storage::Q8F16 => t.quant_type == 3,
+            Storage::Q8F16 | Storage::Q8F16Padded => t.quant_type == 3,
             Storage::Qt44 | Storage::Qt44Padded => t.quant_type == 44,
+            Storage::Bf16 | Storage::Bf16Padded => t.quant_type == 16,
             Storage::Lossless => matches!(t.quant_type, 1 | 2),
             Storage::F32 => t.quant_type == 2,
         };
@@ -960,44 +1213,82 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
                 t.name, t.quant_type
             ));
         }
-        if storage.is_qt44() {
-            if t.quant_type != 44 || t.group_size != 256 || t.shape.len() != 2 {
-                return Err(format!("{}: malformed qt44 entry", t.name));
+        // Geometry is checked for qt44 tensors and for every always-active FFN weight
+        // (whatever codec the artifact stores them in).
+        if storage.is_qt44() || is_shared_ffn_weight(&t.name) {
+            if t.shape.len() != 2 {
+                return Err(format!("{}: malformed {storage:?} entry", t.name));
             }
-            let phys = t.shape[1] as usize;
+            let want_group = match storage {
+                Storage::Qt44 | Storage::Qt44Padded => GROUP as u32,
+                Storage::Q8F16 | Storage::Q8F16Padded => 32,
+                _ => 0,
+            };
+            if t.group_size != want_group {
+                return Err(format!(
+                    "{}: group_size {} != {want_group} for {storage:?}",
+                    t.name, t.group_size
+                ));
+            }
+            let (rows, phys) = (t.shape[0] as usize, t.shape[1] as usize);
             if let Some(entry) = padding.get(&t.name) {
                 let (lk, pk) = (
                     entry["logical_k"].as_u64().unwrap_or(0) as usize,
                     entry["physical_k"].as_u64().unwrap_or(0) as usize,
                 );
-                if storage != Storage::Qt44Padded || pk != phys || physical_k(storage, lk) != pk {
+                if !storage.is_padded() || pk != phys || physical_k(storage, lk) != pk {
                     return Err(format!(
                         "{}: padding record {entry} inconsistent with shape",
                         t.name
                     ));
                 }
                 padded_seen += 1;
-            } else if storage == Storage::Qt44Padded && phys % GROUP != 0 {
+            } else if storage.is_padded() && phys % GROUP != 0 {
                 return Err(format!(
                     "{}: padded class but physical K {phys} not a multiple of {GROUP}",
                     t.name
                 ));
             }
-            if phys % GROUP != 0 {
-                return Err(format!(
-                    "{}: physical K {phys} not a multiple of {GROUP}",
-                    t.name
-                ));
+            let has_sidecar = by_name.contains_key(awq_sidecar_name(&t.name).as_str());
+            if storage.is_qt44() {
+                if phys % GROUP != 0 {
+                    return Err(format!(
+                        "{}: physical K {phys} not a multiple of {GROUP}",
+                        t.name
+                    ));
+                }
+                if !has_sidecar {
+                    return Err(format!("{}: missing AWQ sidecar", t.name));
+                }
+                let (_, bytes) = f.tensor_data(&t.name).ok_or("qt44 data missing")?;
+                if bytes.len() != rows * (phys / GROUP) * MQ4V2_GROUP_BYTES {
+                    return Err(format!("{}: qt44 byte size does not match shape", t.name));
+                }
+                s.halves_verified += verify_symmetric_headers(&t.name, bytes)?;
+                s.qt44 += 1;
+            } else {
+                if has_sidecar {
+                    return Err(format!(
+                        "{}: {storage:?} storage must not carry an AWQ sidecar",
+                        t.name
+                    ));
+                }
+                let want_bytes = match storage {
+                    Storage::Q8F16 | Storage::Q8F16Padded => {
+                        if phys % 32 != 0 {
+                            return Err(format!("{}: Q8F16 physical K {phys} % 32 != 0", t.name));
+                        }
+                        rows * (phys / 32) * Q8F16_BLOCK_BYTES
+                    }
+                    _ => rows * phys * 2,
+                };
+                if t.data_size != want_bytes {
+                    return Err(format!(
+                        "{}: {storage:?} byte size {} does not match shape [{rows},{phys}] ({want_bytes})",
+                        t.name, t.data_size
+                    ));
+                }
             }
-            if !by_name.contains_key(awq_sidecar_name(&t.name).as_str()) {
-                return Err(format!("{}: missing AWQ sidecar", t.name));
-            }
-            let (_, bytes) = f.tensor_data(&t.name).ok_or("qt44 data missing")?;
-            if bytes.len() != t.shape[0] as usize * (phys / GROUP) * MQ4V2_GROUP_BYTES {
-                return Err(format!("{}: qt44 byte size does not match shape", t.name));
-            }
-            s.halves_verified += verify_symmetric_headers(&t.name, bytes)?;
-            s.qt44 += 1;
         }
     }
     if padded_seen != padding.len() {
@@ -1007,6 +1298,7 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
         ));
     }
     s.padded = padded_seen;
+    s.shared_ffn = storage_tag(shared, scope);
     if s.sidecars != s.qt44 {
         return Err(format!(
             "{} qt44 tensors but {} sidecars",
@@ -1014,6 +1306,826 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
         ));
     }
     Ok(s)
+}
+
+/// `hipfire_raon.shared_ffn` of an artifact; artifacts that predate the key store qt44.
+fn shared_ffn_of_metadata(meta: &serde_json::Value) -> Result<(SharedFfn, Scope), String> {
+    let Some(v) = meta.pointer("/hipfire_raon/shared_ffn") else {
+        return Ok((SharedFfn::Qt44, Scope::All));
+    };
+    let tag = v
+        .as_str()
+        .ok_or("metadata hipfire_raon.shared_ffn is not a string")?;
+    let ctx = |e: String| format!("metadata hipfire_raon.shared_ffn: {e}");
+    let (shared, scope) = match tag.split_once(':') {
+        Some((s, sc)) => (
+            SharedFfn::parse(s).map_err(ctx)?,
+            Scope::parse(sc).map_err(ctx)?,
+        ),
+        None => (SharedFfn::parse(tag).map_err(ctx)?, Scope::All),
+    };
+    if storage_tag(shared, scope) != tag {
+        return Err(format!(
+            "metadata hipfire_raon.shared_ffn `{tag}` is not a canonical storage tag"
+        ));
+    }
+    Ok((shared, scope))
+}
+
+// ─── always-active FFN swap / verify routes ─────────────────────────────────
+
+/// `--raon-shared-ffn` outcome: tensor-level accounting of one swap.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SwapSummary {
+    pub(crate) target: String,
+    pub(crate) replaced: usize,
+    pub(crate) dropped_sidecars: usize,
+    pub(crate) passthrough: usize,
+    pub(crate) passthrough_bytes: u64,
+    pub(crate) replaced_bytes_before: u64,
+    pub(crate) replaced_bytes_after: u64,
+    pub(crate) dropped_sidecar_bytes: u64,
+    pub(crate) input_bytes: u64,
+    pub(crate) output_bytes: u64,
+    pub(crate) verified: RaonSummary,
+}
+
+impl SwapSummary {
+    pub(crate) fn report(&self) -> String {
+        format!(
+            "raon swap -> {}: {} tensors replaced ({} -> {} data bytes), {} AWQ sidecars dropped \
+             ({} bytes), {} tensors byte-identical pass-through ({} bytes); file {} -> {} bytes \
+             (delta {:+}); verified {} tensors ({} qt44, {} sidecars, {} padded, {} symmetric \
+             half headers), qt census {:?}",
+            self.target,
+            self.replaced,
+            self.replaced_bytes_before,
+            self.replaced_bytes_after,
+            self.dropped_sidecars,
+            self.dropped_sidecar_bytes,
+            self.passthrough,
+            self.passthrough_bytes,
+            self.input_bytes,
+            self.output_bytes,
+            self.output_bytes as i128 - self.input_bytes as i128,
+            self.verified.tensors,
+            self.verified.qt44,
+            self.verified.sidecars,
+            self.verified.padded,
+            self.verified.halves_verified,
+            self.verified.by_qt,
+        )
+    }
+}
+
+/// Row index of the always-active FFN class tables used by the diff route.
+const CLASS_PASS: usize = 0;
+const CLASS_GATE_UP: usize = 1;
+const CLASS_DOWN: usize = 2;
+const CLASS_DENSE: usize = 3;
+const CLASS_SIDECAR: usize = 4;
+const CLASS_META: usize = 5;
+const CLASS_NAMES: [&str; 6] = [
+    "pass-through",
+    "shared gate/up",
+    "shared down",
+    "dense mlp",
+    "dropped sidecar",
+    "metadata",
+];
+
+/// Table row of an always-active FFN weight (`CLASS_GATE_UP|DOWN|DENSE`).
+fn ffn_class_index(name: &str) -> Option<usize> {
+    let (_, rest) = layer_rest(name)?;
+    match rest {
+        "moe.shared_experts.gate_proj.weight" | "moe.shared_experts.up_proj.weight" => {
+            Some(CLASS_GATE_UP)
+        }
+        "moe.shared_experts.down_proj.weight" => Some(CLASS_DOWN),
+        "mlp.gate_proj.weight" | "mlp.up_proj.weight" | "mlp.down_proj.weight" => Some(CLASS_DENSE),
+        _ => None,
+    }
+}
+
+fn census_of<'a>(
+    tensors: impl Iterator<Item = (&'a str, u8)>,
+) -> Result<BTreeMap<String, usize>, String> {
+    let mut census = BTreeMap::new();
+    for (name, qt) in tensors {
+        let q = QuantType::from_u8(qt).ok_or_else(|| format!("{name}: unknown qt{qt}"))?;
+        *census.entry(format!("{q:?}")).or_insert(0usize) += 1;
+    }
+    Ok(census)
+}
+
+/// Expected payload bytes of a swapped (Q8F16 / BF16) `[rows, phys]` tensor.
+fn swapped_bytes(target: SharedFfn, rows: usize, phys: usize) -> usize {
+    match target {
+        SharedFfn::Q8F16 => rows * (phys / 32) * Q8F16_BLOCK_BYTES,
+        _ => rows * phys * 2,
+    }
+}
+
+fn swapped_qt(target: SharedFfn) -> u8 {
+    match target {
+        SharedFfn::Q8F16 => QuantType::Q8F16 as u8,
+        _ => QuantType::BF16 as u8,
+    }
+}
+
+fn swapped_group(target: SharedFfn) -> u32 {
+    match target {
+        SharedFfn::Q8F16 => 32,
+        _ => 0,
+    }
+}
+
+/// Build an always-active-FFN variant of a shipped qt44 Raon artifact without
+/// re-running calibration: every tensor outside the swap set is copied
+/// byte-identically (streamed through a 4 MiB buffer, original index order); the
+/// shared/dense gate/up/down weights are re-quantized from the source checkpoint at
+/// `target` (same `convert` path as a full conversion) at the same index position;
+/// their AWQ sidecars are dropped; the metadata is updated. Written atomically, then
+/// verified with [`verify_artifact`] (non-unit sidecars, as for any XTS artifact).
+pub(crate) fn swap_shared_ffn(
+    input: &Path,
+    source: &Path,
+    output: &Path,
+    target: SharedFfn,
+    scope: Scope,
+) -> Result<SwapSummary, String> {
+    if target == SharedFfn::Qt44 {
+        return Err(
+            "--raon-shared-ffn target must be q8f16 or bf16 (qt44 is the shipped storage)"
+                .to_string(),
+        );
+    }
+    if let (Ok(a), Ok(b)) = (input.canonicalize(), output.canonicalize()) {
+        if a == b {
+            return Err("--output must differ from --input".to_string());
+        }
+    }
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(format!(
+            "output parent directory does not exist: {}",
+            parent.display()
+        ));
+    }
+
+    let f = RuntimeHfqFile::open_with_reap_plan(input, None)
+        .map_err(|e| format!("open {}: {e}", input.display()))?;
+    if f.arch_id != RAON_ARCH_ID {
+        return Err(format!(
+            "input arch_id {} != {RAON_ARCH_ID} ({RAON_MODEL_TYPE})",
+            f.arch_id
+        ));
+    }
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&f.metadata_json).map_err(|e| format!("metadata JSON: {e}"))?;
+    if meta.get("architecture").and_then(|v| v.as_str()) != Some(RAON_MODEL_TYPE) {
+        return Err(format!(
+            "input metadata architecture is not `{RAON_MODEL_TYPE}`"
+        ));
+    }
+    if meta.get("hipfire_source_revision").and_then(|v| v.as_str()) != Some(SOURCE_REVISION) {
+        return Err(format!(
+            "input was not built from source revision {SOURCE_REVISION}"
+        ));
+    }
+    let tag = storage_tag(target, scope);
+    let (current, current_scope) = shared_ffn_of_metadata(&meta)?;
+    if current == target && current_scope == scope {
+        return Err(format!(
+            "input already stores the always-active FFN as {tag}; nothing to swap"
+        ));
+    }
+    if current != SharedFfn::Qt44 {
+        return Err(format!(
+            "input stores the always-active FFN as {}; the swap starts from a qt44 artifact",
+            storage_tag(current, current_scope)
+        ));
+    }
+    let cfg = meta
+        .get("config")
+        .cloned()
+        .ok_or("input metadata lacks `config`")?;
+    let src = SourceIndex::open(source)?;
+    src.validate(&cfg)?;
+    if let Some(want) = meta
+        .pointer("/hipfire_raon/source_sha256/config.json")
+        .and_then(|v| v.as_str())
+    {
+        let got = sha256_hex(&source.join("config.json"))?;
+        if got != want {
+            return Err(format!(
+                "--raon-source config.json sha256 {got} != the artifact's recorded source {want}"
+            ));
+        }
+    }
+
+    let tensors = f.tensors();
+    let by_name: BTreeMap<&str, &hipfire_runtime::hfq::HfqTensorInfo> =
+        tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+    if by_name.len() != tensors.len() {
+        return Err("duplicate tensor names in input artifact".to_string());
+    }
+    let present: BTreeSet<&str> = by_name
+        .keys()
+        .copied()
+        .filter(|n| !n.ends_with(".awq_scale.weight"))
+        .collect();
+    let want: Vec<String> = expected_names(&cfg, &present)?
+        .into_iter()
+        .filter(|n| scope.covers(n))
+        .collect();
+    if want.is_empty() {
+        return Err("config names no always-active FFN tensors".to_string());
+    }
+    let targets: BTreeSet<&str> = want.iter().map(String::as_str).collect();
+    if let Some(extra) = present
+        .iter()
+        .copied()
+        .find(|n| scope.covers(n) && !targets.contains(*n))
+    {
+        return Err(format!("unexpected always-active FFN tensor `{extra}`"));
+    }
+    for n in &want {
+        let t = by_name
+            .get(n.as_str())
+            .ok_or_else(|| format!("target tensor `{n}` is missing from the input artifact"))?;
+        if t.quant_type != 44 {
+            return Err(format!(
+                "target tensor `{n}` is qt{} (the swap needs the shipped qt44)",
+                t.quant_type
+            ));
+        }
+        if t.shape.len() != 2 {
+            return Err(format!("target tensor `{n}` is not 2-D: {:?}", t.shape));
+        }
+        if !by_name.contains_key(awq_sidecar_name(n).as_str()) {
+            return Err(format!("target tensor `{n}` has no AWQ sidecar"));
+        }
+    }
+
+    let jobs: Vec<(&str, Storage)> = want
+        .iter()
+        .map(|n| classify_with(n, Storage::Q8F16, target).map(|s| (n.as_str(), s)))
+        .collect::<Result<_, _>>()?;
+    eprintln!(
+        "raon swap: re-quantizing {} always-active FFN weights from {} to {}",
+        jobs.len(),
+        source.display(),
+        target.as_str()
+    );
+    let outs: Vec<JobOut> = jobs
+        .par_iter()
+        .map(|(n, s)| convert(&src, n, *s))
+        .collect::<Result<_, _>>()?;
+    let mut repl: Vec<HfqTensor> = Vec::new();
+    let mut repl_idx: BTreeMap<String, usize> = BTreeMap::new();
+    let mut padding: BTreeMap<String, [usize; 2]> = BTreeMap::new();
+    for out in outs {
+        if let Some((n, k, phys)) = out.padded {
+            padding.insert(n, [k, phys]);
+        }
+        for t in out.tensors {
+            repl_idx.insert(t.name.clone(), repl.len());
+            repl.push(t);
+        }
+    }
+    for t in &repl {
+        let a = by_name[t.name.as_str()];
+        if t.shape != a.shape {
+            return Err(format!(
+                "{}: source re-quantizes to shape {:?} but the artifact holds {:?}",
+                t.name, t.shape, a.shape
+            ));
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Piece {
+        Copy(usize),
+        Repl(usize),
+    }
+    let mut entries: Vec<HfqIndexEntry> = Vec::with_capacity(tensors.len());
+    let mut plan: Vec<Piece> = Vec::with_capacity(tensors.len());
+    let mut s = SwapSummary {
+        target: tag.clone(),
+        ..SwapSummary::default()
+    };
+    for (i, t) in tensors.iter().enumerate() {
+        if let Some(parent) = shared_ffn_sidecar_parent(&t.name).filter(|p| scope.covers(p)) {
+            if !targets.contains(parent.as_str()) {
+                return Err(format!("orphan sidecar {}", t.name));
+            }
+            s.dropped_sidecars += 1;
+            s.dropped_sidecar_bytes += t.data_size as u64;
+        } else if let Some(&ri) = repl_idx.get(&t.name) {
+            let r = &repl[ri];
+            entries.push(HfqIndexEntry {
+                name: r.name.clone(),
+                quant_type: r.quant_type as u8,
+                shape: r.shape.clone(),
+                group_size: r.group_size,
+                data_len: r.data.len() as u64,
+            });
+            plan.push(Piece::Repl(ri));
+            s.replaced += 1;
+            s.replaced_bytes_before += t.data_size as u64;
+            s.replaced_bytes_after += r.data.len() as u64;
+        } else {
+            entries.push(HfqIndexEntry {
+                name: t.name.clone(),
+                quant_type: t.quant_type,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data_len: t.data_size as u64,
+            });
+            plan.push(Piece::Copy(i));
+            s.passthrough += 1;
+            s.passthrough_bytes += t.data_size as u64;
+        }
+    }
+    if s.replaced != repl.len() || s.dropped_sidecars != repl.len() {
+        return Err(format!(
+            "swap accounting: {} replaced, {} sidecars dropped, {} converted",
+            s.replaced,
+            s.dropped_sidecars,
+            repl.len()
+        ));
+    }
+
+    let base_recipe = meta
+        .get("hipfire_quant_recipe")
+        .and_then(|v| v.as_str())
+        .ok_or("input metadata lacks hipfire_quant_recipe")?
+        .to_string();
+    {
+        let raon = meta
+            .get_mut("hipfire_raon")
+            .and_then(|v| v.as_object_mut())
+            .ok_or("input metadata lacks the hipfire_raon object")?;
+        raon.insert("shared_ffn".to_string(), tag.as_str().into());
+        raon.insert(
+            "shared_ffn_swap".to_string(),
+            serde_json::json!({
+                "from": SharedFfn::Qt44.as_str(),
+                "to": target.as_str(),
+                "scope": scope.as_str(),
+                "source_revision": SOURCE_REVISION,
+                "replaced_tensors": s.replaced,
+                "dropped_sidecars": s.dropped_sidecars,
+            }),
+        );
+        let pt = raon
+            .get_mut("padded_tensors")
+            .and_then(|v| v.as_object_mut())
+            .ok_or("input metadata lacks hipfire_raon.padded_tensors")?;
+        for n in &want {
+            pt.remove(n);
+        }
+        for (n, [k, phys]) in &padding {
+            pt.insert(
+                n.clone(),
+                serde_json::json!({"logical_k": k, "physical_k": phys}),
+            );
+        }
+        if let Some(r) = raon
+            .get("quant_recipe")
+            .and_then(|v| v.as_str())
+            .map(|r| recipe_with_shared(r, &tag))
+        {
+            raon.insert("quant_recipe".to_string(), r.into());
+        }
+    }
+    meta["hipfire_quant_recipe"] = recipe_with_shared(&base_recipe, &tag).into();
+    meta["hipfire_recipe_census"] = serde_json::to_value(census_of(
+        entries.iter().map(|e| (e.name.as_str(), e.quant_type)),
+    )?)
+    .map_err(|e| format!("census: {e}"))?;
+    let metadata_json = serde_json::to_string(&meta).map_err(|e| format!("metadata: {e}"))?;
+
+    let mut src_file = File::open(input).map_err(|e| format!("open {}: {e}", input.display()))?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    write_hfq_streamed(
+        output,
+        RAON_ARCH_ID,
+        &metadata_json,
+        &entries,
+        |i, out| match plan[i] {
+            Piece::Repl(ri) => out.write_all(&repl[ri].data),
+            Piece::Copy(ti) => {
+                let t = &tensors[ti];
+                src_file.seek(SeekFrom::Start(t.data_offset as u64))?;
+                let mut left = t.data_size;
+                while left > 0 {
+                    let n = left.min(buf.len());
+                    src_file.read_exact(&mut buf[..n])?;
+                    out.write_all(&buf[..n])?;
+                    left -= n;
+                }
+                Ok(())
+            }
+        },
+    )
+    .map_err(|e| format!("write {}: {e}", output.display()))?;
+    s.input_bytes = std::fs::metadata(input)
+        .map_err(|e| format!("stat {}: {e}", input.display()))?
+        .len();
+    s.output_bytes = std::fs::metadata(output)
+        .map_err(|e| format!("stat {}: {e}", output.display()))?
+        .len();
+    match verify_artifact(output, false) {
+        Ok(v) => s.verified = v,
+        Err(e) => {
+            let _ = std::fs::remove_file(output);
+            return Err(format!("variant failed verification (output removed): {e}"));
+        }
+    }
+    Ok(s)
+}
+
+/// One row of the [`raon_hfq_diff`] table.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiffRow {
+    pub(crate) class: &'static str,
+    pub(crate) tensors: usize,
+    pub(crate) a_qt: BTreeSet<u8>,
+    pub(crate) b_qt: BTreeSet<u8>,
+    pub(crate) a_bytes: u64,
+    pub(crate) b_bytes: u64,
+    pub(crate) violations: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DiffReport {
+    pub(crate) rows: Vec<DiffRow>,
+    pub(crate) violations: Vec<String>,
+}
+
+impl DiffReport {
+    pub(crate) fn ok(&self) -> bool {
+        self.violations.is_empty()
+    }
+
+    fn fail(&mut self, class: usize, msg: String) {
+        self.violations.push(msg);
+        self.rows[class].violations += 1;
+    }
+
+    pub(crate) fn table(&self) -> String {
+        let qts = |s: &BTreeSet<u8>| {
+            if s.is_empty() {
+                "-".to_string()
+            } else {
+                s.iter()
+                    .map(|q| format!("qt{q}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        };
+        let mut out = format!(
+            "{:<16} {:>8} {:>10} {:>10} {:>15} {:>15}  {}\n",
+            "class", "tensors", "A qt", "B qt", "A bytes", "B bytes", "verdict"
+        );
+        for r in &self.rows {
+            out.push_str(&format!(
+                "{:<16} {:>8} {:>10} {:>10} {:>15} {:>15}  {}\n",
+                r.class,
+                r.tensors,
+                qts(&r.a_qt),
+                qts(&r.b_qt),
+                r.a_bytes,
+                r.b_bytes,
+                if r.violations == 0 {
+                    "OK".to_string()
+                } else {
+                    format!("FAIL({})", r.violations)
+                }
+            ));
+        }
+        out
+    }
+}
+
+/// First (dotted) key at which two JSON objects differ.
+fn first_meta_diff(a: &serde_json::Value, b: &serde_json::Value) -> Option<String> {
+    let (Some(oa), Some(ob)) = (a.as_object(), b.as_object()) else {
+        return (a != b).then(|| "<root>".to_string());
+    };
+    for k in oa.keys().chain(ob.keys()) {
+        match (oa.get(k), ob.get(k)) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(x), Some(y)) if x.is_object() && y.is_object() => {
+                return Some(first_meta_diff(x, y).map_or(k.clone(), |s| format!("{k}.{s}")));
+            }
+            _ => return Some(k.clone()),
+        }
+    }
+    None
+}
+
+/// Read-only proof that `b` is exactly `a` with the always-active FFN swapped to
+/// `target`: same arch and tensor order; every non-target tensor equal in
+/// (name, qt, shape, group, size) and payload bytes (streamed in 4 MiB windows,
+/// parallel across tensors); target tensors differ only as expected (qt, group,
+/// size; same shape); exactly the targets' AWQ sidecars dropped; metadata equal
+/// modulo the updated keys. `Err` only for I/O or unreadable containers; every
+/// contract violation lands in [`DiffReport::violations`].
+pub(crate) fn raon_hfq_diff(
+    a: &Path,
+    b: &Path,
+    target: SharedFfn,
+    scope: Scope,
+) -> Result<DiffReport, String> {
+    if target == SharedFfn::Qt44 {
+        return Err("the variant storage must be q8f16 or bf16".to_string());
+    }
+    let tag = storage_tag(target, scope);
+    let open = |p: &Path| {
+        RuntimeHfqFile::open_with_reap_plan(p, None)
+            .map_err(|e| format!("open {}: {e}", p.display()))
+    };
+    let fa = open(a)?;
+    let fb = open(b)?;
+    let mut rep = DiffReport {
+        rows: CLASS_NAMES
+            .iter()
+            .map(|c| DiffRow {
+                class: *c,
+                ..DiffRow::default()
+            })
+            .collect(),
+        violations: Vec::new(),
+    };
+    for (label, f) in [("A", &fa), ("B", &fb)] {
+        if f.arch_id != RAON_ARCH_ID {
+            rep.fail(
+                CLASS_META,
+                format!("{label}: arch_id {} != {RAON_ARCH_ID}", f.arch_id),
+            );
+        }
+    }
+    let (ta, tb) = (fa.tensors(), fb.tensors());
+
+    // The B stream implied by A: sidecars of target weights vanish.
+    let b_names: BTreeSet<&str> = tb.iter().map(|t| t.name.as_str()).collect();
+    let mut kept: Vec<(&hipfire_runtime::hfq::HfqTensorInfo, usize)> = Vec::new();
+    let mut n_targets = 0usize;
+    for t in ta {
+        if shared_ffn_sidecar_parent(&t.name).is_some_and(|p| scope.covers(&p)) {
+            let r = &mut rep.rows[CLASS_SIDECAR];
+            r.tensors += 1;
+            r.a_qt.insert(t.quant_type);
+            r.a_bytes += t.data_size as u64;
+            if b_names.contains(t.name.as_str()) {
+                rep.fail(CLASS_SIDECAR, format!("sidecar {} survives in B", t.name));
+            }
+            continue;
+        }
+        let class = if scope.covers(&t.name) {
+            ffn_class_index(&t.name).unwrap_or(CLASS_PASS)
+        } else {
+            CLASS_PASS
+        };
+        if class != CLASS_PASS {
+            n_targets += 1;
+        }
+        kept.push((t, class));
+    }
+    if rep.rows[CLASS_SIDECAR].tensors != n_targets {
+        rep.fail(
+            CLASS_SIDECAR,
+            format!(
+                "A has {n_targets} always-active FFN weights but {} of their sidecars",
+                rep.rows[CLASS_SIDECAR].tensors
+            ),
+        );
+    }
+    if kept.len() != tb.len() {
+        rep.fail(
+            CLASS_PASS,
+            format!(
+                "B has {} tensors, expected {} (A minus dropped sidecars)",
+                tb.len(),
+                kept.len()
+            ),
+        );
+    }
+
+    let want_qt = swapped_qt(target);
+    let want_group = swapped_group(target);
+    let mut pass: Vec<(&str, &[u8], &[u8])> = Vec::new();
+    for (idx, ((x, class), y)) in kept.iter().zip(tb.iter()).enumerate() {
+        if x.name != y.name {
+            rep.fail(
+                CLASS_PASS,
+                format!(
+                    "tensor order/name differs at B index {idx}: expected `{}`, found `{}`",
+                    x.name, y.name
+                ),
+            );
+            break;
+        }
+        let class = *class;
+        {
+            let r = &mut rep.rows[class];
+            r.tensors += 1;
+            r.a_qt.insert(x.quant_type);
+            r.b_qt.insert(y.quant_type);
+            r.a_bytes += x.data_size as u64;
+            r.b_bytes += y.data_size as u64;
+        }
+        if class == CLASS_PASS {
+            if x.quant_type != y.quant_type
+                || x.shape != y.shape
+                || x.group_size != y.group_size
+                || x.data_size != y.data_size
+            {
+                rep.fail(
+                    CLASS_PASS,
+                    format!(
+                        "{}: index entry differs (A qt{} {:?} g{} {}B, B qt{} {:?} g{} {}B)",
+                        x.name,
+                        x.quant_type,
+                        x.shape,
+                        x.group_size,
+                        x.data_size,
+                        y.quant_type,
+                        y.shape,
+                        y.group_size,
+                        y.data_size
+                    ),
+                );
+                continue;
+            }
+            match (fa.tensor_data(&x.name), fb.tensor_data(&y.name)) {
+                (Some((_, da)), Some((_, db))) => pass.push((x.name.as_str(), da, db)),
+                _ => rep.fail(CLASS_PASS, format!("{}: payload unreadable", x.name)),
+            }
+            continue;
+        }
+        if x.quant_type != 44 {
+            rep.fail(
+                class,
+                format!("{}: A is qt{}, expected qt44", x.name, x.quant_type),
+            );
+        }
+        if y.quant_type != want_qt {
+            rep.fail(
+                class,
+                format!("{}: B is qt{}, expected qt{want_qt}", y.name, y.quant_type),
+            );
+        }
+        if y.shape != x.shape || y.shape.len() != 2 {
+            rep.fail(
+                class,
+                format!("{}: B shape {:?} != A shape {:?}", y.name, y.shape, x.shape),
+            );
+            continue;
+        }
+        if y.group_size != want_group {
+            rep.fail(
+                class,
+                format!("{}: B group_size {} != {want_group}", y.name, y.group_size),
+            );
+        }
+        let (rows, phys) = (y.shape[0] as usize, y.shape[1] as usize);
+        if class == CLASS_DOWN && phys % GROUP != 0 {
+            rep.fail(
+                class,
+                format!("{}: B physical K {phys} not a multiple of {GROUP}", y.name),
+            );
+        }
+        if target == SharedFfn::Q8F16 && phys % 32 != 0 {
+            rep.fail(class, format!("{}: B physical K {phys} % 32 != 0", y.name));
+            continue;
+        }
+        let want_bytes = swapped_bytes(target, rows, phys);
+        if y.data_size != want_bytes {
+            rep.fail(
+                class,
+                format!(
+                    "{}: B size {} != expected {want_bytes}",
+                    y.name, y.data_size
+                ),
+            );
+        }
+    }
+
+    // Pass-through payloads, streamed in COPY_CHUNK windows.
+    let bad: Vec<String> = pass
+        .par_iter()
+        .filter_map(|&(name, x, y)| {
+            if x.len() != y.len() {
+                return Some(format!("{name}: payload length differs"));
+            }
+            if x.par_chunks(COPY_CHUNK)
+                .zip(y.par_chunks(COPY_CHUNK))
+                .all(|(p, q)| p == q)
+            {
+                return None;
+            }
+            let at = x
+                .iter()
+                .zip(y.iter())
+                .position(|(p, q)| p != q)
+                .unwrap_or(0);
+            Some(format!("{name}: payload differs (first byte {at})"))
+        })
+        .collect();
+    for msg in bad {
+        rep.fail(CLASS_PASS, msg);
+    }
+
+    // Metadata: equal modulo the keys the swap updates, and those carry the right values.
+    let parse = |label: &str, f: &RuntimeHfqFile| {
+        serde_json::from_str::<serde_json::Value>(&f.metadata_json)
+            .map_err(|e| format!("{label} metadata JSON: {e}"))
+    };
+    let (ma, mb) = (parse("A", &fa)?, parse("B", &fb)?);
+    let strip = |m: &serde_json::Value| {
+        let mut m = m.clone();
+        if let Some(o) = m.as_object_mut() {
+            o.remove("hipfire_recipe_census");
+            o.remove("hipfire_quant_recipe");
+            if let Some(r) = o.get_mut("hipfire_raon").and_then(|v| v.as_object_mut()) {
+                for k in ["shared_ffn", "shared_ffn_swap", "quant_recipe"] {
+                    r.remove(k);
+                }
+            }
+        }
+        m
+    };
+    let mut checks = 0usize;
+    let mut meta_check = |rep: &mut DiffReport, ok: bool, msg: String| {
+        checks += 1;
+        if !ok {
+            rep.fail(CLASS_META, msg);
+        }
+    };
+    meta_check(
+        &mut rep,
+        strip(&ma) == strip(&mb),
+        format!(
+            "metadata differs outside the updated keys at `{}`",
+            first_meta_diff(&strip(&ma), &strip(&mb)).unwrap_or_default()
+        ),
+    );
+    meta_check(
+        &mut rep,
+        shared_ffn_of_metadata(&ma) == Ok((SharedFfn::Qt44, Scope::All)),
+        "A metadata hipfire_raon.shared_ffn is not qt44".to_string(),
+    );
+    meta_check(
+        &mut rep,
+        shared_ffn_of_metadata(&mb) == Ok((target, scope)),
+        format!("B metadata hipfire_raon.shared_ffn is not {tag}"),
+    );
+    for (label, ptr) in [
+        ("hipfire_quant_recipe", "/hipfire_quant_recipe"),
+        ("hipfire_raon.quant_recipe", "/hipfire_raon/quant_recipe"),
+    ] {
+        if let Some(ra) = ma.pointer(ptr).and_then(|v| v.as_str()) {
+            meta_check(
+                &mut rep,
+                mb.pointer(ptr).and_then(|v| v.as_str())
+                    == Some(recipe_with_shared(ra, &tag).as_str()),
+                format!("B {label} is not A's recipe + shared-ffn={tag}",),
+            );
+        } else if ptr == "/hipfire_quant_recipe" {
+            meta_check(
+                &mut rep,
+                false,
+                "A metadata lacks hipfire_quant_recipe".to_string(),
+            );
+        }
+    }
+    let census = census_of(tb.iter().map(|t| (t.name.as_str(), t.quant_type)))
+        .ok()
+        .and_then(|c| serde_json::to_value(c).ok());
+    meta_check(
+        &mut rep,
+        census.is_some() && mb.get("hipfire_recipe_census") == census.as_ref(),
+        "B hipfire_recipe_census does not match B's tensor index".to_string(),
+    );
+    let swap = mb.pointer("/hipfire_raon/shared_ffn_swap");
+    meta_check(
+        &mut rep,
+        swap.and_then(|s| s.get("source_revision"))
+            .and_then(|v| v.as_str())
+            == Some(SOURCE_REVISION)
+            && swap.and_then(|s| s.get("to")).and_then(|v| v.as_str()) == Some(target.as_str())
+            && swap.and_then(|s| s.get("from")).and_then(|v| v.as_str()) == Some("qt44"),
+        "B hipfire_raon.shared_ffn_swap lacks the expected source_revision/from/to".to_string(),
+    );
+    rep.rows[CLASS_META].tensors = checks;
+    Ok(rep)
 }
 
 #[cfg(test)]

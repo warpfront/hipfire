@@ -20,9 +20,12 @@
 //!   ([`SparseDist::build_from_logits`]), so emitted tokens are distributed
 //!   as AR's.
 //! - Verify depth: a window verifies only the draft prefix whose running
-//!   product of selector confidences stays at or above
-//!   [`VERIFY_CONFIDENCE`] (at least one draft); the draft forward still
-//!   proposes the whole block.
+//!   product of selector confidences (each row's top-candidate mass, fixed
+//!   before that row's draw) stays at or above [`VERIFY_CONFIDENCE`] (at
+//!   least one draft); the draft forward still proposes the whole block.
+//!   Whether row `r` is verified depends on the drafts before it only, so a
+//!   sampled verified row is still distributed as its `q` (a cut on the drawn
+//!   token's own mass is not: see the target-law test below).
 //!
 //! The target is reached only through [`SpecTarget`]: it captures the feature
 //! rows (`dflash_extract_layers`), embeds the noise block and applies its head
@@ -635,6 +638,13 @@ fn selector_q(
         .collect())
 }
 
+/// Raw feature rows the draft projects per `fc` GEMM through its staging
+/// buffer ([`DflashScratch::new_windowed_staged`]): every window's new rows
+/// (`<= DFLASH_BLOCK_MAX + 1`) in one GEMM, a cold prompt's window in
+/// `window / 128` of them. 128 Raon-1-mini feature rows (51200 F32) are 26 MB
+/// where the raw window ring was 0.42 GB.
+const FEATURE_STAGE_ROWS: usize = 128;
+
 /// Selector-confidence product below which a window stops verifying drafts.
 /// HIPF-135, Flash-Next on gfx1151 (verify ~36 ms + ~6 ms per row): over 6122
 /// block-8 windows, products 0.3-0.5 maximize the simulated tok/s (+18% over
@@ -643,6 +653,9 @@ const VERIFY_CONFIDENCE: f32 = 0.5;
 
 /// Drafts a window verifies: the longest prefix whose running product of
 /// selector confidences stays at or above [`VERIFY_CONFIDENCE`], at least one.
+/// `confidence[r]` must not depend on row `r`'s own draw
+/// ([`crate::dflash::selector_row_confidence`]): the cut is then a stopping
+/// rule on the earlier drafts, which keeps sampled acceptance exact.
 fn verify_depth(confidence: &[f32]) -> usize {
     let mut product = 1.0;
     let confident = confidence
@@ -695,8 +708,20 @@ pub fn build_dflash2_speculator(
         return Err("DFlash2 draft: candidate selector tensors are missing".into());
     }
     // The draft was trained over its declared sliding window; running it
-    // over any other span is a train/inference mask mismatch.
+    // over any other span is a train/inference mask mismatch. An all-sliding
+    // draft reads its context through the projected rows only, and the raw
+    // feature rows come from `target_hidden_host`: stage them instead of
+    // keeping a window-high raw ring on the device.
     let scratch = match config.declared_window {
+        Some(w) if config.all_layers_sliding => DflashScratch::new_windowed_staged(
+            gpu,
+            &config,
+            block,
+            w,
+            ctx_capacity,
+            weights.has_mq,
+            FEATURE_STAGE_ROWS,
+        ),
         Some(w) => {
             DflashScratch::new_windowed(gpu, &config, block, w, w, ctx_capacity, weights.has_mq)
         }
@@ -959,5 +984,93 @@ mod tests {
         // An unconfident first draft is still verified, a later rise never revives the chain.
         assert_eq!(verify_depth(&[0.1, 1.0, 1.0]), 1);
         assert_eq!(verify_depth(&[1.0; 7]), 7);
+    }
+
+    /// Sampled target law across the verify-depth cut. Two-row chain: `x1 ~
+    /// q1`, `x2 ~ q2(.|x1)` (the selector's predecessor dependence), depth by
+    /// [`verify_depth`] on the row confidences, acceptance by
+    /// [`accept_sampled_prefix`] against `p1` / `p2(.|t1)`; a window that ends
+    /// after one token continues with an exact draw from `p2(.|t1)`. The
+    /// emitted pair must follow `p1(t1) p2(t2|t1)`. With the production
+    /// confidence (top-candidate mass, [`selector_row_confidence`]) it does;
+    /// with the drawn token's own mass the second row is verified more often
+    /// when its draw is the likely one, and `P(t2 = c | t1 = a)` rises from 0.3
+    /// to 0.42 (`0.6 * 0.5 + 0.4 * 0.3`).
+    #[test]
+    fn sampled_verify_depth_keeps_the_target_law() {
+        use crate::dflash::selector_row_confidence;
+        let (a, b, c, d) = (1u32, 2u32, 3u32, 4u32);
+        let dist = |e: &[(u32, f32)]| {
+            let mut s = SparseDist::default();
+            s.set_entries(e.iter().copied());
+            s
+        };
+        let q1 = [(a, 0.9f32), (b, 0.1)];
+        let q2 = |x: u32| {
+            if x == a {
+                [(c, 0.6f32), (d, 0.4)]
+            } else {
+                [(c, 0.5), (d, 0.5)]
+            }
+        };
+        let p1 = [(a, 0.5f32), (b, 0.5)];
+        let p2 = |x: u32| {
+            if x == a {
+                [(c, 0.3f32), (d, 0.7)]
+            } else {
+                [(c, 0.5), (d, 0.5)]
+            }
+        };
+        let scores = |q: &[(u32, f32)]| q.iter().map(|&(_, p)| p.ln()).collect::<Vec<f32>>();
+        let run = |drawn_mass: bool| {
+            let mut rng = SpecRng::new(11);
+            let mut target = SparseDist::default();
+            let mut pairs = std::collections::HashMap::<(u32, u32), u64>::new();
+            let n = 400_000u64;
+            for _ in 0..n {
+                let x1 = dist(&q1).sample(rng.next_f32());
+                let x2 = dist(&q2(x1)).sample(rng.next_f32());
+                let confidence = if drawn_mass {
+                    vec![dist(&q1).prob(x1), dist(&q2(x1)).prob(x2)]
+                } else {
+                    vec![
+                        selector_row_confidence(&scores(&q1)),
+                        selector_row_confidence(&scores(&q2(x1))),
+                    ]
+                };
+                let depth = verify_depth(&confidence);
+                let drafts = &[x1, x2][..depth];
+                let q: Vec<SparseDist> = [dist(&q1), dist(&q2(x1))][..depth].to_vec();
+                let verdict =
+                    accept_sampled_prefix(drafts, &q, None, &mut rng, &mut target, |row, out| {
+                        match row {
+                            0 => out.set_entries(p1),
+                            _ => out.set_entries(p2(drafts[0])),
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let t1 = verdict.committed[0];
+                let t2 = match verdict.committed.get(1) {
+                    Some(&t) => t,
+                    None => dist(&p2(t1)).sample(rng.next_f32()),
+                };
+                *pairs.entry((t1, t2)).or_default() += 1;
+            }
+            let freq =
+                |t1: u32, t2: u32| pairs.get(&(t1, t2)).copied().unwrap_or(0) as f64 / n as f64;
+            freq(a, c) / (freq(a, c) + freq(a, d))
+        };
+        // P(t1 = a) = 0.5: the conditional is estimated on ~200k pairs.
+        let exact = run(false);
+        assert!(
+            (exact - 0.3).abs() < 0.005,
+            "P(c | a) = {exact}, target 0.3"
+        );
+        let biased = run(true);
+        assert!(
+            (biased - 0.42).abs() < 0.005,
+            "the drawn-mass cut must show its bias: P(c | a) = {biased}"
+        );
     }
 }

@@ -256,6 +256,8 @@
       "grouped"
     ],
     "reviewed_unchanged": {
+      "moe_grouped_qt44_a8_sym.gfx12.hip": "new capability kernel, not part of the 38ce67a44 catalogue; launched only by rdna-compute/src/moe_grouped_qt44_iu4.rs (12 kernargs: 6 pointers + M,K,x_row_div,m_total,x_src_rows,n_experts); every entry bit-checked against a CPU recompute in examples/bench_moe_grouped_qt44_iu4.rs",
+      "moe_grouped_qt44_iu4_sym.gfx12.hip": "new capability kernel, not part of the 38ce67a44 catalogue; launched only by rdna-compute/src/moe_grouped_qt44_iu4.rs (12 kernargs: 6 pointers + M,K,x_row_div,m_total,x_src_rows,n_experts); every entry bit-checked against a CPU recompute in examples/bench_moe_grouped_qt44_iu4.rs",
       "deepseek4_moe_topk_bias_aware.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
       "deepseek4_moe_topk_bias_aware_batched.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
       "dflash_hidden_scatter.gfx1100.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",

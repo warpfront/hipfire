@@ -1084,6 +1084,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     }
 
     let precision = match PrefillPrecision::from_env()? {
+        PrefillPrecision::Default => "default",
         PrefillPrecision::F16 => "f16",
         PrefillPrecision::A8 => "a8",
         PrefillPrecision::A4 => "a4",

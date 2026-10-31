@@ -38,6 +38,7 @@
 //! * presence is all-or-none per layer.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::RoutedExpertWeights;
@@ -46,7 +47,7 @@ use hipfire_dispatch::pipeline::{
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
-use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, EmbeddingFormat, WeightTensor};
 use hipfire_runtime::weight_backend::{dequant_weight_raw, load_embedding, MemoryTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -135,10 +136,40 @@ pub struct MlaWeights {
 }
 
 /// Gated SiTU FFN: dense layer-0 MLP (12032) or the shared expert (1088, down K=1280).
+///
+/// `gate`/`up`/`down` are what prefill reads. A projection stored BF16
+/// (source-exact) is resident as its exact F16 image there and has a load-time
+/// Q8_0 copy in `decode` (`[gate, up, down]`) that single-row decode reads
+/// instead (the Flash-Next shared-expert scheme); `None` = decode reads the
+/// resident tensor (qt44 / Q8F16 artifacts).
 pub struct GatedFfnWeights {
     pub gate: WeightTensor,
     pub up: WeightTensor,
     pub down: WeightTensor,
+    pub decode: [Option<WeightTensor>; 3],
+}
+
+impl GatedFfnWeights {
+    /// `(gate, up, down)` for a call over `rows` rows: the decode copies at
+    /// `rows == 1`, the resident tensors otherwise.
+    pub fn projections(&self, rows: usize) -> (&WeightTensor, &WeightTensor, &WeightTensor) {
+        fn pick<'a>(
+            rows: usize,
+            resident: &'a WeightTensor,
+            copy: &'a Option<WeightTensor>,
+        ) -> &'a WeightTensor {
+            if rows == 1 {
+                copy.as_ref().unwrap_or(resident)
+            } else {
+                resident
+            }
+        }
+        (
+            pick(rows, &self.gate, &self.decode[0]),
+            pick(rows, &self.up, &self.decode[1]),
+            pick(rows, &self.down, &self.decode[2]),
+        )
+    }
 }
 
 /// One routed expert, rows fused: `gate_up` is gate rows `0..1088` then up
@@ -170,6 +201,9 @@ pub struct MoeFfnWeights {
     /// Load-time expert identity for the shared sealed-MoE executor.
     pub table: ExpertTable,
     pub cache: ExpertBindingCache,
+    /// Every routed gate/up and down header is symmetric (`zp == -8 * sc`), verified on the device
+    /// at load (gfx1201 only); admits the grouped W4A4 expert core when the IU4 route is enabled.
+    pub iu4_symmetric: bool,
 }
 
 pub enum RaonMixer {
@@ -268,6 +302,9 @@ impl GatedFfnWeights {
         self.gate.free_all(gpu);
         self.up.free_all(gpu);
         self.down.free_all(gpu);
+        for d in self.decode.into_iter().flatten() {
+            d.free_all(gpu);
+        }
     }
 }
 
@@ -292,6 +329,7 @@ impl MoeFfnWeights {
             expert_down_awq,
             table: _,
             cache: _,
+            iu4_symmetric: _,
         } = self;
         router.free_all(gpu);
         free_t(gpu, e_bias);
@@ -970,6 +1008,8 @@ fn upload_f32_named(
 enum Loaded {
     Vec(GpuTensor),
     Mat(WeightTensor),
+    /// A projection with a separate decode copy (BF16 FFN: F16 image + Q8_0).
+    MatDecode(WeightTensor, WeightTensor),
     Host(Vec<f32>),
     Embed(GpuTensor, EmbeddingFormat),
 }
@@ -987,6 +1027,10 @@ impl Pool {
             match item {
                 Loaded::Vec(t) | Loaded::Embed(t, _) => free_t(gpu, t),
                 Loaded::Mat(w) => w.free_all(gpu),
+                Loaded::MatDecode(w, d) => {
+                    w.free_all(gpu);
+                    d.free_all(gpu);
+                }
                 Loaded::Host(_) => {}
             }
         }
@@ -1008,6 +1052,14 @@ impl Pool {
             _ => unreachable!("pool entry {name} verified as weight matrix"),
         }
     }
+    /// An always-active FFN projection and its decode copy, when it has one.
+    fn take_ffn_mat(&mut self, name: &str) -> (WeightTensor, Option<WeightTensor>) {
+        match self.items.remove(name) {
+            Some(Loaded::Mat(w)) => (w, None),
+            Some(Loaded::MatDecode(w, d)) => (w, Some(d)),
+            _ => unreachable!("pool entry {name} verified as weight matrix"),
+        }
+    }
     fn take_host(&mut self, name: &str) -> Vec<f32> {
         match self.items.remove(name) {
             Some(Loaded::Host(v)) => v,
@@ -1016,7 +1068,10 @@ impl Pool {
     }
     fn kind_ok(&self, spec: &TensorSpec) -> bool {
         match (self.items.get(&spec.name), spec.class) {
-            (Some(Loaded::Mat(_)), TensorClass::Proj | TensorClass::Router) => true,
+            (
+                Some(Loaded::Mat(_) | Loaded::MatDecode(..)),
+                TensorClass::Proj | TensorClass::Router,
+            ) => true,
             (Some(Loaded::Vec(_)), TensorClass::F32Vec) => true,
             (Some(Loaded::Host(_)), TensorClass::HostF32) => true,
             (Some(Loaded::Embed(..)), TensorClass::Embedding) => true,
@@ -1047,19 +1102,102 @@ fn f32_weight(
     })
 }
 
+/// Shared-expert and dense-FFN projections: the always-active FFN weights
+/// (every token reads them, unlike a routed expert). `model.layers.N.mlp.*`
+/// (dense layer 0) and `model.layers.N.moe.shared_experts.*`.
+fn is_always_active_ffn(name: &str) -> bool {
+    name.ends_with("_proj.weight")
+        && (name.contains(".mlp.") || name.contains(".moe.shared_experts."))
+}
+
+/// Counters of the BF16 always-active-FFN load (reported once per load).
+static BF16_FFN_TENSORS: AtomicUsize = AtomicUsize::new(0);
+static BF16_FFN_VALUES: AtomicUsize = AtomicUsize::new(0);
+static BF16_FFN_INEXACT: AtomicUsize = AtomicUsize::new(0);
+
+/// F16 little-endian image of a BF16 `[m, k]` weight (every BF16 value in the
+/// F16 normal range is exactly representable: 8 mantissa bits into 10) and the
+/// Q8F16 (`qt3`, 32-element blocks, f16 scale `amax/127`) decode copy of the
+/// same values. Returns `(f16 bytes, q8 bytes, values not exactly
+/// representable in F16)`. A BF16 value that overflows F16 is an error.
+fn bf16_ffn_images(
+    data: &[u8],
+    m: usize,
+    k: usize,
+    name: &str,
+) -> Result<(Vec<u8>, Vec<u8>, usize), String> {
+    if k % 32 != 0 || data.len() != m * k * 2 {
+        return Err(format!(
+            "raon1_mini weights: {name}: BF16 FFN projection needs [m, K%32==0] ({m}x{k}, {} B)",
+            data.len()
+        ));
+    }
+    let mut f16 = Vec::with_capacity(data.len());
+    let mut q8 = Vec::with_capacity(m * (k / 32) * 34);
+    let mut inexact = 0usize;
+    let mut block = [0f32; 32];
+    for (bi, chunk) in data.chunks_exact(64).enumerate() {
+        for (i, c) in chunk.chunks_exact(2).enumerate() {
+            let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+            let h = f32_to_f16(v);
+            let back = f16_to_f32(h);
+            if !back.is_finite() || !v.is_finite() {
+                return Err(format!(
+                    "raon1_mini weights: {name}: BF16 value {v} at element {} does not fit F16",
+                    bi * 32 + i
+                ));
+            }
+            if back.to_bits() != v.to_bits() {
+                inexact += 1;
+            }
+            f16.extend_from_slice(&h.to_le_bytes());
+            block[i] = v;
+        }
+        let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = max_abs / 127.0;
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        q8.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
+        for v in block {
+            q8.push((v * inv).round().clamp(-128.0, 127.0) as i8 as u8);
+        }
+    }
+    Ok((f16, q8, inexact))
+}
+
+/// One projection from the artifact. A BF16 always-active-FFN weight comes
+/// back as its exact F16 image (prefill) plus a Q8_0 decode copy.
 fn load_proj(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
-) -> Result<WeightTensor, String> {
-    let mut wt = read_bytes(hfq, name, |info, data| match info.quant_type {
+) -> Result<(WeightTensor, Option<WeightTensor>), String> {
+    let (mut wt, decode) = read_bytes(hfq, name, |info, data| match info.quant_type {
         qt @ (QT_MQ4V2 | QT_Q8F16) => dequant_weight_raw(gpu, qt, data, m, k, MemoryTarget::Device)
+            .map(|w| (w, None))
             .map_err(|e| format!("raon1_mini weights: upload {name}: {e:?}")),
+        QT_BF16 if is_always_active_ffn(name) => {
+            let (f16, q8, inexact) = bf16_ffn_images(data, m, k, name)?;
+            let w = dequant_weight_raw(gpu, QT_F16, &f16, m, k, MemoryTarget::Device)
+                .map_err(|e| format!("raon1_mini weights: upload {name} (F16): {e:?}"))?;
+            let d = match dequant_weight_raw(gpu, QT_Q8F16, &q8, m, k, MemoryTarget::Device) {
+                Ok(d) => d,
+                Err(e) => {
+                    w.free_all(gpu);
+                    return Err(format!(
+                        "raon1_mini weights: upload {name} (Q8_0 decode copy): {e:?}"
+                    ));
+                }
+            };
+            BF16_FFN_TENSORS.fetch_add(1, Ordering::Relaxed);
+            BF16_FFN_VALUES.fetch_add(m * k, Ordering::Relaxed);
+            BF16_FFN_INEXACT.fetch_add(inexact, Ordering::Relaxed);
+            Ok((w, Some(d)))
+        }
         qt @ (QT_F16 | QT_BF16 | QT_F32) => {
             let f = widen_f32(qt, data, m * k, name)?;
-            f32_weight(gpu, &f, m, k, name)
+            f32_weight(gpu, &f, m, k, name).map(|w| (w, None))
         }
         other => Err(format!(
             "raon1_mini weights: {name}: unsupported projection quant type {other}"
@@ -1071,17 +1209,23 @@ fn load_proj(
                 Ok(t) => wt.awq_scale = Some(t),
                 Err(e) => {
                     wt.free_all(gpu);
+                    if let Some(d) = decode {
+                        d.free_all(gpu);
+                    }
                     return Err(e);
                 }
             },
             Ok(None) => {}
             Err(e) => {
                 wt.free_all(gpu);
+                if let Some(d) = decode {
+                    d.free_all(gpu);
+                }
                 return Err(e);
             }
         }
     }
-    Ok(wt)
+    Ok((wt, decode))
 }
 
 /// `gate`/`up` of one dense FFN must share an AWQ scale (one rotated
@@ -1115,7 +1259,10 @@ fn load_pool_item(
             })?;
             Loaded::Embed(buf, fmt)
         }
-        TensorClass::Proj => Loaded::Mat(load_proj(hfq, gpu, name, spec.shape[0], spec.shape[1])?),
+        TensorClass::Proj => match load_proj(hfq, gpu, name, spec.shape[0], spec.shape[1])? {
+            (w, None) => Loaded::Mat(w),
+            (w, Some(d)) => Loaded::MatDecode(w, d),
+        },
         TensorClass::Router => {
             let f = read_bytes(hfq, name, |info, data| {
                 widen_f32(info.quant_type, data, spec.numel(), name)
@@ -1195,10 +1342,14 @@ fn load_mhc_site(
 }
 
 fn take_gated(pool: &mut Pool, prefix: &str) -> GatedFfnWeights {
+    let (gate, gate_dec) = pool.take_ffn_mat(&format!("{prefix}.gate_proj.weight"));
+    let (up, up_dec) = pool.take_ffn_mat(&format!("{prefix}.up_proj.weight"));
+    let (down, down_dec) = pool.take_ffn_mat(&format!("{prefix}.down_proj.weight"));
     GatedFfnWeights {
-        gate: pool.take_mat(&format!("{prefix}.gate_proj.weight")),
-        up: pool.take_mat(&format!("{prefix}.up_proj.weight")),
-        down: pool.take_mat(&format!("{prefix}.down_proj.weight")),
+        gate,
+        up,
+        down,
+        decode: [gate_dec, up_dec, down_dec],
     }
 }
 
@@ -1250,7 +1401,16 @@ fn check_moe_awq(hfq: &HfqFile, cfg: &RaonConfig, m: &str) -> Result<ExpertAwqHo
     }
     check_gu(hfq, format!("{m}.shared_experts.gate_proj.weight"))?;
     check_gu(hfq, format!("{m}.shared_experts.up_proj.weight"))?;
-    let expected_gu = 2 * cfg.n_experts + 2;
+    // A Q8F16/BF16 shared gate/up consumes the plain activation: no sidecar.
+    let shared_gu = |name: &str| {
+        usize::from(
+            hfq.find_tensor_info(name)
+                .is_some_and(|i| i.quant_type == QT_MQ4V2),
+        )
+    };
+    let expected_gu = 2 * cfg.n_experts
+        + shared_gu(&format!("{m}.shared_experts.gate_proj.weight"))
+        + shared_gu(&format!("{m}.shared_experts.up_proj.weight"));
     if seen_gate_up != 0 && seen_gate_up != expected_gu {
         return Err(format!(
             "raon1_mini weights: {m}: partial gate/up AWQ coverage ({seen_gate_up}/{expected_gu}); \
@@ -1442,6 +1602,32 @@ fn seal_experts(
     Ok((gu, dn, table, cache))
 }
 
+/// Whether every routed gate/up and down group header obeys `zp == -8 * sc` (the symmetric qt44
+/// contract the grouped W4A4 core reads: `w = sc * (u - 8)`), checked on the device with the
+/// route's header checker. `false` off gfx1201, for non-qt44 experts, or when the checker is
+/// unavailable; never an error (the route simply stays off).
+fn verify_symmetric_headers(
+    gpu: &mut Gpu,
+    experts: &[ExpertWeights],
+    gu: &GpuTensor,
+    dn: &GpuTensor,
+) -> bool {
+    let Some(first) = experts.first() else {
+        return false;
+    };
+    if gpu.arch != "gfx1201"
+        || !experts.iter().all(|x| {
+            x.gate_up.gpu_dtype == DType::MQ4G256V2 && x.down.gpu_dtype == DType::MQ4G256V2
+        })
+    {
+        return false;
+    }
+    let n = experts.len();
+    let gu_ok = gpu.qwen4_moe_sym_check(gu, first.gate_up.m, first.gate_up.k, n, 136);
+    let dn_ok = gpu.qwen4_moe_sym_check(dn, first.down.m, first.down.k, n, 136);
+    matches!((gu_ok, dn_ok), (Ok(true), Ok(true)))
+}
+
 fn build_moe(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -1516,10 +1702,13 @@ fn build_moe(
         }
     };
     let shared = take_gated(pool, &format!("{m}.shared_experts"));
-    // The shared expert's gate/up scale must be the layer's (values are
+    // The qt44 shared expert's gate/up scale must be the layer's (values are
     // verified identical by `check_moe_awq`): both present or both absent.
-    let shared_ok = if shared.gate.awq_scale.is_some() != gate_up_awq.is_some()
-        || shared.up.awq_scale.is_some() != gate_up_awq.is_some()
+    // Q8F16/BF16 shared projections consume the plain activation and carry none.
+    let shared_ok = if (shared.gate.gpu_dtype == DType::MQ4G256V2
+        && shared.gate.awq_scale.is_some() != gate_up_awq.is_some())
+        || (shared.up.gpu_dtype == DType::MQ4G256V2
+            && shared.up.awq_scale.is_some() != gate_up_awq.is_some())
     {
         Err(format!(
             "raon1_mini weights: {m}: shared gate/up AWQ presence differs from routed experts"
@@ -1540,6 +1729,7 @@ fn build_moe(
         cleanup(gpu, experts, owners);
         return Err(er);
     }
+    let iu4_symmetric = verify_symmetric_headers(gpu, &experts, &gu, &dn);
     Ok(MoeFfnWeights {
         router: pool.take_mat(&format!("{m}.gate.weight")),
         e_bias: pool.take_vec(&format!("{m}.gate.e_score_correction_bias")),
@@ -1550,6 +1740,7 @@ fn build_moe(
         gate_up_awq,
         expert_down_awq_ptrs: down_ptrs_table,
         expert_down_awq: owners,
+        iu4_symmetric,
         table,
         cache,
     })
@@ -1664,6 +1855,9 @@ pub fn load_raon_weights(
     let specs = tensor_inventory(cfg);
     let index: Vec<IndexEntry> = hfq.tensors().iter().map(IndexEntry::from_info).collect();
     check_inventory(&specs, &index)?;
+    BF16_FFN_TENSORS.store(0, Ordering::Relaxed);
+    BF16_FFN_VALUES.store(0, Ordering::Relaxed);
+    BF16_FFN_INEXACT.store(0, Ordering::Relaxed);
     if index.iter().any(|e| e.quant_type == QT_MQ4V2) && !hfq.mq4v2_symmetric() {
         return Err(
             "raon1_mini weights: qt44 tensors present but the artifact lacks the symmetric \
@@ -1761,6 +1955,15 @@ pub fn load_raon_weights(
             "raon1_mini weights: loaded-but-unassembled tensors: {}",
             list_cap(&leftover)
         ));
+    }
+    let bf16_tensors = BF16_FFN_TENSORS.swap(0, Ordering::Relaxed);
+    if bf16_tensors != 0 {
+        eprintln!(
+            "raon1_mini weights: always-active FFN stored BF16: {bf16_tensors} tensors resident as \
+             F16 images for prefill ({} of {} values not exactly F16-representable) + Q8_0 decode copies",
+            BF16_FFN_INEXACT.swap(0, Ordering::Relaxed),
+            BF16_FFN_VALUES.swap(0, Ordering::Relaxed)
+        );
     }
     Ok(RaonWeights {
         embed,
@@ -2046,6 +2249,96 @@ mod tests {
         assert_eq!(MHC_PARAM_B_POST, 8);
         assert_eq!(MHC_PARAM_B_Z, 12);
         assert_eq!(MHC_PARAM_LEN, 21);
+    }
+
+    /// Re-type the always-active FFN weights of `idx` (and drop their sidecars).
+    fn retype_ffn(idx: &mut Vec<IndexEntry>, qt: u8) {
+        for e in idx.iter_mut() {
+            if is_always_active_ffn(&e.name) {
+                let (m, k) = (e.shape[0], e.shape[1]);
+                e.quant_type = qt;
+                e.data_size = payload_bytes(qt, m, k).unwrap();
+            }
+        }
+        idx.retain(|e| {
+            !(e.name.ends_with(".awq_scale.weight") && {
+                let w = e.name.replace(".awq_scale.weight", ".weight");
+                is_always_active_ffn(&w)
+            })
+        });
+    }
+
+    #[test]
+    fn always_active_ffn_classifier_covers_shared_and_dense_only() {
+        assert!(is_always_active_ffn("model.layers.0.mlp.gate_proj.weight"));
+        assert!(is_always_active_ffn(
+            "model.layers.7.moe.shared_experts.down_proj.weight"
+        ));
+        assert!(!is_always_active_ffn(
+            "model.layers.7.moe.experts.3.down_proj.weight"
+        ));
+        assert!(!is_always_active_ffn("model.layers.7.mlp_raon_mhc.phi_pre"));
+        assert!(!is_always_active_ffn(
+            "model.layers.7.self_attn.q_proj.weight"
+        ));
+    }
+
+    #[test]
+    fn q8f16_and_bf16_always_active_ffn_pass_the_inventory_without_sidecars() {
+        let specs = tensor_inventory(&released());
+        for qt in [QT_Q8F16, QT_BF16] {
+            let mut idx = good_index(&specs);
+            retype_ffn(&mut idx, qt);
+            check_inventory(&specs, &idx).unwrap_or_else(|e| panic!("qt {qt}: {e}"));
+        }
+    }
+
+    #[test]
+    fn unpadded_shared_down_is_refused_for_every_ffn_storage() {
+        let specs = tensor_inventory(&released());
+        for qt in [QT_Q8F16, QT_BF16] {
+            let mut idx = good_index(&specs);
+            retype_ffn(&mut idx, qt);
+            let e = idx
+                .iter_mut()
+                .find(|e| e.name == "model.layers.1.moe.shared_experts.down_proj.weight")
+                .unwrap();
+            e.shape = vec![2560, 1088];
+            e.data_size = payload_bytes(qt, 2560, 1088).unwrap();
+            let err = check_inventory(&specs, &idx).unwrap_err();
+            assert!(err.contains("unpadded K"), "{err}");
+        }
+    }
+
+    #[test]
+    fn bf16_ffn_images_are_exact_f16_and_the_q8_copy_matches_the_quantizer() {
+        let (m, k) = (2, 64);
+        let vals: Vec<f32> = (0..m * k)
+            .map(|i| {
+                let v = ((i as f32) * 0.37 - 20.0) * 0.01;
+                f32::from_bits(v.to_bits() & 0xFFFF_0000)
+            })
+            .collect();
+        let data: Vec<u8> = vals
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let (f16, q8, inexact) = bf16_ffn_images(&data, m, k, "t").unwrap();
+        assert_eq!(inexact, 0);
+        for (i, v) in vals.iter().enumerate() {
+            let h = u16::from_le_bytes([f16[2 * i], f16[2 * i + 1]]);
+            assert_eq!(f16_to_f32(h).to_bits(), v.to_bits(), "element {i}");
+        }
+        assert_eq!(q8.len(), m * (k / 32) * 34);
+        // First block: scale = amax/127 as f16, int8 round-to-nearest.
+        let amax = vals[..32].iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = u16::from_le_bytes([q8[0], q8[1]]);
+        assert_eq!(scale, f32_to_f16(amax / 127.0));
+        for j in 0..32 {
+            let want = (vals[j] * (127.0 / amax)).round() as i8;
+            assert!((q8[2 + j] as i8 - want).abs() <= 1, "q[{j}]");
+        }
+        assert!(bf16_ffn_images(&data, m, 48, "t").is_err());
     }
 
     #[test]

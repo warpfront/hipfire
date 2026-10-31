@@ -30129,6 +30129,89 @@ impl Gpu {
         }
         Ok(())
     }
+    /// Row-tiled F32 GEMM: Y[N,M] = X[N,K] @ A[M,K]^T, same layout and
+    /// bit-identical per-output arithmetic as [`Self::gemm_f32_batched`]
+    /// (lane-strided K loop + shfl_down tree), but a 256-thread block owns
+    /// 4 rows with X staged in LDS, its 8 waves partitioning the outputs.
+    pub fn gemm_f32_tiled_rows(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        const NT: usize = 4;
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        let bytes = f32_batched_extents(m, k, n).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "F32 GEMM dimensions or byte extents overflow")
+        })?;
+        let f32_view = |t: &GpuTensor| matches!(t.dtype, DType::F32 | DType::Raw);
+        if !f32_view(a)
+            || !f32_view(x)
+            || y.dtype != DType::F32
+            || a.buf.size() < bytes[0]
+            || x.buf.size() < bytes[1]
+            || y.buf.size() < bytes[2]
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "F32 GEMM needs full-window F32 weight/activation/output views",
+            ));
+        }
+        self.bind_thread()?;
+        // Wave count 8; MPW=4 serves M <= 32, MPW=16 any M (grid.x over 128).
+        let (kname, grid_x) = if m <= 32 {
+            ("gemm_f32_tiled_rows_mp4", m.div_ceil(32))
+        } else {
+            ("gemm_f32_tiled_rows", m.div_ceil(128))
+        };
+        // Module name is the file so the source compiles once for both symbols.
+        self.ensure_kernel(
+            "gemm_f32_tiled_rows",
+            kernels::GEMM_F32_TILED_ROWS_SRC,
+            kname,
+        )?;
+        // Chunk the grid-y extent (tile count) at the launch limit.
+        let chunk_rows = F32_BATCHED_MAX_GRID_Y * NT;
+        let mut off = 0usize;
+        while off < n {
+            let take = (n - off).min(chunk_rows);
+            let mut ap = a.buf.as_ptr();
+            let mut xp = x
+                .buf
+                .as_ptr()
+                .wrapping_byte_add(off * k * std::mem::size_of::<f32>());
+            let mut yp = y
+                .buf
+                .as_ptr()
+                .wrapping_byte_add(off * m * std::mem::size_of::<f32>());
+            let mut mi = m as i32;
+            let mut ki = k as i32;
+            let mut ni = take as i32;
+            let mut params = [
+                &mut ap as *mut _ as *mut c_void,
+                &mut xp as *mut _ as *mut c_void,
+                &mut yp as *mut _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+            ];
+            launch_params_blob!(
+                self,
+                kname,
+                [grid_x as u32, take.div_ceil(NT) as u32, 1],
+                [256, 1, 1],
+                0,
+                params; ap, xp, yp, mi, ki, ni
+            )?;
+            off += take;
+        }
+        Ok(())
+    }
     /// Native-BF16 weight × F32 input batched GEMM.
     ///
     /// `weight` is row-major `[M, K]` BF16, `x` is row-major `[N, K]` F32,

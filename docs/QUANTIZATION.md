@@ -121,13 +121,23 @@ Flash-Next bench fixture”) and the registry rows in [MODELS.md](MODELS.md).
 
 - **Raon-1-mini-preview XTS** (arch 19, `raon-1-mini-preview.mq4-xts`) by tensor
   class: the attention classes (MLA and RDA projections, including the RDA gates and
-  the MLA/RDA LoRA factors) are promoted to Q8F16 (qt 3); `lm_head` is Q8; the routed,
-  shared and dense-MLP experts are symmetric MQ4V2 XT (qt 44) with the XTS refit
-  (per-group AWQ alpha plus GPTQ scale refit), so the int4-activation prefill and
-  sealed MoE routes apply. The shared-expert gate/up carry the routed experts' `moe_in`
-  AWQ scale, because the runtime feeds both from one rotated activation (the loader
-  rejects a file whose shared gate/up sidecar differs). KLD vs the BF16 teacher:
-  WT2 0.081, code24 0.0138 (the RTN control with the same Q8 attention: 0.102 / 0.019).
+  the MLA/RDA LoRA factors) are promoted to Q8F16 (qt 3); `lm_head` is Q8; the routed
+  experts are symmetric MQ4V2 XT (qt 44) with the XTS refit (per-group AWQ alpha plus
+  GPTQ scale refit), so the int4-activation prefill and sealed MoE routes apply. The
+  always-active FFN (the 24 shared experts and the dense layer-0 MLP, which every token
+  reads, unlike a routed expert) is Q8F16 with no AWQ sidecar: it consumes the plain
+  activation, and a qt 44 shared gate/up would otherwise carry the routed experts'
+  `moe_in` AWQ scale (the runtime feeds routed and shared gate/up from one rotated
+  activation; the loader rejects a qt 44 file whose shared gate/up sidecar differs).
+  Shared and dense down projections are stored with physical K 1280 / 12032 (zero
+  padding). The `-v2` file is the XTS file with exactly those 75 tensors re-quantized
+  from the BF16 source by `hipfire-quantize --raon-shared-ffn q8f16 --input <xts.hfq>
+  --raon-source <checkpoint>` (everything else byte-identical; `--raon-shared-ffn-verify`
+  proves it); `HIPFIRE_RAON_SHARED_FFN=q8f16|bf16|qt44` selects the same class in a full
+  conversion. KLD vs the BF16 teacher: WT2 0.074, code24 0.0116 (the previous XTS file
+  with qt 44 shared/dense FFN: 0.081 / 0.0138; the RTN control with the same Q8
+  attention: 0.102 / 0.019). Source-exact BF16 for the same tensors measured no better
+  (0.075 / 0.0118) and costs 0.8 GB more device memory, so it is not shipped.
   Prefill activation precision resolves once at load via
   `HIPFIRE_RAON_PREFILL_PRECISION` (default f16; A4 is opt-in).
 

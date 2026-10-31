@@ -998,6 +998,9 @@ pub(crate) fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::Qwen4
     } else if args.recipe.is_some() {
         Route::Qwen4StockFp8
+    } else if args.raon_shared_ffn.is_some() || args.raon_shared_ffn_verify.is_some() {
+        // clap makes both flags exclusive with every other recipe route.
+        Route::RaonSharedFfn
     } else if args.mq4v2_final_codes.is_some()
         || args.mq3v2_final_codes.is_some()
         || args.mq2v2_final_codes.is_some()
@@ -1186,6 +1189,65 @@ pub(crate) fn run() {
             }
             Err(error) => {
                 eprintln!("error: qwen4 dev-tiny pack: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // ── Raon-1-mini always-active FFN swap / verify (existing qt44 artifact in) ──
+    if route_for(&args) == crate::cli::Route::RaonSharedFfn {
+        use crate::raon::{raon_hfq_diff, swap_shared_ffn, Scope, SharedFfn};
+        let input = Path::new(args.input.as_deref().expect("--input is required"));
+        let scope = match Scope::parse(args.raon_shared_ffn_scope.as_deref().unwrap_or("all")) {
+            Ok(scope) => scope,
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        };
+        if let Some(storage) = args.raon_shared_ffn.as_deref() {
+            let source = args
+                .raon_source
+                .as_deref()
+                .expect("--raon-source is required with --raon-shared-ffn");
+            match SharedFfn::parse(storage)
+                .and_then(|t| swap_shared_ffn(input, source, Path::new(&args.output), t, scope))
+            {
+                Ok(summary) => {
+                    eprintln!("{}", summary.report());
+                    eprintln!("raon: OK {}", args.output);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("error: raon shared-FFN swap failed: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        let storage = args
+            .raon_shared_ffn_verify
+            .as_deref()
+            .expect("route implies --raon-shared-ffn-verify");
+        match SharedFfn::parse(storage)
+            .and_then(|t| raon_hfq_diff(input, Path::new(&args.output), t, scope))
+        {
+            Ok(report) => {
+                eprint!("{}", report.table());
+                if report.ok() {
+                    eprintln!("raon: shared-FFN {storage} verify OK ({})", args.output);
+                    return;
+                }
+                for v in report.violations.iter().take(50) {
+                    eprintln!("violation: {v}");
+                }
+                eprintln!(
+                    "error: raon shared-FFN verify failed: {} violation(s)",
+                    report.violations.len()
+                );
+                std::process::exit(2);
+            }
+            Err(error) => {
+                eprintln!("error: raon shared-FFN verify failed: {error}");
                 std::process::exit(2);
             }
         }

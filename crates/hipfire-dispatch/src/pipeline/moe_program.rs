@@ -4522,8 +4522,6 @@ pub(super) fn bf16_grouped_view_bytes(rows: usize, width: usize) -> Option<usize
 pub(super) enum ExpertIu4Exclusion {
     /// A specialized route (route policy / sealed grouped route) owns the call.
     SpecializedRoute,
-    /// The recipe is not softmax-gated-shared.
-    Recipe,
     /// CPU-deferred routed experts.
     CpuDeferred,
     /// CPU-cold/GPU-hot split.
@@ -4557,7 +4555,6 @@ impl ExpertIu4Exclusion {
     pub(super) const fn reason(&self) -> &'static str {
         match self {
             Self::SpecializedRoute => "a specialized route owns this call",
-            Self::Recipe => "recipe is not softmax-gated-shared",
             Self::CpuDeferred => "CPU-deferred routed experts",
             Self::CpuSplit => "CPU-cold/GPU-hot split",
             Self::RoutedOut => "EP partial accumulator (routed_out)",
@@ -4577,7 +4574,6 @@ impl ExpertIu4Exclusion {
     const fn class(&self) -> usize {
         match self {
             Self::SpecializedRoute => 19,
-            Self::Recipe => 20,
             Self::CpuDeferred => 21,
             Self::CpuSplit => 22,
             Self::RoutedOut => 23,
@@ -4658,7 +4654,6 @@ pub(super) enum ExpertIu4Decision {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ExpertIu4CallShape {
     pub(super) specialized_route: bool,
-    pub(super) not_softmax_gated_recipe: bool,
     pub(super) cpu_deferred: bool,
     pub(super) cpu_split: bool,
     pub(super) routed_out: bool,
@@ -4852,7 +4847,6 @@ pub(super) fn decide_expert_iu4(f: &ExpertIu4Facts) -> ExpertIu4Decision {
     let s = &f.shape;
     if let Some((_, x)) = [
         (s.specialized_route, X::SpecializedRoute),
-        (s.not_softmax_gated_recipe, X::Recipe),
         (s.cpu_deferred, X::CpuDeferred),
         (s.cpu_split, X::CpuSplit),
         (s.routed_out, X::RoutedOut),
@@ -4953,7 +4947,6 @@ fn expert_iu4_facts(
         host_mapped: expert_iu4_host_mapped(p),
         shape: ExpertIu4CallShape {
             specialized_route: p.route_policy.is_some() || selection.route.is_some(),
-            not_softmax_gated_recipe: !matches!(p.recipe, MoeRecipe::SoftmaxGatedShared { .. }),
             cpu_deferred: selection.cpu_deferred_experts || p.cpu_deferred_experts,
             cpu_split: selection.cpu_split,
             routed_out: p.routed_out.is_some(),
@@ -5744,14 +5737,6 @@ mod tests {
                 Exclusion(X::SpecializedRoute),
             ),
             (
-                "recipe",
-                ExpertIu4Facts {
-                    shape: shape(|s| s.not_softmax_gated_recipe = true),
-                    ..base
-                },
-                Exclusion(X::Recipe),
-            ),
-            (
                 "CPU-deferred",
                 ExpertIu4Facts {
                     shape: shape(|s| s.cpu_deferred = true),
@@ -6147,7 +6132,6 @@ mod tests {
         }
         for x in [
             X::SpecializedRoute,
-            X::Recipe,
             X::CpuDeferred,
             X::CpuSplit,
             X::RoutedOut,
@@ -6306,7 +6290,6 @@ mod tests {
         }
         for x in [
             X::SpecializedRoute,
-            X::Recipe,
             X::CpuDeferred,
             X::CpuSplit,
             X::RoutedOut,
@@ -6769,6 +6752,13 @@ pub struct GroupedMoeRouted<'a> {
     /// `[n_experts]` u64 pointers to per-expert F32 `[down_k]` AWQ divides of
     /// the down input (applied after the pad, before the FWHT).
     pub down_awq_ptrs: Option<&'a GpuTensor>,
+    /// Every routed gate/up and down group header obeys `zp == -8 * sc` (checked at load); admits
+    /// the grouped W4A4 core ([`grouped_moe_iu4_admitted`]).
+    pub iu4_symmetric_verified: bool,
+    /// Activation tier the caller selects for the grouped routed-expert GEMMs
+    /// ([`grouped_moe_site_tiers`]); `F16` keeps the F16 WMMA core (kill switch). Only honoured when
+    /// the capability admission holds, and overridable per site by `HIPFIRE_MOE_GROUPED_TIERS`.
+    pub act_tier: GroupedMoeActTier,
 }
 
 /// Gate/up/down projections of one gated FFN (shared expert or dense layer).
@@ -6890,6 +6880,9 @@ fn projection_kind(
     match dtype {
         DType::MQ4G256V2 => Ok((KernelKey::GemmMq4G256V2, true)),
         DType::Q8_0 => Ok((KernelKey::GemmQ8_0BatchedChunked, false)),
+        // F16-resident exact image of a BF16 source weight (prefill); decode
+        // reads a Q8_0 copy of the same tensor.
+        DType::F16 => Ok((KernelKey::GemmF16WmmaMb8, false)),
         DType::F32 => Ok((KernelKey::GemmF32Batched, false)),
         _ => Err(grouped_refusal(variant, "projection-dtype")),
     }
@@ -7138,6 +7131,11 @@ fn gated_ffn_from_basis(
                 ));
             }
         }
+        // A single row (decode) over a Q8_0 weight: the Q8 GEMV, not a
+        // one-column WMMA tile.
+        if rows == 1 && weight.dtype == DType::Q8_0 {
+            return hip!(gpu.gemv_q8_0(weight.buf, xin, y, m, k));
+        }
         gemm.run_key(
             key,
             ctx,
@@ -7279,6 +7277,88 @@ pub fn execute_gated_ffn(gpu: &mut Gpu, op: &GatedFfnOp<'_>) -> Result<(), Dispa
     )
 }
 
+/// Activation precision of one grouped routed-expert GEMM site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupedMoeActTier {
+    /// F16 WMMA (`gemm_mq4g256v2_moe_grouped_wmma_k2`), the default route.
+    F16,
+    /// Symmetric W4A4 (`wmma_i32_16x16x32_iu4`, `block_i4_128` activations).
+    A4,
+    /// Symmetric W4A8 (`wmma_i32_16x16x16_iu8`, `block_i8_128` activations).
+    A8,
+}
+
+impl GroupedMoeActTier {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "f16" => Some(Self::F16),
+            "a4" => Some(Self::A4),
+            "a8" => Some(Self::A8),
+            _ => None,
+        }
+    }
+}
+
+/// `HIPFIRE_MOE_GROUPED_TIERS=<gate_up>,<down>` (developer; each `f16|a4|a8`): per-site tier override
+/// of the grouped routed-expert core, applied on top of the capability admission (symmetric headers,
+/// qt44, shape, gfx1201, rows). Unset: both sites take the device tier ([`grouped_moe_device_tier`]).
+fn parse_site_tiers(s: &str) -> Option<(GroupedMoeActTier, GroupedMoeActTier)> {
+    let (g, d) = s.split_once(',')?;
+    Some((GroupedMoeActTier::parse(g)?, GroupedMoeActTier::parse(d)?))
+}
+
+/// Capability admission of the grouped symmetric quantized-activation routed-expert core of
+/// [`execute_grouped_moe`], resolved per site `(gate_up, down)`: the caller bound loader-verified
+/// symmetric headers (`zp == -8 * sc` on every gate/up and down group,
+/// [`GroupedMoeRouted::iu4_symmetric_verified`]), the device is gfx1201, the experts are qt44
+/// (`MQ4G256V2`) and the shape fits the kernels ([`grouped_moe_iu4_shape_admits`]). The tier of each
+/// site is the caller's [`GroupedMoeRouted::act_tier`] unless `HIPFIRE_MOE_GROUPED_TIERS` overrides
+/// it. AWQ (input vector, per-expert down table), the activation (SiLU/SiTU), the pad of the down K
+/// and the cast policy are handled by the stages around the two GEMMs and place no condition here. The
+/// route allocates only through the activation scratch, so it is refused under graph capture and
+/// Redline recording. Anything not admitted is `(F16, F16)`.
+pub fn grouped_moe_site_tiers(
+    gpu: &Gpu,
+    op: &GroupedMoeOp<'_>,
+) -> (GroupedMoeActTier, GroupedMoeActTier) {
+    use GroupedMoeActTier::F16;
+    static OVERRIDE: std::sync::LazyLock<Option<(GroupedMoeActTier, GroupedMoeActTier)>> =
+        std::sync::LazyLock::new(|| {
+            let v = hipfire_config::developer_var("HIPFIRE_MOE_GROUPED_TIERS").ok()?;
+            let parsed = parse_site_tiers(&v);
+            if parsed.is_none() {
+                eprintln!("HIPFIRE_MOE_GROUPED_TIERS={v:?}: expected `<gate_up>,<down>` with each of f16|a4|a8; ignored");
+            }
+            parsed
+        });
+    let admitted = gpu.arch == "gfx1201"
+        && op.routed.iu4_symmetric_verified
+        && op.routed.dtype == DType::MQ4G256V2
+        && grouped_moe_iu4_shape_admits(&op.geometry, op.rows)
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_recording();
+    if !admitted {
+        return (F16, F16);
+    }
+    let tier = op.routed.act_tier;
+    OVERRIDE.unwrap_or((tier, tier))
+}
+
+/// Shape half of [`grouped_moe_iu4_admitted`] (pure): at least [`GROUPED_MOE_IU4_MIN_ROWS`] rows,
+/// both GEMM K extents (`hidden`, the padded `down_k`) whole qt44 groups of 256, and both M extents
+/// (`2 * logical_mi` gate/up rows, `hidden` down rows) multiples of the kernel's 64-row CTA tile.
+pub fn grouped_moe_iu4_shape_admits(g: &GroupedMoeGeometry, rows: usize) -> bool {
+    rows >= GROUPED_MOE_IU4_MIN_ROWS
+        && g.hidden % 256 == 0
+        && g.down_k % 256 == 0
+        && (2 * g.logical_mi) % 64 == 0
+        && g.hidden % 64 == 0
+}
+
+/// Row floor of the grouped IU4 core: below it the weight stream of the expert set dominates
+/// both routes and the F16 core stays.
+pub const GROUPED_MOE_IU4_MIN_ROWS: usize = 64;
+
 /// Execute one grouped MoE layer: FP32 router linear and device-resident
 /// top-k, shared rotated input basis, routed experts on the indexed or the
 /// grouped core, the optional ungated shared expert, and the policy combine.
@@ -7296,9 +7376,15 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
     let slots = rows * k;
     let bf16 = op.policy.cast.bf16();
     let protocol = op.protocol.resolve(rows);
+    let (tier_gu, tier_dn) = if protocol == GroupedMoeProtocol::Grouped {
+        grouped_moe_site_tiers(gpu, op)
+    } else {
+        (GroupedMoeActTier::F16, GroupedMoeActTier::F16)
+    };
 
     // Router: FP32 linear of the (BF16-valued) F32 input, then device top-k.
-    hip!(gpu.gemm_f32_batched(
+    hip!(crate::pipeline::stream_mix::f32_rows_gemm(
+        gpu,
         op.router.weight,
         op.x,
         s.router_logits,
@@ -7387,18 +7473,58 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                 m_total,
                 MOE_GROUPED_BLOCK_M,
             ))?;
-            hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
-                op.routed.gate_up_ptrs,
-                t.expert_tile_ids,
-                t.sorted_slot_index,
-                s.x_rot,
-                t.gate_up_rows,
-                2 * g.logical_mi,
-                g.hidden,
-                k,
-                m_total,
-                rows,
-            ))?;
+            if tier_gu == GroupedMoeActTier::A8 {
+                let (nt, rf) =
+                    rdna_compute::moe_grouped_qt44_iu4::select_entry_a8(m_total, 2 * g.logical_mi);
+                let xq = hip!(gpu.ensure_int8_mmq_x(s.x_rot, rows, g.hidden))?;
+                hip!(gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
+                    op.routed.gate_up_ptrs,
+                    t.expert_tile_ids,
+                    t.expert_offsets,
+                    t.sorted_slot_index,
+                    xq,
+                    t.gate_up_rows,
+                    2 * g.logical_mi,
+                    g.hidden,
+                    k,
+                    m_total,
+                    rows,
+                    nt,
+                    rf,
+                ))?;
+            } else if tier_gu == GroupedMoeActTier::A4 {
+                let (nt, rf) =
+                    rdna_compute::moe_grouped_qt44_iu4::select_entry(m_total, 2 * g.logical_mi);
+                let xq = hip!(gpu.ensure_int4_mmq_x(s.x_rot, rows, g.hidden))?;
+                hip!(gpu.gemm_mq4g256v2_moe_grouped_iu4_sym(
+                    op.routed.gate_up_ptrs,
+                    t.expert_tile_ids,
+                    t.expert_offsets,
+                    t.sorted_slot_index,
+                    xq,
+                    t.gate_up_rows,
+                    2 * g.logical_mi,
+                    g.hidden,
+                    k,
+                    m_total,
+                    rows,
+                    nt,
+                    rf,
+                ))?;
+            } else {
+                hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                    op.routed.gate_up_ptrs,
+                    t.expert_tile_ids,
+                    t.sorted_slot_index,
+                    s.x_rot,
+                    t.gate_up_rows,
+                    2 * g.logical_mi,
+                    g.hidden,
+                    k,
+                    m_total,
+                    rows,
+                ))?;
+            }
             hip!(gpu.ffn_activation_grouped_f32(&FfnActivationGrouped {
                 activation: op.policy.activation,
                 y_grouped: t.gate_up_rows,
@@ -7415,18 +7541,57 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                 n_experts: g.n_experts,
             }))?;
             hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
-            hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
-                op.routed.down_ptrs,
-                t.expert_tile_ids,
-                t.sorted_slot_index,
-                s.rot,
-                s.down_rows,
-                g.hidden,
-                g.down_k,
-                1,
-                m_total,
-                slots,
-            ))?;
+            if tier_dn == GroupedMoeActTier::A8 {
+                let (nt, rf) =
+                    rdna_compute::moe_grouped_qt44_iu4::select_entry_a8(m_total, g.hidden);
+                let xq = hip!(gpu.ensure_int8_mmq_x(s.rot, slots, g.down_k))?;
+                hip!(gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
+                    op.routed.down_ptrs,
+                    t.expert_tile_ids,
+                    t.expert_offsets,
+                    t.sorted_slot_index,
+                    xq,
+                    s.down_rows,
+                    g.hidden,
+                    g.down_k,
+                    1,
+                    m_total,
+                    slots,
+                    nt,
+                    rf,
+                ))?;
+            } else if tier_dn == GroupedMoeActTier::A4 {
+                let (nt, rf) = rdna_compute::moe_grouped_qt44_iu4::select_entry(m_total, g.hidden);
+                let xq = hip!(gpu.ensure_int4_mmq_x(s.rot, slots, g.down_k))?;
+                hip!(gpu.gemm_mq4g256v2_moe_grouped_iu4_sym(
+                    op.routed.down_ptrs,
+                    t.expert_tile_ids,
+                    t.expert_offsets,
+                    t.sorted_slot_index,
+                    xq,
+                    s.down_rows,
+                    g.hidden,
+                    g.down_k,
+                    1,
+                    m_total,
+                    slots,
+                    nt,
+                    rf,
+                ))?;
+            } else {
+                hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                    op.routed.down_ptrs,
+                    t.expert_tile_ids,
+                    t.sorted_slot_index,
+                    s.rot,
+                    s.down_rows,
+                    g.hidden,
+                    g.down_k,
+                    1,
+                    m_total,
+                    slots,
+                ))?;
+            }
             Some(t.inverse_perm)
         }
         GroupedMoeProtocol::Auto => unreachable!("resolve never returns Auto"),
@@ -7489,6 +7654,42 @@ mod grouped_moe_tests {
             shared_mi: 1088,
             shared_down_k: 1280,
         }
+    }
+
+    #[test]
+    fn iu4_shape_admits_the_raon_geometry_and_refuses_off_domain_shapes() {
+        let g = raon_geometry();
+        assert!(grouped_moe_iu4_shape_admits(&g, 4096));
+        assert!(grouped_moe_iu4_shape_admits(&g, GROUPED_MOE_IU4_MIN_ROWS));
+        assert!(!grouped_moe_iu4_shape_admits(
+            &g,
+            GROUPED_MOE_IU4_MIN_ROWS - 1
+        ));
+        // down K must be whole qt44 groups (the logical 1088 is padded to 1280).
+        assert!(!grouped_moe_iu4_shape_admits(
+            &GroupedMoeGeometry { down_k: 1088, ..g },
+            4096
+        ));
+        assert!(!grouped_moe_iu4_shape_admits(
+            &GroupedMoeGeometry { hidden: 2688, ..g },
+            4096
+        ));
+        assert!(!grouped_moe_iu4_shape_admits(
+            &GroupedMoeGeometry {
+                logical_mi: 1040,
+                ..g
+            },
+            4096
+        ));
+    }
+
+    #[test]
+    fn site_tiers_parse() {
+        use GroupedMoeActTier::{A4, A8, F16};
+        assert_eq!(parse_site_tiers("a4,f16"), Some((A4, F16)));
+        assert_eq!(parse_site_tiers(" F16 , A8 "), Some((F16, A8)));
+        assert_eq!(parse_site_tiers("a4"), None);
+        assert_eq!(parse_site_tiers("a4,a5"), None);
     }
 
     #[test]

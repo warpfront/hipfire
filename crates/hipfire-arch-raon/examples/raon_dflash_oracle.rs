@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-//! Raon DFlash2 oracle CLI: capture | emit | rowexact | greedy | rollback. Lab-gated
+//! Raon DFlash2 oracle CLI: capture | emit | rowexact | greedy | rollback | verifygraph |
+//! sampled | costs. Lab-gated
 //! (`--features lab`), GPU required. PLAN `raon/dflash2/PLAN.md` §4 gates 1-4.
 //!
 //! ```text
@@ -10,6 +11,8 @@
 //! raon_dflash_oracle greedy   --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N]
 //! raon_dflash_oracle rollback  --model M.hfq [--draft D.hfq] --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
 //! raon_dflash_oracle verifygraph --model M.hfq --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
+//! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--out DIR]
+//! raon_dflash_oracle costs    --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--reps R] [--max-rows K] [--block B] [--out DIR]
 //! ```
 //!
 //! Common options: `--chat on|off` (default off: the prompt file is tokenized as
@@ -19,10 +22,14 @@
 //! 2..=16, default 8), `--tokens N` (greedy stream length, default 64),
 //! `--max-seq N` (context rows to reserve; default prompt + tokens + 112, min 512).
 //!
-//! * `capture` (gate 1): prefill through `SpecTarget::spec_advance(hidden_out)`
-//!   on a fresh state, then on a second fresh state run
-//!   `RaonBundle::dflash_tap_reference` over the same tokens; every captured
-//!   feature float must be bit-identical.
+//! * `capture` (gate 1): (advance) prefill through
+//!   `SpecTarget::spec_advance(hidden_out)` on a fresh state (the production
+//!   prefill feature path: the AR launch sequence plus a per-layer download
+//!   tap), then on a second fresh state run `RaonBundle::dflash_tap_reference`
+//!   over the same tokens; (verify) prefill all but the last K = min(16,
+//!   prompt - 1) tokens, `verify_block` those K with the device capture, and
+//!   compare with the tap over the same K-row batch from the same state. Every
+//!   captured feature float must be bit-identical.
 //! * `emit` (gate 2): prefill, take the target's greedy seed, run one draft
 //!   block (`draft_forward_based`, target `lm_head_logits_device`,
 //!   `propose_candidates_device` = the call sequence of `Dflash2Speculator::step`)
@@ -59,7 +66,10 @@
 //!   `seq_len`, padding) is downloaded after each arm and must be byte-equal per
 //!   `keep`; the table prints the first differing layer/offset and the commit
 //!   cost of each arm. With `--draft` the verify also runs the DFlash feature
-//!   capture (the product verify). Exit 0 iff every `keep` is byte-equal.
+//!   capture (the product verify). Exit 0 iff every `keep` in 2..=7 is
+//!   byte-equal; keep 1 is printed but not judged, because the replay arm's
+//!   1-row forward takes the single-row decode route (different rounding from
+//!   the batched verify rows the recurrence arm reproduces).
 //!
 //! * `verifygraph` (verify-graph gate): for K = 1..=16 at three positions, one verify
 //!   window (`verify_block_logits` + feature capture, `verify_block` argmax, partial and
@@ -69,10 +79,23 @@
 //!   history, `seq_len`) after each commit are bit-identical between the modes and the
 //!   graph route recorded and replayed at least once.
 //!
+//! * `sampled` (distribution gate): `--trials N` (default 2000) cold trials of an AR arm
+//!   (host sampler `sample_top_k_p_with_state`, per-trial SplitMix64 seed) and a DFlash2
+//!   sampled-speculation arm, `--tokens L` (default 4) tokens each, `--temp` (1.0),
+//!   `--top-p` (0.95), `--top-k` (20), `--block` (8). Chi-square goodness of fit of both
+//!   arms against the exact truncated law (position 0; positions 1/2 conditioned on the 3
+//!   most frequent DFlash contexts with >= 200 samples) plus AR-vs-DFlash homogeneity per
+//!   position and on joint pairs. PASS iff every p-value > `--alpha` (1e-3) and no token
+//!   falls outside the exact support. Writes `sampled.json`.
+//! * `costs` (spec-retire policy): device-synced median/mean ms of AR `decode_step`,
+//!   `verify_block` / `verify_block_logits` per row count 1..=`--max-rows` (9), partial
+//!   `commit_prefix` (k = 2 and k = max-rows), the draft sequence and its head, over
+//!   `--reps` (20); prints `window_units[k] = (draft + verify[k]) / decode`. Writes `costs.json`.
+//!
 //! Exit status: 0 pass, 1 verdict failed, 2 usage / runtime error.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -89,9 +112,11 @@ use hipfire_runtime::dflash::{
 use hipfire_runtime::dflash2_spec::build_dflash2_speculator;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::llama::sample_top_k_p_with_state;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::prompt_frame::JinjaChatFrame;
-use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget, Speculator};
+use hipfire_runtime::spec::{SpecAdvance, SpecRequestConfig, SpecScratch, SpecTarget, Speculator};
+use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -103,6 +128,8 @@ const USAGE: &str = "usage:
   raon_dflash_oracle greedy   --model M --draft D --prompt-file P [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N]
   raon_dflash_oracle rollback --model M [--draft D] --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle verifygraph --model M --prompt-file P [--out DIR] [--chat on] [--max-seq N]
+  raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--out DIR]
+  raon_dflash_oracle costs    --model M --draft D --prompt-file P [--chat on] [--reps R] [--max-rows K] [--block B] [--out DIR]
 common: [--chat on|off] [--think on|off]   (raw text tokens by default)";
 
 type Opts = BTreeMap<String, String>;
@@ -112,7 +139,14 @@ fn parse_cli() -> Result<(String, Opts), String> {
     let mode = argv.first().cloned().ok_or("missing mode")?;
     if !matches!(
         mode.as_str(),
-        "capture" | "emit" | "rowexact" | "greedy" | "rollback" | "verifygraph"
+        "capture"
+            | "emit"
+            | "rowexact"
+            | "greedy"
+            | "rollback"
+            | "verifygraph"
+            | "sampled"
+            | "costs"
     ) {
         return Err(format!("unknown mode `{mode}`"));
     }
@@ -144,6 +178,20 @@ fn opt_usize(opts: &Opts, key: &str, default: usize) -> Result<usize, String> {
         Some(s) => s
             .parse::<usize>()
             .map_err(|e| format!("--{key} `{s}`: {e}")),
+        None => Ok(default),
+    }
+}
+
+fn opt_f32(opts: &Opts, key: &str, default: f32) -> Result<f32, String> {
+    match opts.get(key) {
+        Some(s) => s.parse::<f32>().map_err(|e| format!("--{key} `{s}`: {e}")),
+        None => Ok(default),
+    }
+}
+
+fn opt_f64(opts: &Opts, key: &str, default: f64) -> Result<f64, String> {
+    match opts.get(key) {
+        Some(s) => s.parse::<f64>().map_err(|e| format!("--{key} `{s}`: {e}")),
         None => Ok(default),
     }
 }
@@ -342,7 +390,6 @@ fn run_capture(
 ) -> Result<bool, String> {
     let (_hfq, cfg) = draft_config(require(opts, "draft")?)?;
     check_streams(bundle, &cfg)?;
-    let fw = cfg.feature_width();
     SpecTarget::set_dflash_extract_layers(bundle, cfg.target_layer_ids.clone());
 
     bundle.reset(gpu)?;
@@ -375,22 +422,75 @@ fn run_capture(
         t1.elapsed().as_secs_f64()
     );
 
-    let want = prompt.len() * fw;
-    if device_rows.len() != want || tap_rows.len() != want {
+    let advance_ok = compare_feature_rows(
+        "advance",
+        &device_rows,
+        &tap_rows,
+        prompt,
+        &cfg,
+        bundle.config.hidden,
+    );
+
+    // The verify's device capture (one strided copy per extract layer) over
+    // the last K prompt rows, against the tap over the same K-row batch from
+    // the same state.
+    let k = DFLASH_BLOCK_MAX.min(prompt.len() - 1);
+    let split = prompt.len() - k;
+    bundle.reset(gpu)?;
+    bundle.prefill(gpu, &prompt[..split])?;
+    let mut vs = SpecTarget::new_spec_scratch(bundle, gpu, k)?;
+    let mut verify_rows: Vec<f32> = Vec::new();
+    let verified = SpecTarget::verify_block(
+        bundle,
+        gpu,
+        &prompt[split..],
+        split,
+        vs.as_mut(),
+        Some(&mut verify_rows),
+    )
+    .and_then(|_| SpecTarget::abandon_verify(bundle, gpu, vs.as_mut()));
+    vs.free(gpu);
+    verified?;
+    bundle.reset(gpu)?;
+    bundle.prefill(gpu, &prompt[..split])?;
+    let tap_k = bundle.dflash_tap_reference(gpu, &prompt[split..])?;
+    let verify_ok = compare_feature_rows(
+        "verify",
+        &verify_rows,
+        &tap_k,
+        &prompt[split..],
+        &cfg,
+        bundle.config.hidden,
+    );
+    Ok(advance_ok && verify_ok)
+}
+
+/// Bit-compare captured feature rows `got` with the tap reference `want` over
+/// `tokens`; print one PASS/FAIL line naming the first differing float.
+fn compare_feature_rows(
+    label: &str,
+    got: &[f32],
+    want: &[f32],
+    tokens: &[u32],
+    cfg: &DflashConfig,
+    h: usize,
+) -> bool {
+    let fw = cfg.feature_width();
+    let expect = tokens.len() * fw;
+    if got.len() != expect || want.len() != expect {
         println!(
-            "FAIL capture: device rows {} floats, tap reference {} floats, expected {want} ({} rows x {fw})",
-            device_rows.len(),
-            tap_rows.len(),
-            prompt.len()
+            "FAIL capture {label}: captured {} floats, tap reference {} floats, expected {expect} ({} rows x {fw})",
+            got.len(),
+            want.len(),
+            tokens.len()
         );
-        return Ok(false);
+        return false;
     }
-    let h = bundle.config.hidden;
     let per_layer = cfg.target_streams_per_layer * h;
     let mut bad = 0usize;
     let mut first: Option<usize> = None;
     let mut max_abs = 0f32;
-    for (i, (a, b)) in device_rows.iter().zip(&tap_rows).enumerate() {
+    for (i, (a, b)) in got.iter().zip(want).enumerate() {
         if a.to_bits() != b.to_bits() {
             bad += 1;
             first.get_or_insert(i);
@@ -403,28 +503,28 @@ fn run_capture(
     match first {
         None => {
             println!(
-                "PASS capture: {} rows x {fw} floats ({} layers x {} streams x {h}) bit-identical to forward_rows_tapped Ffn(l)",
-                prompt.len(),
+                "PASS capture {label}: {} rows x {fw} floats ({} layers x {} streams x {h}) bit-identical to forward_rows_tapped Ffn(l)",
+                tokens.len(),
                 cfg.num_extract(),
                 cfg.target_streams_per_layer
             );
-            Ok(true)
+            true
         }
         Some(i) => {
             let (row, col) = (i / fw, i % fw);
             let (slot, rem) = (col / per_layer, col % per_layer);
             let (stream, hi) = (rem / h, rem % h);
             println!(
-                "FAIL capture: {bad}/{} floats differ (max |diff| {max_abs:.6e}); first at row {row} (token {}), extract slot {slot} (layer {}), stream {stream}, hidden {hi}: device {:#010x} ({}) vs tap {:#010x} ({})",
-                device_rows.len(),
-                prompt[row],
+                "FAIL capture {label}: {bad}/{} floats differ (max |diff| {max_abs:.6e}); first at row {row} (token {}), extract slot {slot} (layer {}), stream {stream}, hidden {hi}: captured {:#010x} ({}) vs tap {:#010x} ({})",
+                got.len(),
+                tokens[row],
                 cfg.target_layer_ids[slot],
-                device_rows[i].to_bits(),
-                device_rows[i],
-                tap_rows[i].to_bits(),
-                tap_rows[i],
+                got[i].to_bits(),
+                got[i],
+                want[i].to_bits(),
+                want[i],
             );
-            Ok(false)
+            false
         }
     }
 }
@@ -814,6 +914,11 @@ struct Prof {
     /// Every verify in call order: (absolute position, block). The tie judge
     /// replays the window that emitted the first divergent token.
     verifies: Vec<(usize, Vec<u32>)>,
+    /// `sampled`: when set, the truncated law of every row the drafter may
+    /// draw from (the prefill's last row, each verify row) is recorded into
+    /// `last_laws` (replaced by every such call).
+    row_law: Option<SampleSpec>,
+    last_laws: Vec<Vec<(u32, f32)>>,
 }
 
 impl Prof {
@@ -907,13 +1012,27 @@ impl SpecTarget for TimedTarget<'_> {
         abort: &dyn Fn() -> bool,
         hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
-        timed!(
+        let r: Result<SpecAdvance, String> = timed!(
             self,
             gpu,
             "spec_advance",
             self.inner
                 .spec_advance(gpu, tokens, start_pos, reset, abort, hidden_out)
-        )
+        );
+        let advance = r?;
+        let law = self.prof.borrow().row_law;
+        if let (
+            Some(spec),
+            SpecAdvance::Ready {
+                last_logits: Some(row),
+                ..
+            },
+        ) = (law, &advance)
+        {
+            let law = row_law(row, spec)?;
+            self.prof.borrow_mut().last_laws = vec![law];
+        }
+        Ok(advance)
     }
 
     fn verify_block(
@@ -951,13 +1070,24 @@ impl SpecTarget for TimedTarget<'_> {
             *p.verify_rows.entry(block.len()).or_default() += 1;
             p.verifies.push((position, block.to_vec()));
         }
-        timed!(
+        let r: Result<Vec<f32>, String> = timed!(
             self,
             gpu,
             "verify_block_logits",
             self.inner
                 .verify_block_logits(gpu, block, position, scratch, hidden_out)
-        )
+        );
+        let logits = r?;
+        let law = self.prof.borrow().row_law;
+        if let Some(spec) = law {
+            let vocab = self.inner.config.vocab;
+            let laws = logits
+                .chunks_exact(vocab)
+                .map(|row| row_law(row, spec))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.prof.borrow_mut().last_laws = laws;
+        }
+        Ok(logits)
     }
 
     fn commit_prefix(
@@ -1851,7 +1981,14 @@ fn run_rollback(
             }
             let (bytes, first, s_layers, c_layers) = slab_diff(&a, &b, &lay, &conv, &dims);
             let equal = bytes == 0;
-            all_equal &= equal;
+            // keep 1 is reported, never judged: the replay arm's 1-row forward
+            // takes the single-row decode route (`forward_chunk` with one
+            // token), which rounds differently from the batched verify rows
+            // the recurrence arm reproduces, so the two arms differ by
+            // construction. keep 2..=7 replay through the batched route.
+            if keep >= 2 {
+                all_equal &= equal;
+            }
             println!(
                 "  {keep:>4}  {:<5} {bytes:>15}  {rec_ms:>13.3}  {replay_ms:>9.3}  {}",
                 if equal { "equal" } else { "DIFF" },
@@ -1880,7 +2017,7 @@ fn run_rollback(
     restored?;
     freed?;
     println!(
-        "{} rollback: the persistent slab after {} recurrence rollbacks {} byte-identical to the full-replay arm",
+        "{} rollback: the persistent slab after recurrence rollbacks keep 2..={} {} byte-identical to the full-replay arm (keep 1 reported only: the replay arm's 1-row forward takes the decode route)",
         if all_equal { "PASS" } else { "FAIL" },
         BLOCK - 1,
         if all_equal { "is" } else { "is NOT" }
@@ -2153,6 +2290,888 @@ fn run_verifygraph(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// sampled
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SALT_AR: u64 = 0x4152_5F53_414D_504C;
+const SALT_DF: u64 = 0x4446_4C41_5348_3253;
+
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn trial_seed(arm_salt: u64, trial: usize) -> u64 {
+    splitmix64(arm_salt ^ splitmix64(trial as u64))
+}
+
+/// ln Γ(x), Lanczos (g = 7, n = 9).
+fn ln_gamma(x: f64) -> f64 {
+    const C: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let x = x - 1.0;
+    let mut a = C[0];
+    let t = x + 7.5;
+    for (i, &c) in C.iter().enumerate().skip(1) {
+        a += c / (x + i as f64);
+    }
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
+}
+
+/// Regularized upper incomplete gamma Q(a, x) (series / continued fraction).
+fn gamma_q(a: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 1.0;
+    }
+    let ln_pre = -x + a * x.ln() - ln_gamma(a);
+    if x < a + 1.0 {
+        let (mut sum, mut term, mut n) = (1.0 / a, 1.0 / a, a);
+        for _ in 0..1000 {
+            n += 1.0;
+            term *= x / n;
+            sum += term;
+            if term.abs() < sum.abs() * 1e-15 {
+                break;
+            }
+        }
+        1.0 - sum * ln_pre.exp()
+    } else {
+        let tiny = 1e-300;
+        let mut b = x + 1.0 - a;
+        let mut c = 1.0 / tiny;
+        let mut d = 1.0 / b;
+        let mut h = d;
+        for i in 1..1000 {
+            let an = -(i as f64) * (i as f64 - a);
+            b += 2.0;
+            d = an * d + b;
+            if d.abs() < tiny {
+                d = tiny;
+            }
+            c = b + an / c;
+            if c.abs() < tiny {
+                c = tiny;
+            }
+            d = 1.0 / d;
+            let delta = d * c;
+            h *= delta;
+            if (delta - 1.0).abs() < 1e-15 {
+                break;
+            }
+        }
+        ln_pre.exp() * h
+    }
+}
+
+/// Two-sample chi-square homogeneity test of category counts `a` vs `b`.
+/// Categories whose expected count is under 5 in either sample are pooled.
+/// Returns `(statistic, degrees of freedom, p-value)`.
+fn homogeneity<K: std::hash::Hash + Eq + Clone>(a: &[K], b: &[K]) -> (f64, usize, f64) {
+    let mut cells: HashMap<K, (f64, f64)> = HashMap::new();
+    for key in a {
+        cells.entry(key.clone()).or_default().0 += 1.0;
+    }
+    for key in b {
+        cells.entry(key.clone()).or_default().1 += 1.0;
+    }
+    let (na, nb) = (a.len() as f64, b.len() as f64);
+    let n = na + nb;
+    let mut kept: Vec<(f64, f64)> = Vec::new();
+    let mut pooled = (0.0, 0.0);
+    for &(x, y) in cells.values() {
+        let total = x + y;
+        if total * na.min(nb) / n < 5.0 {
+            pooled.0 += x;
+            pooled.1 += y;
+        } else {
+            kept.push((x, y));
+        }
+    }
+    if pooled.0 + pooled.1 > 0.0 {
+        kept.push(pooled);
+    }
+    let mut stat = 0.0;
+    for &(x, y) in &kept {
+        let total = x + y;
+        let (ea, eb) = (total * na / n, total * nb / n);
+        stat += (x - ea).powi(2) / ea + (y - eb).powi(2) / eb;
+    }
+    let df = kept.len().saturating_sub(1).max(1);
+    (stat, df, gamma_q(df as f64 / 2.0, stat / 2.0))
+}
+
+/// Pearson chi-square of independent categorical draws, each from its own
+/// law: `samples[i] = (token_i, law_i)`. Observed count of a token = draws of
+/// it; expected = the sum of its probability over every draw's law (each
+/// draw is one multinomial(1, law_i) trial, so this is the exact mean). Cells
+/// with expected count < 5 are pooled. A draw outside its own law's support
+/// is counted (`outside_support`) and joins the pooled cell.
+/// Returns `(statistic, degrees of freedom, p-value, outside_support)`.
+fn gof_rows(samples: &[(u32, &[(u32, f32)])]) -> (f64, usize, f64, u64) {
+    let mut cells: HashMap<u32, (f64, f64)> = HashMap::new();
+    let mut outside = 0u64;
+    for &(tok, law) in samples {
+        let total: f64 = law.iter().map(|&(_, q)| q as f64).sum();
+        for &(t, q) in law {
+            cells.entry(t).or_default().1 += q as f64 / total;
+        }
+        if !law.iter().any(|&(t, q)| t == tok && q > 0.0) {
+            outside += 1;
+        }
+        cells.entry(tok).or_default().0 += 1.0;
+    }
+    let (mut stat, mut kept) = (0.0f64, 0usize);
+    let mut pooled = (0.0f64, 0.0f64);
+    for &(o, e) in cells.values() {
+        if e < 5.0 {
+            pooled.0 += o;
+            pooled.1 += e;
+        } else {
+            stat += (o - e).powi(2) / e;
+            kept += 1;
+        }
+    }
+    if pooled.1 > 0.0 {
+        stat += (pooled.0 - pooled.1).powi(2) / pooled.1;
+        kept += 1;
+    } else if pooled.0 > 0.0 {
+        stat = f64::INFINITY;
+        kept += 1;
+    }
+    let df = kept.saturating_sub(1).max(1);
+    let p = if stat.is_infinite() {
+        0.0
+    } else {
+        gamma_q(df as f64 / 2.0, stat / 2.0)
+    };
+    (stat, df, p, outside)
+}
+
+/// One printed/serialized test line.
+struct TestRec {
+    name: String,
+    stat: f64,
+    df: usize,
+    p: f64,
+    n: u64,
+    outside: u64,
+    pass: bool,
+    /// Counts toward the verdict (an informational test only reports).
+    gating: bool,
+}
+
+impl TestRec {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: String,
+        stat: f64,
+        df: usize,
+        p: f64,
+        n: u64,
+        outside: u64,
+        alpha: f64,
+        gating: bool,
+    ) -> Self {
+        let pass = p > alpha && outside == 0;
+        let rec = TestRec {
+            name,
+            stat,
+            df,
+            p,
+            n,
+            outside,
+            pass,
+            gating,
+        };
+        println!(
+            "{} {:.4} {} {:.6} {} {}{}",
+            rec.name,
+            rec.stat,
+            rec.df,
+            rec.p,
+            rec.n,
+            if rec.outside > 0 {
+                format!("FAIL(outside_support={})", rec.outside)
+            } else if rec.pass {
+                "PASS".to_string()
+            } else {
+                "FAIL".to_string()
+            },
+            if rec.gating { "" } else { " (info)" }
+        );
+        rec
+    }
+
+    fn json(&self) -> Value {
+        json!({"name": self.name, "stat": self.stat, "df": self.df, "p": self.p,
+               "n": self.n, "outside_support": self.outside, "pass": self.pass,
+               "gating": self.gating})
+    }
+}
+
+/// The truncated sampling law (`SampleSpec`) of one logits row, as entries.
+fn row_law(row: &[f32], spec: SampleSpec) -> Result<Vec<(u32, f32)>, String> {
+    let mut d = SparseDist::default();
+    d.build_from_logits(row, spec, &mut Vec::new())?;
+    Ok(d.entries().to_vec())
+}
+
+/// Mean of per-draw laws (the marginal a position's draws follow).
+fn mean_law(laws: &[&[(u32, f32)]]) -> Vec<(u32, f32)> {
+    let mut m: BTreeMap<u32, f64> = BTreeMap::new();
+    for law in laws {
+        for &(t, p) in *law {
+            *m.entry(t).or_default() += p as f64;
+        }
+    }
+    let n = laws.len().max(1) as f64;
+    m.into_iter().map(|(t, p)| (t, (p / n) as f32)).collect()
+}
+
+/// Total-variation distance between two sparse laws.
+fn tv_distance(a: &[(u32, f32)], b: &[(u32, f32)]) -> f64 {
+    let mut m: HashMap<u32, (f64, f64)> = HashMap::new();
+    for &(t, p) in a {
+        m.entry(t).or_default().0 += p as f64;
+    }
+    for &(t, p) in b {
+        m.entry(t).or_default().1 += p as f64;
+    }
+    0.5 * m.values().map(|(x, y)| (x - y).abs()).sum::<f64>()
+}
+
+/// Sampled-decoding distribution oracle: every emitted token of the AR host
+/// sampler and of DFlash2 sampled speculation against the truncated law of the
+/// target row it was drawn or verified against.
+fn run_sampled(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    prompt: &[u32],
+    opts: &Opts,
+    out: Option<&Path>,
+) -> Result<bool, String> {
+    let trials = opt_usize(opts, "trials", 2000)?;
+    let l = opt_usize(opts, "tokens", 4)?;
+    let block = opt_usize(opts, "block", 8)?;
+    let temp = opt_f32(opts, "temp", 1.0)?;
+    let top_p = opt_f32(opts, "top-p", 0.95)?;
+    let top_k = opt_usize(opts, "top-k", 20)? as u32;
+    let alpha = opt_f64(opts, "alpha", 1e-3)?;
+    if trials == 0 || l == 0 {
+        return Err("--trials and --tokens must be >= 1".into());
+    }
+    if !(2..=DFLASH_BLOCK_MAX).contains(&block) {
+        return Err(format!("--block {block} outside 2..={DFLASH_BLOCK_MAX}"));
+    }
+    if temp <= 0.0 || top_k == 0 {
+        return Err("--temp must be > 0 and --top-k >= 1".into());
+    }
+    let draft_path = require(opts, "draft")?;
+    let model = require(opts, "model")?;
+    let spec_s = SampleSpec::cpu_ar(temp, top_p, Some(top_k), 0.0);
+
+    // AR arm: the production host sampler on the decode path's rows; every
+    // draw keeps the law of the row it was drawn from.
+    let t_ar = Instant::now();
+    let mut ar: Vec<Vec<u32>> = Vec::with_capacity(trials);
+    let mut ar_laws: Vec<Vec<Vec<(u32, f32)>>> = Vec::with_capacity(trials);
+    for t in 0..trials {
+        bundle.reset(gpu)?;
+        bundle.prefill(gpu, prompt)?;
+        let seed = trial_seed(SALT_AR, t);
+        let mut state = (((seed >> 32) as u32) ^ (seed as u32)).max(1);
+        let (mut s, mut laws) = (Vec::with_capacity(l), Vec::with_capacity(l));
+        for i in 0..l {
+            let logits = bundle.download_logits(gpu)?;
+            laws.push(row_law(&logits, spec_s)?);
+            let tok =
+                sample_top_k_p_with_state(&logits, temp, top_p, Some(top_k), None, &mut state);
+            s.push(tok);
+            if i + 1 < l {
+                bundle.decode_step(gpu, tok)?;
+            }
+        }
+        ar.push(s);
+        ar_laws.push(laws);
+        if (t + 1) % 250 == 0 {
+            eprintln!("sampled: AR trial {}/{trials}", t + 1);
+        }
+    }
+    let ar_secs = t_ar.elapsed().as_secs_f64();
+
+    // DFlash arm through the recording wrapper: the prefill row and every
+    // verify row's law, so each emitted token is judged against the row it
+    // was accepted or resampled from (emitted token j of a window = verify
+    // row j: the accepted drafts, then the residual or bonus draw).
+    let t_df = Instant::now();
+    let ctx_capacity = bundle.max_seq();
+    let prof: SharedProf = Rc::new(RefCell::new(Prof {
+        row_law: Some(spec_s),
+        ..Prof::default()
+    }));
+    let mut df: Vec<Vec<u32>> = Vec::with_capacity(trials);
+    let mut df_laws: Vec<Vec<Vec<(u32, f32)>>> = Vec::with_capacity(trials);
+    let (mut windows, mut proposed_sum, mut accepted_sum) = (0u64, 0u64, 0u64);
+    let mut depth_hist: BTreeMap<usize, u64> = BTreeMap::new();
+    {
+        let mut target = TimedTarget {
+            inner: &mut *bundle,
+            prof: Rc::clone(&prof),
+            timed: false,
+        };
+        let mut spec: Box<dyn Speculator> =
+            build_dflash2_speculator(gpu, draft_path, &mut target, ctx_capacity, block)?;
+        let r = (|| -> Result<(), String> {
+            for t in 0..trials {
+                spec.configure_request(SpecRequestConfig {
+                    temp,
+                    top_p,
+                    top_k: Some(top_k),
+                    min_p: 0.0,
+                    rng_seed: trial_seed(SALT_DF, t),
+                    ..Default::default()
+                });
+                let first = spec
+                    .prefill(gpu, &mut target, prompt, prompt, 0, false, None, &|| false)?
+                    .into_first_token()?;
+                let prefill_law = std::mem::take(&mut prof.borrow_mut().last_laws);
+                let [p0] = <[Vec<(u32, f32)>; 1]>::try_from(prefill_law)
+                    .map_err(|v| format!("prefill recorded {} row laws, expected 1", v.len()))?;
+                SpecTarget::map_ahead_for_decode(&mut target, gpu, prompt.len(), l, block);
+                let mut stream = vec![first];
+                let mut laws = vec![p0];
+                let (mut position, mut seed) = (prompt.len(), first);
+                while stream.len() < l {
+                    let step = spec.step(
+                        gpu,
+                        &mut target,
+                        position,
+                        seed,
+                        &stream,
+                        None,
+                        temp,
+                        usize::MAX,
+                    )?;
+                    let rows = std::mem::take(&mut prof.borrow_mut().last_laws);
+                    if rows.len() < step.emit.len() {
+                        return Err(format!(
+                            "a window emitted {} tokens from {} recorded verify rows",
+                            step.emit.len(),
+                            rows.len()
+                        ));
+                    }
+                    laws.extend(rows.into_iter().take(step.emit.len()));
+                    windows += 1;
+                    proposed_sum += step.proposed as u64;
+                    accepted_sum += step.accepted as u64;
+                    *depth_hist.entry(step.proposed).or_default() += 1;
+                    position += step.emit.len();
+                    seed = step.next_seed;
+                    stream.extend_from_slice(&step.emit);
+                }
+                stream.truncate(l);
+                laws.truncate(l);
+                df.push(stream);
+                df_laws.push(laws);
+                if (t + 1) % 250 == 0 {
+                    eprintln!("sampled: DFlash trial {}/{trials}", t + 1);
+                }
+            }
+            Ok(())
+        })();
+        spec.free(gpu);
+        r?;
+    }
+    let df_secs = t_df.elapsed().as_secs_f64();
+
+    // Tests. Gating: every position's draws against their own rows' laws, per
+    // arm. Informational: AR-vs-DFlash homogeneity and the distance between
+    // the two arms' mean laws, which also measure the verify-row vs
+    // decode-row rounding gap (rowexact: up to 1.57 logits; the row-exact
+    // verify work), not the sampler.
+    let mut tests: Vec<TestRec> = Vec::new();
+    let mut tv = Vec::with_capacity(l);
+    let n_t = trials as u64;
+    for i in 0..l {
+        for (arm, streams, laws) in [("ar", &ar, &ar_laws), ("dflash", &df, &df_laws)] {
+            let samples: Vec<(u32, &[(u32, f32)])> = streams
+                .iter()
+                .zip(laws.iter())
+                .map(|(s, l)| (s[i], l[i].as_slice()))
+                .collect();
+            let (stat, d, p, o) = gof_rows(&samples);
+            tests.push(TestRec::new(
+                format!("gof_rows_pos{i}_{arm}"),
+                stat,
+                d,
+                p,
+                n_t,
+                o,
+                alpha,
+                true,
+            ));
+        }
+        let a: Vec<&[(u32, f32)]> = ar_laws.iter().map(|v| v[i].as_slice()).collect();
+        let b: Vec<&[(u32, f32)]> = df_laws.iter().map(|v| v[i].as_slice()).collect();
+        let d = tv_distance(&mean_law(&a), &mean_law(&b));
+        println!("tv_mean_law_pos{i} ar vs dflash: {d:.4}");
+        tv.push(d);
+        let a: Vec<u32> = ar.iter().map(|s| s[i]).collect();
+        let b: Vec<u32> = df.iter().map(|s| s[i]).collect();
+        let (stat, d, p) = homogeneity(&a, &b);
+        tests.push(TestRec::new(
+            format!("homog_pos{i}"),
+            stat,
+            d,
+            p,
+            2 * n_t,
+            0,
+            alpha,
+            false,
+        ));
+    }
+    for (name, i) in [("homog_joint01", 0usize), ("homog_joint12", 1usize)] {
+        if l > i + 1 {
+            let a: Vec<(u32, u32)> = ar.iter().map(|s| (s[i], s[i + 1])).collect();
+            let b: Vec<(u32, u32)> = df.iter().map(|s| (s[i], s[i + 1])).collect();
+            let (stat, d, p) = homogeneity(&a, &b);
+            tests.push(TestRec::new(
+                name.to_string(),
+                stat,
+                d,
+                p,
+                2 * n_t,
+                0,
+                alpha,
+                false,
+            ));
+        }
+    }
+    let pass = tests.iter().filter(|t| t.gating).all(|t| t.pass);
+    println!(
+        "{} sampled (alpha {alpha}, {} gating of {} tests, mean verified depth {:.3}, mean accepted {:.3} over {windows} windows)",
+        if pass { "PASS" } else { "FAIL" },
+        tests.iter().filter(|t| t.gating).count(),
+        tests.len(),
+        proposed_sum as f64 / windows.max(1) as f64,
+        accepted_sum as f64 / windows.max(1) as f64,
+    );
+
+    if let Some(dir) = out {
+        write_json(
+            &dir.join("sampled.json"),
+            &json!({
+                "pass": pass,
+                "config": {
+                    "model": model, "draft": draft_path,
+                    "prompt_tokens": prompt.len(), "prompt_md5": md5_hex_u32(prompt),
+                    "trials": trials, "tokens": l, "block": block,
+                    "temp": temp, "top_p": top_p, "top_k": top_k, "alpha": alpha,
+                    "salt_ar": SALT_AR, "salt_dflash": SALT_DF,
+                },
+                "tests": tests.iter().map(TestRec::json).collect::<Vec<_>>(),
+                "tv_mean_law": tv,
+                "streams": {"ar": ar, "dflash": df},
+                "laws": {"ar": ar_laws, "dflash": df_laws},
+                "dflash_windows": {
+                    "windows": windows, "proposed": proposed_sum, "accepted": accepted_sum,
+                    "depth_hist": depth_hist.iter().map(|(k, v)| (k.to_string(), *v))
+                        .collect::<BTreeMap<String, u64>>(),
+                },
+                "wall_secs": {"ar": ar_secs, "dflash": df_secs},
+            }),
+        )?;
+    }
+    Ok(pass)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// costs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `(median, mean)` of `v`.
+fn median_mean(v: &[f64]) -> (f64, f64) {
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let med = if s.len() % 2 == 1 {
+        s[s.len() / 2]
+    } else {
+        0.5 * (s[s.len() / 2 - 1] + s[s.len() / 2])
+    };
+    (med, s.iter().sum::<f64>() / s.len() as f64)
+}
+
+/// Device-synced wall ms of `f`.
+fn timed_ms<T>(
+    gpu: &mut Gpu,
+    f: impl FnOnce(&mut Gpu) -> Result<T, String>,
+) -> Result<(T, f64), String> {
+    sync(gpu)?;
+    let t = Instant::now();
+    let r = f(gpu)?;
+    sync(gpu)?;
+    Ok((r, t.elapsed().as_secs_f64() * 1e3))
+}
+
+/// Draft-call cost: the call sequence of `emit_block` (draft forward, target
+/// head over the draft rows, selector) from the post-prefill state; returns
+/// the per-rep ms of the whole sequence and of the head alone.
+#[allow(clippy::too_many_arguments)]
+fn draft_cost(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    prompt: &[u32],
+    cfg: &DflashConfig,
+    weights: &DflashWeights,
+    scratch: &mut DflashScratch,
+    block: usize,
+    reps: usize,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
+    let fw = cfg.feature_width();
+    let h = cfg.hidden;
+    let feature_window = cfg.declared_window.filter(|_| cfg.all_layers_sliding);
+    SpecTarget::set_dflash_extract_layers(bundle, cfg.target_layer_ids.clone());
+    if let Some(w) = feature_window {
+        SpecTarget::set_dflash_feature_window(bundle, w);
+    }
+    bundle.reset(gpu)?;
+    let mut host: Vec<f32> = Vec::new();
+    let seed =
+        match SpecTarget::spec_advance(bundle, gpu, prompt, 0, true, &|| false, Some(&mut host))? {
+            SpecAdvance::Ready { last_argmax, .. } => last_argmax,
+            SpecAdvance::Aborted => return Err("spec_advance aborted".into()),
+        };
+    let position = prompt.len();
+    let rows_held = host.len() / fw;
+    let host_base = position
+        .checked_sub(rows_held)
+        .ok_or_else(|| format!("{rows_held} feature rows for {position} tokens"))?;
+    let first_row = match feature_window {
+        Some(w) => host_base.max(position.saturating_sub(w)),
+        None => host_base,
+    };
+    let features = &host[(first_row - host_base) * fw..];
+    let mask_row = SpecTarget::embed_row(bundle, gpu, cfg.mask_token_id)?;
+    let seed_row = SpecTarget::embed_row(bundle, gpu, seed)?;
+    let mut noise = Vec::with_capacity(block * h);
+    noise.extend_from_slice(&seed_row);
+    for _ in 1..block {
+        noise.extend_from_slice(&mask_row);
+    }
+    let positions_q: Vec<i32> = (position as i32..(position + block) as i32).collect();
+    let positions_k: Vec<i32> = (0..(position + block) as i32).collect();
+    let drafts_n = block - 1;
+
+    let mut whole = Vec::with_capacity(reps);
+    for rep in 0..reps + 2 {
+        let (_, ms) = timed_ms(gpu, |gpu| {
+            draft_forward_based(
+                gpu,
+                weights,
+                cfg,
+                Some(&noise),
+                Some(features),
+                first_row,
+                &positions_q,
+                &positions_k,
+                block,
+                position,
+                scratch,
+                false,
+            )
+            .map_err(|e| format!("draft_forward: {e}"))?;
+            let hidden_rows = scratch.x.sub_offset(h, drafts_n * h);
+            let logits_dev =
+                SpecTarget::lm_head_logits_device(bundle, gpu, &hidden_rows, drafts_n)?;
+            propose_candidates_device(
+                gpu,
+                weights,
+                scratch,
+                &hidden_rows,
+                &logits_dev,
+                drafts_n,
+                seed,
+                0.0,
+                None,
+            )
+            .map_err(|e| format!("selector: {e}"))?;
+            Ok(())
+        })?;
+        if rep >= 2 {
+            whole.push(ms);
+        }
+    }
+    // The head alone, over the hidden rows the last draft forward left.
+    let hidden_rows = scratch.x.sub_offset(h, drafts_n * h);
+    let mut head = Vec::with_capacity(reps);
+    for rep in 0..reps + 2 {
+        let (_, ms) = timed_ms(gpu, |gpu| {
+            SpecTarget::lm_head_logits_device(bundle, gpu, &hidden_rows, drafts_n)?;
+            Ok(())
+        })?;
+        if rep >= 2 {
+            head.push(ms);
+        }
+    }
+    Ok((whole, head))
+}
+
+/// Per-call cost measurements for the spec-retire policy: AR decode, verify
+/// (argmax and logits routes) per row count, partial commit, draft sequence.
+fn run_costs(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    prompt: &[u32],
+    opts: &Opts,
+    out: Option<&Path>,
+) -> Result<bool, String> {
+    let reps = opt_usize(opts, "reps", 20)?;
+    let max_rows = opt_usize(opts, "max-rows", 9)?;
+    let block = opt_usize(opts, "block", 8)?;
+    if reps == 0 {
+        return Err("--reps must be >= 1".into());
+    }
+    if !(1..=DFLASH_BLOCK_MAX).contains(&max_rows) {
+        return Err(format!(
+            "--max-rows {max_rows} outside 1..={DFLASH_BLOCK_MAX}"
+        ));
+    }
+    if !(2..=DFLASH_BLOCK_MAX).contains(&block) {
+        return Err(format!("--block {block} outside 2..={DFLASH_BLOCK_MAX}"));
+    }
+    let draft_path = require(opts, "draft")?;
+    let decode_mode = bundle.decode_mode();
+    println!("costs: decode mode {decode_mode}, block {block}, reps {reps}, max rows {max_rows}");
+    let ctx_capacity = bundle.max_seq();
+    let position = prompt.len();
+    if position + max_rows.max(block) > ctx_capacity {
+        return Err(format!(
+            "context {position} + {} rows exceeds max_seq {ctx_capacity}",
+            max_rows.max(block)
+        ));
+    }
+    let mut spec: Box<dyn Speculator> =
+        build_dflash2_speculator(gpu, draft_path, bundle, ctx_capacity, block)?;
+    let mut scratch: Box<dyn SpecScratch> =
+        match SpecTarget::new_spec_scratch(bundle, gpu, max_rows.max(block)) {
+            Ok(s) => s,
+            Err(e) => {
+                spec.free(gpu);
+                return Err(e);
+            }
+        };
+    let r = (|| -> Result<Value, String> {
+        // 1 + 2. Cold spec prefill, then AR decode.
+        let first = spec
+            .prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
+            .into_first_token()?;
+        let mut chain = vec![first];
+        let mut decode = Vec::with_capacity(reps);
+        for i in 0..reps + 2 {
+            let tok = *chain.last().unwrap();
+            let (_, ms) = timed_ms(gpu, |gpu| bundle.decode_step(gpu, tok).map(|_| ()))?;
+            chain.push(argmax(&bundle.download_logits(gpu)?) as u32);
+            if i >= 2 {
+                decode.push(ms);
+            }
+        }
+        let (dec_med, dec_mean) = median_mean(&decode);
+        println!("decode_step: median {dec_med:.3} ms, mean {dec_mean:.3} ms");
+        let first = spec
+            .prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
+            .into_first_token()?;
+        if bundle.n_tokens() != position {
+            return Err(format!(
+                "re-prefill left n_tokens {} != {position}",
+                bundle.n_tokens()
+            ));
+        }
+        let block_for = |k: usize| -> Vec<u32> {
+            (0..k)
+                .map(|i| {
+                    if i == 0 {
+                        first
+                    } else {
+                        chain.get(i).copied().unwrap_or(first)
+                    }
+                })
+                .collect()
+        };
+
+        // 3. Verify cost per row count.
+        println!("  k  verify_ms(med/mean)  verify_logits_ms(med/mean)  window_units");
+        let (mut verify, mut verify_logits) = (Vec::new(), Vec::new());
+        for k in 1..=max_rows {
+            let blk = block_for(k);
+            let mut rows: Vec<f32> = Vec::new();
+            let (mut v_ms, mut vl_ms) = (Vec::new(), Vec::new());
+            for rep in 0..reps + 3 {
+                let (_, ms) = timed_ms(gpu, |gpu| {
+                    SpecTarget::verify_block(
+                        bundle,
+                        gpu,
+                        &blk,
+                        position,
+                        scratch.as_mut(),
+                        Some(&mut rows),
+                    )
+                    .map(|_| ())
+                })?;
+                SpecTarget::abandon_verify(bundle, gpu, scratch.as_mut())?;
+                if rep >= 3 {
+                    v_ms.push(ms);
+                }
+            }
+            for rep in 0..reps + 3 {
+                let (_, ms) = timed_ms(gpu, |gpu| {
+                    SpecTarget::verify_block_logits(
+                        bundle,
+                        gpu,
+                        &blk,
+                        position,
+                        scratch.as_mut(),
+                        Some(&mut rows),
+                    )
+                    .map(|_| ())
+                })?;
+                SpecTarget::abandon_verify(bundle, gpu, scratch.as_mut())?;
+                if rep >= 3 {
+                    vl_ms.push(ms);
+                }
+            }
+            let (vm, va) = median_mean(&v_ms);
+            let (lm, la) = median_mean(&vl_ms);
+            println!("{k:>3}  {vm:>8.3} / {va:<8.3}  {lm:>8.3} / {la:<8.3}");
+            verify.push((k, vm, va));
+            verify_logits.push((k, lm, la));
+        }
+
+        // Partial commit (accept_len = 0) at k = 2 and k = max_rows.
+        let mut partial: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+        let pc_reps = (reps / 4).max(1);
+        for k in [2usize, max_rows] {
+            if k < 2 || partial.contains_key(&k) {
+                continue;
+            }
+            let blk = block_for(k);
+            let mut ms_v = Vec::with_capacity(pc_reps);
+            for _ in 0..pc_reps {
+                spec.prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
+                    .into_first_token()?;
+                SpecTarget::verify_block(bundle, gpu, &blk, position, scratch.as_mut(), None)?;
+                let (_, ms) = timed_ms(gpu, |gpu| {
+                    SpecTarget::commit_prefix(bundle, gpu, &blk, 0, position, scratch.as_mut())
+                        .map(|_| ())
+                })?;
+                ms_v.push(ms);
+            }
+            let (med, mean) = median_mean(&ms_v);
+            println!(
+                "partial commit k={k}: median {med:.3} ms, mean {mean:.3} ms ({pc_reps} reps)"
+            );
+            partial.insert(k, (med, mean));
+        }
+
+        // 4. Draft cost.
+        let (draft_hfq, cfg) = draft_config(draft_path)?;
+        check_streams(bundle, &cfg)?;
+        let weights = DflashWeights::load(gpu, &draft_hfq, &cfg).map_err(|e| format!("{e}"))?;
+        if !weights.has_candidate_selector() {
+            weights.free_gpu(gpu);
+            return Err("DFlash2 draft: candidate selector tensors are missing".into());
+        }
+        let dscratch = match cfg.declared_window {
+            Some(w) => {
+                DflashScratch::new_windowed(gpu, &cfg, block, w, w, ctx_capacity, weights.has_mq)
+            }
+            None => DflashScratch::new_with_mq(gpu, &cfg, block, ctx_capacity, weights.has_mq),
+        };
+        let mut dscratch = match dscratch {
+            Ok(s) => s,
+            Err(e) => {
+                weights.free_gpu(gpu);
+                return Err(format!("{e}"));
+            }
+        };
+        let d = draft_cost(
+            gpu,
+            bundle,
+            prompt,
+            &cfg,
+            &weights,
+            &mut dscratch,
+            block,
+            reps,
+        );
+        dscratch.free_gpu(gpu);
+        weights.free_gpu(gpu);
+        let (draft_v, head_v) = d?;
+        let (draft_med, draft_mean) = median_mean(&draft_v);
+        let (head_med, head_mean) = median_mean(&head_v);
+        println!(
+            "draft sequence (block {block}): median {draft_med:.3} ms, mean {draft_mean:.3} ms"
+        );
+        println!("draft lm_head: median {head_med:.3} ms, mean {head_mean:.3} ms");
+
+        println!("  k  window_units = (draft + verify) / decode");
+        let mut units = Vec::new();
+        for &(k, vm, _) in &verify {
+            let u = (draft_med + vm) / dec_med;
+            println!("{k:>3}  {u:.3}");
+            units.push(u);
+        }
+        let by_k = |v: &[(usize, f64, f64)]| -> Value {
+            Value::Object(
+                v.iter()
+                    .map(|&(k, med, mean)| (k.to_string(), json!({"median": med, "mean": mean})))
+                    .collect(),
+            )
+        };
+        Ok(json!({
+            "decode_ms": {"median": dec_med, "mean": dec_mean, "samples": decode},
+            "verify_ms": by_k(&verify),
+            "verify_logits_ms": by_k(&verify_logits),
+            "partial_commit_ms": Value::Object(partial.iter()
+                .map(|(k, &(med, mean))| (k.to_string(), json!({"median": med, "mean": mean})))
+                .collect()),
+            "draft_ms": {"median": draft_med, "mean": draft_mean},
+            "draft_lm_head_ms": {"median": head_med, "mean": head_mean},
+            "window_units": Value::Object(units.iter().enumerate()
+                .map(|(i, u)| ((i + 1).to_string(), json!(u))).collect()),
+        }))
+    })();
+    scratch.free(gpu);
+    spec.free(gpu);
+    let mut v = r?;
+    if let Some(dir) = out {
+        let o = v.as_object_mut().expect("costs result is an object");
+        o.insert("block".into(), json!(block));
+        o.insert("reps".into(), json!(reps));
+        o.insert("max_rows".into(), json!(max_rows));
+        o.insert("decode_mode".into(), json!(decode_mode));
+        o.insert("draft".into(), json!(draft_path));
+        o.insert("gpu_arch".into(), json!(format!("{}", gpu.arch)));
+        o.insert("prompt_tokens".into(), json!(prompt.len()));
+        write_json(&dir.join("costs.json"), &v)?;
+    }
+    Ok(true)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn run() -> Result<bool, String> {
     let (mode, opts) = parse_cli()?;
@@ -2191,6 +3210,8 @@ fn run() -> Result<bool, String> {
             "greedy" => run_greedy(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
             "rollback" => run_rollback(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
             "verifygraph" => run_verifygraph(&mut gpu, &mut bundle, &prompt, out.as_deref()),
+            "sampled" => run_sampled(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
+            "costs" => run_costs(&mut gpu, &mut bundle, &prompt, &opts, out.as_deref()),
             _ => unreachable!("mode validated by parse_cli"),
         }
     })();

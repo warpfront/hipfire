@@ -1153,3 +1153,722 @@ fn raon_verify_artifact() {
     eprintln!("RAON VERIFY OK: {s:?}");
     assert_eq!(s.padded, 24 * 129);
 }
+
+// ─── always-active FFN storage: class map, swap route, verify route ─────────
+
+const SHARED_TARGETS: [&str; 9] = [
+    "model.layers.0.mlp.gate_proj.weight",
+    "model.layers.0.mlp.up_proj.weight",
+    "model.layers.0.mlp.down_proj.weight",
+    "model.layers.1.moe.shared_experts.gate_proj.weight",
+    "model.layers.1.moe.shared_experts.up_proj.weight",
+    "model.layers.1.moe.shared_experts.down_proj.weight",
+    "model.layers.2.moe.shared_experts.gate_proj.weight",
+    "model.layers.2.moe.shared_experts.up_proj.weight",
+    "model.layers.2.moe.shared_experts.down_proj.weight",
+];
+
+fn shipped_artifact(dir: &Path) -> PathBuf {
+    let out = dir.join("shipped.hfq");
+    convert_synthetic(dir, &out);
+    out
+}
+
+/// Rewrite `input` into `out` tensor by tensor (fixtures only: everything is held in
+/// RAM). `tensor` returns the `(qt, payload)` to keep, or `None` to drop the tensor.
+fn rewrite_hfq(
+    input: &Path,
+    out: &Path,
+    arch: u32,
+    mut tensor: impl FnMut(&hipfire_runtime::hfq::HfqTensorInfo, Vec<u8>) -> Option<(u8, Vec<u8>)>,
+    meta: impl FnOnce(&mut serde_json::Value),
+) {
+    let f = RuntimeHfqFile::open_with_reap_plan(input, None).unwrap();
+    let mut m: serde_json::Value = serde_json::from_str(&f.metadata_json).unwrap();
+    meta(&mut m);
+    let mut entries = Vec::new();
+    let mut data: Vec<Vec<u8>> = Vec::new();
+    for t in f.tensors() {
+        let bytes = f.tensor_data(&t.name).unwrap().1.to_vec();
+        if let Some((qt, bytes)) = tensor(t, bytes) {
+            entries.push(HfqIndexEntry {
+                name: t.name.clone(),
+                quant_type: qt,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data_len: bytes.len() as u64,
+            });
+            data.push(bytes);
+        }
+    }
+    write_hfq_streamed(
+        out,
+        arch,
+        &serde_json::to_string(&m).unwrap(),
+        &entries,
+        |i, w| w.write_all(&data[i]),
+    )
+    .unwrap();
+}
+
+fn deq_q8(bytes: &[u8], rows: usize, phys: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows * phys);
+    for blk in bytes.chunks_exact(Q8F16_BLOCK_BYTES) {
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        out.extend(blk[2..].iter().map(|&q| q as i8 as f32 * d));
+    }
+    assert_eq!(out.len(), rows * phys);
+    out
+}
+
+#[test]
+fn shared_ffn_class_map_is_pure_in_name_and_choice() {
+    use Storage::*;
+    let gate = "model.layers.3.moe.shared_experts.gate_proj.weight";
+    let up = "model.layers.3.moe.shared_experts.up_proj.weight";
+    let down = "model.layers.3.moe.shared_experts.down_proj.weight";
+    let dense = [
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+    ];
+    for (choice, plain, padded) in [
+        (SharedFfn::Qt44, Qt44, Qt44Padded),
+        (SharedFfn::Q8F16, Q8F16, Q8F16Padded),
+        (SharedFfn::Bf16, Bf16, Bf16Padded),
+    ] {
+        for n in [gate, up, dense[0], dense[1], dense[2]] {
+            assert_eq!(classify_with(n, Q8F16, choice).unwrap(), plain, "{n}");
+        }
+        assert_eq!(classify_with(down, Q8F16, choice).unwrap(), padded);
+        // Classes the choice must not touch.
+        for (n, want) in [
+            ("model.layers.3.moe.experts.5.down_proj.weight", Qt44Padded),
+            ("model.layers.3.moe.experts.5.gate_proj.weight", Qt44),
+            ("model.layers.3.moe.experts.0.up_proj.weight", Qt44),
+            ("model.layers.1.self_attn.q_proj.weight", Q8F16),
+            ("model.embed_tokens.weight", Q8F16),
+            ("model.norm.weight", Lossless),
+            ("model.layers.3.moe.gate.weight", F32),
+        ] {
+            assert_eq!(classify_with(n, Q8F16, choice).unwrap(), want, "{n}");
+        }
+        // The head follows its own choice only.
+        assert_eq!(classify_with("lm_head.weight", Qt44, choice).unwrap(), Qt44);
+        assert_eq!(
+            classify_with("lm_head.weight", Q8F16, choice).unwrap(),
+            Q8F16
+        );
+        assert!(classify_with("model.layers.1.self_attn.mystery.weight", Q8F16, choice).is_err());
+    }
+    assert_eq!(physical_k(Q8F16Padded, 1088), 1280);
+    assert_eq!(physical_k(Bf16Padded, 1088), 1280);
+    assert_eq!(physical_k(Bf16Padded, 1280), 1280);
+    assert_eq!(physical_k(Bf16, 12032), 12032);
+    assert_eq!(physical_k(Q8F16, 12032), 12032);
+    for s in ["qt44", "q8f16", "bf16"] {
+        assert_eq!(SharedFfn::parse(s).unwrap().as_str(), s);
+    }
+    for bad in ["", "BF16", "q8", "qt4", "f16"] {
+        assert!(SharedFfn::parse(bad).is_err(), "{bad:?}");
+    }
+    assert!(is_shared_ffn_weight(gate) && is_shared_ffn_weight(dense[2]));
+    assert!(!is_shared_ffn_weight(
+        "model.layers.3.moe.experts.0.up_proj.weight"
+    ));
+    assert_eq!(
+        shared_ffn_sidecar_parent("model.layers.3.moe.shared_experts.up_proj.awq_scale.weight")
+            .as_deref(),
+        Some(up)
+    );
+    assert_eq!(
+        shared_ffn_sidecar_parent("model.layers.3.moe.experts.0.up_proj.awq_scale.weight"),
+        None
+    );
+}
+
+#[test]
+fn bf16_bits_round_nearest_even_and_exact_for_bf16_sources() {
+    for bits in [0u16, 0x8000, 0x3f80, 0xbf80, 0x0001, 0x7f7f, 0xff7f] {
+        assert_eq!(
+            f32_to_bf16_bits(f32::from_bits((bits as u32) << 16)),
+            bits,
+            "{bits:#x}"
+        );
+    }
+    // Ties go to even.
+    assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3f80_8000)), 0x3f80);
+    assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3f81_8000)), 0x3f82);
+    for v in vals(7, 2000, 3.0) {
+        assert_eq!(f32_to_bf16_bits(v), bf16::from_f32(v).to_bits(), "{v}");
+    }
+}
+
+fn check_swap(target: SharedFfn) {
+    let dir = make_source(|_| {});
+    let shipped = shipped_artifact(dir.path());
+    let out = dir.path().join(format!("swap-{}.hfq", target.as_str()));
+    let s = swap_shared_ffn(&shipped, dir.path(), &out, target, Scope::All).unwrap();
+    assert_eq!(s.replaced, 9);
+    assert_eq!(s.dropped_sidecars, 9);
+    assert!(s.replaced_bytes_after > 0 && s.replaced_bytes_before > 0);
+    assert_eq!(s.output_bytes, std::fs::metadata(&out).unwrap().len());
+    assert_eq!(s.verified.shared_ffn, target.as_str());
+    assert_eq!(s.verified.sidecars, s.verified.qt44);
+
+    let fa = RuntimeHfqFile::open_with_reap_plan(&shipped, None).unwrap();
+    let fb = RuntimeHfqFile::open_with_reap_plan(&out, None).unwrap();
+    assert_eq!(fb.arch_id, 19);
+    let dropped: BTreeSet<String> = SHARED_TARGETS.iter().map(|n| awq_sidecar_name(n)).collect();
+    let want_names: Vec<&str> = fa
+        .tensors()
+        .iter()
+        .map(|t| t.name.as_str())
+        .filter(|n| !dropped.contains(*n))
+        .collect();
+    let got_names: Vec<&str> = fb.tensors().iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(got_names, want_names, "order kept, only sidecars removed");
+    assert_eq!(s.passthrough, want_names.len() - 9);
+
+    let src = SourceIndex::open(dir.path()).unwrap();
+    let targets: BTreeSet<&str> = SHARED_TARGETS.iter().copied().collect();
+    for tb in fb.tensors() {
+        let (ta, da) = fa.tensor_data(&tb.name).unwrap();
+        let (_, db) = fb.tensor_data(&tb.name).unwrap();
+        if !targets.contains(tb.name.as_str()) {
+            assert_eq!(
+                (ta.quant_type, &ta.shape, ta.group_size),
+                (tb.quant_type, &tb.shape, tb.group_size),
+                "{}",
+                tb.name
+            );
+            assert_eq!(da, db, "{} must be byte-identical", tb.name);
+            continue;
+        }
+        assert_eq!(ta.quant_type, 44, "{}", tb.name);
+        assert_eq!(tb.shape, ta.shape, "{}", tb.name);
+        let (rows, phys) = (tb.shape[0] as usize, tb.shape[1] as usize);
+        let (wm, wb) = src.get(&tb.name).unwrap();
+        assert_eq!(wm.dtype, "BF16");
+        let k = wm.shape[1];
+        let shared_down = tb.name.contains("shared_experts") && tb.name.contains("down_proj");
+        assert_eq!(phys, if shared_down { 1280 } else { k }, "{}", tb.name);
+        match target {
+            SharedFfn::Bf16 => {
+                assert_eq!((tb.quant_type, tb.group_size), (16, 0), "{}", tb.name);
+                assert_eq!(db.len(), rows * phys * 2);
+                for r in 0..rows {
+                    assert_eq!(
+                        &db[r * phys * 2..r * phys * 2 + 2 * k],
+                        &wb[r * k * 2..(r + 1) * k * 2],
+                        "{} row {r}: exact source bf16 bits",
+                        tb.name
+                    );
+                    assert!(
+                        db[r * phys * 2 + 2 * k..(r + 1) * phys * 2]
+                            .iter()
+                            .all(|&b| b == 0),
+                        "{} row {r}: zero padded columns",
+                        tb.name
+                    );
+                }
+            }
+            _ => {
+                assert_eq!((tb.quant_type, tb.group_size), (3, 32), "{}", tb.name);
+                assert_eq!(db.len(), rows * (phys / 32) * 34);
+                let deq = deq_q8(db, rows, phys);
+                let (sv, _) = src.load_f32(&tb.name).unwrap();
+                for r in 0..rows {
+                    for c in 0..k {
+                        let (want, got) = (sv[r * k + c], deq[r * phys + c]);
+                        assert!(
+                            (want - got).abs() <= 0.2 / 127.0 + 1e-6,
+                            "{} [{r},{c}] {want} vs {got}",
+                            tb.name
+                        );
+                    }
+                    assert!(
+                        deq[r * phys + k..(r + 1) * phys].iter().all(|&v| v == 0.0),
+                        "{} row {r}: zero padded columns",
+                        tb.name
+                    );
+                }
+            }
+        }
+    }
+
+    let meta: serde_json::Value = serde_json::from_str(&fb.metadata_json).unwrap();
+    assert_eq!(meta["hipfire_raon"]["shared_ffn"], target.as_str());
+    assert_eq!(
+        meta["hipfire_raon"]["shared_ffn_swap"]["to"],
+        target.as_str()
+    );
+    assert_eq!(meta["hipfire_raon"]["shared_ffn_swap"]["from"], "qt44");
+    assert_eq!(
+        meta["hipfire_raon"]["shared_ffn_swap"]["source_revision"],
+        SOURCE_REVISION
+    );
+    let padded = &meta["hipfire_raon"]["padded_tensors"]
+        ["model.layers.1.moe.shared_experts.down_proj.weight"];
+    assert_eq!(padded["logical_k"], 1088);
+    assert_eq!(padded["physical_k"], 1280);
+    assert!(meta["hipfire_quant_recipe"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("+shared-ffn={}", target.as_str())));
+    let census_total: u64 = meta["hipfire_recipe_census"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_u64().unwrap())
+        .sum();
+    assert_eq!(census_total as usize, fb.tensors().len());
+    assert_eq!(
+        meta["hipfire_recipe_census"]["BF16"].as_u64(),
+        (target == SharedFfn::Bf16).then_some(9)
+    );
+
+    // The read-only proof accepts it and counts every class.
+    let rep = raon_hfq_diff(&shipped, &out, target, Scope::All).unwrap();
+    assert!(rep.ok(), "{:?}\n{}", rep.violations, rep.table());
+    assert_eq!(rep.rows[CLASS_SIDECAR].tensors, 9);
+    assert_eq!(rep.rows[CLASS_PASS].tensors, s.passthrough);
+    assert_eq!(rep.rows[CLASS_GATE_UP].tensors, 4);
+    assert_eq!(rep.rows[CLASS_DOWN].tensors, 2);
+    assert_eq!(rep.rows[CLASS_DENSE].tensors, 3);
+    assert!(rep.table().contains("shared down"));
+
+    // Reproducible.
+    let out2 = dir.path().join("swap-again.hfq");
+    swap_shared_ffn(&shipped, dir.path(), &out2, target, Scope::All).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap());
+}
+
+#[test]
+fn swap_to_q8f16_replaces_only_the_always_active_ffn() {
+    check_swap(SharedFfn::Q8F16);
+}
+
+#[test]
+fn swap_to_bf16_is_source_exact_and_padded() {
+    check_swap(SharedFfn::Bf16);
+}
+
+#[test]
+fn swap_refuses_bad_inputs_and_writes_nothing() {
+    let dir = make_source(|_| {});
+    let d = dir.path();
+    let shipped = shipped_artifact(d);
+    let out = d.join("o.hfq");
+    let refused = |r: Result<SwapSummary, String>, needle: &str| {
+        let e = r.unwrap_err();
+        assert!(e.contains(needle), "{e}");
+    };
+    refused(
+        swap_shared_ffn(&shipped, d, &out, SharedFfn::Qt44, Scope::All),
+        "q8f16 or bf16",
+    );
+    refused(
+        swap_shared_ffn(&shipped, d, &shipped, SharedFfn::Bf16, Scope::All),
+        "must differ",
+    );
+
+    // Idempotence: a variant is never swapped again.
+    let bf = d.join("bf.hfq");
+    swap_shared_ffn(&shipped, d, &bf, SharedFfn::Bf16, Scope::All).unwrap();
+    refused(
+        swap_shared_ffn(&bf, d, &d.join("again.hfq"), SharedFfn::Bf16, Scope::All),
+        "already stores",
+    );
+    refused(
+        swap_shared_ffn(&bf, d, &d.join("q.hfq"), SharedFfn::Q8F16, Scope::All),
+        "starts from a qt44",
+    );
+
+    // A source that is not the one the artifact was built from.
+    let other = tempfile::tempdir().unwrap();
+    let mut cfg = test_config();
+    cfg["note"] = "different".into();
+    write_checkpoint(other.path(), synthetic_tensors(), &cfg);
+    refused(
+        swap_shared_ffn(&shipped, other.path(), &out, SharedFfn::Q8F16, Scope::All),
+        "sha256",
+    );
+    // An incomplete source.
+    let broken =
+        make_source(|t| t.retain(|x| x.name != "model.layers.1.moe.shared_experts.up_proj.weight"));
+    refused(
+        swap_shared_ffn(&shipped, broken.path(), &out, SharedFfn::Q8F16, Scope::All),
+        "missing",
+    );
+
+    // An artifact without one of the target tensors (and its sidecar).
+    let miss = d.join("miss.hfq");
+    rewrite_hfq(
+        &shipped,
+        &miss,
+        19,
+        |t, b| {
+            (!t.name
+                .starts_with("model.layers.1.moe.shared_experts.up_proj."))
+            .then_some((t.quant_type, b))
+        },
+        |_| {},
+    );
+    refused(
+        swap_shared_ffn(&miss, d, &out, SharedFfn::Q8F16, Scope::All),
+        "missing from the input artifact",
+    );
+    // A target that is not qt44.
+    let notq = d.join("notq.hfq");
+    rewrite_hfq(
+        &shipped,
+        &notq,
+        19,
+        |t, b| {
+            let qt = if t.name == "model.layers.0.mlp.gate_proj.weight" {
+                3
+            } else {
+                t.quant_type
+            };
+            Some((qt, b))
+        },
+        |_| {},
+    );
+    refused(
+        swap_shared_ffn(&notq, d, &out, SharedFfn::Q8F16, Scope::All),
+        "qt3",
+    );
+    // Not a Raon artifact.
+    let wrong = d.join("wrong-arch.hfq");
+    rewrite_hfq(&shipped, &wrong, 18, |t, b| Some((t.quant_type, b)), |_| {});
+    refused(
+        swap_shared_ffn(&wrong, d, &out, SharedFfn::Q8F16, Scope::All),
+        "arch_id",
+    );
+    assert!(!out.exists(), "a refused swap leaves no output");
+    assert!(!d.join("again.hfq").exists() && !d.join("q.hfq").exists());
+}
+
+#[test]
+fn shared_ffn_verify_flags_every_class_of_violation() {
+    let dir = make_source(|_| {});
+    let d = dir.path();
+    let shipped = shipped_artifact(d);
+    let good = d.join("good.hfq");
+    swap_shared_ffn(&shipped, d, &good, SharedFfn::Bf16, Scope::All).unwrap();
+    let verdict = |b: &Path, t: SharedFfn| raon_hfq_diff(&shipped, b, t, Scope::All).unwrap();
+    assert!(verdict(&good, SharedFfn::Bf16).ok());
+    assert!(raon_hfq_diff(&shipped, &good, SharedFfn::Qt44, Scope::All).is_err());
+
+    // Wrong target storage for this variant; unchanged artifact; reversed roles.
+    assert!(!verdict(&good, SharedFfn::Q8F16).ok());
+    let same = verdict(&shipped, SharedFfn::Bf16);
+    assert!(!same.ok());
+    assert!(same.violations.iter().any(|v| v.contains("survives in B")));
+    assert!(!raon_hfq_diff(&good, &shipped, SharedFfn::Bf16, Scope::All)
+        .unwrap()
+        .ok());
+
+    // One flipped payload byte in a pass-through tensor.
+    let off = RuntimeHfqFile::open_with_reap_plan(&good, None)
+        .unwrap()
+        .find_tensor_info("model.embed_tokens.weight")
+        .unwrap()
+        .data_offset;
+    let mut bytes = std::fs::read(&good).unwrap();
+    bytes[off] ^= 1;
+    let tampered = d.join("tampered-payload.hfq");
+    std::fs::write(&tampered, bytes).unwrap();
+    let rep = verdict(&tampered, SharedFfn::Bf16);
+    assert!(!rep.ok());
+    assert!(
+        rep.violations
+            .iter()
+            .any(|v| v.contains("model.embed_tokens.weight") && v.contains("payload differs")),
+        "{:?}",
+        rep.violations
+    );
+    assert_eq!(rep.rows[CLASS_PASS].violations, 1);
+    assert!(rep.table().contains("FAIL(1)"));
+
+    // A pass-through tensor missing from the variant.
+    let short = d.join("short.hfq");
+    rewrite_hfq(
+        &good,
+        &short,
+        19,
+        |t, b| (t.name != "model.norm.weight").then_some((t.quant_type, b)),
+        |_| {},
+    );
+    assert!(!verdict(&short, SharedFfn::Bf16).ok());
+
+    // A target payload of the wrong size.
+    let sized = d.join("sized.hfq");
+    rewrite_hfq(
+        &good,
+        &sized,
+        19,
+        |t, mut b| {
+            if t.name == "model.layers.0.mlp.down_proj.weight" {
+                b.truncate(b.len() - 2);
+            }
+            Some((t.quant_type, b))
+        },
+        |_| {},
+    );
+    let rep = verdict(&sized, SharedFfn::Bf16);
+    assert!(rep
+        .violations
+        .iter()
+        .any(|v| v.contains("model.layers.0.mlp.down_proj.weight") && v.contains("size")));
+
+    // Metadata outside the updated keys changed / updated keys wrong.
+    let meta_a = d.join("meta-a.hfq");
+    rewrite_hfq(
+        &good,
+        &meta_a,
+        19,
+        |t, b| Some((t.quant_type, b)),
+        |m| m["hipfire_lm_head"] = "qt44".into(),
+    );
+    let rep = verdict(&meta_a, SharedFfn::Bf16);
+    assert!(rep
+        .violations
+        .iter()
+        .any(|v| v.contains("metadata differs") && v.contains("hipfire_lm_head")));
+    let meta_b = d.join("meta-b.hfq");
+    rewrite_hfq(
+        &good,
+        &meta_b,
+        19,
+        |t, b| Some((t.quant_type, b)),
+        |m| m["hipfire_raon"]["shared_ffn"] = "q8f16".into(),
+    );
+    assert!(!verdict(&meta_b, SharedFfn::Bf16).ok());
+    let meta_c = d.join("meta-c.hfq");
+    rewrite_hfq(
+        &good,
+        &meta_c,
+        19,
+        |t, b| Some((t.quant_type, b)),
+        |m| m["hipfire_recipe_census"]["BF16"] = 0.into(),
+    );
+    assert!(!verdict(&meta_c, SharedFfn::Bf16).ok());
+}
+
+#[test]
+fn verify_artifact_checks_swapped_classes_against_the_recorded_storage() {
+    let dir = make_source(|_| {});
+    let d = dir.path();
+    let shipped = shipped_artifact(d);
+    for target in [SharedFfn::Q8F16, SharedFfn::Bf16] {
+        let out = d.join(format!("v-{}.hfq", target.as_str()));
+        swap_shared_ffn(&shipped, d, &out, target, Scope::All).unwrap();
+        let s = verify_artifact(&out, false).unwrap();
+        assert_eq!(s.shared_ffn, target.as_str());
+        assert_eq!(s.padded, (NEXP + 1) * 2);
+        // The same tensors under metadata that still claims qt44 are a class violation.
+        let lying = d.join(format!("lie-{}.hfq", target.as_str()));
+        rewrite_hfq(
+            &out,
+            &lying,
+            19,
+            |t, b| Some((t.quant_type, b)),
+            |m| m["hipfire_raon"]["shared_ffn"] = "qt44".into(),
+        );
+        let e = verify_artifact(&lying, false).unwrap_err();
+        assert!(e.contains("violates class"), "{e}");
+        // Unknown storage names are refused.
+        let bad = d.join(format!("bad-{}.hfq", target.as_str()));
+        rewrite_hfq(
+            &out,
+            &bad,
+            19,
+            |t, b| Some((t.quant_type, b)),
+            |m| m["hipfire_raon"]["shared_ffn"] = "int4".into(),
+        );
+        assert!(verify_artifact(&bad, false)
+            .unwrap_err()
+            .contains("shared_ffn"));
+    }
+}
+
+#[test]
+fn shared_ffn_flags_select_their_route_and_conflict_with_other_routes() {
+    use clap::{CommandFactory, FromArgMatches};
+    let parse = |argv: &[&str]| {
+        crate::cli::QuantizeArgs::command()
+            .try_get_matches_from(std::iter::once("hipfire-quantize").chain(argv.iter().copied()))
+    };
+    let swap = [
+        "--raon-shared-ffn",
+        "q8f16",
+        "--raon-source",
+        "d",
+        "--input",
+        "i",
+        "--output",
+        "o",
+    ];
+    let m = parse(&swap).unwrap();
+    let args = crate::cli::QuantizeArgs::from_arg_matches(&m).unwrap();
+    assert_eq!(
+        crate::pipeline::route_for(&args),
+        crate::cli::Route::RaonSharedFfn
+    );
+    crate::cli::reject_unreachable(&m, crate::cli::Route::RaonSharedFfn).unwrap();
+    let verify = [
+        "--raon-shared-ffn-verify",
+        "bf16",
+        "--input",
+        "i",
+        "--output",
+        "o",
+    ];
+    let m = parse(&verify).unwrap();
+    let args = crate::cli::QuantizeArgs::from_arg_matches(&m).unwrap();
+    assert_eq!(
+        crate::pipeline::route_for(&args),
+        crate::cli::Route::RaonSharedFfn
+    );
+    crate::cli::reject_unreachable(&m, crate::cli::Route::RaonSharedFfn).unwrap();
+    // Flags the route never reads are refused.
+    let mut with_awq = swap.to_vec();
+    with_awq.push("--awq");
+    let m = parse(&with_awq).unwrap();
+    let e = crate::cli::reject_unreachable(&m, crate::cli::Route::RaonSharedFfn).unwrap_err();
+    assert!(e.starts_with("--awq has no effect"), "{e}");
+    // The swap flags mean nothing to any other route.
+    let m = parse(&swap).unwrap();
+    for route in [crate::cli::Route::Raon, crate::cli::Route::Main] {
+        let e = crate::cli::reject_unreachable(&m, route).unwrap_err();
+        assert!(e.contains("has no effect"), "{route:?}: {e}");
+    }
+    // Parse-time refusals.
+    assert!(parse(&[
+        "--raon-shared-ffn",
+        "q8f16",
+        "--input",
+        "i",
+        "--output",
+        "o"
+    ])
+    .is_err());
+    assert!(parse(&["--raon-source", "d", "--input", "i", "--output", "o"]).is_err());
+    assert!(parse(&[
+        "--raon-shared-ffn",
+        "qt44",
+        "--raon-source",
+        "d",
+        "--input",
+        "i",
+        "--output",
+        "o"
+    ])
+    .is_err());
+    let mut both = swap.to_vec();
+    both.extend(["--raon-shared-ffn-verify", "bf16"]);
+    assert!(parse(&both).is_err());
+    let mut codes = swap.to_vec();
+    codes.extend(["--mq4v2-final-codes", "r"]);
+    assert!(parse(&codes).is_err());
+}
+
+#[test]
+fn partial_scope_swaps_only_its_class_and_is_described_and_verified() {
+    use Storage::*;
+    assert!(Scope::Shared.covers("model.layers.1.moe.shared_experts.up_proj.weight"));
+    assert!(!Scope::Shared.covers("model.layers.0.mlp.up_proj.weight"));
+    assert!(Scope::Dense.covers("model.layers.0.mlp.up_proj.weight"));
+    assert!(!Scope::Dense.covers("model.layers.1.moe.shared_experts.up_proj.weight"));
+    assert!(Scope::All.covers("model.layers.0.mlp.up_proj.weight"));
+    assert!(!Scope::All.covers("model.layers.1.moe.experts.0.up_proj.weight"));
+    assert_eq!(
+        classify_scoped(
+            "model.layers.0.mlp.up_proj.weight",
+            Q8F16,
+            SharedFfn::Bf16,
+            Scope::Shared
+        )
+        .unwrap(),
+        Qt44
+    );
+    assert_eq!(
+        classify_scoped(
+            "model.layers.1.moe.shared_experts.down_proj.weight",
+            Q8F16,
+            SharedFfn::Bf16,
+            Scope::Shared
+        )
+        .unwrap(),
+        Bf16Padded
+    );
+    assert_eq!(storage_tag(SharedFfn::Q8F16, Scope::All), "q8f16");
+    assert_eq!(storage_tag(SharedFfn::Q8F16, Scope::Dense), "q8f16:dense");
+    assert!(Scope::parse("both").is_err());
+    assert_eq!(Scope::parse("shared-gateup").unwrap(), Scope::SharedGateUp);
+    assert!(Scope::SharedGateUp.covers("model.layers.1.moe.shared_experts.gate_proj.weight"));
+    assert!(Scope::SharedGateUp.covers("model.layers.1.moe.shared_experts.up_proj.weight"));
+    assert!(!Scope::SharedGateUp.covers("model.layers.1.moe.shared_experts.down_proj.weight"));
+    assert!(!Scope::SharedGateUp.covers("model.layers.0.mlp.gate_proj.weight"));
+    assert!(!Scope::Shared.covers("model.layers.0.mlp.down_proj.weight"));
+
+    let dir = make_source(|_| {});
+    let d = dir.path();
+    let shipped = shipped_artifact(d);
+    for (scope, target, replaced, tag) in [
+        (Scope::Shared, SharedFfn::Q8F16, 6usize, "q8f16:shared"),
+        (Scope::Dense, SharedFfn::Bf16, 3usize, "bf16:dense"),
+        (
+            Scope::SharedGateUp,
+            SharedFfn::Q8F16,
+            4usize,
+            "q8f16:shared-gateup",
+        ),
+    ] {
+        let out = d.join(format!("scope-{}.hfq", scope.as_str()));
+        let s = swap_shared_ffn(&shipped, d, &out, target, scope).unwrap();
+        assert_eq!((s.replaced, s.dropped_sidecars), (replaced, replaced));
+        assert_eq!(s.verified.shared_ffn, tag);
+        let fa = RuntimeHfqFile::open_with_reap_plan(&shipped, None).unwrap();
+        let fb = RuntimeHfqFile::open_with_reap_plan(&out, None).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&fb.metadata_json).unwrap();
+        assert_eq!(meta["hipfire_raon"]["shared_ffn"], tag);
+        assert_eq!(
+            meta["hipfire_raon"]["shared_ffn_swap"]["scope"],
+            scope.as_str()
+        );
+        assert!(meta["hipfire_quant_recipe"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("+shared-ffn={tag}")));
+        for t in SHARED_TARGETS {
+            let (ia, da) = fa.tensor_data(t).unwrap();
+            let (ib, db) = fb.tensor_data(t).unwrap();
+            if scope.covers(t) {
+                assert_eq!(ib.quant_type, swapped_qt(target), "{t}");
+                assert!(fb.find_tensor_info(&awq_sidecar_name(t)).is_none(), "{t}");
+            } else {
+                assert_eq!((ia.quant_type, ib.quant_type), (44, 44), "{t}");
+                assert_eq!(da, db, "{t} stays byte-identical");
+                assert!(fb.find_tensor_info(&awq_sidecar_name(t)).is_some(), "{t}");
+            }
+        }
+        let rep = raon_hfq_diff(&shipped, &out, target, scope).unwrap();
+        assert!(rep.ok(), "{:?}\n{}", rep.violations, rep.table());
+        assert_eq!(rep.rows[CLASS_SIDECAR].tensors, replaced);
+        // Verify expects the same scope: the other scopes must fail.
+        for other in [Scope::All, Scope::Shared, Scope::SharedGateUp, Scope::Dense] {
+            if other != scope {
+                assert!(
+                    !raon_hfq_diff(&shipped, &out, target, other).unwrap().ok(),
+                    "{scope:?} variant must not verify as {other:?}"
+                );
+            }
+        }
+        // A scoped variant is not swapped again.
+        let e = swap_shared_ffn(&out, d, &d.join("x.hfq"), target, Scope::All).unwrap_err();
+        assert!(e.contains("starts from a qt44"), "{e}");
+    }
+}

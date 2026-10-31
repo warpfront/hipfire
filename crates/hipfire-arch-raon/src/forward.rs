@@ -86,6 +86,11 @@ pub struct RaonWork {
 }
 
 impl RaonWork {
+    /// Select the activation tier of the grouped routed-expert GEMMs (bundle load, once).
+    pub fn set_routed_tier(&mut self, tier: hipfire_dispatch::pipeline::GroupedMoeActTier) {
+        self.moe_dims.routed_tier = tier;
+    }
+
     /// Module geometries every work buffer is derived from.
     fn shapes(cfg: &RaonConfig) -> Result<(RaonMhcShape, RdaGeometry, RaonMoeDims), String> {
         let mhc_shape = RaonMhcShape {
@@ -119,6 +124,7 @@ impl RaonWork {
             value_beta: cfg.situ_linear_beta,
             router_eps: cfg.router_eps,
             router_scale: cfg.routed_scale,
+            routed_tier: hipfire_dispatch::pipeline::GroupedMoeActTier::F16,
         };
         moe_dims.validate()?;
         Ok((mhc_shape, rda_geom, moe_dims))
@@ -854,7 +860,8 @@ fn ffn_block(
 ) -> Result<(), String> {
     match &layer.ffn {
         RaonFfn::Dense(d) => {
-            let refs = RaonDenseRefs::from_parts(&d.gate, &d.up, &d.down)?;
+            let (gate, up, down) = d.projections(rows);
+            let refs = RaonDenseRefs::from_parts(gate, up, down)?;
             forward_dense(
                 gpu,
                 ctx,
@@ -867,17 +874,19 @@ fn ffn_block(
             )
         }
         RaonFfn::Moe(m) => {
+            let (shared_gate, shared_up, shared_down) = m.shared.projections(rows);
             let refs = RaonMoeLayerRefs::from_parts(
                 &m.router,
                 &m.e_bias,
-                &m.shared.gate,
-                &m.shared.up,
-                &m.shared.down,
+                shared_gate,
+                shared_up,
+                shared_down,
                 &m.expert_gate_up_ptrs,
                 &m.expert_down_ptrs,
                 m.gate_up_awq.as_ref(),
                 m.expert_down_awq_ptrs.as_ref(),
-            );
+            )
+            .with_iu4_symmetric(m.iu4_symmetric);
             forward_moe(
                 gpu,
                 ctx,
@@ -1603,43 +1612,13 @@ pub fn forward_rows_tapped(
     )
 }
 
-/// [`forward_rows`] with the DFlash2 device capture ([`DflashCapture`]): the
+/// [`forward_rows`] with the DFlash2 device capture ([`DflashCapture`]: the
 /// post-FFN carrier of the listed layers lands in `capture.dst` rows
-/// `capture.row0..capture.row0 + tokens.len()`. The launch sequence is
-/// [`forward_rows`]'s plus one strided copy per listed layer.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_rows_captured(
-    cfg: &RaonConfig,
-    w: &RaonWeights,
-    s: &mut RaonState,
-    scratch: &mut RaonPrefillScratch,
-    work: &mut RaonWork,
-    gpu: &mut Gpu,
-    tokens: &[u32],
-    start_pos: u32,
-    want_logits: bool,
-    capture: Option<&DflashCapture<'_>>,
-) -> Result<(), String> {
-    forward_impl(
-        cfg,
-        w,
-        s,
-        scratch,
-        work,
-        gpu,
-        tokens,
-        start_pos,
-        want_logits,
-        None,
-        capture,
-        None,
-    )
-}
-
-/// [`forward_rows_captured`] with the rollback ring ([`RdaRing`]) armed: the
-/// RDA recurrence inputs of every row land in `ring` (same launch sequence).
-/// This is the verify forward (`crate::rollback`); `capture` is the DFlash2
-/// feature capture when the drafter wants this window's features.
+/// `capture.row0..capture.row0 + tokens.len()`, one strided copy per listed
+/// layer) and the rollback ring ([`RdaRing`]) armed (the RDA recurrence inputs
+/// of every row land in `ring`; same launch sequence). This is the verify
+/// forward (`crate::rollback`); `capture` is present when the drafter wants
+/// this window's features.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_rows_verify(
     cfg: &RaonConfig,

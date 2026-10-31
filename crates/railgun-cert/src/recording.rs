@@ -1394,6 +1394,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "grouped-moe-act-tier-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "quantized-activation tiers (A8/A4) of the generic grouped routed-expert core, taken only eagerly: hipfire-dispatch moe_program.rs grouped_moe_site_tiers admits the caller's act_tier only when exact gfx1201, load-verified symmetric qt44 experts, the grouped IU4 shape admits, `!gpu.graphs.capture_mode` and `!gpu.replay.is_recording()`; otherwise both sites run the F16 grouped core",
+        effect: KernelSelection,
+        switches: "eager: moe_grouped_qt44_a8_sym / moe_grouped_qt44_iu4_sym gate_up and down plus their int8/int4 activation producers (Raon prefill default A8 on gfx1201); hipGraph capture or a live Redline recording: the F16 grouped WMMA core for the same layer",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "the A8/A4 tiers quantize the routed-expert activations, so their output differs from the F16 core's (code24/WT2 KLD deltas recorded in the CHANGELOG entry for the Raon W4A8 default); the only caller is the Raon batched prefill, which is never graph-captured or Redline-recorded, so no recorded program reaches the quantized tiers; the excluded branch is the unchanged F16 core",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-opt-in-eager-fusions",
         predicates: &[IsRecording, CaptureMode],
         condition: "opt-in Qwen4 prefill fusions and exact-gfx1151 single-token decode fusions taken only with `!is_recording() && !capture_mode`: hyper_read_pairs_write (HIPFIRE_QWEN4_HC_FUSE >= 1, layer_ops.rs), gemm_mq6g256v2_hcw_applies (HC_FUSE >= 2, gemm.rs), absorbs_clear (HIPFIRE_QWEN4_MOE_COMBINE_ZINIT, moe_program.rs; also not under a retained body), indexed_attention_select_batch_impl (HIPFIRE_QWEN4_QSA_SELECT_EXACT, and the default rows8/rows16 scoring route for F32 pooled keys, 4 index heads, budget <= 512, tensor_ops.rs), execute_grouped_depthwise (HIPFIRE_QWEN4_PLE_FUSE, layer_ops.rs), gemm_bf16_xf16_f16_wmma's gfx1201 and gfx1151 arms through hc_down_tile_selected (HIPFIRE_QWEN4_HC_DOWN_TILE, gemm.rs; recording/capture gate the gfx1151 arm only), qwen4_trunk_iu4_applies (HIPFIRE_QWEN4_TRUNK_IU4, gemm.rs), gemm_mq4g256v2_xf16_applies (the gfx1151 MQ4G256V2 shared-F16 prefill route and, under HIPFIRE_QWEN4_MQ4_X4_PM, its BF16-out / regions / HC-write entries, gemm.rs), hc_row_fold_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs), moe_router_softmax_top10_f32 (HIPFIRE_QWEN4_ROUTER_FAST, moe.rs), project_trunk_masked_inner (HIPFIRE_QWEN4_DECODE_ZBA_X3, layer_ops.rs: exact gfx1151, one-row F32 FN GDN decode with an MQ6G256V2 qkv and MQ4G256V2 a/b/z, no trunk IU4), decode_gate_side_stage (HIPFIRE_QWEN4_DECODE_HEAD_FUSE, pipeline/mod.rs: exact gfx1151, batch 1, K = 2560, Q8_0 shared gate/up, and additionally no active_capture, hessian_capture, MoE dump, hidden dump or EP)",
@@ -2393,6 +2404,12 @@ pub const SITES: &[Site] = &[
         function: "absorbs_clear",
         occurrences: 2,
         decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "grouped_moe_site_tiers",
+        occurrences: 2,
+        decisions: &["grouped-moe-act-tier-eager-only"],
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",

@@ -210,9 +210,10 @@ impl RaonBundle {
     }
 
     /// One verify forward over `block` at the slot's current position: the
-    /// speculative `forward_chunk(.., want_logits = false, capture_row0)` with
-    /// the rollback ring armed when the mode is [`RollbackMode::Recurrence`]
-    /// (the launch sequence is the unarmed one; only the RDA pointers move).
+    /// batched forward with no logits, the DFlash2 device capture landing at
+    /// `capture_row0` (when given) and the rollback ring armed when the mode is
+    /// [`RollbackMode::Recurrence`] (the launch sequence is the unarmed one;
+    /// only the RDA pointers move).
     /// Records the ring ticket `(position, block.len())` on success.
     pub(crate) fn forward_verify_chunk(
         &mut self,

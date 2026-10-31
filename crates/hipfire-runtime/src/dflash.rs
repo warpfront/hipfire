@@ -46,6 +46,17 @@ use std::collections::{HashMap, HashSet};
 /// first-call `fc` rotation (one-shot per prompt, negligible vs prefill).
 const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
+/// Elements of the MQ rotation scratch (`mq_x_rot` and its F16 twin): a
+/// [`MQ_X_ROT_CHUNK_ROWS`] chunk of the widest rotated input. With staged
+/// features (`stage = Some(n)`) `fc` rotates at most `n` feature rows per
+/// call, so the feature width no longer sets the chunk.
+fn mq_x_rot_elems(inter: usize, qd: usize, fw: usize, stage: Option<usize>) -> usize {
+    match stage {
+        None => MQ_X_ROT_CHUNK_ROWS * inter.max(qd).max(fw),
+        Some(n) => (MQ_X_ROT_CHUNK_ROWS * inter.max(qd)).max(n * fw),
+    }
+}
+
 // ─── Config ────────────────────────────────────────────────────────────────
 
 /// DFlash2 runtime proposal width without VMM batching: what `auto` (the
@@ -1791,6 +1802,13 @@ pub struct DflashScratch {
     /// Developer-only online draft tuner (`HIPFIRE_DFLASH_ONLINE_TUNE`);
     /// `None` keeps the shipping argmax proposal path.
     pub online: Option<crate::dflash_online::OnlineDraftTuner>,
+    /// Staged feature rows ([`Self::new_windowed_staged`]): `target_hidden`
+    /// holds this many rows and is NOT a resident context ring. Every
+    /// `draft_forward_based` streams the rows it projects (`fc` +
+    /// `hidden_norm`) from the caller's host feature rows through it, at most
+    /// this many per GEMM; only the projected rows stay resident. `None`: the
+    /// resident ring every other path reads.
+    pub feature_stage_rows: Option<usize>,
 }
 
 impl DflashScratch {
@@ -1830,6 +1848,46 @@ impl DflashScratch {
             with_mq,
             &mut || Ok(()),
         )
+    }
+
+    /// [`Self::new_windowed`] for an all-sliding DFlash2 draft fed from host
+    /// feature rows (`draft_forward_based` with `target_hidden = Some`), with
+    /// a `stage_rows`-row feature staging buffer instead of the `w`-row raw
+    /// feature ring ([`Self::feature_stage_rows`]). The raw ring only ever
+    /// served the projection of rows not yet projected, so staging leaves the
+    /// draft's inputs unchanged while saving `(w - stage_rows) x
+    /// feature_width x 4` bytes (Raon-1-mini: 51200-wide rows, 0.42 GB at
+    /// `w = 2048`). A draft with a full-attention layer (backfill from the
+    /// raw ring) is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_windowed_staged(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        w: usize,
+        max_ctx: usize,
+        with_mq: bool,
+        stage_rows: usize,
+    ) -> HipResult<Self> {
+        if !cfg.all_layers_sliding || stage_rows == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "staged draft features need an all-sliding draft and a non-empty stage",
+            ));
+        }
+        let stage_rows = stage_rows.min(w);
+        let mut s = Self::new_with_mq_inner(
+            gpu,
+            cfg,
+            max_block_size,
+            w,
+            with_mq,
+            Some(stage_rows),
+            &mut || Ok(()),
+        )?;
+        s.max_ctx_len = max_ctx;
+        s.ctx_mode = DraftCtxMode::Windowed { w, w_full: w };
+        Ok(s)
     }
 
     #[allow(clippy::too_many_arguments)] // Mirrors the public constructor plus a test-only boundary.
@@ -1947,6 +2005,29 @@ impl DflashScratch {
         with_mq: bool,
         after_owner: &mut impl FnMut() -> HipResult<()>,
     ) -> HipResult<Self> {
+        Self::new_with_mq_inner(
+            gpu,
+            cfg,
+            max_block_size,
+            max_ctx_len,
+            with_mq,
+            None,
+            after_owner,
+        )
+    }
+
+    /// `feature_stage_rows`: `Some(n)` sizes `target_hidden` as an `n`-row
+    /// staging buffer ([`Self::feature_stage_rows`]) instead of the
+    /// `max_ctx_len`-row ring.
+    fn new_with_mq_inner(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        max_ctx_len: usize,
+        with_mq: bool,
+        feature_stage_rows: Option<usize>,
+        after_owner: &mut impl FnMut() -> HipResult<()>,
+    ) -> HipResult<Self> {
         let b = max_block_size;
         let l = max_ctx_len;
         let tot = l + b;
@@ -2019,7 +2100,10 @@ impl DflashScratch {
             // inside `gemm_dispatch`. The first-call rotations are split into
             // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
             // 1K prefix tokens (negligible vs seconds-scale prefill).
-            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, fw));
+            //
+            // Staged features: `fc` sees at most `stage` rows per call, so its
+            // rotation needs `stage × feature_width`, not a chunk of them.
+            let widest = mq_x_rot_elems(inter, qd, fw, feature_stage_rows);
             Some(at!(&[widest]))
         } else {
             None
@@ -2028,7 +2112,7 @@ impl DflashScratch {
         // Joins the `at!` transaction (dtype arm): a bare `?` here would
         // leak every earlier allocation (`GpuTensor` has no `Drop`).
         let i_mq_x_rot_f16 = if with_mq {
-            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, fw));
+            let widest = mq_x_rot_elems(inter, qd, fw, feature_stage_rows);
             Some(at!(&[widest], DType::F16))
         } else {
             None
@@ -2086,7 +2170,7 @@ impl DflashScratch {
         let i_attn_out = at!(&[b * qd]);
         let i_residual = at!(&[b * h]);
 
-        let i_target_hidden = at!(&[l * fw]);
+        let i_target_hidden = at!(&[feature_stage_rows.unwrap_or(l) * fw]);
         let i_target_hidden_proj = at!(&[l * h]);
 
         let i_k_cat = at!(&[tot * kvd]);
@@ -2152,6 +2236,7 @@ impl DflashScratch {
             draft_ffn_warmed_up,
             lane_ws: None,
             online: crate::dflash_online::OnlineDraftTuner::from_env(),
+            feature_stage_rows,
         };
         debug_assert!(live.iter().all(|s| s.is_none()));
         Ok(scratch)
@@ -3495,7 +3580,16 @@ fn draft_forward_based_impl(
     if let Some(ne_slice) = noise_embedding {
         upload_slice_f32(gpu, &scratch.x, ne_slice)?;
     }
-    if let Some(th_slice) = target_hidden {
+    // Staged features ([`DflashScratch::feature_stage_rows`]) are never
+    // uploaded as a ring: step 1 streams the rows it projects from the host.
+    let stage_rows = scratch.feature_stage_rows;
+    if stage_rows.is_some() && target_hidden.is_none() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "staged draft features need the host feature rows (target_hidden = Some)",
+        ));
+    }
+    if let Some(th_slice) = target_hidden.filter(|_| stage_rows.is_none()) {
         // Incremental-upload fast path: the caller passes a rolling prefix
         // (rows 0..l) of target_hidden. In DFlash's common steady-state
         // (ctx_slice == None), the prefix grows by accept+1 rows per cycle
@@ -3629,20 +3723,55 @@ fn draft_forward_based_impl(
     let fc_start = cached_rows.max(l.saturating_sub(swa_w));
     let delta = l.saturating_sub(fc_start);
     if delta > 0 {
-        for (_row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
-            let th_slice = scratch.target_hidden.sub_offset(slot0 * fw, len * fw);
-            let thp_slice = scratch.target_hidden_proj.sub_offset(slot0 * h, len * h);
-            gemm_dispatch(
-                gpu,
-                &th_slice,
-                &weights.fc,
-                &thp_slice,
-                len,
-                scratch.mq_x_rot.as_ref(),
-                scratch.mq_x_rot_f16.as_ref(),
-            )?;
-            gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
+        for (row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
+            let (Some(stage), Some(host)) = (stage_rows, target_hidden) else {
+                let th_slice = scratch.target_hidden.sub_offset(slot0 * fw, len * fw);
+                let thp_slice = scratch.target_hidden_proj.sub_offset(slot0 * h, len * h);
+                gemm_dispatch(
+                    gpu,
+                    &th_slice,
+                    &weights.fc,
+                    &thp_slice,
+                    len,
+                    scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
+                )?;
+                gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
+                continue;
+            };
+            // Staged: host rows → stage buffer → fc + hidden_norm into the
+            // projection ring, at most `stage` rows per GEMM.
+            let mut done = 0usize;
+            while done < len {
+                let n = stage.min(len - done);
+                let first = row0 + done - base;
+                let seg = &host[first * fw..(first + n) * fw];
+                // SAFETY: `seg` is `n * fw` initialized f32s viewed as bytes.
+                let src_bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4) };
+                gpu.hip
+                    .memcpy_htod_offset(&scratch.target_hidden.buf, 0, src_bytes)?;
+                let th_slice = scratch.target_hidden.sub_offset(0, n * fw);
+                let thp_slice = scratch
+                    .target_hidden_proj
+                    .sub_offset((slot0 + done) * h, n * h);
+                gemm_dispatch(
+                    gpu,
+                    &th_slice,
+                    &weights.fc,
+                    &thp_slice,
+                    n,
+                    scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
+                )?;
+                gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, n, h, eps)?;
+                done += n;
+            }
         }
+    }
+    if stage_rows.is_some() {
+        // Every row through `l` was either projected above or already cached.
+        scratch.thlog.mark_uploaded(l);
     }
 
     // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
@@ -4894,11 +5023,21 @@ pub struct DflashCandidateProposal {
     /// Per-row probability of the selected token (entry of `probabilities` at
     /// the chosen index when temperature>0). `None` for greedy.
     pub selected_probabilities: Option<Vec<f32>>,
-    /// Per-row softmax (temperature 1) mass of the selected candidate over
-    /// the row's top-K selector scores, at every temperature (the draft's own
-    /// confidence; picks the DFlash2 verify depth).
+    /// Per-row softmax (temperature 1) mass of the row's TOP candidate over
+    /// its top-K selector scores ([`selector_row_confidence`]), at every
+    /// temperature: the draft's own confidence in this row, fixed before the
+    /// row's draw (picks the DFlash2 verify depth).
     pub confidence: Vec<f32>,
     pub top_k: usize,
+}
+
+/// The selector's confidence in one row: the temperature-1 softmax mass of
+/// its top candidate over the row's `scores` (`1 / Σ exp(s - max)`). A
+/// function of the row's scores only, so it is fixed before the row's draw.
+pub fn selector_row_confidence(scores: &[f32]) -> f32 {
+    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let z: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+    1.0 / z
 }
 
 /// Softmax scores/temp → normalized q; sample index via inverse-CDF on `uniform`.
@@ -5083,10 +5222,15 @@ fn propose_inner_capture(
         if let Some(c) = capture.as_deref_mut() {
             c.extend_from_slice(&scores);
         }
-        // Softmax (temperature 1) mass of the selected candidate, at every
-        // request temperature: the draft's own confidence in this row.
-        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let z: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+        // The draft's confidence in this row: its top candidate's
+        // temperature-1 mass, computed before the draw. It depends on the
+        // drafts of earlier rows only (through `pred`), never on this row's
+        // own draw: a verify depth cut on the drawn token's mass would admit
+        // a sampled draft into the verify more often when it is a likely one,
+        // and the verified row would no longer be distributed as `q`
+        // (DFlash2 `verify_depth`; the target law test lives there).
+        // Greedy picks the top candidate, so its value is unchanged.
+        confidence.push(selector_row_confidence(&scores));
         let sel_idx = if temperature == 0.0 {
             let mut best = 0usize;
             let mut best_s = scores[0];
@@ -5111,7 +5255,6 @@ fn propose_inner_capture(
             }
             idx
         };
-        confidence.push((scores[sel_idx] - max_s).exp() / z);
         let cand_id = top_ids[id_off + sel_idx];
         tokens.push(cand_id);
         pred = cand_id;

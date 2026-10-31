@@ -375,7 +375,7 @@ Registry `desc` carries dated KLD and tok/s figures for these tags; they are reg
 
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
-| `raon-1-mini-preview` | `raon-1-mini-preview.mq4-xts` | 17.7 | 20 | KRAFTON Raon-1-mini-preview, 28.8B / 4.3B-active MoE (arch 19; RDA gated-delta + MLA + mHC, SiTU experts). MQ4 XTS: experts symmetric MQ4V2 (qt 44) with AWQ + GPTQ refit, attention and `lm_head` Q8F16; 20 GB-card fit pending real-hardware measurement (32K+ context admitted under 7900 XT capacity emulation). Reasoning model (thinking on by default), XML `<tool_call>` tools. Registry sampling defaults: temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence_penalty 1.5, repeat_penalty 1.0 (the model card's coding / math setting is presence_penalty 0; presence applies to generated tokens only). |
+| `raon-1-mini-preview` | `raon-1-mini-preview-v2.mq4-xts` | 17.9 | 20 | KRAFTON Raon-1-mini-preview, 28.8B / 4.3B-active MoE (arch 19; RDA gated-delta + MLA + mHC, SiTU experts). MQ4 XTS v2: routed experts symmetric MQ4V2 (qt 44) with AWQ + GPTQ refit; the always-active shared-expert and dense layer-0 FFN, attention and `lm_head` Q8F16; 20 GB-card fit pending real-hardware measurement (32K+ context admitted under 7900 XT capacity emulation). Reasoning model (thinking on by default), XML `<tool_call>` tools. Registry sampling defaults: temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence_penalty 1.5, repeat_penalty 1.0 (the model card's coding / math setting is presence_penalty 0; presence applies to generated tokens only). |
 
 ### Image generation (FLUX.1, arch 40)
 
