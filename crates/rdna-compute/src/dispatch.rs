@@ -12600,8 +12600,10 @@ mod tests {
 }
 
 /// Fixed device reserve a planned admission leaves for driver/runtime state
-/// that is not in the allocation ledger (code objects, queues, context).
-pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 512 << 20;
+/// that is not in the allocation ledger (code objects, queues, context, graph
+/// pools). Measured unledgered residency after load: ~3.5 GiB (A3B R9700),
+/// ~4.0 GiB (Raon R9700), ~4.9 GiB (Raon 7900 XTX).
+pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 4 << 30;
 
 /// Result of [`Gpu::planned_capacity`]; `Display` is the load-log input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

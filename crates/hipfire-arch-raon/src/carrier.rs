@@ -179,16 +179,17 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
             return Err(e);
         }
     };
-    let (scratch, rows) = match alloc_scratch_descending(ctx.gpu, &dims, rows, state.max_seq()) {
-        Ok(s) => s,
-        Err(e) => {
-            if let Err(fe) = state.free_gpu(ctx.gpu) {
-                eprintln!("raon1_mini: state free after scratch failure: {fe}");
+    let (scratch, rows) =
+        match alloc_scratch_descending(ctx.gpu, &config, &dims, rows, state.max_seq()) {
+            Ok(s) => s,
+            Err(e) => {
+                if let Err(fe) = state.free_gpu(ctx.gpu) {
+                    eprintln!("raon1_mini: state free after scratch failure: {fe}");
+                }
+                weights.free_gpu(ctx.gpu);
+                return Err(format!("raon1_mini: RaonPrefillScratch::new failed: {e}"));
             }
-            weights.free_gpu(ctx.gpu);
-            return Err(format!("raon1_mini: RaonPrefillScratch::new failed: {e}"));
-        }
-    };
+        };
     let _ = rows;
     RaonBundle::new(ctx.gpu, config, weights, state, scratch)
 }
@@ -198,6 +199,7 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
 /// room never changes the route).
 fn alloc_scratch_descending(
     gpu: &mut Gpu,
+    config: &RaonConfig,
     dims: &RaonStateDims,
     rows: usize,
     max_seq: usize,
@@ -212,7 +214,22 @@ fn alloc_scratch_descending(
     }
     let mut last_err = String::new();
     for r in rungs {
-        match RaonPrefillScratch::new(gpu, dims, r) {
+        // The chunk's module work buffers (MoE scratch etc.) are allocated by
+        // `RaonBundle::new` after this returns, where a failure would abort the
+        // load. Probe them here so the rung is verified as a whole.
+        let attempt = RaonPrefillScratch::new(gpu, dims, r).and_then(|s| {
+            match RaonWork::new(gpu, config, r) {
+                Ok(work) => {
+                    work.free(gpu);
+                    Ok(s)
+                }
+                Err(e) => {
+                    let _ = s.free_gpu(gpu);
+                    Err(format!("module work buffers: {e}"))
+                }
+            }
+        });
+        match attempt {
             Ok(s) => {
                 if r != rows {
                     eprintln!(
