@@ -2189,10 +2189,14 @@ impl Qwen4Bundle {
                 .execution
                 .as_ref()
                 .and_then(|forward| forward.ep_reserve_resident_rows());
+            // The rows a mesh window can carry: every lane at the widest
+            // verify block (the step row budget only caps decode lanes and
+            // is `serve.max_batch_tokens` wide, never a window's rows).
+            let window_rows = max_lanes * crate::gpu_forward_lanes::LANE_MAX_ROWS;
             crate::ep_reserve::spec_store_reserve_verdict(
                 true,
                 crate::ep_reserve::ep_mtp_reserve_share_enabled(),
-                row_budget,
+                window_rows,
                 resident_rows,
             )
             .map_err(ep_err)?;
