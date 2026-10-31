@@ -288,9 +288,25 @@ fn load_raon_mesh_bands(
         });
         match loaded {
             Ok(band) => {
-                // Rank 0's admission (auto = the widest rung that fits it)
-                // sets the width every later band must take.
-                rows.get_or_insert(band.prefill_chunk_rows());
+                let got = band.prefill_chunk_rows();
+                if rank == 0 {
+                    // Rank 0's admission (auto = the widest rung that fits
+                    // it) sets the width every later band must take.
+                    rows = Some(got);
+                } else if rows != Some(got) {
+                    // A later band's scratch allocation stepped down the
+                    // ladder: the bands disagree. Retry at its width.
+                    let wanted = rows.unwrap_or(got);
+                    bands.push(band);
+                    free_loaded(gpus, bands);
+                    return Err(MeshLoadFailure {
+                        error: format!(
+                            "raon1_mini: pipeline band {rank} of {stages} admitted {got} prefill \
+                             rows where the first band admitted {wanted}"
+                        ),
+                        narrower_may_fit: Some(got),
+                    });
+                }
                 bands.push(band);
             }
             Err(error) => {

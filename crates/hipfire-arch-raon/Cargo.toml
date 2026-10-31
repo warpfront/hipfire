@@ -39,6 +39,16 @@ required-features = ["lab"]
 name = "bench_a8_reuse_chain"
 required-features = ["lab"]
 
+# Raon band oracles: one layer cut on one device (`raon_band_oracle`) and the
+# generic mesh executor over per-rank bands (`raon_mesh_oracle`), each against the
+# whole-model run. Built with --features lab.
+[[example]]
+name = "raon_band_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "raon_mesh_oracle"
+required-features = ["lab"]
 [dev-dependencies]
 md5 = "0.8"
 
