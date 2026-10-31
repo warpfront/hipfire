@@ -58,7 +58,7 @@ use crate::forward::{
     embed_lookup, forward_rows_tapped, readout_logits, stage_decode_token, validate_extract_layers,
     DflashCapture, TapSite,
 };
-use crate::projection::{project, OutRound};
+use crate::projection::{project_rows_batched, OutRound};
 use crate::rollback::{RdaRingBuf, RollbackMode};
 use crate::state::RaonStateSnapshot;
 use crate::verify_graph::VerifyGraphs;
@@ -797,7 +797,8 @@ impl SpecTarget for RaonBundle {
         self.ensure_head_buffers(gpu, n)?;
         let head = self.spec.head.as_ref().expect("verify head just ensured");
         let mut logits = head.logits.sub_offset(0, n * vocab);
-        project(
+        // Draft rows are never decode rows: the batched head, row-exact or not.
+        project_rows_batched(
             gpu,
             &self.weights.lm_head,
             &hidden_rows.sub_offset(0, n * hidden),

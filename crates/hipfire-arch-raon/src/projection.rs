@@ -115,17 +115,44 @@ pub fn project_rows(
     if rows == 1 {
         return project_row(gpu, w, x, y, round);
     }
+    if rows > ROWS_EXACT_MAX || !rows_exact() {
+        return project_rows_batched(gpu, w, x, y, rows, round, tier);
+    }
     match w.gpu_dtype {
         // Row-exact verify: qt44 and F32 have no multi-row kernel with the decode
         // reduction order (WMMA F16 x for qt44, a 32-lane tree for F32 vs the 256-thread
         // `gemv_f32`), so each row runs the decode projection itself.
-        DType::MQ4G256V2 | DType::F32 if rows <= ROWS_EXACT_MAX && rows_exact() => {
-            per_row_decode(gpu, w, x, y, rows)
-        }
-        DType::MQ4G256V2 => weight_gemm(gpu, w, x, y, rows).map_err(|e| format!("{e:?}")),
-        DType::Q8_0 if rows <= ROWS_EXACT_MAX && rows_exact() => gpu
+        DType::MQ4G256V2 | DType::F32 => per_row_decode(gpu, w, x, y, rows),
+        DType::Q8_0 => gpu
             .gemv_q8_0_rows_exact(&w.buf, x, y, w.m, w.k, rows)
             .map_err(|e| e.to_string()),
+        other => unreachable!("dtype {other:?} rejected by check()"),
+    }
+    .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;
+    if round == OutRound::Bf16 {
+        round_bf16_rows(gpu, y, rows, w.m)?;
+    }
+    Ok(())
+}
+
+/// [`project_rows`] on the batched GEMM routes whatever the row-exact knob says:
+/// for rows no decode step ever produces (the drafter's head over its draft
+/// rows), where the multi-row GEMM is the cheap route and exactness buys nothing.
+pub fn project_rows_batched(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    round: OutRound,
+    tier: PrefillActTier,
+) -> Result<(), String> {
+    check(w, x, y, rows, "rows")?;
+    if rows == 1 {
+        return project_row(gpu, w, x, y, round);
+    }
+    match w.gpu_dtype {
+        DType::MQ4G256V2 => weight_gemm(gpu, w, x, y, rows).map_err(|e| format!("{e:?}")),
         DType::Q8_0 => q8_0_prefill_gemm(gpu, tier, &w.buf, x, y, w.m, w.k, rows)
             .map(|_| ())
             .map_err(|e| e.to_string()),
