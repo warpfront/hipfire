@@ -2781,8 +2781,8 @@ fn qwen4_settled_charges(
     settled.ok_or_else(|| "qwen4: settled placement has no owning margin/stage charge".into())
 }
 
-/// Free VRAM of every device in `devices` (HIP logical ids), in order, as
-/// [`rdna_compute::Gpu::device_mem_info_for`] reports it before any rank of
+/// Planned capacity of every device in `devices` (HIP logical ids), in order, as
+/// [`rdna_compute::Gpu::planned_capacity_for`] reports it before any rank of
 /// the load allocates. Run on the thread that owns `gpu` (the daemon thread):
 /// other devices are queried by `device_mem_info_for`, which switches the
 /// thread's current device with raw HIP setters and restores the previous
@@ -2804,10 +2804,15 @@ pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Ve
     }
     let mut free = Vec::with_capacity(devices.len());
     for &device in devices {
-        let (bytes, _) = gpu
-            .device_mem_info_for(device)
+        // Planned capacity (device total minus this process's own live
+        // allocations minus the fixed reserve), not the instantaneous free
+        // figure: a foreign process's transient allocation must not move the
+        // agreed split. UMA parts keep the free figure.
+        let capacity = gpu
+            .planned_capacity_for(device)
             .map_err(|error| format!("qwen4: device {device} memory query: {error}"))?;
-        free.push(bytes as u64);
+        eprintln!("  qwen4 EP device {device}: {capacity}");
+        free.push(capacity.bytes as u64);
     }
     Ok(qwen4_ep_alias_free(devices, &free))
 }
