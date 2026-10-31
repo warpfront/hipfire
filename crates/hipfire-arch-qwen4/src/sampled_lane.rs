@@ -392,6 +392,9 @@ pub struct LaneSampler {
     host: Vec<f32>,
     scratch: Vec<(u32, f32)>,
     target: SparseDist,
+    /// The driver closes lanes (`MeshRoot::set_driver_terminates`): a
+    /// `terminal` window does not end the request, only a release does.
+    driver_terminates: bool,
 }
 
 impl LaneSampler {
@@ -405,7 +408,13 @@ impl LaneSampler {
             host: Vec::new(),
             scratch: Vec::with_capacity(SampleSpec::MAX_POOL),
             target: SparseDist::default(),
+            driver_terminates: false,
         }
+    }
+
+    /// See the `driver_terminates` field.
+    pub fn set_driver_terminates(&mut self, on: bool) {
+        self.driver_terminates = on;
     }
 
     /// Register a sampled request: its sampler, the full rendered `prompt`
@@ -640,7 +649,7 @@ impl AcceptRule for LaneSampler {
         self.rows = None;
         for lane in &out.lanes {
             let epoch = lane.key.request_epoch;
-            if lane.cancelled || lane.terminal {
+            if lane.cancelled || (lane.terminal && !self.driver_terminates) {
                 self.lanes.remove(&epoch);
                 continue;
             }
@@ -2301,5 +2310,48 @@ mod tests {
             m.root.rng_fingerprint(epoch(2)).unwrap(),
             solo.fingerprints[&2]
         );
+    }
+
+    /// A serve driver closes lanes itself: a `terminal` window (length/EOS
+    /// reached by the root's own accounting) must not drop the sampler of a
+    /// lane the driver keeps stepping.
+    #[test]
+    fn sampled_lane_terminal_window_keeps_the_sampler_under_driver_termination() {
+        let output = |terminal: bool| StepOutput {
+            key: MeshStepKey {
+                topology_generation: 1,
+                step_seq: 0,
+                lanes: vec![key(1, 0)],
+                policy_digest: 0,
+            },
+            lanes: vec![crate::mesh_lane_protocol::LaneOutput {
+                key: key(1, 0),
+                emitted: vec![3],
+                forced: false,
+                terminal,
+                cancelled: false,
+                consumed_rows: 1,
+                next_seed: 3,
+                source: crate::mesh_lane_protocol::SourceAccounting {
+                    source: ProposalSource::None,
+                    offered: 0,
+                    accepted: 0,
+                    confirm: crate::mesh_lane_protocol::ConfirmOutcome::NotAsked,
+                },
+            }],
+        };
+        let cfg = request_cfg(1.0, 1.0, None, 0.0, 5);
+        let mut s = LaneSampler::new(V);
+        s.admit(epoch(1), &cfg, &[1], 2).unwrap();
+        s.on_publish(&output(true));
+        assert!(
+            !s.is_registered(&epoch(1)),
+            "root-terminated lane is dropped"
+        );
+        let mut s = LaneSampler::new(V);
+        s.set_driver_terminates(true);
+        s.admit(epoch(1), &cfg, &[1], 2).unwrap();
+        s.on_publish(&output(true));
+        assert!(s.is_registered(&epoch(1)), "the driver releases it");
     }
 }

@@ -1893,6 +1893,9 @@ impl EpMeshLanes {
     /// EOS/stop/length, the root never does and drafts through an EOS draft.
     pub fn set_driver_terminates(&mut self, on: bool) {
         self.root.set_driver_terminates(on);
+        if let Some(sampler) = self.sampler.as_mut() {
+            sampler.set_driver_terminates(on);
+        }
     }
 
     /// Whether the root holds `epoch`'s lane.
