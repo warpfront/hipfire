@@ -16,7 +16,7 @@
 //!   with attested `rolled_back=true`.
 //! - P3 abort today: attested `aborted`+`done(aborted)`; unattested collapses
 //!   to one correlated error (shape pinned via the same emitters
-//!   `emit_pipeline_cancel_after_rollback` uses).
+//!   `emit_cancel_after_rollback_for_route` uses).
 //!
 //! E2/E3 update the P2/S1/S2/S4 assertions to the attested shape
 //! (`rolled_back=true`); the abort-shape and policy-gate tests never change.

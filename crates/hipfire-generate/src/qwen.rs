@@ -1775,19 +1775,7 @@ pub fn ep_emit_abort(
     completion_tokens: usize,
 ) {
     let epilogue = ep_reset_after_abort(m);
-    if !epilogue.rolled_back {
-        emit_fail_closed_error_for_route(
-            route,
-            stdout,
-            Some(id),
-            "client cancelled; fail-closed EP rollback could not be attested",
-            "validation",
-            false,
-            &epilogue,
-        );
-        return;
-    }
-    crate::ar::emit_generation_cancel(route, stdout, id, completion_tokens);
+    emit_cancel_after_rollback_for_route(route, stdout, id, completion_tokens, &epilogue);
 }
 
 /// ds4 EP prefill + greedy decode.
@@ -2193,7 +2181,7 @@ pub fn ep_serve_ds4(
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
     // Two-phase commit before cache / done. No post-commit tool_calls event.
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
-    let effects = ds4_client_commit_effects(decision, finish_reason == "tool_calls", store_cache);
+    let effects = decision.commit_effects(finish_reason == "tool_calls", store_cache);
     if !effects.emit_done {
         ep_emit_abort(
             crate::ar::GenerationRoute::Deepseek4Ep,
@@ -4125,8 +4113,7 @@ pub fn generate_dflash(
                 // terminals are complete at commit_ready. Final done is identical.
                 stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
                 let decision = await_client_terminal_commit(stdout, id, &pending_done);
-                let effects = qwen_client_commit_effects(
-                    decision,
+                let effects = decision.commit_effects(
                     *release_tool_calls && !wire_tool_calls.is_empty(),
                     *store_cache,
                 );
@@ -4281,7 +4268,7 @@ pub fn generate_dflash(
         let decision = await_client_terminal_commit(stdout, id, &pending_done);
         let intended_release = finish_reason == "tool_calls" && !wire_calls.is_empty();
         let intended_store = !hit_length_cap && !open_think && !cached_seq.is_empty();
-        let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
+        let effects = decision.commit_effects(intended_release, intended_store);
         if !effects.emit_done {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
@@ -6206,32 +6193,6 @@ pub fn attach_mtp_window_timings(
     }
 }
 
-fn emit_pipeline_cancel_after_rollback(
-    stdout: &mut impl Write,
-    id: &str,
-    completion_tokens: usize,
-    epilogue: &RollbackEpilogue,
-) {
-    if epilogue.rolled_back {
-        crate::ar::emit_generation_cancel(
-            crate::ar::GenerationRoute::PipelineParallel,
-            stdout,
-            id,
-            completion_tokens,
-        );
-    } else {
-        emit_fail_closed_error_for_route(
-            crate::ar::GenerationRoute::PipelineParallel,
-            stdout,
-            Some(id),
-            "client cancelled; fail-closed rollback could not be attested",
-            "validation",
-            false,
-            epilogue,
-        );
-    }
-}
-
 /// PP decode seam: classify one forward-committed token through the shared
 /// Qwen AR semantic producer (`commit_and_classify`), exactly as single-card
 /// does. The caller's `publish_after_forward` already advanced
@@ -6800,7 +6761,13 @@ pub fn generate_multi(
         // G4.9: the mesh dispatcher resets recurrent state and attests
         // graph invalidation + synchronization on every PP device.
         let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
-        emit_pipeline_cancel_after_rollback(stdout, id, 0, &ep);
+        crate::common::emit_cancel_after_rollback_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            id,
+            0,
+            &ep,
+        );
         return;
     }
 
@@ -6901,7 +6868,13 @@ pub fn generate_multi(
             // G4.9: the mesh dispatcher resets recurrent state and attests
             // graph invalidation + synchronization on every PP device.
             let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
-            emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
+            crate::common::emit_cancel_after_rollback_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                id,
+                generated,
+                &ep,
+            );
             return;
         }
         // Commit the sampled token only after its device/KV mutation succeeds.
@@ -7465,7 +7438,13 @@ pub fn generate_multi(
         // G4.9: the mesh dispatcher resets recurrent state and attests graph
         // invalidation + synchronization on every PP device.
         let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
-        emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
+        crate::common::emit_cancel_after_rollback_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            id,
+            generated,
+            &ep,
+        );
         return;
     }
     crate::ar::emit_generation_done_value(
@@ -7539,31 +7518,6 @@ pub fn generate_mesh_carrier(
 }
 
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---
-
-/// Walk a [`serde_json::Value`] and produce a canonical-key
-/// representation: objects emit keys in lexical order (recursively),
-/// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
-/// messages with the same logical tool args hash identically
-/// regardless of source-side insertion order.
-
-pub fn qwen_client_commit_effects(
-    decision: ClientTerminalDecision,
-    intended_release: bool,
-    intended_store: bool,
-) -> QwenClientCommitEffects {
-    match decision {
-        ClientTerminalDecision::Commit => QwenClientCommitEffects {
-            release_tool_calls: intended_release,
-            store_cache: intended_store,
-            emit_done: true,
-        },
-        ClientTerminalDecision::Abort => QwenClientCommitEffects {
-            release_tool_calls: false,
-            store_cache: false,
-            emit_done: false,
-        },
-    }
-}
 
 /// Open the DS4 EP wire contract before prefill can eventually emit tokens.
 ///
@@ -8619,16 +8573,6 @@ pub fn classify_evict_failure_wire() -> SpecFailClosedWire {
 }
 
 // --- iter appended ---
-
-/// Pure Commit/Abort side-effect gate for Qwen AR + DFlash successful terminals.
-/// Commit preserves the intended release/store/done flags; Abort suppresses all
-/// three so producers never store or release after a client cancel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QwenClientCommitEffects {
-    pub release_tool_calls: bool,
-    pub store_cache: bool,
-    pub emit_done: bool,
-}
 
 /// Host-side bookkeeping after one SpecStep is consumed by the semantic loop.
 ///

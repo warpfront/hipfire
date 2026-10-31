@@ -21,18 +21,20 @@ use hipfire_arch_deepseek4::dsml::{
     TOOL_CALLS_OPEN,
 };
 use hipfire_engine::emit::emit_visible_token;
-use hipfire_engine::terminal::{set_active_attempt_id, ClientTerminalDecision};
+use hipfire_engine::terminal::{
+    set_active_attempt_id, ClientCommitEffects, ClientTerminalDecision,
+};
 use hipfire_engine::turn_cache::{apply_turn_cache_action, asst_turn_fingerprint};
 use hipfire_generate::common::{ds4_spec_finish_route, emit_ds4_malformed_terminal};
 use hipfire_generate::{
     common::ds4_ar_ep_cache_action, common::ds4_ar_ep_finish_route,
-    common::ds4_client_commit_effects, common::ds4_ep_abort_wire_events,
-    common::ds4_gen_start_contract_version, common::ds4_malformed_terminal_action,
-    common::ds4_stream_event_wireable, common::emit_ds4_malformed_action,
-    common::gen_start_contract_version_for_arch, common::normalize_asst_turn_for_fingerprint,
-    common::Ds4ArEpRouteTerminal, common::Ds4ClientCommitEffects, dense::ds4_cache_action,
-    dense::ds4_spec_wire_terminal, dense::Ds4SpecWireTerminal, qwen::emit_ds4_ep_gen_start,
-    qwen::spec_outcome_seed_committable, qwen::spec_should_flush_pending_seed,
+    common::ds4_ep_abort_wire_events, common::ds4_gen_start_contract_version,
+    common::ds4_malformed_terminal_action, common::ds4_stream_event_wireable,
+    common::emit_ds4_malformed_action, common::gen_start_contract_version_for_arch,
+    common::normalize_asst_turn_for_fingerprint, common::Ds4ArEpRouteTerminal,
+    dense::ds4_cache_action, dense::ds4_spec_wire_terminal, dense::Ds4SpecWireTerminal,
+    qwen::emit_ds4_ep_gen_start, qwen::spec_outcome_seed_committable,
+    qwen::spec_should_flush_pending_seed,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use hipfire_runtime::spec::{ClientEvent, FinishSummary, SpecEmit};
@@ -764,32 +766,20 @@ fn ds4_empty_event_eos_seed_not_terminal_flushed_or_history() {
 
 #[test]
 fn ds4_client_commit_effects_commit_preserves_intended_flags() {
-    let e = hipfire_generate::common::ds4_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        true,
-        true,
-    );
+    let e = ClientTerminalDecision::Commit.commit_effects(true, true);
     assert_eq!(
         e,
-        hipfire_generate::common::Ds4ClientCommitEffects {
+        ClientCommitEffects {
             release_tool_calls: true,
             store_cache: true,
             emit_done: true,
         }
     );
-    let e = hipfire_generate::common::ds4_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        false,
-        true,
-    );
+    let e = ClientTerminalDecision::Commit.commit_effects(false, true);
     assert!(!e.release_tool_calls);
     assert!(e.store_cache);
     assert!(e.emit_done);
-    let e = hipfire_generate::common::ds4_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        false,
-        false,
-    );
+    let e = ClientTerminalDecision::Commit.commit_effects(false, false);
     assert!(!e.release_tool_calls);
     assert!(!e.store_cache);
     assert!(e.emit_done);
@@ -801,14 +791,10 @@ fn ds4_client_commit_effects_abort_suppresses_all_routes() {
     for (intended_release, intended_store) in
         [(true, true), (true, false), (false, true), (false, false)]
     {
-        let e = hipfire_generate::common::ds4_client_commit_effects(
-            ClientTerminalDecision::Abort,
-            intended_release,
-            intended_store,
-        );
+        let e = ClientTerminalDecision::Abort.commit_effects(intended_release, intended_store);
         assert_eq!(
             e,
-            hipfire_generate::common::Ds4ClientCommitEffects {
+            ClientCommitEffects {
                 release_tool_calls: false,
                 store_cache: false,
                 emit_done: false,
@@ -837,11 +823,8 @@ fn ds4_ar_ep_safe_commit_gate_retains_calls_cache_done() {
         panic!("expected Safe");
     };
     assert_eq!(finish_reason, "tool_calls");
-    let effects = hipfire_generate::common::ds4_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        !wire_tool_calls.is_empty(),
-        store_cache,
-    );
+    let effects =
+        ClientTerminalDecision::Commit.commit_effects(!wire_tool_calls.is_empty(), store_cache);
     assert!(effects.release_tool_calls);
     assert!(effects.store_cache);
     assert!(effects.emit_done);
@@ -887,11 +870,8 @@ fn ds4_ar_ep_safe_abort_gate_suppresses_calls_cache_done() {
     else {
         panic!("expected Safe");
     };
-    let effects = hipfire_generate::common::ds4_client_commit_effects(
-        ClientTerminalDecision::Abort,
-        !wire_tool_calls.is_empty(),
-        store_cache,
-    );
+    let effects =
+        ClientTerminalDecision::Abort.commit_effects(!wire_tool_calls.is_empty(), store_cache);
     assert!(!effects.release_tool_calls);
     assert!(!effects.store_cache);
     assert!(!effects.emit_done);
@@ -940,11 +920,7 @@ fn ds4_spec_safe_commit_and_abort_gates() {
         panic!("expected Done");
     };
 
-    let commit = hipfire_generate::common::ds4_client_commit_effects(
-        ClientTerminalDecision::Commit,
-        release_tool_calls,
-        store_cache,
-    );
+    let commit = ClientTerminalDecision::Commit.commit_effects(release_tool_calls, store_cache);
     assert!(commit.release_tool_calls && commit.store_cache && commit.emit_done);
     let terminal_commit = hipfire_generate::dense::Ds4SpecWireTerminal::Done {
         finish_reason: "tool_calls",
@@ -958,11 +934,7 @@ fn ds4_spec_safe_commit_and_abort_gates() {
     );
     assert!(action_commit.store);
 
-    let abort = hipfire_generate::common::ds4_client_commit_effects(
-        ClientTerminalDecision::Abort,
-        release_tool_calls,
-        store_cache,
-    );
+    let abort = ClientTerminalDecision::Abort.commit_effects(release_tool_calls, store_cache);
     assert!(!abort.release_tool_calls && !abort.store_cache && !abort.emit_done);
     let terminal_abort = hipfire_generate::dense::Ds4SpecWireTerminal::Done {
         finish_reason: "tool_calls",

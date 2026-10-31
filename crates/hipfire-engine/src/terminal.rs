@@ -23,6 +23,31 @@ pub enum ClientTerminalDecision {
     Abort,
 }
 
+/// Side effects a producer may perform after the client terminal handshake.
+/// Commit keeps the intended release/store flags and emits `done`; Abort
+/// suppresses all three so no route stores or releases after a cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientCommitEffects {
+    pub release_tool_calls: bool,
+    pub store_cache: bool,
+    pub emit_done: bool,
+}
+
+impl ClientTerminalDecision {
+    pub fn commit_effects(
+        self,
+        intended_release: bool,
+        intended_store: bool,
+    ) -> ClientCommitEffects {
+        let commit = self == Self::Commit;
+        ClientCommitEffects {
+            release_tool_calls: commit && intended_release,
+            store_cache: commit && intended_store,
+            emit_done: commit,
+        }
+    }
+}
+
 /// Control decision latched against the active generate transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalControlDecision {

@@ -720,7 +720,7 @@ pub fn generate_deepseek4_spec(
             stage_terminal_tool_calls(&mut pending_done, finish_reason, &held_calls);
             // Two-phase commit before cache / done.
             let decision = await_client_terminal_commit(stdout, id, &pending_done);
-            let effects = ds4_client_commit_effects(decision, release_tool_calls, store_cache);
+            let effects = decision.commit_effects(release_tool_calls, store_cache);
             if !effects.emit_done {
                 let ep = production_fail_closed_rollback(m, gpu, None, None);
                 emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
@@ -1544,7 +1544,7 @@ pub fn generate_deepseek4(
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
         // Two-phase commit before cache / normal done.
         let decision = await_client_terminal_commit(stdout, id, &pending_done);
-        let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), store_cache);
+        let effects = decision.commit_effects(!wire_tool_calls.is_empty(), store_cache);
         if !effects.emit_done {
             ds4_ar_client_abort(
                 stdout,
@@ -1981,7 +1981,7 @@ pub fn generate_deepseek4_heterogeneous(
     });
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
-    let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), true);
+    let effects = decision.commit_effects(!wire_tool_calls.is_empty(), true);
     if !effects.emit_done {
         let Some(bundle) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any)
