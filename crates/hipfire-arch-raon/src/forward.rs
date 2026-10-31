@@ -333,7 +333,7 @@ fn fire_stage_width(
         return Ok(());
     }
     let view = t.sub_offset(0, rows * width);
-    fire(tap, gpu, TapSite::Stage(layer, name), &view, rows)
+    fire(tap, gpu, TapSite::Stage(layer, name), &view, rows, width)
 }
 
 /// Census taps of an mHC site's controls (`prefix` is `attn` or `ffn`).
