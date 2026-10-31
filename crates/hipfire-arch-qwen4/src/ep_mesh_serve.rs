@@ -18,20 +18,34 @@
 //! rank-0 lane statistics the done event reports. Nothing here chooses a
 //! route: the root plans on merged rank evidence (DESIGN §3).
 //!
-//! Scope: greedy lanes. A sampled request is never admitted to the mesh (the
-//! EP rank executor has no sampler-owner distribution hooks yet); the daemon
-//! stages AR lanes when `serve.batch_sampled` is on (see
-//! `batch_staging::stage_qwen4_lanes`).
+//! Sampled lanes (`serve.batch_sampled`, neutral penalties) run on the mesh
+//! too: the lane's [`LaneSampling`] becomes the root's per-request sampler
+//! ([`EpMeshLanes::admit_lane_sampled`]) and every window is accepted by the
+//! Leviathan rule ([`EpMeshLanes::step_sampled`]): rank 0 reads the head's
+//! candidates and its target logits rows, the root alone draws.
 
 use crate::bundle::Qwen4Bundle;
 use crate::ep_mesh_lanes::{EpMeshLanes, MeshLaneAdmission, MeshStepError};
-use crate::lane::{LaneSpecStats, LaneStatus};
-use crate::mesh_lane_protocol::{
-    ConfirmOutcome, GreedyRule, LaneRequest, ProposalSource, SamplingMode,
-};
+use crate::lane::{LaneSampling, LaneSpecStats, LaneStatus};
+use crate::mesh_lane_protocol::{ConfirmOutcome, LaneRequest, ProposalSource, SamplingMode};
 use hipfire_runtime::slot_batch::{RequestAdvance, RequestEpoch};
+use hipfire_runtime::spec::SpecRequestConfig;
 use rdna_compute::Gpu;
 use std::time::{Duration, Instant};
+
+/// The root-side sampler configuration of a sampled serve lane: the lane's
+/// AR sampler (temperature, top-p, top-k, min-p) with neutral penalties, the
+/// only kind a batch-sampled lane carries.
+fn sampler_config(sampling: &LaneSampling) -> SpecRequestConfig {
+    SpecRequestConfig {
+        temp: sampling.temperature,
+        top_p: sampling.top_p,
+        top_k: sampling.top_k,
+        min_p: sampling.min_p.unwrap_or(0.0),
+        rng_seed: u64::from(sampling.seed),
+        ..SpecRequestConfig::default()
+    }
+}
 
 /// The longest host gap between two mesh decode steps that still counts as
 /// part of the step's price (emission, scheduling and admission work of one
@@ -265,7 +279,7 @@ impl Qwen4Bundle {
         let mut lane_requests: Vec<LaneRequest> = Vec::with_capacity(requests.len());
         let mut retired_before: Vec<bool> = Vec::with_capacity(requests.len());
         for request in requests {
-            let admission = {
+            let (admission, sampling) = {
                 let store = self
                     .lanes
                     .as_ref()
@@ -279,28 +293,29 @@ impl Qwen4Bundle {
                         request.epoch, lane.host.status
                     ));
                 }
-                if lane.host.sampling.is_some() {
-                    return Err(format!(
-                        "mesh step: lane {:?} is sampled; EP mesh lanes are greedy only",
-                        request.epoch
-                    ));
-                }
+                let sampling = lane.host.sampling;
                 let seed = lane.host.pending_seed.ok_or_else(|| {
                     format!("mesh step: lane {:?} has no pending seed", request.epoch)
                 })?;
-                (!mesh.has_lane(request.epoch)).then(|| MeshLaneAdmission {
+                let admission = (!mesh.has_lane(request.epoch)).then(|| MeshLaneAdmission {
                     epoch: request.epoch,
                     position: lane.state.position,
                     seed,
                     eos: Some(eos),
-                    rng_seed: request.epoch.request_tag,
+                    rng_seed: sampling.map_or(request.epoch.request_tag, |s| u64::from(s.seed)),
                     prompt: lane.host.prompt.clone(),
                     // An AR-only lane of a mixed store joins the root as an AR lane.
                     spec_k: lane.spec.is_some().then_some(spec_k),
-                })
+                });
+                (admission, sampling)
             };
             if let Some(admission) = admission {
-                mesh.admit_lane(self, gpu, admission)?;
+                match &sampling {
+                    Some(sampling) => {
+                        mesh.admit_lane_sampled(self, gpu, admission, &sampler_config(sampling))?
+                    }
+                    None => mesh.admit_lane(self, gpu, admission)?,
+                }
             }
             let (_, seed) = mesh
                 .root()
@@ -328,12 +343,16 @@ impl Qwen4Bundle {
                 remaining: request.tokens_left.max(1),
                 context_left,
                 forced: None,
-                sampling: SamplingMode::Greedy,
+                sampling: if sampling.is_some() {
+                    SamplingMode::Leviathan
+                } else {
+                    SamplingMode::Greedy
+                },
             });
         }
         let budgets = mesh.window_budgets(self, routes)?;
         let report = mesh
-            .step(self, gpu, &lane_requests, &budgets, &mut GreedyRule)
+            .step_sampled(self, gpu, &lane_requests, &budgets)
             .map_err(|error| match error {
                 MeshStepError::Aborted(record) => {
                     format!(

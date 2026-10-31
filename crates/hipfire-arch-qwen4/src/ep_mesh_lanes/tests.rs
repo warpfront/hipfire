@@ -842,3 +842,172 @@ fn mesh_lane_ep_step_errors_map_preflight_abort_and_protocol() {
     ));
     assert_eq!(MeshKind::Ep, MeshKind::Ep);
 }
+
+// ---- sampled lanes through the EP driver -----------------------------------
+
+const SAMPLED_VOCAB: usize = 10;
+
+struct ConstRows(Vec<f32>);
+
+impl TargetRowSource for ConstRows {
+    fn row_logits(
+        &mut self,
+        _key: &LaneWindowKey,
+        _row: usize,
+        host: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        host.clear();
+        host.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+/// [`ThreadedFanout`] with what a real sampler owner adds: the head's
+/// candidate read on every native proposal (rank 0) and the row handle in the
+/// verify answer. `reads: false` is a sampler owner that forgot the read.
+struct SampledFan {
+    inner: ThreadedFanout,
+    reads: bool,
+}
+
+impl MeshFanout for SampledFan {
+    fn admit(&mut self, admit: &LaneAdmit) -> Result<(), RankError> {
+        self.inner.admit(admit)
+    }
+    fn release(&mut self, epoch: &RequestEpoch) -> Result<(), RankError> {
+        self.inner.release(epoch)
+    }
+    fn begin(&mut self, start: &WindowStart) -> Result<Vec<RankReady>, RankError> {
+        self.inner.begin(start)
+    }
+    fn reject(&mut self, key: &MeshStepKey) {
+        self.inner.reject(key)
+    }
+    fn draft(&mut self, round: &DraftRound) -> Result<Vec<RankDraftResult>, RankError> {
+        let mut results = self.inner.draft(round)?;
+        if self.reads {
+            for proposal in results
+                .iter_mut()
+                .filter_map(|r| r.proposals.as_mut())
+                .flatten()
+            {
+                proposal.read = Some(DraftRead::Candidates(vec![
+                    (0, 1.8),
+                    (2, 1.7),
+                    (1, 0.2),
+                    (5, 1.0),
+                    (3, 0.1),
+                    (7, 0.9),
+                    (4, -0.5),
+                    (6, -1.0),
+                ]));
+            }
+        }
+        Ok(results)
+    }
+    fn verify(&mut self, plan: &VerifyPlan) -> Result<Vec<RankVerifyResult>, RankError> {
+        let mut results = self.inner.verify(plan)?;
+        let rows = RowHandle::new(ConstRows(
+            (0..SAMPLED_VOCAB).map(|i| 2.0 - 0.4 * i as f32).collect(),
+        ));
+        for sampler in results.iter_mut().filter_map(|r| r.sampler.as_mut()) {
+            sampler.rows = Some(rows.clone());
+        }
+        Ok(results)
+    }
+    fn prepare(&mut self, d: &CommitDecision) -> Result<Vec<PreparedReceipt>, RankError> {
+        self.inner.prepare(d)
+    }
+    fn publish(&mut self, d: &CommitDecision) -> Vec<Option<String>> {
+        self.inner.publish(d)
+    }
+    fn abort(&mut self, key: &MeshStepKey, phase: StepPhase, reason: &str) {
+        self.inner.abort(key, phase, reason)
+    }
+    fn evidence(&mut self, key: &MeshStepKey) -> Vec<Option<RankCostEvidence>> {
+        self.inner.evidence(key)
+    }
+}
+
+fn sampled_req(tag: u64) -> LaneRequest {
+    LaneRequest {
+        sampling: SamplingMode::Leviathan,
+        ..req(tag, 64)
+    }
+}
+
+fn sampled_run(seed: u64, reads: bool) -> Result<Vec<u32>, ProtocolError> {
+    let mut root = root(false);
+    let mut fan = SampledFan {
+        inner: fanout_with(vec![script(1, 0, &[3, 3, 3], &[0, 0, 0, 0])], |_, _| {}),
+        reads,
+    };
+    let a = root
+        .admit_lane(LaneAdmission {
+            epoch: epoch(1),
+            position: 10,
+            seed: 9,
+            eos: None,
+            rng_seed: seed,
+            prompt: vec![1, 2, 3],
+            spec_k: Some(3),
+            head: HeadState::Aligned,
+            copy: false,
+            head_lag: Vec::new(),
+        })
+        .unwrap();
+    fan.admit(&a).unwrap();
+    let mut sampler = LaneSampler::new(SAMPLED_VOCAB);
+    sampler
+        .admit(
+            epoch(1),
+            &SpecRequestConfig {
+                temp: 1.0,
+                rng_seed: seed,
+                ..SpecRequestConfig::default()
+            },
+            &[1, 2, 3],
+            9,
+        )
+        .unwrap();
+    let driven = drive_step(
+        &mut root,
+        &mut fan,
+        None,
+        &[sampled_req(1)],
+        &budgets(LabRoutes::Batched, 3),
+        &mut sampler,
+    );
+    let emitted = driven.map(|d| d.output.lanes[0].emitted.clone());
+    if emitted.is_ok() {
+        // `on_publish` ran: the lane stays registered (not terminal) and the
+        // sampler dropped its row handle.
+        assert!(sampler.is_registered(&epoch(1)));
+    }
+    fan.inner.finish();
+    emitted
+}
+
+#[test]
+fn mesh_lane_ep_sampled_lane_draws_on_the_root_from_the_ranks_reads() {
+    let first = sampled_run(7, true).expect("a sampled step on two scripted ranks");
+    assert!(!first.is_empty() && first.iter().all(|&t| (t as usize) < SAMPLED_VOCAB));
+    // Root-only RNG: the same seed replays the same tokens regardless of the
+    // ranks (the scripted picks are all 0, the draws are not).
+    assert_eq!(sampled_run(7, true).unwrap(), first);
+    // Over a few seeds the draws are not the scripted argmax stream.
+    let any_drawn = (0..16u64).any(|seed| sampled_run(seed, true).unwrap() != vec![0, 0, 0, 0]);
+    assert!(
+        any_drawn,
+        "sampled acceptance must draw, not follow the picks"
+    );
+}
+
+#[test]
+fn mesh_lane_ep_sampled_lane_without_the_head_read_aborts_the_step() {
+    // The driver hands the rule every proposal (`collect_draft_with`): a
+    // Leviathan lane with no candidate read is an abort, never a silent
+    // greedy proposal.
+    let error = sampled_run(7, false).expect_err("a Leviathan proposal needs its read");
+    assert!(matches!(error, ProtocolError::Aborted(_)), "{error}");
+}
