@@ -349,6 +349,127 @@ static __device__ __forceinline__ void gemv_q8_0_row_multi(
             sum[r] += __shfl_down(sum[r], offset);
 }
 
+// gemv_q8_0 (gemv_q8_0.hip) over `rows` (1..=8) activation rows at
+// K % 64 == 0 (x row stride K, y row stride M), Q8_ROWS_W weight rows per
+// wave. Each 8-block (272 B) chunk of the wave's rows is copied into LDS
+// with dword loads (the next chunk's loads in flight while the current one
+// is consumed), each x value is loaded once per wave, and every
+// (weight row, activation row) sum runs gemv_q8_0's per-lane order and tree,
+// so every output is bitwise gemv_q8_0's. Per-lane byte and scale loads
+// (gemv_q8_0's) issue ~4x the memory instructions per weight byte, and one
+// weight row per wave re-reads x per row. Grid [ceil(M / Q8_ROWS_W)], block 32.
+#define Q8_ROWS_W 4
+template <int R>
+static __device__ __forceinline__ void gemv_q8_0_rows_tile(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K, int row0, int lane,
+    unsigned int (&staged)[Q8_ROWS_W][68]
+) {
+    constexpr int W = Q8_ROWS_W;
+    constexpr int CHUNK = 68; // dwords per 8 blocks
+    const int blocks_per_row = K / 32;
+    const unsigned int* src[W];
+#pragma unroll
+    for (int w = 0; w < W; ++w) {
+        // A ragged last tile re-reads row M - 1 and skips its stores.
+        const int row = row0 + w < M ? row0 + w : M - 1;
+        src[w] = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * blocks_per_row * 34);
+    }
+    float sum[W][R];
+#pragma unroll
+    for (int w = 0; w < W; ++w)
+#pragma unroll
+        for (int r = 0; r < R; ++r) sum[w][r] = 0.0f;
+    const int outer_iters = blocks_per_row / 8;
+    unsigned int v[W][3];
+    auto load = [&](int oi) {
+#pragma unroll
+        for (int w = 0; w < W; ++w) {
+            const unsigned int* s = src[w] + oi * CHUNK;
+            v[w][0] = s[lane];
+            v[w][1] = s[lane + 32];
+            v[w][2] = lane < CHUNK - 64 ? s[lane + 64] : 0u;
+        }
+    };
+    if (outer_iters > 0) load(0);
+    for (int oi = 0; oi < outer_iters; oi++) {
+#pragma unroll
+        for (int w = 0; w < W; ++w) {
+            staged[w][lane] = v[w][0];
+            staged[w][lane + 32] = v[w][1];
+            if (lane < CHUNK - 64) staged[w][lane + 64] = v[w][2];
+        }
+        // One wave: its LDS accesses complete in order, so no workgroup fence.
+        __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+        if (oi + 1 < outer_iters) load(oi + 1);
+#pragma unroll
+        for (int sub = 0; sub < 8; sub++) {
+            const int bi = oi * 8 + sub;
+            float xv[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) xv[r] = x[(size_t)r * K + bi * 32 + lane];
+#pragma unroll
+            for (int w = 0; w < W; ++w) {
+                const unsigned char* block =
+                    reinterpret_cast<const unsigned char*>(staged[w]) + sub * 34;
+                float d = (float)*((const _Float16*)block);
+                signed char qval = (signed char)block[2 + lane];
+#pragma unroll
+                for (int r = 0; r < R; ++r) sum[w][r] += d * (float)qval * xv[r];
+            }
+        }
+        __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    }
+    for (int bi = outer_iters * 8; bi < blocks_per_row; bi++) {
+        float xv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) xv[r] = x[(size_t)r * K + bi * 32 + lane];
+#pragma unroll
+        for (int w = 0; w < W; ++w) {
+            const unsigned char* block = reinterpret_cast<const unsigned char*>(src[w]) + bi * 34;
+            float d = (float)*((const _Float16*)block);
+            signed char qval = (signed char)block[2 + lane];
+#pragma unroll
+            for (int r = 0; r < R; ++r) sum[w][r] += d * (float)qval * xv[r];
+        }
+    }
+#pragma unroll
+    for (int w = 0; w < W; ++w)
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum[w][r] += __shfl_down(sum[w][r], offset);
+    if (lane != 0) return;
+#pragma unroll
+    for (int w = 0; w < W; ++w)
+        if (row0 + w < M)
+#pragma unroll
+            for (int r = 0; r < R; ++r) y[(size_t)r * M + row0 + w] = sum[w][r];
+}
+
+__launch_bounds__(32)
+extern "C" __global__ void gemv_q8_0_rows(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K, int rows
+) {
+    const int row0 = (int)blockIdx.x * Q8_ROWS_W;
+    if (row0 >= M) return;
+    const int lane = threadIdx.x;
+    __shared__ __align__(16) unsigned int staged[Q8_ROWS_W][68];
+    switch (rows) {
+#define Q8_ROWS(R)                                                                     \
+    case R:                                                                            \
+        gemv_q8_0_rows_tile<R>(A_q8, x, y, M, K, row0, lane, staged);                  \
+        return;
+    Q8_ROWS(1) Q8_ROWS(2) Q8_ROWS(3) Q8_ROWS(4) Q8_ROWS(5) Q8_ROWS(6) Q8_ROWS(7) Q8_ROWS(8)
+#undef Q8_ROWS
+    }
+}
+
 template <int R>
 static __device__ __forceinline__ void gemv_q8_0_k8_rows_body(
     const unsigned char* __restrict__ A_q8,
