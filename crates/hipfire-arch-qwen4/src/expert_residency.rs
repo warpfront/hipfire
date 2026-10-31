@@ -249,8 +249,10 @@ pub fn resident_split(
 }
 
 /// [`resident_split`] for one rank of a `ranks`-way expert-parallel load: the
-/// non-expert bytes are replicated on every rank, the layer-0 routed-expert
-/// bytes are the per-expert bytes times `max_local_count` (the largest rank's
+/// non-expert bytes are replicated on every rank (a non-routed entry placed in
+/// host RAM, [`place_embedding_host`], takes no device bytes and is left out),
+/// the layer-0 routed-expert bytes are the per-expert bytes times
+/// `max_local_count` (the largest rank's
 /// share; an uneven split gives the low ranks one more expert).
 pub fn resident_split_ranks(
     weights: &[WeightEntry],
@@ -269,7 +271,9 @@ pub fn resident_split_ranks(
         let bytes =
             bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
         if !is_routed_expert(&entry.name) {
-            non_expert += bytes;
+            if takes_device_non_expert_bytes(entry) {
+                non_expert += bytes;
+            }
         } else if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
             layer_arena_max = layer_arena_max.max(rank_share(entry, bytes, 0, ranks)?);
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
@@ -1114,9 +1118,11 @@ fn band_weight_census(
         }
         let bytes = payload(entry)?;
         if !is_routed_expert(&entry.name) {
-            non_expert = non_expert
-                .checked_add(bytes)
-                .ok_or_else(|| overflow("non-expert bytes"))?;
+            if takes_device_non_expert_bytes(entry) {
+                non_expert = non_expert
+                    .checked_add(bytes)
+                    .ok_or_else(|| overflow("non-expert bytes"))?;
+            }
         } else if entry.name.starts_with("mtp.") {
             mtp = mtp
                 .checked_add(bytes)
@@ -3086,6 +3092,35 @@ pub fn place_routed_experts_set(weights: &mut [WeightEntry], resident: &[usize])
         }
     }
     moved
+}
+
+/// Mark the replicated token embedding table ([`crate::weights::QWEN4_EMBED`])
+/// [`WeightResidency::HostMapped`]: an expert-parallel rank pins its own copy in
+/// host RAM and the embedding kernels read the rows they gather (one row per
+/// decoded token, one per prompt token of a prefill chunk) zero-copy over the
+/// link through the device alias, so the table takes no device bytes
+/// ([`resident_split_ranks`] leaves it out of the non-expert bytes). The tied
+/// MTP alias has no payload of its own and stays as it is, and an entry already
+/// placed (or absent) is untouched. Returns the number of entries moved (0 or 1).
+pub fn place_embedding_host(weights: &mut [WeightEntry]) -> usize {
+    let mut moved = 0;
+    for entry in weights.iter_mut() {
+        if entry.name != crate::weights::QWEN4_EMBED
+            || entry.residency != WeightResidency::Resident
+            || matches!(entry.policy, ShardPolicy::Tied { .. })
+        {
+            continue;
+        }
+        entry.residency = WeightResidency::HostMapped;
+        moved += 1;
+    }
+    moved
+}
+
+/// Whether `entry` takes device bytes in a non-expert census: it does unless it
+/// is a non-routed entry placed in host RAM ([`place_embedding_host`]).
+fn takes_device_non_expert_bytes(entry: &WeightEntry) -> bool {
+    entry.residency != WeightResidency::HostMapped
 }
 
 /// Pinned host bytes the [`WeightResidency::HostMapped`] entries will take.
@@ -7243,6 +7278,155 @@ mod tests {
         assert!(routed_expert_bytes_ranks(&manifest.weights, element_bytes, 0).is_err());
         // A stack whose bytes are not a multiple of its expert count is refused.
         assert!(resident_split_ranks(&manifest.weights, |_| Some(1), 3).is_err());
+    }
+
+    /// The Q8_0 embedding table of the Flash-Next artifact (248320 x 2560).
+    const FN_EMBED_Q8_BYTES: u64 = 675_430_400;
+
+    /// `element_bytes` with the real Q8 size for the embedding table.
+    fn embed_q8_bytes(entry: &WeightEntry) -> Option<u64> {
+        if entry.name == crate::weights::QWEN4_EMBED {
+            Some(FN_EMBED_Q8_BYTES)
+        } else {
+            element_bytes(entry)
+        }
+    }
+
+    #[test]
+    fn place_embedding_host_flips_exactly_the_embed_entry() {
+        let config = crate::config::compact_test_config();
+        assert!(config.mtp.is_some());
+        let mut weights = crate::weights::Qwen4Manifest::build(&config)
+            .expect("FN manifest")
+            .weights;
+        let before = weights.clone();
+        assert_eq!(place_embedding_host(&mut weights), 1);
+        for (placed, original) in weights.iter().zip(&before) {
+            if original.name == crate::weights::QWEN4_EMBED {
+                assert_eq!(original.residency, WeightResidency::Resident);
+                assert_eq!(placed.residency, WeightResidency::HostMapped);
+                assert_eq!(placed.policy, original.policy);
+            } else {
+                assert_eq!(placed, original, "{}", original.name);
+            }
+        }
+        // The MTP head's embedding is a tied alias of it: no payload of its
+        // own, never marked.
+        let alias = weights
+            .iter()
+            .find(|entry| entry.name == "mtp.embed_tokens.weight")
+            .expect("tied MTP embedding");
+        assert!(matches!(alias.policy, ShardPolicy::Tied { .. }));
+        assert_eq!(alias.residency, WeightResidency::Resident);
+        // Placed once; an entry already host-mapped (or no embed entry) is a no-op.
+        assert_eq!(place_embedding_host(&mut weights), 0);
+        weights.retain(|entry| entry.name != crate::weights::QWEN4_EMBED);
+        assert_eq!(place_embedding_host(&mut weights), 0);
+    }
+
+    #[test]
+    fn host_mapped_embed_leaves_the_device_census_and_joins_the_host_bytes() {
+        let config = crate::config::compact_test_config();
+        let single = crate::weights::Qwen4BandScope::single(&config);
+        let base = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        // The single-device census agrees with the band census either way.
+        let mut local = base.weights.clone();
+        let (resident_non_expert, layer) = resident_split(&local, embed_q8_bytes).unwrap();
+        place_embedding_host(&mut local);
+        let (host_non_expert, host_layer) = resident_split(&local, embed_q8_bytes).unwrap();
+        assert_eq!(host_non_expert, resident_non_expert - FN_EMBED_Q8_BYTES);
+        assert_eq!(host_layer, layer);
+        assert_eq!(
+            band_weight_census(&local, &embed_q8_bytes, &single)
+                .unwrap()
+                .non_expert,
+            host_non_expert
+        );
+        for ranks in [2usize, 3, 4, 8] {
+            let mut ep = base
+                .clone()
+                .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks })
+                .expect("EP manifest")
+                .weights;
+            let (device0, layer0) = resident_split_ranks(&ep, embed_q8_bytes, ranks).unwrap();
+            let routed_host0 = {
+                let mut placed = ep.clone();
+                place_routed_experts(&mut placed, 7);
+                host_mapped_bytes_ranks(&placed, embed_q8_bytes, ranks).unwrap()
+            };
+            assert_eq!(place_embedding_host(&mut ep), 1);
+            // The replicated trunk drops by exactly the table; the per-layer
+            // expert bytes are untouched.
+            assert_eq!(
+                resident_split_ranks(&ep, embed_q8_bytes, ranks),
+                Ok((device0 - FN_EMBED_Q8_BYTES, layer0)),
+                "ranks={ranks}"
+            );
+            // Every rank pins its own whole copy of the table (plus one pad).
+            let embed_host = FN_EMBED_Q8_BYTES + HOST_MAPPED_PAD_BYTES;
+            assert_eq!(
+                host_mapped_bytes_ranks(&ep, embed_q8_bytes, ranks),
+                Ok(vec![embed_host; ranks]),
+                "ranks={ranks}"
+            );
+            let mut placed = ep.clone();
+            place_routed_experts(&mut placed, 7);
+            let routed_host1 = host_mapped_bytes_ranks(&placed, embed_q8_bytes, ranks).unwrap();
+            for (before, after) in routed_host0.iter().zip(&routed_host1) {
+                assert_eq!(*after, before + embed_host, "ranks={ranks}");
+            }
+            assert_eq!(
+                host_mapped_bytes(&placed, embed_q8_bytes).unwrap(),
+                {
+                    let mut unplaced = base.weights.clone();
+                    place_routed_experts(&mut unplaced, 7);
+                    host_mapped_bytes(&unplaced, embed_q8_bytes).unwrap()
+                } + embed_host
+            );
+            // The hot-set host census counts the table the same way.
+            let hotset_with = hotset_host_mapped_bytes(&ep, embed_q8_bytes, 7).unwrap();
+            let hotset_without =
+                hotset_host_mapped_bytes(&base.weights, embed_q8_bytes, 7).unwrap();
+            assert_eq!(hotset_with, hotset_without + embed_host, "ranks={ranks}");
+        }
+    }
+
+    #[test]
+    fn host_mapped_embed_buys_the_ep2_plan_a_resident_layer() {
+        let config = crate::config::compact_test_config();
+        let base = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let mut ep = base
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .expect("EP manifest")
+            .weights;
+        // The compact test manifest's census moves by exactly the table.
+        let (census, _) = resident_split_ranks(&ep, embed_q8_bytes, 2).unwrap();
+        place_embedding_host(&mut ep);
+        let (freed_census, _) = resident_split_ranks(&ep, embed_q8_bytes, 2).unwrap();
+        assert_eq!(freed_census, census - FN_EMBED_Q8_BYTES);
+        // The Flash-Next mq4 EP2 plan at its measured sizes: the replicated
+        // trunk (5_115 MiB, embed table included), one MoE layer's experts
+        // per rank (1_336_934_400 / 2 B) and the census reserve. A card that
+        // holds exactly 20 resident layers with the table on it keeps exactly
+        // one more once the 644 MiB table leaves it: the table is more than
+        // one 637 MiB layer and less than two.
+        let (non_expert, layer, reserve) = (5_115u64 << 20, 1_336_934_400u64 / 2, 6_656u64 << 20);
+        assert!(FN_EMBED_Q8_BYTES > layer && FN_EMBED_Q8_BYTES < 2 * layer);
+        let free = non_expert + reserve + 20 * layer;
+        assert_eq!(
+            ep_vram_layers(&config, &[free; 2], non_expert, layer, reserve),
+            20
+        );
+        assert_eq!(
+            ep_vram_layers(
+                &config,
+                &[free; 2],
+                non_expert - FN_EMBED_Q8_BYTES,
+                layer,
+                reserve
+            ),
+            21
+        );
     }
 
     #[test]

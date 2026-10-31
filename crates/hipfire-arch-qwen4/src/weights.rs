@@ -211,6 +211,10 @@ const QWEN4_Q8_MARKERS: &[&str] = &["embed_tokens.weight"];
 /// 46% (shared expert, no fast exact multi-row Q8 GEMM) for no decode speed.
 pub(crate) const QWEN4_LM_HEAD: &str = "lm_head.weight";
 
+/// The input token embedding table (Q8_0 in a Flash-Next artifact). The MTP
+/// head's `mtp.embed_tokens.weight` is a tied alias of it.
+pub const QWEN4_EMBED: &str = "model.language_model.embed_tokens.weight";
+
 fn qwen4_q8_dtype(name: &str) -> bool {
     QWEN4_Q8_MARKERS.iter().any(|marker| name.ends_with(marker))
 }
@@ -1078,7 +1082,7 @@ impl Qwen4Manifest {
         );
         weights.push(
             model(
-                "model.language_model.embed_tokens.weight",
+                QWEN4_EMBED,
                 vec![config.vocab_size, hidden],
                 DType::BF16,
                 ShardPolicy::Pin(PinTarget::Embed),
@@ -1106,7 +1110,7 @@ impl Qwen4Manifest {
                     vec![config.vocab_size, hidden],
                     DType::BF16,
                     ShardPolicy::Tied {
-                        source: "model.language_model.embed_tokens.weight".to_string(),
+                        source: QWEN4_EMBED.to_string(),
                     },
                     &bf16,
                 )
@@ -3440,7 +3444,7 @@ fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError
     let hidden = config.hidden_size;
     let hc_wide = config.hc_count * hidden;
     let embedding = TensorRef::new(
-        "model.language_model.embed_tokens.weight",
+        QWEN4_EMBED,
         TensorRole::TokenEmbedding,
         None,
         vec![config.vocab_size, hidden],
