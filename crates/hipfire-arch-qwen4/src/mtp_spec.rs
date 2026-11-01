@@ -10087,7 +10087,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     return false;
                 }
                 run.restart =
-                    bundle.session_plan_capped(prompt_tokens, SessionRoute::Mtp, prompt_len);
+                    bundle.rank_session_plan(prompt_tokens, SessionRoute::Mtp, prompt_len);
                 true
             },
             |run| run.restart,

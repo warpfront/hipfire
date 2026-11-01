@@ -3807,12 +3807,17 @@ pub fn generate_dflash(
         // sessions are not distributed); `plan_qwen4_session` returns 0 for a
         // mesh on the MTP route. DFlash2 never runs on a mesh.
         let mut start = plan_qwen4_session(m, &prompt_tokens, route);
-        // DFlash2 resumes only where its draft context can restart.
-        if m.speculator
-            .as_ref()
-            .is_some_and(|s| !s.can_resume_at(&prompt_tokens, start))
-        {
-            start = 0;
+        // DFlash2 resumes only where its draft context can restart: fall
+        // back to the deepest reuse point it can resume, else cold.
+        if let (Some(spec), Some(b)) = (m.speculator.as_ref(), m.qwen4()) {
+            if start > 0 && !spec.can_resume_at(&prompt_tokens, start) {
+                start = hipfire_runtime::arch_model::ArchModel::session_plan_resumable(
+                    b,
+                    &prompt_tokens,
+                    route,
+                    &|s| spec.can_resume_at(&prompt_tokens, s),
+                );
+            }
         }
         let start_is_live = m
             .qwen4()

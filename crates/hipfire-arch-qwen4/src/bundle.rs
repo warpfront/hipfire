@@ -4288,11 +4288,10 @@ impl Qwen4Bundle {
         Some(result)
     }
 
-    /// [`ArchModel::session_plan`](hipfire_runtime::arch_model::ArchModel::session_plan)
-    /// restricted to reuse points `<= cap` ([`SessionDriver::plan_capped`]).
-    /// With `cap = prompt.len()` it is the plain plan; the EP mesh lowers `cap`
-    /// until every rank agrees on one reuse point.
-    pub(crate) fn session_plan_capped(
+    /// This rank's own session-driver plan restricted to reuse points `<= cap`
+    /// ([`SessionDriver::plan_capped`]), ignoring any PP/EP mesh; the EP mesh
+    /// lowers `cap` until every rank agrees on one reuse point.
+    pub(crate) fn rank_session_plan(
         &self,
         prompt: &[u32],
         route: SessionRoute,
@@ -4570,7 +4569,7 @@ impl Qwen4Bundle {
             reused,
             |bundle, start| bundle.prefill_final_from(gpu, prompt, start, logits),
             |bundle| bundle.take_npu_trunk_fault(),
-            |bundle| bundle.session_plan_capped(prompt, SessionRoute::Ar, prompt.len()),
+            |bundle| bundle.rank_session_plan(prompt, SessionRoute::Ar, prompt.len()),
         )
     }
 
@@ -5651,18 +5650,16 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
         Qwen4Bundle::session_request_write_limit(self, through);
     }
 
-    fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+    fn session_plan_capped(&self, prompt: &[u32], route: SessionRoute, cap: usize) -> usize {
         // Under an attached PP mesh only the aggregate record plans
         // (`pp_session_plan`); a root-only plan would restore one band.
         if self.pp.is_some() {
             return 0;
         }
         if self.ep.is_some() {
-            return self.ep_session_plan(prompt, route);
+            return self.ep_session_plan(prompt, route, cap);
         }
-        self.session
-            .as_ref()
-            .map_or(0, |session| session.plan(self, prompt, route))
+        self.rank_session_plan(prompt, route, cap)
     }
 
     fn session_commit(&mut self) {
