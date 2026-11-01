@@ -946,16 +946,30 @@ pub trait Speculator {
     /// this prompt cache drafts from those rows), and return the next token:
     /// the target's argmax, or for a sampled request on a speculator with
     /// [`Self::supports_sampled_ar_step`] a draw from the request's sampling
-    /// law. No draft runs.
+    /// law. No draft runs. `emitted` is the committed generation so far with
+    /// the pending `seed` last, as [`Self::step`] receives it: the penalty
+    /// history of a speculator that [`Self::supports_penalties`].
     fn ar_step(
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        emitted: &[u32],
     ) -> Result<u32, String> {
-        let _ = (gpu, target, position, seed);
+        let _ = (gpu, target, position, seed, emitted);
         Err(format!("{}: speculator has no AR step", self.name()))
+    }
+
+    /// Whether this speculator reproduces AR under non-neutral
+    /// repeat/presence/frequency penalties: every verify row (and the AR
+    /// step) is penalized against `suffix_W(history || emitted || earlier
+    /// drafts)` with AR's own arithmetic, `history` being the prompt unless
+    /// [`SpecRequestConfig::penalty_generated_only`]. Route selection admits
+    /// a penalized request to a speculator only when this is `true`.
+    /// Default `false`: the speculator refuses or ignores penalties.
+    fn supports_penalties(&self) -> bool {
+        false
     }
 
     /// Whether [`Self::ar_step`] samples a temperature > 0 request with the
@@ -1199,6 +1213,12 @@ pub struct SpecRequestConfig {
     /// [`Speculator::token_logits`] keeps the target logit row behind each
     /// emitted token. Default `false`, which keeps no rows.
     pub logprobs: bool,
+    /// The three penalties see the generated tokens only, not the rendered
+    /// prompt (Raon's AR producer: `penalty_generated_only`). Default `false`:
+    /// every other producer penalizes `prompt ‖ generated`. Read by the
+    /// speculators that own a [`crate::spec_sampling::PenaltyHistory`]; they
+    /// seed it with an empty prompt when set.
+    pub penalty_generated_only: bool,
 }
 
 impl Default for SpecRequestConfig {
@@ -1219,6 +1239,7 @@ impl Default for SpecRequestConfig {
             frequency_penalty: 0.0,
             stop_sequences: false,
             logprobs: false,
+            penalty_generated_only: false,
         }
     }
 }
@@ -1242,7 +1263,8 @@ impl SpecRequestConfig {
     /// exact predicate `sampler::sample_cpu` (and the GPU sampler) applies.
     /// A penalty-capable verifier reproduces AR only if every verify row
     /// is penalized against `suffix_W(prompt || emitted || earlier drafts)`
-    /// — the full rendered prompt included, not the generated ids alone.
+    /// — the full rendered prompt included, not the generated ids alone —
+    /// unless [`Self::penalty_generated_only`] drops the prompt.
     pub fn penalties_active(&self) -> bool {
         self.repeat_window > 0
             && (self.repeat_penalty != 1.0

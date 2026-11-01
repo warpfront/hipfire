@@ -81,7 +81,14 @@
 # equal to one uncut card, so PP-R is a valid reference when one card would need more pinned host RAM than the host
 # has. With --mtp the arms `single-mtp` (`ref-ppR-mtp`) and `ppN-mtp` also run. The arms clear inherited
 # HIPFIRE_PP_LAYERS / HIPFIRE_MESH_TRANSPORT / HIPFIRE_TOPOLOGY_PP / HIPFIRE_MTP_* and the expert-placement variables
-# the loader refuses under pp (HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS, _EXPERT_HOTSET, _EXPERT_STAGE, _TURN_SNAPSHOTS).
+# the loader refuses under pp (HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS, _EXPERT_HOTSET, _EXPERT_STAGE, _TURN_SNAPSHOTS) and
+# HIPFIRE_PREFILL_CHUNK_ROWS. Prefill chunk (changes numerics, so a pair is only comparable at one chunk): every PP load
+# negotiates its own canonical chunk from its cards' free VRAM, so the reference arm runs FIRST unpinned, its logged
+# `qwen4 PP canonical chunk: N rows` (a single-card reference: `qwen4 prefill chunk: N rows`) is read back
+# (scripts/fn_ep_gate_chunk.py) and pinned as HIPFIRE_PREFILL_CHUNK_ROWS=N on the target arm, the MTP arms and every
+# speed cell; a target whose bands cannot admit N fails its load with the loader's explicit-chunk refusal. A
+# HIPFIRE_PREFILL_CHUNK_ROWS=N in EXTRA_ENV wins and pins every arm (the reference included). The chunk and how it was
+# chosen are recorded in receipt.json (`config.pp_prefill_chunk`) and summary.txt.
 # Comparison: OUT_DIR/pp_compare.py (it reuses the helpers of scripts/fn_ep_compare.py, which itself needs EP rank
 # mirrors). Only when both metas carry canonical_state and ranks == pp are `ranks` not compared; then meta
 # (completed, tokens, max_seq, spec, steps_run, prompts, state_steps, vocab), every logits/window/tokens/state
@@ -262,6 +269,11 @@ STARTED=$(date -u +%FT%TZ)
 RECEIPT_DONE=0
 MTP_STATE="not run" SPEED_FAIL=0 PP_ANY_ERR=0 PP_ANY_FAIL=0 PAIR_RC=0 PAIR_STATE=""
 PP_PINNED_MTP=(HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_NGRAM=off)
+# PP prefill chunk: both arms of a pair must load the same canonical chunk (the chunk changes numerics).
+# PP_CHUNK_DERIVED is the chunk the reference arm settled on, pinned on every later arm; an explicit
+# HIPFIRE_PREFILL_CHUNK_ROWS in EXTRA_ENV wins (PP_CHUNK_USER). PP_CHUNK/PP_CHUNK_HOW are what the receipt records.
+PP_CHUNK="" PP_CHUNK_HOW="not applicable" PP_CHUNK_DERIVED="" PP_CHUNK_USER=""
+CHUNK_HELPER=$(dirname "${BASH_SOURCE[0]}")/fn_ep_gate_chunk.py
 
 # ------------------------------------------------------------------ receipt
 write_receipt() {
@@ -273,7 +285,7 @@ write_receipt() {
     GATE_SKIP_SPEED=$SKIP_SPEED GATE_NO_ISOLATE=$NO_ISOLATE GATE_EXTRA_ENV=$EXTRA_ENV \
     GATE_LONG_TOKENS=$LONG_PROMPT_TOKENS GATE_REF_RANKS=$REF_RANKS GATE_REF_ARM=$REF_ARM \
     GATE_MODE=$MODE GATE_TARGET_ARM=$MODE$N GATE_PP_LAYERS=$PP_LAYERS GATE_TRANSPORT=$TRANSPORT GATE_MTP=$MTP \
-    GATE_MTP_STATE=$MTP_STATE GATE_SPEED_FAIL=$SPEED_FAIL \
+    GATE_MTP_STATE=$MTP_STATE GATE_SPEED_FAIL=$SPEED_FAIL GATE_PP_CHUNK=$PP_CHUNK GATE_PP_CHUNK_HOW="$PP_CHUNK_HOW" \
     GATE_RESERVE_ARMS=$RESERVE_ARMS GATE_MIN_RESIDENT=$MIN_RESIDENT
   python3 - <<'PY' || echo "fn-ep-gate: WARNING: receipt writer failed" >&2
 import json, os, re, statistics, datetime
@@ -576,6 +588,10 @@ if mode == "pp":
     receipt["config"].update({
         "mode": "pp", "pp": n, "ref_pp": ref_ranks, "target_arm": target_arm,
         "pp_layers_requested": E.get("GATE_PP_LAYERS") or None,
+        "pp_prefill_chunk": {
+            "rows": int(E["GATE_PP_CHUNK"]) if (E.get("GATE_PP_CHUNK") or "").isdigit() else None,
+            "how": E.get("GATE_PP_CHUNK_HOW"),
+        },
         "transport_requested": E.get("GATE_TRANSPORT"),
         "mtp": mtp,
         "mtp_pinned_env": "HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_NGRAM=off; oracle --spec mtp --temp 0 --ngram off" if mtp else None,
@@ -599,6 +615,7 @@ if mode == "pp":
         E.get("GATE_TRANSPORT"), E.get("GATE_PP_LAYERS") or "uniform",
         "one card (host-mapped experts by default)" if ref_ranks == 1 else "PP%d on the first %d cards, uniform bands" % (ref_ranks, ref_ranks)))
     lines.append("ref_ranks=%d  mtp exactness pair: %s" % (ref_ranks, "on" if mtp else "off"))
+    lines.append("prefill chunk: %s (%s)" % ("%s rows on every arm" % E["GATE_PP_CHUNK"] if E.get("GATE_PP_CHUNK") else "unpinned", E.get("GATE_PP_CHUNK_HOW")))
 elif mode == "reserve":
     lines.append("mode=reserve  arch=%s  EP%s  hipfire devices: %s  (off arm: HIPFIRE_EP_RESERVE_DECOUPLE=0; on arm: HIPFIRE_EP_RESERVE_DECOUPLE=1; one binary)" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
     lines.append("prompt chunk rows 4096 (never lowered)  min resident layers/rank %s  arms: %s" % (E.get("GATE_MIN_RESIDENT"), " ".join(arm_names)))
@@ -997,7 +1014,8 @@ arm_env() {
   # PP mode: everything an arm pins, and every placement variable the loader refuses under pp, is cleared first so
   # an inherited value cannot leak into (or break) an arm.
   if [[ $MODE == pp ]]; then
-    unset_pp=(-u HIPFIRE_PP_LAYERS -u HIPFIRE_MESH_TRANSPORT -u HIPFIRE_TOPOLOGY_PP
+    # HIPFIRE_PREFILL_CHUNK_ROWS is cleared too: the chunk is the gate's (derived from the reference arm) or EXTRA_ENV's.
+    unset_pp=(-u HIPFIRE_PP_LAYERS -u HIPFIRE_MESH_TRANSPORT -u HIPFIRE_TOPOLOGY_PP -u HIPFIRE_PREFILL_CHUNK_ROWS
       -u HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS -u HIPFIRE_QWEN4_EXPERT_HOTSET -u HIPFIRE_QWEN4_EXPERT_STAGE
       -u HIPFIRE_QWEN4_TURN_SNAPSHOTS -u HIPFIRE_MTP_AR_FLOOR -u HIPFIRE_MTP_INCREMENTAL -u HIPFIRE_MTP_NGRAM)
   fi
@@ -1016,6 +1034,8 @@ arm_env() {
       ARM_ENV+=("HIPFIRE_MESH_TRANSPORT=$TRANSPORT")
       [[ -z $layers ]] || ARM_ENV+=("HIPFIRE_PP_LAYERS=$layers")
     fi
+    # The chunk the reference arm settled on (before EXTRA_ENV, which can override it).
+    [[ -z $PP_CHUNK_DERIVED ]] || ARM_ENV+=("HIPFIRE_PREFILL_CHUNK_ROWS=$PP_CHUNK_DERIVED")
   fi
   if ((NO_ISOLATE == 0)); then
     local home=$OUT/home-$arm
@@ -1471,11 +1491,43 @@ pp_eval_pair() {
   fi
 }
 
+# An explicit HIPFIRE_PREFILL_CHUNK_ROWS in EXTRA_ENV is every arm's chunk (it reaches the arms through EXTRA_ENV).
+pp_choose_chunk_user() {
+  local rows
+  if rows=$(python3 "$CHUNK_HELPER" user "$EXTRA_ENV"); then
+    PP_CHUNK_USER=$rows PP_CHUNK=$rows PP_CHUNK_HOW="explicit HIPFIRE_PREFILL_CHUNK_ROWS in EXTRA_ENV"
+    log "prefill chunk $PP_CHUNK rows on every arm ($PP_CHUNK_HOW)"
+  fi
+}
+
+# The reference arm loads first and negotiates its own canonical chunk from its cards' free VRAM; the
+# target arm and every later arm are pinned to exactly that chunk, so both arms of every pair load the
+# same chunk. A target whose bands cannot admit it fails its load with the loader's explicit-chunk
+# refusal (a pinned chunk is never lowered); it never silently runs a different chunk.
+pp_choose_chunk_from_reference() {
+  [[ -z $PP_CHUNK_USER ]] || return 0
+  local found
+  if oracle_arm_ok "$REF_ARM" && found=$(python3 "$CHUNK_HELPER" parse "$OUT/oracle/$REF_ARM-receipt/stderr.txt"); then
+    PP_CHUNK_DERIVED=${found%%$'\t'*}
+    PP_CHUNK=$PP_CHUNK_DERIVED
+    PP_CHUNK_HOW="chosen by the $REF_ARM reference arm (${found#*$'\t'}), pinned on every other arm"
+    log "prefill chunk $PP_CHUNK rows on every later arm ($PP_CHUNK_HOW)"
+  else
+    PP_CHUNK_HOW="not pinned: the $REF_ARM reference arm failed or logged no chunk, so no comparison"
+    log "prefill chunk: $PP_CHUNK_HOW"
+  fi
+}
+
 run_pp_gate() {
   write_pp_helpers
   local ref_mtp=$REF_ARM-mtp tgt_mtp=$EPARM-mtp
+  pp_choose_chunk_user
   run_oracle_arm "$REF_ARM" 1 "$REF_DEVS" "$REF_RANKS" "$REF_RANKS" 0 ""
+  pp_choose_chunk_from_reference
   run_oracle_arm "$EPARM" 1 "$DEVS" "$N" "$N" 0 "$PP_LAYERS"
+  if ! oracle_arm_ok "$EPARM" && [[ -n $PP_CHUNK ]]; then
+    log "the $EPARM arm did not load at the pinned $PP_CHUNK-row chunk ($PP_CHUNK_HOW); see oracle/$EPARM-receipt/stderr.txt"
+  fi
   if ((MTP)); then
     run_oracle_arm "$ref_mtp" 1 "$REF_DEVS" "$REF_RANKS" "$REF_RANKS" 1 ""
     run_oracle_arm "$tgt_mtp" 1 "$DEVS" "$N" "$N" 1 "$PP_LAYERS"

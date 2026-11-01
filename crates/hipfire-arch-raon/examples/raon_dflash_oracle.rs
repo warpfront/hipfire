@@ -8,10 +8,10 @@
 //! raon_dflash_oracle capture  --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--max-seq N]
 //! raon_dflash_oracle emit     --model M.hfq --draft D.hfq --prompt-file P.txt --out DIR [--block N] [--max-seq N]
 //! raon_dflash_oracle rowexact --model M.hfq --prompt-file P.txt [--out DIR] [--max-seq N] [--census on [--census-k 2,4]]
-//! raon_dflash_oracle greedy   --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N]
+//! raon_dflash_oracle greedy   --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off]
 //! raon_dflash_oracle rollback  --model M.hfq [--draft D.hfq] --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
 //! raon_dflash_oracle verifygraph --model M.hfq --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
-//! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--out DIR]
+//! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off] [--out DIR]
 //! raon_dflash_oracle costs    --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
 //! raon_dflash_oracle draftgraph --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--block B] [--tokens N] [--out DIR] [--max-seq N]
 //! ```
@@ -66,6 +66,13 @@
 //!   around every call) and prints/writes ms per step for verify, commit
 //!   (full-accept vs replay, replayed rows), head, embed and draft + selector
 //!   (= step - target calls), the verify-rows histogram and AR ms/token.
+//!   `--presence P` / `--frequency F` / `--repeat-penalty R` / `--repeat-window W` (defaults 0 /
+//!   0 / 1.0 = off; see the penalty paragraph below) run both arms penalized: the AR arm
+//!   penalizes each step's logits with the generated-only history (`sampler::apply_logit_policy_cpu`,
+//!   host argmax) and DFlash2 runs with `SpecRequestConfig::penalty_generated_only`. The streams
+//!   must be byte-identical when verify is row-exact (`HIPFIRE_RAON_VERIFY_ROWEXACT=1`); otherwise
+//!   the tie judge applies, judging the decode and verify rows after the same penalization.
+//!   Example: `raon_dflash_oracle greedy --model M.hfq --draft D.hfq --prompt-file P.txt --presence 1.5`.
 //! * `rollback` (recurrence-rollback gate): after prefill, an 8-row block (the
 //!   target's greedy seed plus 7 tokens of its AR greedy chain). For
 //!   `keep` = 1..=7: arm A = restore the post-prefill state, `verify_block`,
@@ -97,6 +104,29 @@
 //!   most frequent DFlash contexts with >= 200 samples) plus AR-vs-DFlash homogeneity per
 //!   position and on joint pairs. PASS iff every p-value > `--alpha` (1e-3) and no token
 //!   falls outside the exact support. Writes `sampled.json`.
+//!   With `--presence P` / `--frequency F` / `--repeat-penalty R` / `--repeat-window W` both arms
+//!   run penalized (generated-only history, as Raon's AR producer): the AR arm penalizes each
+//!   step's logits with `sampler::apply_logit_policy_cpu` over the tokens it emitted so far
+//!   before the law and the draw; the DFlash2 arm is configured with the same penalties and
+//!   `penalty_generated_only`. The law each DFlash2 emitted token is judged against is rebuilt from
+//!   the recorded raw target row, penalized over `emitted prefix (pending seed included once) ++
+//!   earlier drafts of that window` = the emitted prefix of that position, so the gate is the
+//!   same per-position chi-square against the penalized law of the prefix actually emitted.
+//!   Example: `raon_dflash_oracle sampled --model M.hfq --draft D.hfq --prompt-file P.txt --presence 1.5`.
+//! * penalty flags (`sampled`, `greedy`): `--presence P` (default 0), `--frequency F` (0),
+//!   `--repeat-penalty R` (1.0), `--repeat-window W`. The default window is
+//!   `max(128, --tokens)`: 128 is the request default the AR producers use, and
+//!   `RaonSampling::resolve` (hipfire-generate `raon.rs`) widens the window to at least `max_tokens`
+//!   so a generation never forgets its early tokens; here `--tokens` is the generation length, so
+//!   the default window always covers the whole oracle generation. Absent flags leave the
+//!   neutral path unchanged.
+//! * `--draft-penalty on|off` (`sampled`, `greedy`; default: follow `HIPFIRE_DFLASH_DRAFT_PENALTY`,
+//!   itself default on): whether the DFlash2 selector scores its candidates after the request's
+//!   penalties (history = emitted prefix plus the drafts selected for earlier rows, the history
+//!   of the verify row that will judge the draft) or from the raw target head. Output is the
+//!   AR stream / law either way; only tau changes, printed as `tau` (greedy: mean
+//!   tokens/step, sampled: mean tokens/window). A/B it with the same penalty flags:
+//!   `greedy ... --presence 1.5 --draft-penalty on` against `... --draft-penalty off`.
 //! * `costs` (spec-retire policy): device-synced median/mean ms of AR `decode_step`,
 //!   `verify_block` / `verify_block_logits` per row count 1..=`--max-rows` (9), partial
 //!   `commit_prefix` (k = 2 and k = max-rows), the draft sequence and its head, over
@@ -139,13 +169,14 @@ use hipfire_runtime::dflash::{
 };
 use hipfire_runtime::dflash2_spec::{
     build_dflash2_speculator, last_draft_graph_stats, new_draft_scratch, set_draft_graph_override,
-    trace_windows_begin, trace_windows_take, DraftWindowTrace,
+    set_draft_penalty_override, trace_windows_begin, trace_windows_take, DraftWindowTrace,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::sample_top_k_p_with_state;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::prompt_frame::JinjaChatFrame;
+use hipfire_runtime::sampler::{apply_logit_policy_cpu, SamplerConfig};
 use hipfire_runtime::spec::{
     RowPick, SpecAdvance, SpecRequestConfig, SpecScratch, SpecTarget, Speculator,
 };
@@ -158,10 +189,10 @@ const USAGE: &str = "usage:
   raon_dflash_oracle capture  --model M --draft D --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle emit     --model M --draft D --prompt-file P --out DIR [--block N] [--max-seq N]
   raon_dflash_oracle rowexact --model M --prompt-file P [--out DIR] [--max-seq N] [--census on [--census-k 2,4]]
-  raon_dflash_oracle greedy   --model M --draft D --prompt-file P [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N]
+  raon_dflash_oracle greedy   --model M --draft D --prompt-file P [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off]
   raon_dflash_oracle rollback --model M [--draft D] --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle verifygraph --model M --prompt-file P [--out DIR] [--chat on] [--max-seq N]
-  raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--out DIR]
+  raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off] [--out DIR]
   raon_dflash_oracle costs    --model M --draft D --prompt-file P [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
   raon_dflash_oracle draftgraph --model M --draft D --prompt-file P [--chat on] [--block B] [--tokens N] [--fc-compare on|off] [--out DIR] [--max-seq N]
 common: [--chat on|off] [--think on|off]   (raw text tokens by default)";
@@ -237,6 +268,103 @@ fn on_off(opts: &Opts, key: &str, default: bool) -> Result<bool, String> {
         Some("on") => Ok(true),
         Some("off") => Ok(false),
         Some(other) => Err(format!("--{key} `{other}`: on|off")),
+    }
+}
+
+/// The request window the AR producers default to (`repeat_window` absent).
+const DEFAULT_REPEAT_WINDOW: usize = 128;
+
+/// Penalty flags of `sampled` and `greedy`: `--repeat-penalty`, `--presence`, `--frequency`,
+/// `--repeat-window`. Generated-only history, as Raon's AR producer; neutral by default.
+#[derive(Clone, Copy, Debug)]
+struct PenaltyOpts {
+    repeat_penalty: f32,
+    presence: f32,
+    frequency: f32,
+    window: usize,
+    /// `--draft-penalty on|off`: the selector scores its candidates after the request's
+    /// penalties (`HIPFIRE_DFLASH_DRAFT_PENALTY`); `None` follows the env var (default on).
+    draft_penalty: Option<bool>,
+}
+
+impl PenaltyOpts {
+    /// `tokens` is the generation length: the default window is
+    /// `max(DEFAULT_REPEAT_WINDOW, tokens)`, covering the whole oracle generation.
+    fn parse(opts: &Opts, tokens: usize) -> Result<Self, String> {
+        let p = Self {
+            repeat_penalty: opt_f32(opts, "repeat-penalty", 1.0)?,
+            presence: opt_f32(opts, "presence", 0.0)?,
+            frequency: opt_f32(opts, "frequency", 0.0)?,
+            window: opt_usize(opts, "repeat-window", DEFAULT_REPEAT_WINDOW.max(tokens))?,
+            draft_penalty: match opts.get("draft-penalty") {
+                Some(_) => Some(on_off(opts, "draft-penalty", true)?),
+                None => None,
+            },
+        };
+        if !(p.repeat_penalty > 0.0 && p.repeat_penalty.is_finite()) {
+            return Err("--repeat-penalty must be finite and > 0".into());
+        }
+        if !(p.presence >= 0.0 && p.presence.is_finite())
+            || !(p.frequency >= 0.0 && p.frequency.is_finite())
+        {
+            return Err("--presence and --frequency must be finite and >= 0".into());
+        }
+        Ok(p)
+    }
+
+    /// Whether any penalty moves the logits (the predicate `sampler` applies).
+    fn active(&self) -> bool {
+        self.window > 0
+            && (self.repeat_penalty != 1.0 || self.presence > 0.0 || self.frequency > 0.0)
+    }
+
+    /// Penalize one logits row over the generated-only `history` (trailing window); a no-op
+    /// when neutral.
+    fn apply(&self, row: &mut [f32], history: &[u32]) {
+        if self.active() {
+            let cfg = SamplerConfig {
+                repeat_penalty: self.repeat_penalty,
+                repeat_window: self.window,
+                presence_penalty: self.presence,
+                frequency_penalty: self.frequency,
+                ..SamplerConfig::greedy()
+            };
+            apply_logit_policy_cpu(row, history, &cfg);
+        }
+    }
+
+    /// Put the penalties into a speculator request (generated-only history); untouched when
+    /// neutral.
+    fn configure(&self, cfg: &mut SpecRequestConfig) {
+        if self.active() {
+            cfg.repeat_penalty = self.repeat_penalty;
+            cfg.repeat_window = self.window;
+            cfg.presence_penalty = self.presence;
+            cfg.frequency_penalty = self.frequency;
+            cfg.penalty_generated_only = true;
+        }
+    }
+
+    /// Apply `--draft-penalty` to every speculator built from now on.
+    fn arm_draft_penalty(&self) {
+        set_draft_penalty_override(self.draft_penalty);
+    }
+
+    /// `on` / `off` for the print lines: the flag, else the env var (default on).
+    fn draft_penalty_label(&self) -> &'static str {
+        match self.draft_penalty {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "env",
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "repeat_penalty": self.repeat_penalty, "presence_penalty": self.presence,
+            "frequency_penalty": self.frequency, "repeat_window": self.window,
+            "generated_only": true, "draft_penalty": self.draft_penalty,
+        })
     }
 }
 
@@ -1110,6 +1238,11 @@ struct Prof {
     /// `last_laws` (replaced by every such call).
     row_law: Option<SampleSpec>,
     last_laws: Vec<Vec<(u32, f32)>>,
+    /// `sampled` with penalties: record the raw (unpenalized) rows instead of their laws
+    /// into `last_rows` (flat, `vocab` floats per row), so the oracle penalizes each row
+    /// over its own history.
+    raw_rows: bool,
+    last_rows: Vec<f32>,
 }
 
 impl Prof {
@@ -1211,17 +1344,21 @@ impl SpecTarget for TimedTarget<'_> {
                 .spec_advance(gpu, tokens, start_pos, reset, abort, hidden_out)
         );
         let advance = r?;
-        let law = self.prof.borrow().row_law;
-        if let (
-            Some(spec),
-            SpecAdvance::Ready {
-                last_logits: Some(row),
-                ..
-            },
-        ) = (law, &advance)
+        let (law, raw) = {
+            let p = self.prof.borrow();
+            (p.row_law, p.raw_rows)
+        };
+        if let SpecAdvance::Ready {
+            last_logits: Some(row),
+            ..
+        } = &advance
         {
-            let law = row_law(row, spec)?;
-            self.prof.borrow_mut().last_laws = vec![law];
+            if raw {
+                self.prof.borrow_mut().last_rows = row.clone();
+            } else if let Some(spec) = law {
+                let law = row_law(row, spec)?;
+                self.prof.borrow_mut().last_laws = vec![law];
+            }
         }
         Ok(advance)
     }
@@ -1269,8 +1406,13 @@ impl SpecTarget for TimedTarget<'_> {
                 .verify_block_logits(gpu, block, position, scratch, hidden_out)
         );
         let logits = r?;
-        let law = self.prof.borrow().row_law;
-        if let Some(spec) = law {
+        let (law, raw) = {
+            let p = self.prof.borrow();
+            (p.row_law, p.raw_rows)
+        };
+        if raw {
+            self.prof.borrow_mut().last_rows = logits.clone();
+        } else if let Some(spec) = law {
             let vocab = self.inner.config.vocab;
             let laws = logits
                 .chunks_exact(vocab)
@@ -1303,9 +1445,16 @@ impl SpecTarget for TimedTarget<'_> {
                 .commit_row(gpu, token, position, scratch, hidden_out, want_logits)
         );
         let pick = r?;
-        let law = self.prof.borrow().row_law;
-        if let (Some(spec), RowPick::Logits(logits)) = (law, &pick) {
-            self.prof.borrow_mut().last_laws = vec![row_law(logits, spec)?];
+        let (law, raw) = {
+            let p = self.prof.borrow();
+            (p.row_law, p.raw_rows)
+        };
+        if let RowPick::Logits(logits) = &pick {
+            if raw {
+                self.prof.borrow_mut().last_rows = logits.clone();
+            } else if let Some(spec) = law {
+                self.prof.borrow_mut().last_laws = vec![row_law(logits, spec)?];
+            }
         }
         Ok(pick)
     }
@@ -1488,9 +1637,13 @@ fn dflash_arm(
     eos: &[u32],
     prof: &SharedProf,
     timed: bool,
+    request: Option<SpecRequestConfig>,
 ) -> Result<DflashRun, String> {
     let mut spec: Box<dyn Speculator> =
         build_dflash2_speculator(gpu, draft_path, target, ctx_capacity, block)?;
+    if let Some(cfg) = request {
+        spec.configure_request(cfg);
+    }
     let r = (|| -> Result<DflashRun, String> {
         let t0 = Instant::now();
         let first = spec
@@ -1569,6 +1722,7 @@ fn tie_judge(
     a: u32,
     b: u32,
     window: Option<&(usize, Vec<u32>)>,
+    pen: &PenaltyOpts,
 ) -> Result<(bool, Value), String> {
     let i = common.len();
     let vocab = bundle.config.vocab;
@@ -1665,6 +1819,15 @@ fn tie_judge(
             block.len()
         );
     }
+    // With penalties both rows are judged after the same penalization: the decode path's
+    // history and the verify row's (`common` + earlier block rows = the emitted prefix) are
+    // the same generated-only `common`.
+    let mut dec_row = dec_row;
+    pen.apply(&mut dec_row, common);
+    let ver_row = ver_row.map(|mut v| {
+        pen.apply(&mut v, common);
+        v
+    });
     let (dec_arg, dec_json) = describe_row(&dec_row, a, b);
     let (ver_arg, ver_json) = match (&ver_row, ver_argmax_only) {
         (Some(row), _) => describe_row(row, a, b),
@@ -1825,6 +1988,7 @@ fn run_greedy(
     let n = opt_usize(opts, "tokens", 64)?;
     let block = opt_usize(opts, "block", 8)?;
     let profile = on_off(opts, "profile", false)?;
+    let pen = PenaltyOpts::parse(opts, n)?;
     if n == 0 {
         return Err("--tokens must be >= 1".into());
     }
@@ -1839,7 +2003,8 @@ fn run_greedy(
     let mut ar_top2: Vec<[(u32, f32); 2]> = Vec::with_capacity(n);
     let (mut ar_decode_ms, mut ar_decode_tokens) = (0f64, 0usize);
     loop {
-        let l = bundle.download_logits(gpu)?;
+        let mut l = bundle.download_logits(gpu)?;
+        pen.apply(&mut l, &ar);
         let t2 = top2(&l);
         let tok = t2[0].0;
         ar_top2.push(t2);
@@ -1865,7 +2030,13 @@ fn run_greedy(
     // with --profile, timing) wrapper.
     bundle.reset(gpu)?;
     let ctx_capacity = bundle.max_seq();
+    pen.arm_draft_penalty();
     let prof: SharedProf = Rc::new(RefCell::new(Prof::default()));
+    let request = pen.active().then(|| {
+        let mut cfg = SpecRequestConfig::default();
+        pen.configure(&mut cfg);
+        cfg
+    });
     let run = {
         let mut wrapped = TimedTarget {
             inner: &mut *bundle,
@@ -1883,6 +2054,7 @@ fn run_greedy(
             &eos,
             &prof,
             profile,
+            request,
         )?
     };
     let mut df = run.stream.clone();
@@ -1900,6 +2072,9 @@ fn run_greedy(
         "greedy: prompt {} tokens, {n} requested, block {block}",
         prompt.len()
     );
+    if pen.active() {
+        println!("  penalties: {}", pen.json());
+    }
     println!(
         "  AR     {} tokens  md5 {ar_md5}  ({ar_secs:.2}s incl. prefill)",
         ar.len()
@@ -1914,6 +2089,11 @@ fn run_greedy(
         run.steps,
         run.accepted as f64 / run.steps.max(1) as f64,
         run.proposed as f64 / run.steps.max(1) as f64
+    );
+    println!(
+        "  tau {tokens_per_step:.3} tokens/step  draft penalty {} (penalties {})",
+        pen.draft_penalty_label(),
+        if pen.active() { "active" } else { "neutral" }
     );
     let profile_json = if profile {
         report_profile(&run, ar_decode_ms, ar_decode_tokens)
@@ -1955,7 +2135,7 @@ fn run_greedy(
                     .rev()
                     .find(|(pos, block)| *pos < target_pos && target_pos <= pos + block.len())
             });
-            let (j, v) = tie_judge(gpu, bundle, prompt, &ar[..i], ar[i], df[i], window)?;
+            let (j, v) = tie_judge(gpu, bundle, prompt, &ar[..i], ar[i], df[i], window, &pen)?;
             justified = j;
             tie = v;
             // Second level: the exact window replayed from the AR arm's state
@@ -1994,20 +2174,21 @@ fn run_greedy(
         }
     );
     if let Some(dir) = out {
-        write_json(
-            &dir.join("greedy.json"),
-            &json!({
-                "pass": pass, "identical": identical, "block": block, "prompt_tokens": prompt.len(),
-                "ar_md5": ar_md5, "dflash_md5": df_md5,
-                "ar_tokens": ar, "dflash_tokens": df,
-                "steps": run.steps, "mean_tokens_per_step": tokens_per_step,
-                "accepted": run.accepted, "proposed": run.proposed,
-                "divergence": divergence,
-                "tie_judge": tie,
-                "near_tie": near_tie,
-                "profile": profile_json,
-            }),
-        )?;
+        let mut report = json!({
+            "pass": pass, "identical": identical, "block": block, "prompt_tokens": prompt.len(),
+            "ar_md5": ar_md5, "dflash_md5": df_md5,
+            "ar_tokens": ar, "dflash_tokens": df,
+            "steps": run.steps, "mean_tokens_per_step": tokens_per_step,
+            "accepted": run.accepted, "proposed": run.proposed,
+            "divergence": divergence,
+            "tie_judge": tie,
+            "near_tie": near_tie,
+            "profile": profile_json,
+        });
+        if pen.active() {
+            report["penalties"] = pen.json();
+        }
+        write_json(&dir.join("greedy.json"), &report)?;
     }
     Ok(pass)
 }
@@ -2060,6 +2241,7 @@ fn draftgraph_arm(
             &eos,
             &prof,
             false,
+            None,
         )
     };
     let windows = trace_windows_take();
@@ -3074,6 +3256,8 @@ fn run_sampled(
     let top_p = opt_f32(opts, "top-p", 0.95)?;
     let top_k = opt_usize(opts, "top-k", 20)? as u32;
     let alpha = opt_f64(opts, "alpha", 1e-3)?;
+    let pen = PenaltyOpts::parse(opts, l)?;
+    let penalized = pen.active();
     if trials == 0 || l == 0 {
         return Err("--trials and --tokens must be >= 1".into());
     }
@@ -3099,7 +3283,8 @@ fn run_sampled(
         let mut state = (((seed >> 32) as u32) ^ (seed as u32)).max(1);
         let (mut s, mut laws) = (Vec::with_capacity(l), Vec::with_capacity(l));
         for i in 0..l {
-            let logits = bundle.download_logits(gpu)?;
+            let mut logits = bundle.download_logits(gpu)?;
+            pen.apply(&mut logits, &s);
             laws.push(row_law(&logits, spec_s)?);
             let tok =
                 sample_top_k_p_with_state(&logits, temp, top_p, Some(top_k), None, &mut state);
@@ -3120,10 +3305,13 @@ fn run_sampled(
     // verify row's law, so each emitted token is judged against the row it
     // was accepted or resampled from (emitted token j of a window = verify
     // row j: the accepted drafts, then the residual or bonus draw).
+    pen.arm_draft_penalty();
     let t_df = Instant::now();
     let ctx_capacity = bundle.max_seq();
+    let vocab = bundle.config.vocab;
     let prof: SharedProf = Rc::new(RefCell::new(Prof {
         row_law: Some(spec_s),
+        raw_rows: penalized,
         ..Prof::default()
     }));
     let mut df: Vec<Vec<u32>> = Vec::with_capacity(trials);
@@ -3140,20 +3328,37 @@ fn run_sampled(
             build_dflash2_speculator(gpu, draft_path, &mut target, ctx_capacity, block)?;
         let r = (|| -> Result<(), String> {
             for t in 0..trials {
-                spec.configure_request(SpecRequestConfig {
+                let mut request = SpecRequestConfig {
                     temp,
                     top_p,
                     top_k: Some(top_k),
                     min_p: 0.0,
                     rng_seed: trial_seed(SALT_DF, t),
                     ..Default::default()
-                });
+                };
+                pen.configure(&mut request);
+                spec.configure_request(request);
                 let first = spec
                     .prefill(gpu, &mut target, prompt, prompt, 0, false, None, &|| false)?
                     .into_first_token()?;
-                let prefill_law = std::mem::take(&mut prof.borrow_mut().last_laws);
-                let [p0] = <[Vec<(u32, f32)>; 1]>::try_from(prefill_law)
-                    .map_err(|v| format!("prefill recorded {} row laws, expected 1", v.len()))?;
+                let p0 = if penalized {
+                    // The prefill row predicts position 0: empty generated history.
+                    let mut raw = std::mem::take(&mut prof.borrow_mut().last_rows);
+                    if raw.len() != vocab {
+                        return Err(format!(
+                            "prefill recorded {} logits, expected {vocab}",
+                            raw.len()
+                        ));
+                    }
+                    pen.apply(&mut raw, &[]);
+                    row_law(&raw, spec_s)?
+                } else {
+                    let prefill_law = std::mem::take(&mut prof.borrow_mut().last_laws);
+                    let [p0] = <[Vec<(u32, f32)>; 1]>::try_from(prefill_law).map_err(|v| {
+                        format!("prefill recorded {} row laws, expected 1", v.len())
+                    })?;
+                    p0
+                };
                 SpecTarget::map_ahead_for_decode(&mut target, gpu, prompt.len(), l, block);
                 let mut stream = vec![first];
                 let mut laws = vec![p0];
@@ -3169,15 +3374,42 @@ fn run_sampled(
                         temp,
                         usize::MAX,
                     )?;
-                    let rows = std::mem::take(&mut prof.borrow_mut().last_laws);
-                    if rows.len() < step.emit.len() {
-                        return Err(format!(
-                            "a window emitted {} tokens from {} recorded verify rows",
-                            step.emit.len(),
-                            rows.len()
-                        ));
-                    }
-                    laws.extend(rows.into_iter().take(step.emit.len()));
+                    let window_laws: Vec<Vec<(u32, f32)>> = if penalized {
+                        // Row j of the window predicts emitted token j; its history is the
+                        // emitted stream (pending seed last) plus the window's earlier
+                        // emitted tokens (= the accepted drafts it was verified against).
+                        let raw = std::mem::take(&mut prof.borrow_mut().last_rows);
+                        if raw.len() < step.emit.len() * vocab {
+                            return Err(format!(
+                                "a window emitted {} tokens from {} recorded verify rows",
+                                step.emit.len(),
+                                raw.len() / vocab
+                            ));
+                        }
+                        let mut hist = stream.clone();
+                        let mut row = vec![0f32; vocab];
+                        let mut out = Vec::with_capacity(step.emit.len());
+                        for (j, raw_row) in
+                            raw.chunks_exact(vocab).take(step.emit.len()).enumerate()
+                        {
+                            row.copy_from_slice(raw_row);
+                            pen.apply(&mut row, &hist);
+                            out.push(row_law(&row, spec_s)?);
+                            hist.push(step.emit[j]);
+                        }
+                        out
+                    } else {
+                        let rows = std::mem::take(&mut prof.borrow_mut().last_laws);
+                        if rows.len() < step.emit.len() {
+                            return Err(format!(
+                                "a window emitted {} tokens from {} recorded verify rows",
+                                step.emit.len(),
+                                rows.len()
+                            ));
+                        }
+                        rows.into_iter().take(step.emit.len()).collect()
+                    };
+                    laws.extend(window_laws);
                     windows += 1;
                     proposed_sum += step.proposed as u64;
                     accepted_sum += step.accepted as u64;
@@ -3273,31 +3505,38 @@ fn run_sampled(
         proposed_sum as f64 / windows.max(1) as f64,
         accepted_sum as f64 / windows.max(1) as f64,
     );
+    println!(
+        "  tau {:.3} tokens/window  draft penalty {} (penalties {})",
+        (accepted_sum + windows) as f64 / windows.max(1) as f64,
+        pen.draft_penalty_label(),
+        if penalized { "active" } else { "neutral" }
+    );
 
     if let Some(dir) = out {
-        write_json(
-            &dir.join("sampled.json"),
-            &json!({
-                "pass": pass,
-                "config": {
-                    "model": model, "draft": draft_path,
-                    "prompt_tokens": prompt.len(), "prompt_md5": md5_hex_u32(prompt),
-                    "trials": trials, "tokens": l, "block": block,
-                    "temp": temp, "top_p": top_p, "top_k": top_k, "alpha": alpha,
-                    "salt_ar": SALT_AR, "salt_dflash": SALT_DF,
-                },
-                "tests": tests.iter().map(TestRec::json).collect::<Vec<_>>(),
-                "tv_mean_law": tv,
-                "streams": {"ar": ar, "dflash": df},
-                "laws": {"ar": ar_laws, "dflash": df_laws},
-                "dflash_windows": {
-                    "windows": windows, "proposed": proposed_sum, "accepted": accepted_sum,
-                    "depth_hist": depth_hist.iter().map(|(k, v)| (k.to_string(), *v))
-                        .collect::<BTreeMap<String, u64>>(),
-                },
-                "wall_secs": {"ar": ar_secs, "dflash": df_secs},
-            }),
-        )?;
+        let mut report = json!({
+            "pass": pass,
+            "config": {
+                "model": model, "draft": draft_path,
+                "prompt_tokens": prompt.len(), "prompt_md5": md5_hex_u32(prompt),
+                "trials": trials, "tokens": l, "block": block,
+                "temp": temp, "top_p": top_p, "top_k": top_k, "alpha": alpha,
+                "salt_ar": SALT_AR, "salt_dflash": SALT_DF,
+            },
+            "tests": tests.iter().map(TestRec::json).collect::<Vec<_>>(),
+            "tv_mean_law": tv,
+            "streams": {"ar": ar, "dflash": df},
+            "laws": {"ar": ar_laws, "dflash": df_laws},
+            "dflash_windows": {
+                "windows": windows, "proposed": proposed_sum, "accepted": accepted_sum,
+                "depth_hist": depth_hist.iter().map(|(k, v)| (k.to_string(), *v))
+                    .collect::<BTreeMap<String, u64>>(),
+            },
+            "wall_secs": {"ar": ar_secs, "dflash": df_secs},
+        });
+        if penalized {
+            report["config"]["penalties"] = pen.json();
+        }
+        write_json(&dir.join("sampled.json"), &report)?;
     }
     Ok(pass)
 }

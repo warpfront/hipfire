@@ -13,8 +13,9 @@
 
 use crate::Carrier;
 pub use hipfire_arch_qwen4::admission::{
-    qwen4_pp_auto_fit, qwen4_pp_edge_max_bytes, qwen4_pp_rank_lines, Qwen4PpAutoFit,
-    Qwen4PpBudgetInputs, Qwen4PpRankFit, QWEN4_PP_FIRST_BAND_MIN_LAYERS, QWEN4_PP_RESERVE_BYTES,
+    qwen4_pp_auto_fit, qwen4_pp_chunk_ladder, qwen4_pp_edge_max_bytes, qwen4_pp_negotiate_chunk,
+    qwen4_pp_rank_lines, Qwen4PpAutoFit, Qwen4PpBudgetInputs, Qwen4PpRankFit,
+    QWEN4_PP_FIRST_BAND_MIN_LAYERS, QWEN4_PP_RESERVE_BYTES,
 };
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};

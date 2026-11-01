@@ -2688,6 +2688,7 @@ impl Speculator for DflashSpeculator {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        _emitted: &[u32],
     ) -> Result<u32, String> {
         let slot = target
             .as_any_mut()

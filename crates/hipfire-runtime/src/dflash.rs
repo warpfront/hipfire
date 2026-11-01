@@ -5492,6 +5492,21 @@ pub struct DflashCandidateProposal {
     pub top_k: usize,
 }
 
+/// The request's penalties for the selector walk ([`propose_candidates_device_penalized`]):
+/// the policy [`crate::sampler::apply_logit_policy_cpu`] applies, and the window's
+/// [`crate::spec_sampling::PenaltyHistory`] opened at its base
+/// ([`crate::spec_sampling::PenaltyHistory::begin_window`]: the loop's `emitted`,
+/// pending seed last). Row `r` of the walk scores its candidates after the
+/// penalties over `base ‖ tokens selected for rows 0..r`, the history of the
+/// target row that will verify the draft `r` selects, so the selector's `q`
+/// tracks the penalized target `p` instead of the raw head. Only the
+/// candidates the raw top-K kept are rescored (penalties never promote a
+/// token). The walk leaves the history at its base.
+pub struct SelectorPenalty<'a> {
+    pub cfg: &'a crate::sampler::SamplerConfig,
+    pub history: &'a mut crate::spec_sampling::PenaltyHistory,
+}
+
 /// The selector's confidence in one row: the temperature-1 softmax mass of
 /// its top candidate over the row's `scores` (`1 / Σ exp(s - max)`). A
 /// function of the row's scores only, so it is fixed before the row's draw.
@@ -5575,6 +5590,35 @@ pub fn propose_candidates_from_rows_capture(
     uniforms: Option<&[f32]>,
     capture: Option<&mut Vec<f32>>,
 ) -> HipResult<DflashCandidateProposal> {
+    propose_candidates_from_rows_penalized(
+        weights,
+        projection,
+        ids,
+        unaries,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+        capture,
+        None,
+    )
+}
+
+/// [`propose_candidates_from_rows_capture`] with the request's penalties
+/// applied to each row's raw unaries before scoring ([`SelectorPenalty`]);
+/// `None` is the unpenalized walk, bit for bit.
+pub fn propose_candidates_from_rows_penalized(
+    weights: &DflashWeights,
+    projection: &[f32],
+    ids: &[u32],
+    unaries: &[f32],
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+    capture: Option<&mut Vec<f32>>,
+    penalty: Option<&mut SelectorPenalty<'_>>,
+) -> HipResult<DflashCandidateProposal> {
     if rows == 0 {
         return Err(hip_bridge::HipError::new(0, "rows must be >0"));
     }
@@ -5601,7 +5645,8 @@ pub fn propose_candidates_from_rows_capture(
     let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
     propose_inner_capture(
         vocab,
-        weights,
+        weights.predecessor_codebook.as_ref().unwrap(),
+        weights.successor_codebook.as_ref().unwrap(),
         projection,
         ids,
         unaries,
@@ -5612,12 +5657,17 @@ pub fn propose_candidates_from_rows_capture(
         temperature,
         uniforms,
         capture,
+        penalty,
     )
 }
 
-fn propose_inner_capture(
+/// The sequential selector walk over host readbacks (see
+/// [`propose_candidates_from_rows`]); takes the two codebooks only, so a CPU
+/// test can drive it without a device.
+pub(crate) fn propose_inner_capture(
     vocab_size: usize,
-    weights: &DflashWeights,
+    pred_cb: &SelectorCodebook,
+    succ_cb: &SelectorCodebook,
     hidden_proj_host: &[f32], // [rows*rank] already projected, row-major
     top_ids: &[u32],          // [rows*K]
     top_vals: &[f32],         // [rows*K] raw unaries
@@ -5628,6 +5678,7 @@ fn propose_inner_capture(
     temperature: f32,
     uniforms: Option<&[f32]>,
     mut capture: Option<&mut Vec<f32>>,
+    mut penalty: Option<&mut SelectorPenalty<'_>>,
 ) -> HipResult<DflashCandidateProposal> {
     if temperature > 0.0 && uniforms.is_none() {
         return Err(hip_bridge::HipError::new(
@@ -5640,8 +5691,6 @@ fn propose_inner_capture(
             return Err(hip_bridge::HipError::new(0, "uniforms length < rows"));
         }
     }
-    let pred_cb = weights.predecessor_codebook.as_ref().unwrap();
-    let succ_cb = weights.successor_codebook.as_ref().unwrap();
     let mut tokens = Vec::with_capacity(rows);
     // Sparse q over every top-K candidate (temp>0 only); selected q matches chosen entry.
     let mut all_probs: Option<Vec<f32>> = if temperature > 0.0 {
@@ -5655,12 +5704,28 @@ fn propose_inner_capture(
         None
     };
     let mut confidence = Vec::with_capacity(rows);
+    let mut penalized_vals: Vec<f32> = Vec::new();
     let mut pred = anchor;
     for r in 0..rows {
         let proj_off = r * rank;
         let proj = &hidden_proj_host[proj_off..proj_off + rank];
         // Build scores for this row's K candidates
         let id_off = r * k;
+        // The row's raw unaries, penalized over this row's history when asked.
+        let row_vals: &[f32] = match penalty.as_deref_mut() {
+            Some(p) => {
+                penalized_vals.clear();
+                penalized_vals.extend_from_slice(&top_vals[id_off..id_off + k]);
+                crate::sampler::apply_logit_policy_candidates_cpu(
+                    &top_ids[id_off..id_off + k],
+                    &mut penalized_vals,
+                    p.history.row(r),
+                    p.cfg,
+                );
+                &penalized_vals
+            }
+            None => &top_vals[id_off..id_off + k],
+        };
         let mut scores = Vec::with_capacity(k);
         for j in 0..k {
             let cand = top_ids[id_off + j] as usize;
@@ -5670,7 +5735,7 @@ fn propose_inner_capture(
                     "candidate id out of vocab range",
                 ));
             }
-            let unary = top_vals[id_off + j];
+            let unary = row_vals[j];
             // dot( pred_cb[pred] * proj , succ_cb[cand] )
             let mut dot = 0.0f32;
             for d in 0..rank {
@@ -5719,6 +5784,13 @@ fn propose_inner_capture(
         let cand_id = top_ids[id_off + sel_idx];
         tokens.push(cand_id);
         pred = cand_id;
+        if let Some(p) = penalty.as_deref_mut() {
+            // Row r + 1 sees the token this row selected.
+            p.history.push_draft(cand_id);
+        }
+    }
+    if let Some(p) = penalty {
+        p.history.rewind_drafts();
     }
     Ok(DflashCandidateProposal {
         tokens,
@@ -5840,6 +5912,35 @@ pub fn propose_candidates_device(
     temperature: f32,
     uniforms: Option<&[f32]>,
 ) -> HipResult<DflashCandidateProposal> {
+    propose_candidates_device_penalized(
+        gpu,
+        weights,
+        scratch,
+        hidden,
+        logits,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+        None,
+    )
+}
+
+/// [`propose_candidates_device`] with the request's penalties applied to each
+/// row's candidate scores ([`SelectorPenalty`]); `None` is the unpenalized
+/// proposal, bit for bit.
+pub fn propose_candidates_device_penalized(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+    penalty: Option<&mut SelectorPenalty<'_>>,
+) -> HipResult<DflashCandidateProposal> {
     if rows == 0 {
         return Err(hip_bridge::HipError::new(0, "rows must be >0"));
     }
@@ -5882,7 +5983,7 @@ pub fn propose_candidates_device(
     }
     gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
     let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows * k)?;
-    propose_candidates_from_rows(
+    propose_candidates_from_rows_penalized(
         weights,
         &host_proj,
         &top_ids,
@@ -5891,6 +5992,8 @@ pub fn propose_candidates_device(
         anchor,
         temperature,
         uniforms,
+        None,
+        penalty,
     )
 }
 

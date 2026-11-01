@@ -3868,6 +3868,9 @@ pub fn generate_dflash(
     // (greedy or sampled, thinking on or off) when `speculation.mtp_ngram`
     // (env HIPFIRE_MTP_NGRAM) resolves on for this model and GPU: `auto`, the
     // default, arms native Qwen4 MTP on gfx1151/gfx1201 only.
+    // Raon's AR producer penalizes generated tokens only
+    // (`penalty_generated_only`); the speculative route must follow.
+    let penalty_generated_only = m.raon().is_some();
     if let Some(spec) = m.speculator.as_mut() {
         spec.configure_request(SpecRequestConfig {
             temp,
@@ -3889,6 +3892,7 @@ pub fn generate_dflash(
             stop_sequences: !stop.is_empty(),
             // The Qwen spec routes emit no logprobs.
             logprobs: false,
+            penalty_generated_only,
         });
     }
     let prefill_tokens_full = prefill_tokens.len();
@@ -5385,7 +5389,7 @@ pub fn generate_spec(
         let mtp_outer_t0 = std::time::Instant::now();
         let ar_step = retire.is_retired();
         let step_result = if ar_step {
-            spec.ar_step(gpu, slot, position, seed_token)
+            spec.ar_step(gpu, slot, position, seed_token, &emitted)
                 .map(|t| hipfire_runtime::spec::SpecStep::new([t], t, 0, 0))
         } else {
             spec_step(

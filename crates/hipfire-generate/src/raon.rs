@@ -108,7 +108,8 @@ impl RaonSampling {
     /// penalty for this request once [`Self::resolve`] has applied the model
     /// defaults. Route selection reads this, not the request's raw penalties:
     /// a sampled request that set nothing explicit is penalized by the card's
-    /// presence default, and the DFlash2 verifiers implement no penalties.
+    /// presence default, so it needs a speculator that penalizes its verify
+    /// rows ([`hipfire_runtime::spec::Speculator::supports_penalties`]).
     pub fn penalized_after_defaults(
         &self,
         defaults: &hipfire_arch_raon::GenerationDefaults,
@@ -521,9 +522,13 @@ fn spec_prompt_matches_ar(
 ///   the conversation mirror and the assistant-turn cache are cleared first,
 ///   so the shared body plans a cold prefill of the full render and never
 ///   splices cached tokens into it;
-/// * the sampling is the AR route's: `top_k` after the card defaults
-///   ([`RaonSampling::resolve`]); route selection already kept every request
-///   that the defaults penalize on the AR route.
+/// * the sampling is the AR route's: `top_k` and the presence penalty after
+///   the card defaults ([`RaonSampling::resolve`]), the penalty window sized
+///   to cover the generation, and the penalties over the generated tokens
+///   only (the shared body installs `SpecRequestConfig::penalty_generated_only`
+///   for Raon, as [`generate_raon`] runs `penalty_generated_only`); route
+///   selection admits a penalized request here only for a speculator that
+///   penalizes its verify rows.
 ///
 /// A speculative context-capacity miss emitted nothing, and falls through to
 /// [`generate_raon`].
@@ -760,6 +765,7 @@ mod tests {
             has_speculator: false,
             speculator_is_mtp: false,
             speculator_is_dflash2: false,
+            speculator_supports_penalties: false,
             deepseek4_spec_requested: false,
             ngram_can_sample: false,
             temp: 1.0,
@@ -819,6 +825,7 @@ mod tests {
         GenerationRouteInputs {
             has_speculator: true,
             speculator_is_dflash2: true,
+            speculator_supports_penalties: true,
             supports_temp_swor: true,
             supports_chain_nucleus_verify: true,
             temp,
@@ -835,12 +842,57 @@ mod tests {
                 GenerationRoute::RaonSpec,
                 "{request:?}"
             );
-            // The DFlash2 verifiers apply no token penalty; adaptive KV and the
-            // force-AR switches keep the AR producer; so does a load without
-            // the drafter.
+            // Penalties (the card's presence default included) ride the spec
+            // route because the DFlash2 verifiers penalize every row with the
+            // generated-only history; a drafter that does not
+            // (`supports_penalties` false) keeps the AR producer, and so do
+            // adaptive KV, the force-AR switches and a load without the
+            // drafter.
+            let penalized = GenerationRouteInputs {
+                nonneutral_penalties: true,
+                ..request
+            };
+            assert_eq!(
+                select_generation_route(&penalized),
+                GenerationRoute::RaonSpec,
+                "{penalized:?}"
+            );
             for refused in [
                 GenerationRouteInputs {
                     nonneutral_penalties: true,
+                    speculator_supports_penalties: false,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    kv_adaptive: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    force_ar_chat: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    temp_spec_env_off: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    has_speculator: false,
+                    speculator_is_dflash2: false,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    speculator_is_dflash2: false,
+                    speculator_is_mtp: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    pp: 2,
                     ..request
                 },
                 GenerationRouteInputs {
@@ -921,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn raon_defaults_that_penalize_keep_sampled_requests_on_ar() {
+    fn raon_defaults_that_penalize_count_as_penalized_for_route_selection() {
         let d = hipfire_arch_raon::GenerationDefaults::default();
         assert!(d.presence_penalty != 0.0, "the card default is penalized");
         let base = RaonSampling {
