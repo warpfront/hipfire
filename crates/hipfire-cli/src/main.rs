@@ -1963,6 +1963,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         "id": "run",
         "prompt": prompt,
         "max_tokens": max_tokens,
+        // Mandatory on the wire: both Engine::generate and the daemon's
+        // generate arm reject a request without a numeric attempt_id
+        // ("generate missing attempt_id"), which made every local-spawn
+        // `hipfire run` fail before reaching the model.
+        "attempt_id": next_attempt_id(),
     });
     insert_optional_f64(&mut request, "temperature", temperature);
     insert_optional_f64(&mut request, "top_p", top_p);

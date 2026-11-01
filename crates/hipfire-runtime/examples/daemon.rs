@@ -18429,6 +18429,15 @@ fn generate_lfm2moe(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
+    // Contract opener (see generate_lfm3): gen_start must precede every other
+    // event or the CLI serve's StreamContractGate rejects the stream.
+    // started_in_think mirrors the Jinja enable_thinking flag below.
+    emit_gen_start(
+        stdout,
+        id,
+        max_think_tokens != 1,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -18714,7 +18723,7 @@ fn generate_lfm2moe(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => emit_qwen_ar_cancelled(stdout, id, generated_count),
     }
 }
 
@@ -18740,6 +18749,20 @@ fn generate_lfm3(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
+    // Contract opener: the CLI serve's StreamContractGate rejects every
+    // pre-gen_start event (PreStartEvent → client abort → drain deadlock), so
+    // this path MUST emit gen_start before any token/error event. Matches the
+    // main generate() opener (line ~15614); arch 13 latches the legacy
+    // contract (gen_start_contract_version_for_arch returns None for 13).
+    // started_in_think mirrors the Jinja enable_thinking flag below: when
+    // thinking is on, the template's assistant prefix ends inside <think>, so
+    // generated tokens ARE reasoning until the model emits </think>.
+    emit_gen_start(
+        stdout,
+        id,
+        max_think_tokens != 1,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -18940,8 +18963,15 @@ fn generate_lfm3(
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
-        // String-level EOS-class guard (catches `` which doesn't id-round-trip).
-        if matches!(frag.trim(), "" | "</s>" | "<|im_end|>") {
+        // String-level EOS-class guard: exact EOS-class strings only. A
+        // whitespace-only fragment (" ", "\n") is LEGITIMATE model output —
+        // LFM3 thinking emits standalone space/newline tokens constantly —
+        // so this must NOT trim() before matching: trim-to-empty killed
+        // generation on the first whitespace token (surfaced through serve as
+        // truncated/"zero content" answers). Exact "" is kept: an EOS variant
+        // that decodes to the empty string doesn't id-round-trip into
+        // stop_toks, so the string form is the only catch.
+        if matches!(frag.as_str(), "" | "</s>" | "<|im_end|>") {
             break;
         }
         let envelope = serde_json::json!({
@@ -18992,7 +19022,11 @@ fn generate_lfm3(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        // Client cancelled (or the handshake failed closed): emit the
+        // correlated cancellation transcript so the CLI serve's
+        // abort_and_drain terminates instead of waiting forever while holding
+        // the serve admission slot (queue-wide stall).
+        ClientTerminalDecision::Abort => emit_qwen_ar_cancelled(stdout, id, generated_count),
     }
 }
 
@@ -19026,6 +19060,11 @@ fn generate_lfm3_vl(
         repeat_window: _,
     } = *params;
 
+    // Contract opener (see generate_lfm3): gen_start must precede every other
+    // event or the CLI serve's StreamContractGate rejects the stream. The VL
+    // Jinja frame below renders with enable_thinking: true, so the stream
+    // starts inside <think>.
+    emit_gen_start(stdout, id, true, gen_start_contract_version_for_arch(m.arch_id));
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_vision_weights.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -19356,7 +19395,7 @@ fn generate_lfm3_vl(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => emit_qwen_ar_cancelled(stdout, id, generated_count),
     }
 }
 
@@ -19382,6 +19421,11 @@ fn generate_lfm3_audio(
 ) {
     use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
 
+    // Contract opener (see generate_lfm3): gen_start must precede every other
+    // event or the CLI serve's StreamContractGate rejects the stream. The ASR
+    // prompt uses AssistantPrefix::OpenThink below, so the stream starts
+    // inside <think>.
+    emit_gen_start(stdout, id, true, gen_start_contract_version_for_arch(m.arch_id));
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_audio_weights.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -19651,7 +19695,7 @@ fn generate_lfm3_audio(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => emit_qwen_ar_cancelled(stdout, id, generated_count),
     }
 }
 /// LFM3-Omni TTS (audio output) path — Phase 4c. Generates audio OUTPUT: a
@@ -19693,6 +19737,11 @@ fn generate_lfm3_omni(
     use hipfire_arch_lfm3_omni as omni;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
 
+    // Contract opener (see generate_lfm3): gen_start must precede every other
+    // event or the CLI serve's StreamContractGate rejects the stream. The
+    // omni prompt ends with the thinking-END marker (<think></think>) before
+    // the mode marker, so the stream starts in answer mode.
+    emit_gen_start(stdout, id, false, gen_start_contract_version_for_arch(m.arch_id));
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_depth_weights.is_none() {
         write_error(stdout, id, "lfm3-omni: tokenizer / lfm3 bundle / depth decoder missing");
         return;
@@ -28834,6 +28883,13 @@ mod generation_route_matrix_tests {
                 },
             ),
             (
+                GenerationRoute::Lfm3Ar,
+                GenerationRouteInputs {
+                    arch_id: 13,
+                    ..base()
+                },
+            ),
+            (
                 GenerationRoute::LlamaAr,
                 GenerationRouteInputs {
                     arch_id: 0,
@@ -29324,10 +29380,11 @@ mod generation_route_matrix_tests {
     }
 
     #[test]
-    fn all_variant_count_is_twenty() {
-        // Pin count so accidental ALL edits surface here too.
-        assert_eq!(GenerationRoute::ALL.len(), 20);
-        assert_eq!(capability_rows().len(), 20);
+    fn all_variant_count_is_twenty_one() {
+        // Pin count so accidental ALL edits surface here too. 21 since the
+        // Phase-1 Lfm3Ar route (arch_id 13) joined the matrix.
+        assert_eq!(GenerationRoute::ALL.len(), 21);
+        assert_eq!(capability_rows().len(), 21);
     }
 }
 

@@ -835,6 +835,7 @@ name = "hipfire-arch-lfm3-omni"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-arch-lfm3",
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
