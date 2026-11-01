@@ -16,6 +16,16 @@
 //! |---|---|---|
 //! | `lane_ar` | AR lanes (no spec), sampled | lane executor AR rows, host draw from the lane's own RNG |
 //! | `lane_batched` / `lane_adaptive` | native-MTP lanes, every lane MTP (`spec_lanes: None`), no copy lane | `Qwen4Bundle::ep_mesh_decode_step` (root Leviathan) |
+//! | `lane_cross` | native-MTP lanes as above, `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3` (the shipped `lane_switch::DEFAULT_MAX_ACTIVE`, pinned) | the same mesh step under the native<->AR switch at 3; 8 lanes only, staggered admission |
+//!
+//! The native arms (`lane_batched`, `lane_adaptive`, `lane_cross`) draft at the
+//! lane depth the cohort chose with `HIPFIRE_SAMPLED_MTP_LANE_K` (2, the
+//! shipped `ep_lane_spec_k` default, or 3), pinned through
+//! `HIPFIRE_EP_MTP_LANE_K` and checked against the depth the store resolves
+//! ([`check_lane_k`]). The evidence records `lane_k`, the most drafts any window
+//! offered (`max_offered`) and the drafts offered by each request's first
+//! window (`first_window_offered`); the coverage refuses a window above K and a
+//! run whose first windows never offered K.
 //!
 //! A trial is `lanes` concurrent requests of the same fixture prompt, admitted
 //! together and kept in lockstep (all prefill tiles of a tick, then one mesh
@@ -25,6 +35,20 @@
 //! t, i)` truncated to the lane RNG's 32 bits (`LaneSampling::seed`; the
 //! singleton AR arm truncates its seeds the same way). Nothing depends on the
 //! slot a request ran in.
+//!
+//! `lane_cross` is the one arm whose trial is not admitted together
+//! (`lane_suite::admit_schedule`: `[3, 5]` at 8 lanes): the first three requests
+//! are admitted at tick 0 and the other five on the tick after the first group
+//! has forwarded its whole prompt, so the first group's first decode window
+//! runs native with three active lanes and its later windows run with eight
+//! (AR windows of `lane_switch::native_mode`: AR from `max_active + 2` = 5
+//! lanes, a step at 4 lanes holds the previous mode). Request `i` is
+//! lane `i` either way. The evidence counts the requests that ran both a
+//! native and an AR window (`crossing_requests`) and keeps the occupancy
+//! histogram of the mesh steps (occupancy 4, the hold case, is recorded; the
+//! coverage requires steps at <= 3 and >= 5); the lane coverage refuses a run without both.
+//! A prompt that needs several prefill tiles lets the first group run
+//! more native windows before the second joins; the counters record what ran.
 //!
 //! The evidence the verdict reads is derived from real counters only: each
 //! mesh window is classified from the lane's `LaneSpecStats` delta
@@ -49,8 +73,12 @@ const EP_DEGREE: usize = 2;
 pub(super) enum ArmKind {
     /// Target-only AR lanes (the reference).
     Ar,
-    /// Native-MTP mesh lanes (no copy lane: it is off by default on EP serve).
+    /// Native-MTP mesh lanes (no copy lane: it is off by default on EP serve)
+    /// with the fixed-count pin: native windows at every lane count.
     Mtp,
+    /// Native-MTP mesh lanes under the product step switch
+    /// (`lane_suite::CROSS_MAX_ACTIVE`) with staggered admission.
+    Cross,
 }
 
 impl ArmKind {
@@ -58,6 +86,7 @@ impl ArmKind {
         match arm {
             "lane_ar" => Ok(Self::Ar),
             "lane_batched" | "lane_adaptive" => Ok(Self::Mtp),
+            "lane_cross" => Ok(Self::Cross),
             "lane_copy" => Err(
                 "lane_copy has no ep2 executor: the copy lane is off by default on EP serve and no ep2 cohort covers it"
                     .to_string(),
@@ -67,7 +96,7 @@ impl ArmKind {
     }
 
     fn mesh(self) -> bool {
-        matches!(self, Self::Mtp)
+        matches!(self, Self::Mtp | Self::Cross)
     }
 }
 
@@ -79,15 +108,18 @@ pub(super) fn store_lanes(lanes: usize) -> usize {
 }
 
 /// Host-only environment check of an EP2 lane arm. `max_active` is
-/// `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` as the runtime resolves it: below the lane
-/// count the mesh step would switch to AR windows and the arm would not run
-/// the native windows its name claims.
+/// `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` as the runtime resolves it.
+///
+/// * Fixed-count native arms (`Mtp`): at least the lane count; below it the
+///   mesh step would switch to AR windows and the arm would not run the native
+///   windows its name claims.
+/// * The crossing arm: exactly 8 lanes and exactly `lane_suite::CROSS_MAX_ACTIVE`
+///   (pinned explicitly): any other value changes which steps run native.
 pub(super) fn check_ep_env(
     kind: ArmKind,
     lanes: usize,
     max_active: usize,
     ep_degree: usize,
-    spec_k: usize,
 ) -> Result<(), String> {
     if ep_degree != EP_DEGREE {
         return Err(format!(
@@ -95,17 +127,47 @@ pub(super) fn check_ep_env(
             lane_suite::TOPOLOGY_ENV
         ));
     }
-    if kind.mesh() {
-        if max_active < lanes {
-            return Err(format!(
-                "HIPFIRE_EP_MTP_LANE_MAX_ACTIVE={max_active} is below the {lanes} lanes: the mesh step would run AR windows instead of native ones; pin it to at least {lanes}"
-            ));
+    match kind {
+        ArmKind::Ar => {}
+        ArmKind::Mtp => {
+            if max_active < lanes {
+                return Err(format!(
+                    "HIPFIRE_EP_MTP_LANE_MAX_ACTIVE={max_active} is below the {lanes} lanes: the mesh step would run AR windows instead of native ones; pin it to at least {lanes}"
+                ));
+            }
         }
-        if spec_k != MTP_K {
-            return Err(format!(
-                "the EP lane draft depth resolves to {spec_k} (HIPFIRE_EP_MTP_LANE_K caps it) but the distribution config records mtp_k = {MTP_K}"
-            ));
+        ArmKind::Cross => {
+            if lanes != lane_suite::CROSS_LANES {
+                return Err(format!(
+                    "lane_cross runs {} lanes (it admits {} requests, then the rest); the process has {lanes}",
+                    lane_suite::CROSS_LANES,
+                    lane_suite::CROSS_FIRST_GROUP
+                ));
+            }
+            if max_active != lane_suite::CROSS_MAX_ACTIVE_N {
+                return Err(format!(
+                    "HIPFIRE_EP_MTP_LANE_MAX_ACTIVE={max_active}: lane_cross pins {} so eight lanes cross the native<->AR switch; any other value changes which steps run native windows",
+                    lane_suite::CROSS_MAX_ACTIVE
+                ));
+            }
         }
+    }
+    Ok(())
+}
+
+/// The lane draft depth check: the EP lane store drafts at `spec_k`
+/// (`ep_lane_spec_k`: the load's K capped at `HIPFIRE_EP_MTP_LANE_K`), which
+/// must be the cohort's depth `lane_k` (`HIPFIRE_SAMPLED_MTP_LANE_K`) for the
+/// native arms (the AR reference drafts nothing).
+pub(super) fn check_lane_k(kind: ArmKind, spec_k: usize, lane_k: usize) -> Result<(), String> {
+    if kind.mesh() && spec_k != lane_k {
+        return Err(format!(
+            "the EP lane draft depth resolves to {spec_k} ({}={:?} caps it; the oracle loads K={MTP_K}) but the cohort runs lane K {lane_k} ({}): pin {}={lane_k}",
+            lane_suite::EP_LANE_K_ENV,
+            std::env::var(lane_suite::EP_LANE_K_ENV).ok(),
+            lane_suite::LANE_K_ENV,
+            lane_suite::EP_LANE_K_ENV
+        ));
     }
     Ok(())
 }
@@ -336,6 +398,13 @@ impl MeshTally {
     }
 }
 
+/// Whether a request ran both a native and an AR window: it crossed the
+/// product native<->AR switch (or, for the reference arm, never could).
+pub(super) fn crossed(windows: &[WindowFact]) -> bool {
+    windows.iter().any(|w| w.kind == WindowKind::Native)
+        && windows.iter().any(|w| w.kind == WindowKind::Ar)
+}
+
 /// The counters of one lane arm shard (the schema of
 /// [`lane_suite::lane_coverage`]).
 #[derive(Debug, Default)]
@@ -353,6 +422,12 @@ pub(super) struct LaneEvidence {
     retired_trials: usize,
     calibration_ok_trials: usize,
     no_window_trials: usize,
+    /// Requests that ran both a native and an AR window ([`crossed`]).
+    crossing_requests: usize,
+    /// The most drafts any one window offered.
+    max_offered: usize,
+    /// Requests by the drafts their first window offered (native first windows).
+    first_window_offered: BTreeMap<usize, usize>,
     drafted: usize,
     accepted: usize,
     retire_steps: Vec<usize>,
@@ -389,6 +464,14 @@ impl LaneEvidence {
             self.calibration_ok_trials += usize::from(record.windows.first().is_some_and(|w| {
                 w.kind == WindowKind::Native && w.offered == 0 && w.accepted == 0
             }));
+            self.crossing_requests += usize::from(crossed(&record.windows));
+            if let Some(first) = record
+                .windows
+                .first()
+                .filter(|w| w.kind == WindowKind::Native)
+            {
+                *self.first_window_offered.entry(first.offered).or_default() += 1;
+            }
             if let Some(step) = record.retired_at {
                 self.retired_trials += 1;
                 self.retire_steps.push(step);
@@ -409,6 +492,7 @@ impl LaneEvidence {
                 }
                 self.drafted += window.offered;
                 self.accepted += window.accepted;
+                self.max_offered = self.max_offered.max(window.offered);
             }
             if sampled {
                 self.per_trial.push(json!({
@@ -489,12 +573,18 @@ impl LaneEvidence {
             .iter()
             .map(|(lanes, steps)| (lanes.to_string(), *steps))
             .collect();
+        let first_window_offered: BTreeMap<String, usize> = self
+            .first_window_offered
+            .iter()
+            .map(|(offered, requests)| (offered.to_string(), *requests))
+            .collect();
         json!({
             "kind": "lane-evidence",
             "arm": arm,
             "executor": placement.executor.as_str(),
             "topology": placement.topology.as_str(),
             "lanes": placement.lanes,
+            "lane_k": placement.lane_k,
             "range": [range.0, range.1],
             "probe_budget": probe_budget,
             "trials": self.trials,
@@ -505,6 +595,9 @@ impl LaneEvidence {
             "retired_trials": self.retired_trials,
             "calibration_ok_trials": self.calibration_ok_trials,
             "no_window_trials": self.no_window_trials,
+            "crossing_requests": self.crossing_requests,
+            "max_offered": self.max_offered,
+            "first_window_offered": first_window_offered,
             "copy_windows": self.copy_windows,
             "copy_point_mass_windows": self.copy_point_mass_windows,
             "steps": self.windows(),
@@ -714,7 +807,7 @@ fn load_ep(
 }
 
 impl EpLanes {
-    fn load(model: &Path, arm: &str, lanes: usize) -> Result<Self, String> {
+    fn load(model: &Path, arm: &str, lanes: usize, lane_k: usize) -> Result<Self, String> {
         let kind = ArmKind::of(arm)?;
         let store_lanes = store_lanes(lanes);
         // The daemon's host-memory residency preamble (pinned experts stay out
@@ -738,8 +831,8 @@ impl EpLanes {
             lanes,
             hipfire_arch_qwen4::lane_switch::max_active(),
             ep_degree,
-            spec_k,
         )?;
+        check_lane_k(kind, spec_k, lane_k)?;
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         let mut loaded = load_ep(model, kind, store_lanes, spec_k, &mut gpu)?;
         let tokenizer = loaded.tokenizer.take().ok_or("the load has no tokenizer")?;
@@ -835,6 +928,7 @@ impl EpLanes {
             eos,
             trial,
             &seeds,
+            &lane_suite::admit_schedule(arm, lanes),
             next_tag,
             &mut requests,
             tally,
@@ -914,25 +1008,16 @@ struct LaneReq {
     released: bool,
 }
 
-/// Admit `seeds.len()` requests together, then tick until every one is done:
-/// each tick runs the executor half (every prefilling lane's next tile; the AR
-/// arm also one AR row per decoding lane) and, for the MTP arms, one mesh step
-/// carrying every lane that was decoding at the tick's start. A request is
-/// released the moment it is done.
-#[allow(clippy::too_many_arguments)]
-fn drive_trial(
+/// Admits `seeds` as one group of new requests (lane `i` of the trial is
+/// `reqs.len()` at its admission), arming each lane's sampler.
+fn admit_group(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
-    kind: ArmKind,
-    store_lanes: usize,
     prompt: &[u32],
     sampler: &LaneSamplerSpec,
-    eos: u32,
-    trial: usize,
     seeds: &[u32],
     next_tag: &mut u64,
     reqs: &mut Vec<LaneReq>,
-    tally: &mut MeshTally,
 ) -> Result<(), String> {
     for &seed in seeds {
         *next_tag += 1;
@@ -959,9 +1044,53 @@ fn drive_trial(
             .set_lane_sampling(&epoch, sampler.lane(seed))
             .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+/// Admit the trial's `seeds` in the groups of `schedule`
+/// (`lane_suite::admit_schedule`: every arm but `lane_cross` admits all at
+/// once; the first group is admitted at tick 0 and each later one on the tick
+/// after the previous groups have forwarded their whole prompt), then tick
+/// until every one is done: each tick runs the executor half (every prefilling
+/// lane's next tile; the AR arm also one AR row per decoding lane) and, for the
+/// MTP arms, one mesh step carrying every lane that was decoding at the tick's
+/// start. A request is released the moment it is done.
+#[allow(clippy::too_many_arguments)]
+fn drive_trial(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    kind: ArmKind,
+    store_lanes: usize,
+    prompt: &[u32],
+    sampler: &LaneSamplerSpec,
+    eos: u32,
+    trial: usize,
+    seeds: &[u32],
+    schedule: &[usize],
+    next_tag: &mut u64,
+    reqs: &mut Vec<LaneReq>,
+    tally: &mut MeshTally,
+) -> Result<(), String> {
+    if schedule.iter().sum::<usize>() != seeds.len() {
+        return Err(format!(
+            "admission schedule {schedule:?} does not cover the trial's {} seeds",
+            seeds.len()
+        ));
+    }
+    let mut admitted_groups = 0;
     let tick_cap = prompt.len() + 16 * TOKENS + 64;
     for _tick in 0..tick_cap {
-        if reqs.iter().all(|r| r.done) {
+        while admitted_groups < schedule.len() {
+            let prefilled: Vec<usize> = reqs.iter().map(|r| r.prefilled).collect();
+            if !lane_suite::next_group_due(&prefilled, prompt.len()) {
+                break;
+            }
+            let first = reqs.len();
+            let group = &seeds[first..first + schedule[admitted_groups]];
+            admit_group(bundle, gpu, prompt, sampler, group, next_tag, reqs)?;
+            admitted_groups += 1;
+        }
+        if admitted_groups == schedule.len() && reqs.iter().all(|r| r.done) {
             return Ok(());
         }
         // Lanes decoding at the tick's start (a lane finishing its prompt this
@@ -1161,7 +1290,7 @@ pub(super) fn run_ep_arm(
     let ids_path = dir.join(format!("{stem}.ids.json"));
     let sampler = LaneSamplerSpec::from_settings(settings)?;
     let lanes = placement.lanes;
-    let mut run = EpLanes::load(model, arm, lanes)?;
+    let mut run = EpLanes::load(model, arm, lanes, placement.lane_k)?;
     let prompt = render_prompt(
         &run.tokenizer,
         &run.template,
@@ -1259,6 +1388,14 @@ pub(super) fn run_ep_arm(
         evidence.mesh.offered,
         evidence.mesh.accepted
     );
+    println!(
+        "ARM {arm} lane_k={} max_offered={} first_window_offered={:?} crossing_requests={} of {} requests (a request that ran both a native and an AR window)",
+        placement.lane_k,
+        evidence.max_offered,
+        evidence.first_window_offered,
+        evidence.crossing_requests,
+        trials.iter().map(Vec::len).sum::<usize>()
+    );
     debug_assert!(rows.iter().all(|row| row.len() == TOKENS));
     fs::write(
         &ids_path,
@@ -1307,6 +1444,7 @@ mod tests {
             executor: lane_suite::Executor::Lanes,
             topology: lane_suite::Topology::Ep2,
             lanes,
+            lane_k: 2,
         }
     }
 
@@ -1337,6 +1475,8 @@ mod tests {
         }
         assert_eq!(ArmKind::of("lane_ar"), Ok(ArmKind::Ar));
         assert_eq!(ArmKind::of("lane_adaptive"), Ok(ArmKind::Mtp));
+        assert_eq!(ArmKind::of("lane_cross"), Ok(ArmKind::Cross));
+        assert!(ArmKind::Cross.mesh() && ArmKind::Mtp.mesh() && !ArmKind::Ar.mesh());
         assert!(ArmKind::of("lane_copy")
             .unwrap_err()
             .contains("no ep2 executor"));
@@ -1351,22 +1491,78 @@ mod tests {
     }
 
     #[test]
-    fn the_env_check_pins_the_topology_native_windows_and_depth() {
+    fn the_env_check_pins_the_topology_and_native_windows() {
         let mtp = ArmKind::Mtp;
-        assert!(check_ep_env(mtp, 8, 8, 2, MTP_K).is_ok());
-        assert!(check_ep_env(mtp, 1, 8, 2, MTP_K).is_ok());
+        assert!(check_ep_env(mtp, 8, 8, 2).is_ok());
+        assert!(check_ep_env(mtp, 1, 8, 2).is_ok());
         assert!(
-            check_ep_env(ArmKind::Ar, 8, 1, 2, 1).is_ok(),
+            check_ep_env(ArmKind::Ar, 8, 1, 2).is_ok(),
             "the AR store never switches windows"
         );
-        let low = check_ep_env(mtp, 8, 4, 2, MTP_K).unwrap_err();
+        let low = check_ep_env(mtp, 8, 4, 2).unwrap_err();
         assert!(low.contains("HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=4"), "{low}");
-        assert!(check_ep_env(mtp, 8, 8, 1, MTP_K)
+        assert!(check_ep_env(mtp, 8, 8, 1)
             .unwrap_err()
             .contains("topology.ep"));
-        assert!(check_ep_env(mtp, 8, 8, 2, MTP_K - 1)
+    }
+
+    #[test]
+    fn the_lane_depth_must_be_the_cohorts_for_the_native_arms_only() {
+        for lane_k in lane_suite::LANE_K_VALUES {
+            for kind in [ArmKind::Mtp, ArmKind::Cross] {
+                assert!(check_lane_k(kind, lane_k, lane_k).is_ok());
+                let other = if lane_k == 2 { 3 } else { 2 };
+                let error = check_lane_k(kind, other, lane_k).unwrap_err();
+                assert!(
+                    error.contains("HIPFIRE_EP_MTP_LANE_K")
+                        && error.contains("HIPFIRE_SAMPLED_MTP_LANE_K"),
+                    "{error}"
+                );
+            }
+            // The AR reference drafts nothing and pins nothing.
+            assert!(check_lane_k(ArmKind::Ar, 1, lane_k).is_ok());
+        }
+        assert!(check_lane_k(ArmKind::Mtp, 1, 2).is_err());
+    }
+
+    #[test]
+    fn every_suite_lane_count_passes_the_fixed_count_env_check() {
+        for lanes in lane_suite::LANE_COUNTS {
+            // The fixed-count pin is the largest lane count: native windows at every N.
+            assert!(check_ep_env(ArmKind::Mtp, lanes, 8, 2).is_ok(), "{lanes}");
+            // A store is never smaller than the serve's two-lane minimum.
+            assert_eq!(store_lanes(lanes), lanes.max(2));
+            // Native windows need at least as many active slots as lanes.
+            let below = check_ep_env(ArmKind::Mtp, lanes, lanes - 1, 2);
+            assert!(below.is_err(), "{lanes}");
+        }
+    }
+
+    #[test]
+    fn the_crossing_env_check_pins_the_shipped_max_active_and_eight_lanes() {
+        use hipfire_arch_qwen4::lane_switch::DEFAULT_MAX_ACTIVE;
+        let cross = ArmKind::Cross;
+        assert_eq!(lane_suite::CROSS_MAX_ACTIVE_N, DEFAULT_MAX_ACTIVE);
+        assert!(check_ep_env(cross, 8, DEFAULT_MAX_ACTIVE, 2).is_ok());
+        // The fixed-count pin (8) would never switch: refused for the crossing arm.
+        let wide = check_ep_env(cross, 8, 8, 2).unwrap_err();
+        assert!(wide.contains("HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8"), "{wide}");
+        for max_active in [1, 2, 4, 5, 6, 7] {
+            assert!(
+                check_ep_env(cross, 8, max_active, 2).is_err(),
+                "{max_active}"
+            );
+        }
+        for lanes in 1..=7 {
+            let error = check_ep_env(cross, lanes, DEFAULT_MAX_ACTIVE, 2).unwrap_err();
+            assert!(
+                error.contains("lane_cross runs 8 lanes"),
+                "{lanes}: {error}"
+            );
+        }
+        assert!(check_ep_env(cross, 8, DEFAULT_MAX_ACTIVE, 1)
             .unwrap_err()
-            .contains("mtp_k"));
+            .contains("topology.ep"));
     }
 
     #[test]
@@ -1707,6 +1903,196 @@ mod tests {
         assert_eq!(tally.lanes, 22);
         assert_eq!(tally.by_lanes[&8], 2);
         assert_eq!(tally.by_lanes[&1], 1);
+    }
+
+    fn ar_window() -> WindowFact {
+        WindowFact {
+            kind: WindowKind::Ar,
+            offered: 0,
+            accepted: 0,
+            emitted: 1,
+        }
+    }
+
+    #[test]
+    fn a_request_crosses_when_it_ran_both_a_native_and_an_ar_window() {
+        assert!(crossed(&[native(3, 2, 3), ar_window()]));
+        assert!(crossed(&[ar_window(), native(0, 0, 1)]));
+        assert!(!crossed(&[native(3, 2, 3), native(3, 1, 2)]));
+        assert!(!crossed(&[ar_window(), ar_window()]));
+        assert!(!crossed(&[]));
+    }
+
+    /// One 8-lane crossing trial: lanes 0..crossed_lanes ran a native window
+    /// then an AR one, the others native windows only.
+    fn cross_trial(trial: usize, crossed_lanes: usize) -> Vec<RequestRecord> {
+        (0..8)
+            .map(|lane| {
+                let windows = if lane < crossed_lanes {
+                    vec![native(3, 2, 3), ar_window()]
+                } else {
+                    vec![native(3, 3, 4)]
+                };
+                record(trial, lane, windows)
+            })
+            .collect()
+    }
+
+    fn note_steps(evidence: &mut LaneEvidence, occupancies: &[usize]) {
+        for &lanes in occupancies {
+            evidence.mesh.note(&MeshStepFacts {
+                lanes,
+                ..MeshStepFacts::default()
+            });
+        }
+    }
+
+    #[test]
+    fn crossing_evidence_counts_crossed_requests_and_the_occupancy_histogram() {
+        let mut evidence = LaneEvidence::with_samples(0);
+        evidence.observe_trial(0, &cross_trial(0, 5), &|_| String::new());
+        note_steps(&mut evidence, &[3, 8, 8, 4, 5]);
+        let json = evidence.to_json("lane_cross", placement(8), (0, 1), 3);
+        assert_eq!(json["crossing_requests"], 5);
+        assert_eq!(json["requests"], 8);
+        assert_eq!(
+            json["mesh"]["steps_by_lanes"],
+            serde_json::json!({"3": 1, "4": 1, "5": 1, "8": 2})
+        );
+        let failures =
+            lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_cross", 8, 1, &json);
+        assert!(failures.is_empty(), "{failures:?}");
+        // Every other arm records the counter too (the reference never crosses).
+        let mut reference = LaneEvidence::with_samples(0);
+        let records: Vec<_> = (0..2)
+            .map(|lane| record(0, lane, vec![ar_window(); 3]))
+            .collect();
+        reference.observe_trial(0, &records, &|_| String::new());
+        assert_eq!(
+            reference.to_json("lane_ar", placement(2), (0, 1), 3)["crossing_requests"],
+            0
+        );
+    }
+
+    #[test]
+    fn a_run_that_never_crossed_has_no_crossing_verdict() {
+        // No request ran both kinds of window.
+        let mut evidence = LaneEvidence::with_samples(0);
+        evidence.observe_trial(0, &cross_trial(0, 0), &|_| String::new());
+        // AR windows exist elsewhere, so only the crossing rule is violated.
+        evidence.ar_windows += 1;
+        note_steps(&mut evidence, &[3, 8]);
+        let json = evidence.to_json("lane_cross", placement(8), (0, 1), 3);
+        assert_eq!(json["crossing_requests"], 0);
+        let failures =
+            lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_cross", 8, 1, &json)
+                .concat();
+        assert!(failures.contains("crossing_requests=0"), "{failures}");
+
+        // Steps that never had occupancy <= 3 / >= 5 (4 is the hold case).
+        for (occupancies, needle) in [
+            (&[8, 8][..], "<= 3"),
+            (&[3, 4][..], ">= 5"),
+            (&[][..], "<= 3"),
+        ] {
+            let mut evidence = LaneEvidence::with_samples(0);
+            evidence.observe_trial(0, &cross_trial(0, 5), &|_| String::new());
+            note_steps(&mut evidence, occupancies);
+            let json = evidence.to_json("lane_cross", placement(8), (0, 1), 3);
+            let failures =
+                lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_cross", 8, 1, &json)
+                    .concat();
+            assert!(failures.contains(needle), "{occupancies:?}: {failures}");
+        }
+    }
+
+    #[test]
+    fn crossing_evidence_shards_merge_and_still_cover() {
+        let shard = |first: usize| {
+            let mut evidence = LaneEvidence::with_samples(0);
+            evidence.observe_trial(first, &cross_trial(first, 3), &|_| String::new());
+            // Shard 0 sees only the native side, shard 1 only the AR side: the
+            // merged histogram covers both.
+            note_steps(&mut evidence, if first == 0 { &[3, 3] } else { &[8, 5] });
+            evidence.to_json("lane_cross", placement(8), (first, first + 1), 3)
+        };
+        let (a, b) = (shard(0), shard(1));
+        assert!(
+            !lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_cross", 8, 1, &a)
+                .is_empty(),
+            "one shard alone never reached the AR side"
+        );
+        let merged = lane_suite::merge_evidence(&[a, b]).unwrap();
+        assert_eq!(merged["crossing_requests"], 6);
+        assert_eq!(
+            merged["mesh"]["steps_by_lanes"],
+            serde_json::json!({"3": 2, "5": 1, "8": 1})
+        );
+        let failures =
+            lane_suite::lane_coverage(lane_suite::Topology::Ep2, "lane_cross", 8, 2, &merged);
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    fn depth_evidence(offered: &[usize], lane_k: usize) -> Value {
+        let records: Vec<_> = offered
+            .iter()
+            .enumerate()
+            .map(|(lane, &drafts)| record(0, lane, vec![native(drafts, drafts, drafts + 1)]))
+            .collect();
+        let mut evidence = LaneEvidence::with_samples(0);
+        evidence.observe_trial(0, &records, &|_| String::new());
+        let placement = lane_suite::Placement {
+            lane_k,
+            ..placement(offered.len())
+        };
+        evidence.to_json("lane_batched", placement, (0, 1), 3)
+    }
+
+    #[test]
+    fn the_evidence_records_the_lane_depth_and_what_the_windows_offered() {
+        let json = depth_evidence(&[3, 3, 1], 3);
+        assert_eq!(json["lane_k"], 3);
+        assert_eq!(json["max_offered"], 3);
+        assert_eq!(
+            json["first_window_offered"],
+            serde_json::json!({"1": 1, "3": 2})
+        );
+        assert!(lane_suite::lane_k_coverage("lane_batched", 3, &json).is_empty());
+        // The same windows under a K=2 cohort: a window above K, and no first
+        // window at K.
+        let json = depth_evidence(&[3, 3, 1], 2);
+        let failures = lane_suite::lane_k_coverage("lane_batched", 2, &json).concat();
+        assert!(failures.contains("above the pinned lane K=2"), "{failures}");
+        assert!(failures.contains("first window offered K=2"), "{failures}");
+        // K=2 evidence read under a K=3 cohort is the wrong cohort.
+        let json = depth_evidence(&[2, 2, 1], 2);
+        assert!(lane_suite::lane_k_coverage("lane_batched", 2, &json).is_empty());
+        let failures = lane_suite::lane_k_coverage("lane_batched", 3, &json).concat();
+        assert!(failures.contains("records lane_k"), "{failures}");
+        // The first windows never reached K.
+        let json = depth_evidence(&[1, 1, 0], 2);
+        let failures = lane_suite::lane_k_coverage("lane_batched", 2, &json).concat();
+        assert!(failures.contains("never exercised"), "{failures}");
+        // The reference arm has no depth rule; the crossing arm has it.
+        assert!(lane_suite::lane_k_coverage("lane_ar", 2, &json).is_empty());
+        assert!(!lane_suite::lane_k_coverage("lane_cross", 2, &json).is_empty());
+    }
+
+    #[test]
+    fn depth_evidence_shards_merge_and_disagreeing_depths_do_not() {
+        let a = depth_evidence(&[3, 1], 3);
+        let b = depth_evidence(&[2, 2], 3);
+        let merged = lane_suite::merge_evidence(&[a.clone(), b]).unwrap();
+        assert_eq!(merged["max_offered"], 3);
+        assert_eq!(
+            merged["first_window_offered"],
+            serde_json::json!({"1": 1, "2": 2, "3": 1})
+        );
+        assert_eq!(merged["lane_k"], 3);
+        let k2 = depth_evidence(&[2, 1], 2);
+        assert!(lane_suite::merge_evidence(&[a, k2])
+            .unwrap_err()
+            .contains("lane_k"));
     }
 
     #[test]

@@ -5,7 +5,8 @@
 # job_sampled_lane_shards.sh SPEC... -- inside ONE fabric `correct` job on cards C,B (EP2): runs
 # EP2 sampled lane-suite shards one after another, each in its own fresh process
 # (`scripts/sampled_lane_suite.sh shard`, topology ep2). A SPEC is ARM:LANES:START..END, e.g.
-#   lane_ar:8:0..8 lane_ar:1:0..8 lane_batched:8:0..8 lane_batched:1:0..8
+#   lane_ar:8:0..8 lane_ar:1:0..8 lane_batched:8:0..8 lane_batched:1:0..8 lane_cross:8:0..8 (lanes 1..8; lane_cross at 8 only)
+# LANE_K (2 default, or 3) is part of every shard's identity: use the same value for every shard, the merge and the verdict.
 #
 # job_sampled_lane_shards.sh merge|verdict LANES -- CPU only, no fabric job and no GPU: the shard merge /
 #   the lane verdict of $RUNROOT/out-ep2-L<LANES> under the SAME scrubbed environment as the shards (the
@@ -39,7 +40,7 @@ SD=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 MODE=shard
 if [[ ${1:-} == merge || ${1:-} == verdict ]]; then
   MODE=$1; shift
-  [[ $# == 1 && ${1:-} =~ ^(1|8)$ ]] || { echo "usage: $0 $MODE LANES (1|8)" >&2; exit 2; }
+  [[ $# == 1 && ${1:-} =~ ^[1-8]$ ]] || { echo "usage: $0 $MODE LANES (1..8)" >&2; exit 2; }
   CPU_LANES=$1; set -- "cpu:$MODE"
 fi
 [[ $# -ge 1 ]] || { sed -n '2,/^set -uo/{/^set -uo/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}" >&2; exit 2; }
@@ -54,7 +55,8 @@ DRY=${EPLANE_DRY:-0}
 specs=()
 for spec in "$@"; do
   [[ $MODE != shard ]] && { specs+=("$spec"); continue; }
-  [[ $spec =~ ^(lane_ar|lane_batched|lane_adaptive):(1|8):[0-9]+\.\.[0-9]+$ ]] || { echo "bad SPEC '$spec' (ARM:LANES:START..END)" >&2; exit 2; }
+  [[ $spec =~ ^(lane_ar|lane_batched|lane_adaptive|lane_cross):[1-8]:[0-9]+\.\.[0-9]+$ ]] || { echo "bad SPEC '$spec' (ARM:LANES:START..END)" >&2; exit 2; }
+  [[ $spec != lane_cross:* || $spec == lane_cross:8:* ]] || { echo "lane_cross runs at 8 lanes only ('$spec')" >&2; exit 2; }
   specs+=("$spec")
 done
 O=$RUNROOT/$TAG
@@ -117,7 +119,7 @@ fi
 T0=$(date +%s); worst=0
 for spec in "${specs[@]}"; do
   if [[ $MODE != shard ]]; then
-    cmd=("${EV[@]}" MODEL="$MODEL" OUT="$RUNROOT/out-ep2-L$CPU_LANES" TOPOLOGY=ep2 LANES="$CPU_LANES" TRIALS="$TRIALS" PROMPT="$PROMPT"
+    cmd=("${EV[@]}" MODEL="$MODEL" OUT="$RUNROOT/out-ep2-L$CPU_LANES" TOPOLOGY=ep2 LANES="$CPU_LANES" LANE_K="${LANE_K:-2}" TRIALS="$TRIALS" PROMPT="$PROMPT"
          TEST_EXE="$EXE" "$SD/sampled_lane_suite.sh" "$MODE")
     if [[ $DRY == 1 ]]; then printf '%q ' "${cmd[@]}"; echo; continue; fi
     mkdir -p "$O"; "${cmd[@]}" > "$O/$MODE.out" 2> "$O/$MODE.err"; rc=$?
@@ -126,7 +128,7 @@ for spec in "${specs[@]}"; do
   IFS=: read -r arm lanes range <<< "$spec"
   out=$RUNROOT/out-ep2-L$lanes
   left=$(( BUDGET - ($(date +%s) - T0) ))
-  cmd=("${EV[@]}" MODEL="$MODEL" OUT="$out" TOPOLOGY=ep2 LANES="$lanes" TRIALS="$TRIALS" PROMPT="$PROMPT" TEST_EXE="$EXE"
+  cmd=("${EV[@]}" MODEL="$MODEL" OUT="$out" TOPOLOGY=ep2 LANES="$lanes" LANE_K="${LANE_K:-2}" TRIALS="$TRIALS" PROMPT="$PROMPT" TEST_EXE="$EXE"
        "$SD/sampled_lane_suite.sh" shard "$arm" "$range")
   if [[ $DRY == 1 ]]; then printf 'timeout -k 15 <left> '; printf '%q ' "${cmd[@]}"; echo; continue; fi
   if (( left < 120 )); then echo "skip $spec: $left s left of the $BUDGET s budget" | tee -a "$O/logs/skipped.txt"; worst=1; continue; fi

@@ -619,16 +619,40 @@ logs once per process. The sampled-MTP chi-square oracle
 (`sampled_mtp_distribution_hw`) runs its short arms on a PP2 mesh with
 `HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2` (test harness variable, with
 `HIPFIRE_PP_LAYERS`). This does not admit other speculative engines under PP.
-`HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes` with `HIPFIRE_SAMPLED_MTP_LANES=1|8` selects
+`HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes` with `HIPFIRE_SAMPLED_MTP_LANES=1..8` (any lane
+count 1 to 8) selects
 the lane suite of the same test (arms `lane_ar`, `lane_batched`, `lane_adaptive`,
-`lane_copy`; topology `single`, `pp2` or `ep2`; merged and judged per lane in a
+`lane_copy`, `lane_cross`; topology `single`, `pp2` or `ep2`; merged and judged per lane in a
 separate output directory per executor). Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2`
 (`HIPFIRE_TOPOLOGY_EP=2`, two visible cards) each arm process runs the EP2 lane
 executor over a `HIPFIRE_SAMPLED_MTP_SHARD=START..END` trial shard: `lane_ar` is
 sampled AR lanes (the reference), `lane_batched` / `lane_adaptive` are
 native-MTP mesh lanes with root Leviathan acceptance (the `ep2` cohort has no
-`lane_copy`: the copy lane is off by default on EP serve). The native-MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so the
-8-lane arm runs native windows. The test never hashes artifacts: the model, its
+`lane_copy`: the copy lane is off by default on EP serve). The fixed-count
+native-MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so that `N` lanes run
+native windows at every `N`; they are native-window coverage arms, not the shipped
+switching policy. `lane_cross` (`ep2`, `HIPFIRE_SAMPLED_MTP_LANES=8` only; the
+`ep2` cohort of any other lane count has no such arm) is the shipped policy:
+native batched drafting (`HIPFIRE_MTP_INCREMENTAL=0`, `HIPFIRE_MTP_AR_FLOOR=0`)
+under `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3` (the shipped
+`lane_switch::DEFAULT_MAX_ACTIVE`, pinned so the identity records it) with a
+staggered trial: 3 of the 8 requests are admitted at tick 0 and the other 5
+once the first group has forwarded its prompt, so the early lanes' first decode
+window runs native with 3 active lanes and their later windows run AR with 8
+(AR from `max_active + 2` = 5 lanes; 4 lanes is the hold case, recorded in the
+occupancy histogram). Its coverage fails (with a clear message, never a
+verdict) when no request ran both a native and an AR window or when mesh steps
+never had occupancy <= 3 and >= 5; it is judged against `lane_ar` like
+`lane_batched` (pooled, per lane, merge route `cross`). The native arms
+(`lane_batched`, `lane_adaptive`, `lane_cross`) draft at the lane depth chosen
+with `HIPFIRE_SAMPLED_MTP_LANE_K` (test harness variable: `2`, the shipped
+`HIPFIRE_EP_MTP_LANE_K` default, or `3`, the sensitivity run; anything else is
+refused) and pin `HIPFIRE_EP_MTP_LANE_K` to it; `lane_ar` pins nothing. The
+depth is part of every shard's merge key and identity (a K=2 set never merges
+with a K=3 set) and of the evidence (`lane_k`, `max_offered`,
+`first_window_offered`): a window offering more than K drafts, or first windows
+that never offered K, fail the coverage.
+The test never hashes artifacts: the model, its
 `.ple-q4` and `.expert-hotset` need records in `<HIPFIRE_HOME>/cache/verified-artifacts.json`,
 and `HIPFIRE_FABRIC_ADMISSION` is excluded from the compared identity (it names
 the job). The single and pp2 lane topologies validate their configuration and
@@ -2651,6 +2675,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SAMPLED_MTP_FREQUENCY_PENALTY` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_GREEDY_TOKENS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_LANES` | crates/hipfire-arch-qwen4/tests/common/lane_suite.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_LANE_K` | crates/hipfire-arch-qwen4/tests/common/lane_ep.rs, crates/hipfire-arch-qwen4/tests/common/lane_suite.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_LATE_TOKENS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_MIN_P` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_OUT` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/common/lane_run.rs | harness |

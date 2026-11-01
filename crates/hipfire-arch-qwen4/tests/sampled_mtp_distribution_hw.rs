@@ -335,7 +335,7 @@
 //!
 //! Compares the continuous-batching lane executor with AR lanes in
 //! distribution. `HIPFIRE_SAMPLED_MTP_EXECUTOR=lanes` (default `singleton`)
-//! selects it; `HIPFIRE_SAMPLED_MTP_LANES=1|8` (required, refused under
+//! selects it; `HIPFIRE_SAMPLED_MTP_LANES=1..8` (any count 1 to 8; required, refused under
 //! `singleton`) is the concurrent request count of a trial;
 //! `HIPFIRE_SAMPLED_MTP_TOPOLOGY` takes `single`, `pp2` or `ep2` (`ep2` only
 //! under the lane executor; the singleton arms stay `single`/`pp2`). The
@@ -353,7 +353,7 @@
 //! every shard on executor, topology, model artifact hash, lane count, route,
 //! sampling/cohort settings, GDN state format and trial range, requires one key
 //! per arm and one cross-arm key, ranges that tile `0..trials` exactly once, and
-//! every arm of its topology's cohort (all four, or the three `ep2` arms). `sampled_mtp_matches_ar_distribution_on_flash_next` under
+//! every arm of its cohort (all four; under `ep2` the three fixed arms, plus `lane_cross` at 8 lanes: the cohort follows the lane count the shards record). `sampled_mtp_matches_ar_distribution_on_flash_next` under
 //! `lanes` never launches an arm: it judges the merged files (>= 2000 trials)
 //! pooled and per lane against `lane_ar`, plus route coverage from each arm's
 //! evidence. The host-only logic and its CPU tests are `common/lane_suite.rs`
@@ -362,9 +362,10 @@
 //! # EP2 lane arms (`lane_ep.rs`)
 //!
 //! Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2` the cohort is `lane_ar`,
-//! `lane_batched` and `lane_adaptive` (`lane_suite::EP2_ARMS`: the copy lane is
+//! `lane_batched` and `lane_adaptive` (`lane_suite::EP2_FIXED_ARMS`), plus
+//! `lane_cross` at 8 lanes (`lane_suite::EP2_ARMS`); the copy lane is
 //! off by default on EP serve, so `lane_copy` is refused under `ep2` and its
-//! shards are foreign to an `ep2` merge). A lane arm process (cards C,B under
+//! shards are foreign to an `ep2` merge. A lane arm process (cards C,B under
 //! `HIPFIRE_TOPOLOGY_EP=2`, one fresh process per arm and shard) loads the
 //! artifact once through the product loader with the serve's `serve.vmm_batch`
 //! lane reservation, stages one lane store and runs its `START..END` trials
@@ -372,11 +373,41 @@
 //! executor AR rows, host draws from each lane's RNG: the reference);
 //! `lane_batched` and `lane_adaptive` are native-MTP mesh lanes
 //! (`Qwen4Bundle::ep_mesh_decode_step`, root Leviathan acceptance, every lane
-//! MTP, no copy lane). The MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so
-//! even the 8-lane arm runs native windows (the step switch would otherwise run
-//! AR windows above four lanes). The mesh router calibrates inline, so the
+//! MTP, no copy lane). The fixed-count MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so
+//! `N` lanes run native windows at every lane count `1..=8` (the step switch would otherwise run
+//! AR windows above `max_active + 1` lanes): they are native-window coverage arms, not the shipped
+//! switching policy. The mesh router calibrates inline, so the
 //! `ep2` adaptive coverage needs native windows and a floor-on route class
 //! (`adaptive-floor` in its recorded config), not a zero-draft first window.
+//!
+//! `lane_cross` (8 lanes, `ep2` only) is the shipped switching policy: native
+//! batched drafting as `lane_batched` (`HIPFIRE_MTP_INCREMENTAL=0`,
+//! `HIPFIRE_MTP_AR_FLOOR=0`) with `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3` (the shipped
+//! `lane_switch::DEFAULT_MAX_ACTIVE`, pinned so the identity records it; a test
+//! keeps the two equal) and a staggered trial
+//! (`lane_suite::admit_schedule`): the first 3 requests are admitted at tick 0
+//! and the other 5 once the first group has finished its prompt prefill, so the
+//! early lanes' first decode window runs native with 3 active lanes and their
+//! later windows run AR with 8 (`lane_switch::native_mode`: AR from
+//! `max_active + 2` = 5 lanes, 4 lanes is the hold case).
+//! Request `i` is lane `i`. Its evidence adds `crossing_requests` (requests with
+//! both a native and an AR window) and the mesh step occupancy histogram
+//! (`mesh.steps_by_lanes`, occupancy 4 recorded); its coverage fails (a
+//! COVERAGE FAILURE, never a verdict) when no request crossed or the steps never
+//! had occupancy <= 3 and >= 5. It is judged against `lane_ar` exactly like
+//! `lane_batched`: pooled and per lane chi-square over tokens 1..4 and the
+//! joint, with merge key route `cross`.
+//!
+//! The native arms (`lane_batched`, `lane_adaptive`, `lane_cross`) draft at the
+//! lane depth chosen with `HIPFIRE_SAMPLED_MTP_LANE_K` (`2` = the shipped
+//! `ep_lane_spec_k` default, or `3` for the sensitivity run; anything else is
+//! refused): the arm pins `HIPFIRE_EP_MTP_LANE_K` to it, `lane_ar` pins nothing.
+//! The oracle still loads and calls the drafter with `MTP_K=3`; the EP lane store
+//! drafts at `min(3, HIPFIRE_EP_MTP_LANE_K)`. The depth is recorded in every
+//! shard's `lane_suite` block and merge key (a K=2 set never merges with a K=3
+//! set), in the identity environment, and in the evidence (`lane_k`,
+//! `max_offered`, `first_window_offered`): the coverage fails a window that
+//! offered more than K drafts and a run whose first windows never offered K.
 //! Request seeds are the lane suite's `lane_request_seed` truncated to the lane
 //! RNG's 32 bits. Each shard writes `<arm>.<START>-<END>.ids.json`
 //! (`(END - START) * lanes` lane-minor rows), `.ids.config.json`,
@@ -2375,12 +2406,13 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Route knob of a forced arm: a `batched` / `interleaved` name is a fixed
-/// route (`HIPFIRE_MTP_INCREMENTAL` 0 / 1, floor off); every other arm
+/// route (`HIPFIRE_MTP_INCREMENTAL` 0 / 1, floor off); the lane suite's
+/// `lane_cross` runs the batched route too; every other arm
 /// (`ar`, `adaptive`, `*_adaptive`, `late_*`) runs with no route knob.
 fn arm_route(arm: &str) -> Option<&'static str> {
     if arm.ends_with("interleaved") {
         Some("1")
-    } else if arm.ends_with("batched") {
+    } else if arm.ends_with("batched") || arm == lane_suite::CROSS_ARM {
         Some("0")
     } else {
         None
@@ -2409,7 +2441,14 @@ fn arm_overrides(arm: &str, mode: &'static str) -> Vec<(&'static str, Option<&'s
             overrides.push((FLOOR_ENV, None));
         }
     }
-    overrides.extend(lane_suite::lane_env_overrides(arm));
+    if lane_suite::is_lane_arm(arm) {
+        let lane_k = lane_suite::parse_lane_k(
+            std::env::var(lane_suite::LANE_K_ENV).ok().as_deref(),
+            lane_suite::Executor::Lanes,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        overrides.extend(lane_suite::lane_env_overrides(arm, lane_k));
+    }
     let (state_request, _) = hw_identity::gdn_test_state_quant().unwrap_or_else(|e| panic!("{e}"));
     overrides.push((hw_identity::GDN_TEST_STATE_QUANT_ENV, Some(state_request)));
     overrides
@@ -4724,6 +4763,67 @@ mod coverage_logic {
         ] {
             assert_eq!(find(arm, FLOOR_ENV), Some(None), "{arm}");
             assert_eq!(find(arm, INCREMENTAL_ENV), Some(None), "{arm}");
+        }
+    }
+
+    /// `lane_cross` is a forced batched, floor-off arm that pins the shipped
+    /// `max_active` (3); the fixed-count native arms pin 8; the native arms
+    /// pin the cohort's lane depth and the reference pins nothing.
+    #[test]
+    fn the_crossing_lane_arm_runs_batched_floor_off_with_the_shipped_max_active() {
+        use hipfire_arch_qwen4::lane_switch::DEFAULT_MAX_ACTIVE;
+        let find = |arm: &str, name: &str| {
+            arm_overrides(arm, "leviathan")
+                .into_iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value)
+        };
+        let max_active = lane_suite::MAX_ACTIVE_ENV;
+        for arm in ["lane_batched", lane_suite::CROSS_ARM] {
+            assert_eq!(find(arm, INCREMENTAL_ENV), Some(Some("0")), "{arm}");
+            assert_eq!(find(arm, FLOOR_ENV), Some(Some("0")), "{arm}");
+        }
+        assert_eq!(
+            find(lane_suite::CROSS_ARM, max_active),
+            Some(Some("3")),
+            "the pin is the shipped default"
+        );
+        assert_eq!(lane_suite::CROSS_MAX_ACTIVE, DEFAULT_MAX_ACTIVE.to_string());
+        assert_eq!(find("lane_batched", max_active), Some(Some("8")));
+        assert_eq!(find("lane_adaptive", max_active), Some(Some("8")));
+        assert_eq!(find("lane_adaptive", FLOOR_ENV), Some(None));
+        assert_eq!(
+            find("lane_ar", max_active),
+            None,
+            "the reference pins nothing"
+        );
+    }
+
+    /// The native lane arms pin `HIPFIRE_EP_MTP_LANE_K` to the cohort's depth
+    /// (`HIPFIRE_SAMPLED_MTP_LANE_K`, default 2); the reference and every
+    /// singleton arm pin nothing.
+    #[test]
+    fn the_native_lane_arms_pin_the_cohort_lane_depth() {
+        let lane_k = lane_suite::parse_lane_k(
+            std::env::var(lane_suite::LANE_K_ENV).ok().as_deref(),
+            lane_suite::Executor::Lanes,
+        )
+        .unwrap();
+        let find = |arm: &str| {
+            arm_overrides(arm, "leviathan")
+                .into_iter()
+                .find(|(key, _)| *key == lane_suite::EP_LANE_K_ENV)
+                .map(|(_, value)| value)
+        };
+        for arm in ["lane_batched", "lane_adaptive", lane_suite::CROSS_ARM] {
+            assert_eq!(
+                find(arm),
+                Some(Some(lane_suite::lane_k_str(lane_k))),
+                "{arm}"
+            );
+        }
+        for arm in ["lane_ar", "ar", "batched", "interleaved", "adaptive"] {
+            assert_eq!(find(arm), None, "{arm}");
         }
     }
 }
