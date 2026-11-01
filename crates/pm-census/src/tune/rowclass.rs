@@ -518,7 +518,9 @@ pub fn receipt(
         return Err("no --record given".to_owned());
     }
     // hip_loop writes `vs` as `{baseline:{contract,..}, candidate:{..}}`; older/synthetic
-    // records carry a plain string. Normalize to `contract:<baseline id>`.
+    // records carry a plain string. Normalize to `contract:<baseline id>`. A `--cand FILE`
+    // record has no `vs`: its incumbent is the node's own contract (the shipped body) and its
+    // candidate is the judged file, identified by the candidate code sha256.
     let values: Vec<Value> = recs
         .iter()
         .map(|r| {
@@ -529,6 +531,18 @@ pub fn receipt(
                 .map(|s| format!("contract:{s}"))
             {
                 v["vs"] = Value::String(id);
+            } else if v.get("vs").is_none() {
+                if let (Some(id), Some(sha)) = (
+                    v.pointer("/contract/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    v.pointer("/candidate/code_sha256")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                ) {
+                    v["vs"] = Value::String(format!("contract:{id}"));
+                    v["node"] = Value::String(format!("cand:{sha}"));
+                }
             }
             v
         })
@@ -931,6 +945,47 @@ mod tests {
         assert_eq!(mx(8), true);
         assert_eq!(mx(1), true);
         assert_eq!(mx(64), false); // beyond derived max
+    }
+
+    #[test]
+    fn receipt_accepts_a_cand_file_record_against_the_node_contract() {
+        let mut r = signature();
+        let o = r.as_object_mut().unwrap();
+        o.remove("vs");
+        o.insert(
+            "contract".into(),
+            json!({"id": "generic_seq.latent_attention_flash_prefill"}),
+        );
+        o.insert("candidate".into(), json!({"code_sha256": "ab12"}));
+        let d = receipt(
+            &[rec_bytes(&r, "c.json")],
+            "FA2_MIN_ROWS",
+            "x.rs",
+            512,
+            Kind::Min,
+            &pol(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            d["incumbent"],
+            "contract:generic_seq.latent_attention_flash_prefill"
+        );
+        assert_eq!(d["candidate"], "cand:ab12");
+        assert_eq!(d["covers"], true);
+        // a record with neither `vs` nor a candidate code identity is still refused
+        let mut bare = signature();
+        bare.as_object_mut().unwrap().remove("vs");
+        assert!(receipt(
+            &[rec_bytes(&bare, "d.json")],
+            "X",
+            "x.rs",
+            512,
+            Kind::Min,
+            &pol(),
+            &[]
+        )
+        .is_err());
     }
 
     #[test]

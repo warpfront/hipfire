@@ -30,7 +30,7 @@
 //!   by a domain rule (`head_dim == 128`, `width == 2560`, `wa/wb/dv == 128/64/128`): other geometries need
 //!   another contract. The pins are Raon's, the only model these generic launchers are exercised with.
 
-use crate::work::{op_class, BindSource, BindV1, Pipe, WorkSpecV1, WorkV1, ALL_ROWS};
+use crate::work::{op_class, BindSource, BindV1, Pipe, RowDomainV1, WorkSpecV1, WorkV1, ALL_ROWS};
 use crate::{
     Access, Arch, Axis, DomainRuleV1, ExportV1, Expr, FieldKind, FieldV1, FormatId, HiddenKind,
     HiddenV1, KernelAbiV1, NumericContractId, ObjectRefV1, OperandV1, ParamV1, Rule, ScalarTy,
@@ -772,7 +772,7 @@ mod conv {
 mod flash {
     use super::*;
 
-    const PARAMS: &[ParamV1] = &[
+    pub(super) const PARAMS: &[ParamV1] = &[
         ip("n_rows", "query rows of this call"),
         ip("n_heads", "heads (grid y)"),
         ip("wa", "k_a width (nope)"),
@@ -790,7 +790,7 @@ mod flash {
         ip("round_y", "1: round y to bf16"),
     ];
 
-    const OPERANDS: &[OperandV1] = &[
+    pub(super) const OPERANDS: &[OperandV1] = &[
         opd(
             "q",
             FORMAT_F32_FLAT,
@@ -853,7 +853,7 @@ mod flash {
         ),
     ];
 
-    const FIELDS: &[FieldV1] = &[
+    pub(super) const FIELDS: &[FieldV1] = &[
         f_ptr("q", 0),
         f_ptr("y", 8),
         f_ptr("ka", 16),
@@ -877,7 +877,7 @@ mod flash {
         f_i32("round_y", 104, "round_y"),
     ];
 
-    const DOMAIN: &[DomainRuleV1] = &[
+    pub(super) const DOMAIN: &[DomainRuleV1] = &[
         rule(Rule::Positive(p!("n_rows")), "n_rows > 0"),
         rule(Rule::Positive(p!("n_heads")), "n_heads > 0"),
         rule(Rule::AtMost(p!("n_heads"), 65535), "grid y limit"),
@@ -932,7 +932,7 @@ mod flash {
         exports: EXPORTS,
     };
 
-    const BIND: &[BindV1] = &[
+    pub(super) const BIND: &[BindV1] = &[
         bind("n_rows", BindSource::ChunkRows),
         bind("prefix", BindSource::CausalPrefix),
         bind("wa", CFG_NOPE),
@@ -968,6 +968,65 @@ mod flash {
             admit: ALL_ROWS,
             bind: BIND,
             note: "n_heads exact from grid y; grid x only bounds n_rows (chunk rows binds it). prefix = rows already processed in the pass. Bytes: q read + y written once, K/V (prefix + rows) rows read once per head (an upper bound when the rope tail is shared across heads).",
+        },
+    };
+}
+
+// ================================================================================
+// latent_attention_flash_prefill_fa2_q128w8 (GEN-FA2 F2a)
+// ================================================================================
+
+mod flash_fa2 {
+    use super::*;
+
+    const EXPORTS: &[ExportV1] = &[ExportV1 {
+        symbol: "latent_attention_flash_prefill_fa2_q128w8",
+        arch: Arch::Gfx1201,
+        object: ObjectRefV1::HipccSource {
+            module: "latent_attention_flash_fa2",
+            source: "kernels/src/latent_attention_flash_fa2.hip",
+        },
+        block: [256, 1, 1],
+        dynamic_lds: 44032,
+        group_segment_fixed: 0,
+        // 8 waves x 16 query rows per workgroup; grid z is 1 (dv pinned to 128).
+        grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
+        consts: &[],
+    }];
+
+    /// Same encoding, operands, domain and numerics as `generic_seq.latent_attention_flash_prefill`
+    /// (bit-identical, j6115); only the schedule differs: 256 threads, 128 query rows per CTA, K/V
+    /// streamed through 44032 bytes of LDS.
+    pub static ABI: KernelAbiV1 = KernelAbiV1 {
+        id: "generic_seq.latent_attention_flash_prefill_fa2_q128w8",
+        version: 1,
+        wave: 32,
+        numeric: NumericContractId("latent_attention.flash_prefill.bf16_wmma_f32"),
+        params: flash::PARAMS,
+        operands: flash::OPERANDS,
+        fields: flash::FIELDS,
+        hidden: hidden_std!(112, dyn_lds 232),
+        explicit_bytes: 108,
+        segment_bytes: 368,
+        segment_align: 8,
+        domain: flash::DOMAIN,
+        exports: EXPORTS,
+    };
+
+    const FA2_ADMIT: RowDomainV1 = RowDomainV1 {
+        min_rows: 17,
+        max_rows: None,
+        predicate: "crates/rdna-compute/src/latent_attention_flash.rs::FA2_MIN_ROWS",
+        kill_env: Some("HIPFIRE_ATTN_FA2_GENERIC"),
+    };
+
+    /// The incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default off).
+    pub static WORK: WorkSpecV1 = WorkSpecV1 {
+        abi: &ABI,
+        work: WorkV1 {
+            admit: FA2_ADMIT,
+            note: "FA2 route (default OFF, gfx1201): same work as the incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
+            ..flash::WORK.work
         },
     };
 }
@@ -2652,6 +2711,7 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &gdn::ABI,
     &conv::ABI,
     &flash::ABI,
+    &flash_fa2::ABI,
     &rda_prepare::ABI,
     &gated_rms::ABI,
     &postmix::ABI,
@@ -2672,6 +2732,7 @@ pub static WORK: &[&WorkSpecV1] = &[
     &gdn::WORK,
     &conv::WORK,
     &flash::WORK,
+    &flash_fa2::WORK,
     &rda_prepare::WORK,
     &gated_rms::WORK,
     &postmix::WORK,
@@ -2785,6 +2846,49 @@ mod tests {
         let (dq, dv) = (128u32 + 64, 128u32);
         assert_eq!(e.dynamic_lds, 4 * 16 * (dq + 8) * 2 + dv.min(128) * 36 * 4);
         assert_eq!(e.dynamic_lds, 44032);
+    }
+
+    #[test]
+    fn flash_fa2_contract_and_grid_inversion() {
+        flash_fa2::WORK.self_check().unwrap();
+        let e = &flash_fa2::ABI.exports[0];
+        assert_eq!(e.block, [256, 1, 1]);
+        assert_eq!(e.dynamic_lds, 44032);
+        assert_eq!(e.dynamic_lds, flash::ABI.exports[0].dynamic_lds);
+        assert_eq!(flash_fa2::ABI.explicit_bytes, flash::ABI.explicit_bytes);
+        assert_eq!(flash_fa2::ABI.segment_bytes, flash::ABI.segment_bytes);
+        assert_eq!(flash_fa2::ABI.numeric, flash::ABI.numeric);
+        let w = &flash_fa2::WORK.work;
+        assert_eq!(w.admit.min_rows, 17);
+        assert_eq!(
+            w.admit.predicate,
+            "crates/rdna-compute/src/latent_attention_flash.rs::FA2_MIN_ROWS"
+        );
+        assert_eq!(w.admit.kill_env, Some("HIPFIRE_ATTN_FA2_GENERIC"));
+        // Raon dispatch: 512 rows / 128 = 4 tiles x 256 threads, 40 heads.
+        let (x, y) = work_items(
+            &flash_fa2::ABI,
+            &[
+                ("n_rows", 512),
+                ("n_heads", 40),
+                ("wa", 128),
+                ("wb", 64),
+                ("dv", 128),
+            ],
+        );
+        assert_eq!((x, y), (1024, 40));
+        // 129 rows -> 2 tiles -> grid x 512 work items.
+        let (x, _) = work_items(
+            &flash_fa2::ABI,
+            &[
+                ("n_rows", 129),
+                ("n_heads", 40),
+                ("wa", 128),
+                ("wb", 64),
+                ("dv", 128),
+            ],
+        );
+        assert_eq!(x, 512);
     }
 
     #[test]

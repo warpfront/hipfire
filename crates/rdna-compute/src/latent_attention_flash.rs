@@ -37,9 +37,45 @@ use crate::latent_attention_tiled::{err, LatentRows, TiledAttention};
 pub const LATENT_ATTENTION_FLASH_SRC: &str =
     include_str!("../../../kernels/src/latent_attention_flash.hip");
 
+/// GEN-FA2 F2a body (q128w8-kt64): 8 compute waves, 128 query rows per CTA.
+pub const LATENT_ATTENTION_FLASH_FA2_SRC: &str =
+    include_str!("../../../kernels/src/latent_attention_flash_fa2.hip");
+
 const FLASH_MODULE: &str = "latent_attention_flash";
 const FLASH_FUNC: &str = "latent_attention_flash_prefill";
 const FLASH_Q8_FUNC: &str = "latent_attention_flash_prefill_q8";
+const FLASH_FA2_MODULE: &str = "latent_attention_flash_fa2";
+const FLASH_FA2_FUNC: &str = "latent_attention_flash_prefill_fa2_q128w8";
+/// Developer switch of the FA2 route (default OFF; `0` kills).
+pub const FA2_FLAG: &str = "HIPFIRE_ATTN_FA2_GENERIC";
+/// Smallest row count the FA2 body is routed at (below it the incumbent wins: j6115, 1 row prefix 0 is 1.105x).
+// selector-receipt: receipts/selectors/fa2_min_rows.json
+pub(crate) const FA2_MIN_ROWS: usize = 17;
+/// Query rows per FA2 CTA (8 waves x 16 rows).
+const FA2_QT: usize = 128;
+/// Threads per FA2 CTA.
+const FA2_BLOCK: u32 = 256;
+/// Dynamic LDS of the FA2 body (K 64 x 200 x 2 + V^T 128 x 36 x 4, fixed by the judged geometry).
+const FA2_LDS: u32 = 44032;
+
+/// Whether the FA2 body takes a BF16 non-wide launch: gfx1201, flag on, `rows >= FA2_MIN_ROWS`, and the judged
+/// geometry (`wa` 128, `wb` 64 so `wa + wb <= 192`, `dv` 128; the body returns without writing otherwise).
+pub(crate) fn fa2_route_admits(
+    arch: &str,
+    flag: bool,
+    n_rows: usize,
+    wa: usize,
+    wb: usize,
+    dv: usize,
+) -> bool {
+    arch == "gfx1201"
+        && flag
+        && n_rows >= FA2_MIN_ROWS
+        && wa + wb <= 192
+        && wa == 128
+        && wb == 64
+        && dv == 128
+}
 
 /// Largest query/key width (`k_a.width + k_b.width`) the kernel supports.
 pub const LATENT_ATTENTION_FLASH_MAX_DQ: usize = 1024;
@@ -144,6 +180,7 @@ impl Gpu {
             FLASH_FUNC,
             LATENT_ATTENTION_FLASH_SRC,
             false,
+            true,
         )
     }
 
@@ -162,6 +199,7 @@ impl Gpu {
             FLASH_Q8_FUNC,
             LATENT_ATTENTION_FLASH_SRC,
             true,
+            false,
         )
     }
 
@@ -176,7 +214,7 @@ impl Gpu {
         func: &str,
         src: &str,
     ) -> HipResult<()> {
-        self.flash_prefill_impl(a, module, func, src, false)
+        self.flash_prefill_impl(a, module, func, src, false, false)
     }
 
     fn flash_prefill_impl(
@@ -186,6 +224,7 @@ impl Gpu {
         func: &str,
         src: &str,
         q8: bool,
+        fa2_route: bool,
     ) -> HipResult<()> {
         if q8 {
             a.validate_q8()?;
@@ -234,7 +273,25 @@ impl Gpu {
             && dv % 64 == 0
             && dv <= WIDE_MAX_DV
             && wide_lds_bytes(dq, dv) <= LATENT_ATTENTION_FLASH_LDS_LIMIT;
-        let (waves, shared, func, grid_z) = if wide {
+        let fa2 = fa2_route
+            && !q8
+            && !wide
+            && fa2_route_admits(
+                &self.arch,
+                hipfire_config::developer_bool(FA2_FLAG, false),
+                a.n_rows,
+                wa,
+                wb,
+                dv,
+            );
+        let (module, src) = if fa2 {
+            (FLASH_FA2_MODULE, LATENT_ATTENTION_FLASH_FA2_SRC)
+        } else {
+            (module, src)
+        };
+        let (waves, shared, func, grid_z) = if fa2 {
+            (8usize, FA2_LDS, FLASH_FA2_FUNC, 1usize)
+        } else if wide {
             (
                 4usize,
                 wide_lds_bytes(dq, dv) as u32,
@@ -301,12 +358,16 @@ impl Gpu {
             &scale as *const _ as *mut c_void,
             &round_y as *const _ as *mut c_void,
         ];
-        let tiles = a.n_rows.div_ceil(if wide { 16 } else { 16 * waves });
+        let tiles = if fa2 {
+            a.n_rows.div_ceil(FA2_QT)
+        } else {
+            a.n_rows.div_ceil(if wide { 16 } else { 16 * waves })
+        };
         let grid = [tiles as u32, a.n_heads as u32, grid_z as u32];
         self.launch_maybe_blob(
             func,
             grid,
-            [32 * waves as u32, 1, 1],
+            [if fa2 { FA2_BLOCK } else { 32 * waves as u32 }, 1, 1],
             shared,
             &mut params,
             || {
@@ -325,5 +386,47 @@ impl Gpu {
                 b
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fa2_route_predicate() {
+        let ok = |arch, flag, rows, wa, wb, dv| fa2_route_admits(arch, flag, rows, wa, wb, dv);
+        assert!(ok("gfx1201", true, 512, 128, 64, 128));
+        assert!(ok("gfx1201", true, FA2_MIN_ROWS, 128, 64, 128));
+        assert!(!ok("gfx1201", true, FA2_MIN_ROWS - 1, 128, 64, 128));
+        assert!(!ok("gfx1201", true, 1, 128, 64, 128));
+        assert!(!ok("gfx1201", false, 512, 128, 64, 128));
+        for arch in ["gfx1100", "gfx1151", "gfx1010", ""] {
+            assert!(!ok(arch, true, 512, 128, 64, 128), "{arch}");
+        }
+        // geometry: anything but the judged 128 + 64 -> 128 falls back.
+        assert!(!ok("gfx1201", true, 512, 128, 64, 256));
+        assert!(!ok("gfx1201", true, 512, 128, 64, 64));
+        assert!(!ok("gfx1201", true, 512, 64, 64, 128));
+        assert!(!ok("gfx1201", true, 512, 128, 128, 128));
+        assert!(!ok("gfx1201", true, 512, 512, 64, 128));
+        assert_eq!(FA2_MIN_ROWS, 17);
+    }
+
+    #[test]
+    fn fa2_launch_constants_match_the_contract() {
+        use hipfire_kernel_abi::families::generic_seq;
+        let abi = generic_seq::ABIS
+            .iter()
+            .find(|a| a.id == "generic_seq.latent_attention_flash_prefill_fa2_q128w8")
+            .expect("fa2 contract");
+        let e = &abi.exports[0];
+        assert_eq!(e.symbol, FLASH_FA2_FUNC);
+        assert_eq!(e.block, [FA2_BLOCK, 1, 1]);
+        assert_eq!(e.dynamic_lds, FA2_LDS);
+        // K stage 64 rows x pitch 200 x 2 B plus V^T 128 x 36 words.
+        assert_eq!(FA2_LDS as usize, 64 * 200 * 2 + 128 * FLASH_VP_WORDS * 4);
+        assert!(LATENT_ATTENTION_FLASH_FA2_SRC.contains(FLASH_FA2_FUNC));
+        assert!(!LATENT_ATTENTION_FLASH_FA2_SRC.contains("hip_loop"));
     }
 }
