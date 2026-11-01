@@ -8583,7 +8583,9 @@ impl Gpu {
                 std::slice::from_raw_parts_mut(out[start..].as_mut_ptr() as *mut u8, numel * 4)
             };
             match stream {
-                Some(stream) => self.hip.memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?,
+                Some(stream) => self
+                    .hip
+                    .memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?,
                 None => self.hip.memcpy_dtoh(bytes, &tensor.buf)?,
             }
         }
