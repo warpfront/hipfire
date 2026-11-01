@@ -166,3 +166,69 @@ def test_coverage_of_held_reads(corpus, capsys):
     # held reads hit units 0,1 (layer 0) and 6,7 (layer 1); top 50% of 8 = ids 1,7,0,2
     assert "top 50.00% of units -> 75.00%" in text
 
+
+
+def write_route_hist(tmp, name, matrix, tokens, split="cal"):
+    np = pytest.importorskip("numpy")
+    base = tmp / f"route_hist.pooled.{split}.{name}"
+    doc = dict(
+        schema="route_hist.v1", source={"path": "shards.tsv", "sha256": "s" * 64},
+        model="m.mq4-xts", n_experts=EXPERTS, topk=TOPK,
+        records=[{"layer": 0, "n": tokens, "k": TOPK, "position": 0}],
+        per_layer=[dict(layer=i, tokens=tokens, counts=row) for i, row in enumerate(matrix)],
+        total=dict(tokens=tokens), ids={"path": "shards.tsv", "sha256": "i" * 64}, id="r" * 64,
+        x_miheat=dict(**{"class": "pooled"}, split=split, docs=1, head_counts=[1, 2, 3, 4]))
+    Path(str(base) + ".json").write_text(json.dumps(doc))
+    np.savez(str(base) + ".counts.npz", counts=np.array(matrix, dtype=np.int64))
+    return str(base) + ".json"
+
+
+def test_route_hist_reader_checks_the_npz_and_the_read_total(tmp_path):
+    matrix = [[3, 2, 1, 0], [0, 4, 2, 0]]  # 6 slot reads/layer = 3 tokens x top_k 2
+    path = write_route_hist(tmp_path, "ok", matrix, 3)
+    rh = k0rank.read_route_hist(path)
+    assert rh["counts"] == [3, 2, 1, 0, 0, 4, 2, 0]  # global id = layer * experts + expert
+    assert (rh["layers"], rh["experts"], rh["tokens"]) == (2, 4, 3)
+    assert "head_counts" not in rh["x_miheat"]
+    bad = write_route_hist(tmp_path, "bad", [[3, 2, 1, 0], [0, 4, 2, 1]], 3)
+    with pytest.raises(ValueError, match="slot reads"):
+        k0rank.read_route_hist(bad)
+    import numpy as np
+    np.savez(path[:-5] + ".counts.npz", counts=np.zeros((2, 4), dtype=np.int64))
+    with pytest.raises(ValueError, match="differ"):
+        k0rank.read_route_hist(path)
+
+
+def test_write_from_route_hist_labels_and_orders(tmp_path):
+    path = write_route_hist(tmp_path, "w", [[3, 2, 1, 0], [0, 4, 2, 0]], 3)
+    out = tmp_path / "mi.expert-hotset"
+    k0rank.main(["write", "--route-hist", path, "--capture-label", "gfx942-derived",
+                 "--out", str(out), "--bind-from", bind_file(tmp_path)])
+    doc = json.loads(out.read_text())
+    assert tuple(doc) == k0rank.SCHEMA_KEYS
+    k0rank.validate_doc(doc)
+    assert doc["counts"] == [3, 2, 1, 0, 0, 4, 2, 0]
+    assert doc["rank"] == [5, 0, 1, 6, 2, 3, 4, 7]
+    assert doc["capture_tokens"] == 3 and "gfx942-derived" in doc["corpus"]
+    prov = json.loads((tmp_path / "mi.expert-hotset.provenance.json").read_text())
+    assert prov["source_kind"] == "route_hist.v1" and prov["capture_label"] == "gfx942-derived"
+    assert prov["route_hist"]["json_sha256"] and prov["route_hist"]["counts_npz_sha256"]
+    assert prov["route_hist"]["id"] == "r" * 64 and prov["split"] == "cal"
+    with pytest.raises(SystemExit, match="exactly one"):
+        k0rank.main(["write", "--out", str(out), "--bind-from", bind_file(tmp_path)])
+
+
+def test_static_hit_and_compare_on_route_hist(tmp_path, capsys):
+    held_path = write_route_hist(tmp_path, "h", [[3, 2, 1, 0], [0, 4, 2, 0]], 3, split="held")
+    rank = k0rank.order([3, 2, 1, 0, 0, 4, 2, 0])
+    held = [3, 2, 1, 0, 0, 4, 2, 0]
+    # parity ownership: rank 0 owns experts 0,2 ; rank 1 owns 1,3. one unit per rank.
+    assert k0rank.static_hit(rank, held, EXPERTS, 1) == pytest.approx(7 / 12)
+    assert k0rank.static_hit(rank, held, EXPERTS, 4) == 1.0
+    assert k0rank.per_layer_hit(held, EXPERTS, 1) == pytest.approx(0.5)
+    ranking = tmp_path / "r.expert-hotset"
+    k0rank.main(["write", "--route-hist", held_path, "--out", str(ranking),
+                 "--bind-from", bind_file(tmp_path)])
+    k0rank.main(["compare", "--ranking", str(ranking), "--held", f"route_hist={held_path}",
+                 "--per-rank-units", "1", "--layers-resident", "1"])
+    assert "| 58.33% | 50.00% |" in capsys.readouterr().out

@@ -31,7 +31,13 @@ nslots / top_k). `--drop-class` removes whole steps of a class before counting.
 
 Usage
   k0rank.py write    --manifest M.tsv --split cal --bind-from EXISTING.expert-hotset --out F
-  k0rank.py validate F [--manifest M.tsv --split held]       (+ coverage curve)
+  k0rank.py write    --route-hist route_hist.pooled.cal.json --capture-label gfx942-derived ... --out F
+                     (MiHeat route_hist.v1: per_layer counts[48][512] flatten to global ids; the sibling
+                      .counts.npz must equal them; reads total = tokens x top_k x layers is checked)
+  k0rank.py validate F [--manifest M.tsv --split held | --route-hist H.json]   (+ coverage curve)
+  k0rank.py compare  --ranking A --ranking B --held manifest=M.tsv --held route_hist=H.json
+                     (top-50% / top-68.75% coverage, static hit at --per-rank-units 8448 per rank by
+                      expert % 2 ownership, and today's 33-layer per-layer hit)
 
 MANIFEST columns: dump<TAB>split<TAB>domain<TAB>mode   (split cal|held).
 """
@@ -269,57 +275,130 @@ def load_bind(args):
     return bind
 
 
-def cmd_write(args):
-    bind = load_bind(args)
+def read_route_hist(path):
+    """Read a MiHeat `route_hist.v1` pair (`X.json` + sibling `X.counts.npz`).
+
+    The npz `counts` is the (layers, experts) slot-read matrix; row-major flattening is the
+    global id `layer * experts + expert`. It must equal the JSON `per_layer` counts, which
+    are the contract; the npz is only used to check it. Head (MTP) counts are not trunk
+    units and are not read into the ranking.
+    """
+    import numpy as np
+
+    with open(path) as fh:
+        doc = json.load(fh)
+    if doc.get("schema") != "route_hist.v1":
+        raise ValueError(f"{path}: schema {doc.get('schema')!r}, expected route_hist.v1")
+    experts, topk = int(doc["n_experts"]), int(doc["topk"])
+    per_layer = doc["per_layer"]
+    layers = len(per_layer)
+    for i, row in enumerate(per_layer):
+        if row["layer"] != i or len(row["counts"]) != experts:
+            raise ValueError(f"{path}: per_layer[{i}] is not layer {i} x {experts} counts")
+    matrix = np.array([row["counts"] for row in per_layer], dtype=np.int64)
+    npz_path = path[:-len(".json")] + ".counts.npz" if path.endswith(".json") else path + ".counts.npz"
+    with np.load(npz_path) as z:
+        if not np.array_equal(z["counts"], matrix):
+            raise ValueError(f"{npz_path}: counts differ from {path} per_layer")
+    tokens = int(per_layer[0]["tokens"])
+    if any(int(row["tokens"]) != tokens for row in per_layer):
+        raise ValueError(f"{path}: per-layer token counts differ")
+    if int(matrix.sum()) != tokens * topk * layers:
+        raise ValueError(f"{path}: slot reads {int(matrix.sum())} != tokens x top_k x layers")
+    x = dict(doc.get("x_miheat") or {})
+    x.pop("head_counts", None)
+    return dict(layers=layers, experts=experts, top_k=topk, tokens=tokens,
+                counts=[int(v) for v in matrix.reshape(-1)], docs=len(doc.get("records") or []),
+                json=path, json_sha256=sha256_file(path), npz=npz_path,
+                npz_sha256=sha256_file(npz_path), model=doc.get("model"), id=doc.get("id"),
+                source=doc.get("source"), ids=doc.get("ids"), x_miheat=x)
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def emit(args, bind, layers, topk, counts, tokens, corpus, rule, provenance):
+    """Write the ranking and its sidecar; `provenance` carries the source-specific part."""
     experts = int(bind["experts_per_layer"])
-    (layers, topk), counts, dumps = pool(args.manifest, args.split, experts, tuple(args.drop_class))
     if layers != bind["layers"] or topk != bind["top_k"]:
-        raise SystemExit(f"dump layers/top_k {layers}/{topk} differ from the binding "
+        raise SystemExit(f"source layers/top_k {layers}/{topk} differ from the binding "
                          f"{bind['layers']}/{bind['top_k']}")
-    tokens = sum((d["run"] or {}).get("tokens", 0) for d in dumps)
-    if tokens == 0:
-        tokens = args.capture_tokens
-    if not tokens:
-        raise SystemExit("no token count found next to the dumps; pass --capture-tokens")
+    if len(counts) != layers * experts:
+        raise SystemExit(f"source has {len(counts)} units, binding wants {layers * experts}")
     rank = order(counts)
-    domains = sorted({d["domain"] for d in dumps})
     doc = dict(
         version=VERSION, kind=KIND, model_sha256=bind["model_sha256"],
         base_size=bind["base_size"], base_index_sha256=bind["base_index_sha256"],
         counts_sha256=counts_sha256(counts), format_map=bind["format_map"],
         format_map_sha256=bind["format_map_sha256"], layers=layers,
         experts_per_layer=experts, top_k=topk, capture_tokens=tokens,
-        ranking_rule=RANKING_RULE + (f"; dropped step classes: {','.join(args.drop_class)}"
-                                     if args.drop_class else ""),
-        corpus=args.corpus or (f"K0 {args.split} route dumps: {len(dumps)} dumps, domains "
-                               f"{'/'.join(domains)}, pooled"),
-        rank=rank, counts=counts)
+        ranking_rule=rule, corpus=corpus, rank=rank, counts=counts)
     assert tuple(doc) == SCHEMA_KEYS
     body = json.dumps(doc, separators=(",", ":")) + "\n"
     with open(args.out, "w") as fh:
         fh.write(body)
     out_sha = hashlib.sha256(body.encode()).hexdigest()
-    mix = {}
-    for d in dumps:
-        for c, v in d["slot_reads_by_class"].items():
-            mix[c] = mix.get(c, 0) + v
     prov = dict(
-        tool=TOOL, tool_version=tool_rev(), date=datetime.datetime.now(datetime.timezone.utc)
-        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        tool=TOOL, tool_version=tool_rev(), date=now_utc(),
         ranking_file=os.path.basename(args.out), ranking_sha256=out_sha,
-        counts_sha256=doc["counts_sha256"], units=len(rank),
-        base_binding=dict(bind), split=args.split, domains=domains,
-        drop_class=list(args.drop_class), class_mix_slot_reads=mix,
-        cal_slot_reads=sum(counts), capture_tokens=tokens,
-        capture_tokens_rule="sum over dumps of oracle manifest tokens x distinct prompts "
-                            "(generated tokens per prompt; one dump = one oracle run)",
-        ownership="static parity e % ranks (EP2: rank = expert % 2)",
-        dumps=dumps)
+        counts_sha256=doc["counts_sha256"], units=len(rank), base_binding=dict(bind),
+        slot_reads=sum(counts), capture_tokens=tokens,
+        ownership="static parity e % ranks (EP2: rank = expert % 2)", **provenance)
     with open(args.out + ".provenance.json", "w") as fh:
         json.dump(prov, fh, indent=1)
         fh.write("\n")
     print(f"wrote {args.out}: {len(rank)} units, sha256 {out_sha}, {sum(counts)} slot reads, "
           f"{tokens} tokens")
+
+
+def cmd_write(args):
+    bind = load_bind(args)
+    if bool(args.manifest) == bool(args.route_hist):
+        raise SystemExit("give exactly one of --manifest (K0 dumps) or --route-hist (MiHeat)")
+    if args.route_hist:
+        rh = read_route_hist(args.route_hist)
+        if rh["experts"] != bind["experts_per_layer"]:
+            raise SystemExit(f"route_hist has {rh['experts']} experts/layer, binding "
+                             f"{bind['experts_per_layer']}")
+        corpus = args.corpus or (f"MiHeat route_hist.v1 {rh['x_miheat'].get('class', '?')}/"
+                                 f"{rh['x_miheat'].get('split', '?')}: {rh['docs']} docs, "
+                                 f"{rh['tokens']} tokens x {rh['layers']} layers, {args.capture_label}")
+        rule = (RANKING_RULE.replace("K0 routing dumps", "route_hist counts")
+                + f"; {args.capture_label}")
+        emit(args, bind, rh["layers"], rh["top_k"], rh["counts"], rh["tokens"], corpus, rule,
+             dict(source_kind="route_hist.v1", capture_label=args.capture_label, split=args.split_label
+                  or rh["x_miheat"].get("split"), route_hist=rh_provenance(rh)))
+        return
+    experts = int(bind["experts_per_layer"])
+    (layers, topk), counts, dumps = pool(args.manifest, args.split, experts, tuple(args.drop_class))
+    tokens = sum((d["run"] or {}).get("tokens", 0) for d in dumps)
+    if tokens == 0:
+        tokens = args.capture_tokens
+    if not tokens:
+        raise SystemExit("no token count found next to the dumps; pass --capture-tokens")
+    domains = sorted({d["domain"] for d in dumps})
+    mix = {}
+    for d in dumps:
+        for c, v in d["slot_reads_by_class"].items():
+            mix[c] = mix.get(c, 0) + v
+    emit(args, bind, layers, topk, counts, tokens,
+         args.corpus or (f"K0 {args.split} route dumps: {len(dumps)} dumps, domains "
+                         f"{'/'.join(domains)}, pooled"),
+         RANKING_RULE + (f"; dropped step classes: {','.join(args.drop_class)}"
+                         if args.drop_class else ""),
+         dict(source_kind="k0_route_dump", split=args.split, domains=domains,
+              drop_class=list(args.drop_class), class_mix_slot_reads=mix,
+              capture_tokens_rule="sum over dumps of oracle manifest tokens x distinct prompts "
+                                  "(generated tokens per prompt; one dump = one oracle run)",
+              dumps=dumps))
+
+
+def rh_provenance(rh):
+    return dict(json=rh["json"], json_sha256=rh["json_sha256"], counts_npz=rh["npz"],
+                counts_npz_sha256=rh["npz_sha256"], id=rh["id"], model=rh["model"],
+                shard_manifest=rh["source"], ids=rh["ids"], docs=rh["docs"], tokens=rh["tokens"],
+                x_miheat=rh["x_miheat"])
 
 
 def validate_doc(doc):
@@ -350,23 +429,87 @@ def coverage(rank, held_counts, fractions):
     return out
 
 
+def held_counts(args, experts):
+    """(label, per-unit counts) of the held source: --route-hist or --manifest."""
+    if getattr(args, "route_hist", None):
+        rh = read_route_hist(args.route_hist)
+        return f"route_hist {os.path.basename(args.route_hist)} ({rh['tokens']} tokens)", rh["counts"]
+    _, held, dumps = pool(args.manifest, args.split, experts, tuple(args.drop_class))
+    return f"{args.split} dumps of {os.path.basename(args.manifest)} ({len(dumps)} dumps)", held
+
+
+def static_hit(rank, held, experts, per_rank_units, ranks=2):
+    """Share of `held` reads served from VRAM when every rank keeps its top `per_rank_units`
+    owned units (ownership expert % ranks, as the seal verifies) of the ranking."""
+    tot = sum(held)
+    kept = 0
+    for r in range(ranks):
+        owned = [i for i in rank if (i % experts) % ranks == r]
+        kept += sum(held[i] for i in owned[:per_rank_units])
+    return kept / tot if tot else 0.0
+
+
+def per_layer_hit(held, experts, layers_resident):
+    """Today's placement: the first `layers_resident` layers fully resident (layers >= N host)."""
+    tot = sum(held)
+    return sum(held[:layers_resident * experts]) / tot if tot else 0.0
+
+
 def cmd_validate(args):
     with open(args.file) as fh:
         doc = json.load(fh)
     validate_doc(doc)
     print(f"ok: {len(doc['rank'])} units, permutation, (count desc, id asc), counts_sha256 matches")
-    if args.manifest:
-        _, held, dumps = pool(args.manifest, args.split, doc["experts_per_layer"], tuple(args.drop_class))
-        print(f"coverage of {args.split} slot reads ({sum(held)} over {len(dumps)} dumps):")
+    if args.manifest or args.route_hist:
+        label, held = held_counts(args, doc["experts_per_layer"])
+        print(f"coverage of {label}, {sum(held)} slot reads:")
         for f, v in coverage(doc["rank"], held, (0.25, 0.5, 0.6875, 0.75)).items():
             print(f"  top {f * 100:5.2f}% of units -> {v * 100:.2f}%")
+
+
+def cmd_compare(args):
+    docs = []
+    for path in args.ranking:
+        with open(path) as fh:
+            doc = json.load(fh)
+        validate_doc(doc)
+        docs.append((os.path.basename(path), doc))
+    experts = docs[0][1]["experts_per_layer"]
+    sources = []
+    for spec in args.held:
+        ns = argparse.Namespace(route_hist=None, manifest=None, split="held",
+                                drop_class=list(args.drop_class))
+        kind, _, value = spec.partition("=")
+        if kind == "route_hist":
+            ns.route_hist = value
+        elif kind == "manifest":
+            ns.manifest = value
+        else:
+            raise SystemExit(f"--held {spec!r}: expected route_hist=PATH or manifest=PATH")
+        sources.append(held_counts(ns, experts))
+    fracs = (0.5, 0.6875)
+    print(f"static hit = share of held slot reads in each rank's top {args.per_rank_units} owned "
+          f"units (ownership expert % 2); per-layer = first {args.layers_resident} layers resident")
+    print("| held source | ranking | top-50% | top-68.75% | static hit | per-layer (today) |")
+    print("|---|---|---:|---:|---:|---:|")
+    for label, held in sources:
+        for name, doc in docs:
+            cov = coverage(doc["rank"], held, fracs)
+            sh = static_hit(doc["rank"], held, experts, args.per_rank_units)
+            pl = per_layer_hit(held, experts, args.layers_resident)
+            print(f"| {label} | {name} | {cov[0.5] * 100:.2f}% | {cov[0.6875] * 100:.2f}% | "
+                  f"{sh * 100:.2f}% | {pl * 100:.2f}% |")
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     w = sub.add_parser("write")
-    w.add_argument("--manifest", required=True)
+    w.add_argument("--manifest", help="K0 dump manifest (mutually exclusive with --route-hist)")
+    w.add_argument("--route-hist", help="MiHeat route_hist.v1 JSON (sibling .counts.npz is checked)")
+    w.add_argument("--capture-label", default="",
+                   help="provenance label for a route_hist source, e.g. 'gfx942-derived'")
+    w.add_argument("--split-label", help="override the split recorded for a route_hist source")
     w.add_argument("--split", default="cal", choices=("cal", "held"))
     w.add_argument("--out", required=True)
     w.add_argument("--bind-from", help="existing .expert-hotset of the same base to copy the binding from")
@@ -384,10 +527,18 @@ def main(argv=None):
     v = sub.add_parser("validate")
     v.add_argument("file")
     v.add_argument("--manifest")
+    v.add_argument("--route-hist")
     v.add_argument("--split", default="held", choices=("cal", "held"))
     v.add_argument("--drop-class", action="append", default=[], choices=CLASSES)
+    c = sub.add_parser("compare", help="coverage + static hit of several rankings on held sources")
+    c.add_argument("--ranking", action="append", required=True)
+    c.add_argument("--held", action="append", required=True, metavar="route_hist=PATH|manifest=PATH")
+    c.add_argument("--drop-class", action="append", default=[], choices=CLASSES,
+                   help="applies to manifest= held sources")
+    c.add_argument("--per-rank-units", type=int, default=8448)
+    c.add_argument("--layers-resident", type=int, default=33)
     args = ap.parse_args(argv)
-    {"write": cmd_write, "validate": cmd_validate}[args.cmd](args)
+    {"write": cmd_write, "validate": cmd_validate, "compare": cmd_compare}[args.cmd](args)
 
 
 if __name__ == "__main__":
