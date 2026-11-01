@@ -38,7 +38,7 @@ def sections(text: str) -> dict[str, str]:
 
 
 def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8")
 
 
 def first_diff_line(a: str, b: str) -> int:
@@ -62,7 +62,7 @@ def check(repo: Path, changelog: Path) -> list[str]:
     if reference is None:
         return []
     ref_tag, released = reference
-    current = sections(changelog.read_text())
+    current = sections(changelog.read_text(encoding="utf-8"))
     errors = []
     for version in sorted(set(tagged) & set(released)):
         body = current.get(version)

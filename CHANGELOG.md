@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- **gfx1100: MQ4G256V2-Lloyd (qt=52) prefill MMQ twin behind `HIPFIRE_LLOYD_MMQ_A4=1` (default off).** The Lloyd-X128 prefill route expanded codebooks inside the K loop (per-K16 v_perm/pairtab work against 8 packed bytes); the twin hoists expansion to publish time (per-K64-slab v_perm from the C0..C3/D0..D3 kernargs, amortized like the X128 pack stage), so the K loop matches the uniform parent (b128 A/X/B loads + WMMAs + zp' fold). Single tile128-only variant, 36864 B LDS = 1 CTA/WGP, no pairtab. Exact gfx1100 only, eager-only (no replay/capture), K%256, N>=64; qkv/qkvza stay X128; with the flag unset all dispatch arms are unchanged (byte-identical to upstream). 27B mq4l, 3 fresh processes per leg interleaved off/on, pp2048 (`docs/perf-checkpoints/2026-10-31-lloyd-mmq-a4-staged-final-ab-gfx1100.md`): OFF 1050.3/1048.2/1047.2 → ON 1218.9/1217.4/1218.2 (**+16.2%**), decode tied (~41 tok/s); residual + fused gate_up twins bound every ON round. Twin-vs-CPU-oracle rel_l2 ≈ 8e-8 all shapes; KLD (WT2, q8 prefill, 24 chunks, gfx1100) Lloyd 0.0325 vs uniform-X128 0.0400. 0.8B hybrid (residual-only route) +11.3% with byte-identical greedy output. KLD claimed by construction (the eval path bypasses dispatch) plus the 8e-8 differential, not a separate twin KLD run. (#1029)
+
 ## v0.4.5 — 2026-10-30
 
 Highlights (details in the entries below):
