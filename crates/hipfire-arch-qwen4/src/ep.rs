@@ -1588,6 +1588,14 @@ impl Qwen4Bundle {
                 .kernel_boundaries(kernel_boundaries),
         ));
         let register = |rank: usize, bundle: &Qwen4Bundle, gpu: &mut Gpu| -> Result<(), String> {
+            // gfx11 system-scope release/acquire does not write back or invalidate L2,
+            // so a peer could read stale rows (same limit as tp2_graph_signal.gfx1100.hip).
+            if kernel_boundaries && !gpu.arch.starts_with("gfx12") {
+                return Err(format!(
+                    "{QWEN4_EP_BOUNDARY_ENV}=kernel needs gfx12 on every rank; rank {rank} is {}",
+                    gpu.arch
+                ));
+            }
             let buffers = bundle
                 .execution
                 .as_ref()
