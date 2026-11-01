@@ -2170,6 +2170,190 @@ pub(crate) enum MtpStep {
     Append,
 }
 
+/// Head step stage 2a (row stage, rows-shaped): the token embedding, the two
+/// pre-FC norms, both FC projections, their broadcast add and the attention
+/// HC read. Every op here is row-local (`rows` is 1 at present); a batched
+/// round runs it once over all drafting lanes.
+fn push_head_rows_front<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    weights: &'a Qwen4Weights,
+    config: &Qwen4Config,
+    mtp: &'a crate::weights::Qwen4MtpWeights,
+    scratch: &'a MtpGpuScratch,
+    backbone_hidden: &'a GpuTensor,
+    attn_read: &Qwen4HyperReadWeights<'a>,
+) -> Result<(), MtpGpuError> {
+    let hidden = config.hidden_size;
+    steps.push(Step::Embed(EmbeddingOp {
+        table: weights.resident(&weights.root.embedding)?,
+        rotated: &scratch.embedding_rot,
+        token_ids: &scratch.token_ids,
+        output: &scratch.token_embedding,
+        rows: 1,
+        dim: hidden,
+    }));
+    steps.push(Step::HyperNorm(HyperNormOp {
+        input: &scratch.token_embedding,
+        norm_weight: weights.resident(&mtp.pre_fc_norm_embedding)?,
+        normalized: &scratch.embedding_norm,
+        branches: 1,
+        hidden,
+        state_bf16: false,
+    }));
+    steps.push(Step::Project(ProjectOp {
+        weight: dense_ref(weights, &mtp.fc_embedding)?,
+        input: &scratch.embedding_norm,
+        output: &scratch.projected_embedding,
+        rows: 1,
+        rotation: Some(&scratch.rotation),
+        ladder: ProjectLadder::Trunk,
+        residual: None,
+    }));
+    steps.push(Step::HyperNorm(HyperNormOp {
+        input: backbone_hidden,
+        norm_weight: weights.resident(&mtp.pre_fc_norm_hidden)?,
+        normalized: &scratch.hidden_norm,
+        branches: config.hc_count,
+        hidden,
+        state_bf16: false,
+    }));
+    // Both branch rows in one projection (each bitwise its own).
+    steps.push(Step::Project(ProjectOp {
+        weight: dense_ref(weights, &mtp.fc_hidden)?,
+        input: &scratch.hidden_norm,
+        output: &scratch.projected_hidden,
+        rows: config.hc_count,
+        rotation: Some(&scratch.rotation),
+        ladder: ProjectLadder::Trunk,
+        residual: None,
+    }));
+    steps.push(Step::BroadcastAdd(BroadcastAddOp {
+        rows_input: &scratch.projected_hidden,
+        row: &scratch.projected_embedding,
+        output: &scratch.wide,
+        rows: config.hc_count,
+        width: hidden,
+    }));
+    steps.push(Step::HyperRead(hc_read(attn_read, scratch, config)));
+    Ok(())
+}
+
+/// Head step stage 3 (per lane): the lane's own indexed attention over its
+/// head arena (`state`), one row. Stateful, never shared across lanes.
+fn head_attention_op<'a>(
+    config: &Qwen4Config,
+    scratch: &'a MtpGpuScratch,
+    state: &'a MtpGpuState,
+    qsa: Qwen4QsaWeights<'a>,
+    mode: IndexedAttentionMode<'a>,
+) -> IndexedAttentionOp<'a> {
+    let hidden = config.hidden_size;
+    IndexedAttentionOp {
+        indexer_qk: qsa.indexer_qk,
+        indexer_q_norm: qsa.indexer_q_norm,
+        indexer_k_norm: qsa.indexer_k_norm,
+        q: qsa.q,
+        k: qsa.k,
+        v: qsa.v,
+        q_norm: qsa.q_norm,
+        k_norm: qsa.k_norm,
+        output: qsa.output,
+        state: IndexedAttentionState {
+            // The one MTP layer keeps the exact F32 QSA state.
+            format: QsaKvFormat::F32,
+            full_keys: &state.full_keys,
+            full_values: &state.full_values,
+            raw_index_keys: &state.raw_index_keys,
+            pooled_keys: &state.pooled_keys,
+            selected_indices: &state.selected_indices,
+            f16_arena: None,
+            pooled_bf16: None,
+            full_capacity: state.full_capacity,
+            raw_capacity: state.raw_capacity,
+            pooled_capacity: state.pooled_capacity,
+            selected_capacity: state.selected_capacity,
+            position_capacity: state.full_capacity,
+            full_len: state.full_len,
+            raw_len: state.raw_len,
+            pooled_len: state.pooled_len,
+            selected_len: state.selected_len,
+            position: state.position,
+        },
+        input: &scratch.hc_mixed,
+        index_scratch: &scratch.index,
+        qgate_scratch: &scratch.q_and_gate,
+        k_scratch: &scratch.qsa_k,
+        v_scratch: &scratch.qsa_v,
+        qsa_output: &scratch.qsa_output,
+        selected_scratch: &scratch.qsa_selected,
+        attention_output: &scratch.projected_embedding,
+        bf16_scratch: &scratch.hc_bf16,
+        rows: 1,
+        index_heads: config.indexer_n_heads,
+        index_kv_heads: config.indexer_kv_heads,
+        index_dim: config.indexer_head_dim,
+        budget: config.indexer_budget,
+        compress: config.indexer_compress_ratio,
+        heads: config.num_attention_heads,
+        kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        rotary_dim: config.rotary_dim(),
+        rope: config.rope(),
+        input_width: hidden,
+        rotation: &scratch.rotation,
+        mode,
+        trunk_a4: 0,
+        phase: MixerPhase::Whole,
+    }
+}
+
+/// Head step stage 4 (row stage, rows-shaped): everything after the
+/// attention: attention HC write, MLP HC read, the MoE or dense FFN,
+/// MLP HC write and (Predict) the final HC read. `ffn` is `None` for an
+/// Append step, which stops after the attention.
+#[allow(clippy::too_many_arguments)]
+fn push_head_rows_back<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    config: &Qwen4Config,
+    scratch: &'a MtpGpuScratch,
+    attn_write: &Qwen4HyperWriteWeights<'a>,
+    mlp_read: &Qwen4HyperReadWeights<'a>,
+    mlp_write: &Qwen4HyperWriteWeights<'a>,
+    final_read: &Qwen4HyperReadWeights<'a>,
+    ffn: Option<MtpFfnCall<'a>>,
+    predict: bool,
+) {
+    let hidden = config.hidden_size;
+    if let Some(ffn) = ffn {
+        steps.push(Step::HyperWrite(hc_write(
+            attn_write,
+            &scratch.projected_embedding,
+            scratch,
+            config,
+        )));
+        steps.push(Step::HyperRead(hc_read(mlp_read, scratch, config)));
+        match ffn {
+            MtpFfnCall::Moe(moe) => {
+                steps.push(Step::Clear(ClearOp {
+                    tensor: &scratch.ffn_output,
+                    elements: hidden,
+                }));
+                steps.push(Step::Moe(moe));
+            }
+            MtpFfnCall::Dense(dense) => steps.push(Step::GatedMlp(dense)),
+        }
+        steps.push(Step::HyperWrite(hc_write(
+            mlp_write,
+            &scratch.ffn_output,
+            scratch,
+            config,
+        )));
+        if predict {
+            steps.push(Step::HyperRead(hc_read(final_read, scratch, config)));
+        }
+    }
+}
+
 /// The FFN call of one non-Append MTP step, in the profile's FFN kind.
 enum MtpFfnCall<'a> {
     Moe(hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>),
@@ -2913,22 +3097,18 @@ impl Qwen4MtpGpu {
         Ok(())
     }
 
-    /// The head step's checks and device work up to (not including) the
-    /// draft: returns the lengths the step publishes in
-    /// [`Self::finish_head_step`].
-    #[allow(clippy::too_many_arguments)]
-    fn head_block(
+    /// Head step stage 1 (per lane, host): the backbone-hidden staging, the
+    /// I1 position guards, the draft history observation and the one-token
+    /// H2D. Everything here is per-lane state; a batched round runs it once
+    /// per drafting lane before the shared row stages.
+    fn head_prologue(
         &mut self,
         gpu: &mut Gpu,
-        weights: &Qwen4Weights,
         config: &Qwen4Config,
         token: u32,
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
-        fresh_qsa_selection: bool,
-        step: MtpStep,
-        ep: Option<MtpEpGather<'_>>,
-    ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
+    ) -> Result<(), MtpGpuError> {
         let wide = config
             .hc_count
             .checked_mul(config.hidden_size)
@@ -2968,7 +3148,26 @@ impl Qwen4MtpGpu {
             .host_token_bytes
             .copy_from_slice(&(token as i32).to_ne_bytes());
         gpu.memcpy_htod_auto(&self.scratch.token_ids.buf, &self.scratch.host_token_bytes)?;
+        Ok(())
+    }
 
+    /// The head step's checks and device work up to (not including) the
+    /// draft: returns the lengths the step publishes in
+    /// [`Self::finish_head_step`].
+    #[allow(clippy::too_many_arguments)]
+    fn head_block(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+        step: MtpStep,
+        ep: Option<MtpEpGather<'_>>,
+    ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
+        self.head_prologue(gpu, config, token, backbone_hidden, position)?;
         let mtp = bound_mtp(weights)?;
         let lengths = {
             let scratch = &self.scratch;
@@ -2987,63 +3186,7 @@ impl Qwen4MtpGpu {
                     selected_len_out: &state.selected_len_out,
                 },
             };
-            let attention = IndexedAttentionOp {
-                indexer_qk: qsa.indexer_qk,
-                indexer_q_norm: qsa.indexer_q_norm,
-                indexer_k_norm: qsa.indexer_k_norm,
-                q: qsa.q,
-                k: qsa.k,
-                v: qsa.v,
-                q_norm: qsa.q_norm,
-                k_norm: qsa.k_norm,
-                output: qsa.output,
-                state: IndexedAttentionState {
-                    // The one MTP layer keeps the exact F32 QSA state.
-                    format: QsaKvFormat::F32,
-                    full_keys: &state.full_keys,
-                    full_values: &state.full_values,
-                    raw_index_keys: &state.raw_index_keys,
-                    pooled_keys: &state.pooled_keys,
-                    selected_indices: &state.selected_indices,
-                    f16_arena: None,
-                    pooled_bf16: None,
-                    full_capacity: state.full_capacity,
-                    raw_capacity: state.raw_capacity,
-                    pooled_capacity: state.pooled_capacity,
-                    selected_capacity: state.selected_capacity,
-                    position_capacity: state.full_capacity,
-                    full_len: state.full_len,
-                    raw_len: state.raw_len,
-                    pooled_len: state.pooled_len,
-                    selected_len: state.selected_len,
-                    position: state.position,
-                },
-                input: &scratch.hc_mixed,
-                index_scratch: &scratch.index,
-                qgate_scratch: &scratch.q_and_gate,
-                k_scratch: &scratch.qsa_k,
-                v_scratch: &scratch.qsa_v,
-                qsa_output: &scratch.qsa_output,
-                selected_scratch: &scratch.qsa_selected,
-                attention_output: &scratch.projected_embedding,
-                bf16_scratch: &scratch.hc_bf16,
-                rows: 1,
-                index_heads: config.indexer_n_heads,
-                index_kv_heads: config.indexer_kv_heads,
-                index_dim: config.indexer_head_dim,
-                budget: config.indexer_budget,
-                compress: config.indexer_compress_ratio,
-                heads: config.num_attention_heads,
-                kv_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-                rotary_dim: config.rotary_dim(),
-                rope: config.rope(),
-                input_width: hidden,
-                rotation: &scratch.rotation,
-                mode,
-                trunk_a4: 0,
-                phase: MixerPhase::Whole,
-            };
+            let attention = head_attention_op(config, scratch, state, qsa, mode);
             let lengths = attention.next_lengths()?;
             // Under EP a MoE head step exchanges its expanded rows through the
             // forward's row gather: gather buffer `2 + j % 2` and layer index
@@ -3132,86 +3275,27 @@ impl Qwen4MtpGpu {
                 })
             };
             let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
-            steps.push(Step::Embed(EmbeddingOp {
-                table: weights.resident(&weights.root.embedding)?,
-                rotated: &scratch.embedding_rot,
-                token_ids: &scratch.token_ids,
-                output: &scratch.token_embedding,
-                rows: 1,
-                dim: hidden,
-            }));
-            steps.push(Step::HyperNorm(HyperNormOp {
-                input: &scratch.token_embedding,
-                norm_weight: weights.resident(&mtp.pre_fc_norm_embedding)?,
-                normalized: &scratch.embedding_norm,
-                branches: 1,
-                hidden,
-                state_bf16: false,
-            }));
-            steps.push(Step::Project(ProjectOp {
-                weight: dense_ref(weights, &mtp.fc_embedding)?,
-                input: &scratch.embedding_norm,
-                output: &scratch.projected_embedding,
-                rows: 1,
-                rotation: Some(&scratch.rotation),
-                ladder: ProjectLadder::Trunk,
-                residual: None,
-            }));
-            steps.push(Step::HyperNorm(HyperNormOp {
-                input: backbone_hidden,
-                norm_weight: weights.resident(&mtp.pre_fc_norm_hidden)?,
-                normalized: &scratch.hidden_norm,
-                branches: config.hc_count,
-                hidden,
-                state_bf16: false,
-            }));
-            // Both branch rows in one projection (each bitwise its own).
-            steps.push(Step::Project(ProjectOp {
-                weight: dense_ref(weights, &mtp.fc_hidden)?,
-                input: &scratch.hidden_norm,
-                output: &scratch.projected_hidden,
-                rows: config.hc_count,
-                rotation: Some(&scratch.rotation),
-                ladder: ProjectLadder::Trunk,
-                residual: None,
-            }));
-            steps.push(Step::BroadcastAdd(BroadcastAddOp {
-                rows_input: &scratch.projected_hidden,
-                row: &scratch.projected_embedding,
-                output: &scratch.wide,
-                rows: config.hc_count,
-                width: hidden,
-            }));
-            steps.push(Step::HyperRead(hc_read(&attn.read, scratch, config)));
+            push_head_rows_front(
+                &mut steps,
+                weights,
+                config,
+                mtp,
+                scratch,
+                backbone_hidden,
+                &attn.read,
+            )?;
             steps.push(Step::IndexedAttention(attention));
-            if let Some(ffn) = ffn {
-                steps.push(Step::HyperWrite(hc_write(
-                    &attn.write,
-                    &scratch.projected_embedding,
-                    scratch,
-                    config,
-                )));
-                steps.push(Step::HyperRead(hc_read(&mlp.read, scratch, config)));
-                match ffn {
-                    MtpFfnCall::Moe(moe) => {
-                        steps.push(Step::Clear(ClearOp {
-                            tensor: &scratch.ffn_output,
-                            elements: hidden,
-                        }));
-                        steps.push(Step::Moe(moe));
-                    }
-                    MtpFfnCall::Dense(dense) => steps.push(Step::GatedMlp(dense)),
-                }
-                steps.push(Step::HyperWrite(hc_write(
-                    &mlp.write,
-                    &scratch.ffn_output,
-                    scratch,
-                    config,
-                )));
-                if step == MtpStep::Predict {
-                    steps.push(Step::HyperRead(hc_read(&final_read, scratch, config)));
-                }
-            }
+            push_head_rows_back(
+                &mut steps,
+                config,
+                scratch,
+                &attn.write,
+                &mlp.read,
+                &mlp.write,
+                &final_read,
+                ffn,
+                step == MtpStep::Predict,
+            );
             validate_steps(gpu, &steps)?;
             execute_validated_steps(gpu, &ctx, &steps)?;
             lengths
