@@ -758,10 +758,24 @@ fn istft_overlap_add_raw(
     let win_sq: Vec<f32> = window.iter().map(|w| w * w).collect();
 
     for t in 0..num_frames {
+        // polar(exp(log_mag), angle) → cartesian re/im for the irfft:
+        //   Re(X[k]) = exp(log_mag[k])·cos(angle[k])
+        //   Im(X[k]) = exp(log_mag[k])·sin(angle[k])
+        // (mirrors HF `torch.polar(log_magnitude.exp(), angle)` before
+        // `torch.fft.irfft`; feeding magnitude/angle directly as re/im
+        // injects the raw phase values as spectral samples — static.)
         let re: Vec<f32> = (0..n_bins)
-            .map(|k| (log_mag[t * n_bins + k]).exp())
+            .map(|k| {
+                let mag = log_mag[t * n_bins + k].exp();
+                mag * angle[t * n_bins + k].cos()
+            })
             .collect();
-        let im: Vec<f32> = (0..n_bins).map(|k| angle[t * n_bins + k]).collect();
+        let im: Vec<f32> = (0..n_bins)
+            .map(|k| {
+                let mag = log_mag[t * n_bins + k].exp();
+                mag * angle[t * n_bins + k].sin()
+            })
+            .collect();
         let frame = irfft(&re, &im, n_fft);
         let off = t * hop;
         for j in 0..win {
