@@ -2533,13 +2533,19 @@ pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4
 /// symbol (`gemv_mq4g256v2_lloyd`) so the module cannot alias the uniform one.
 pub const GEMV_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
 /// Residual-epilogue twin of `GEMV_MQ4G256V2_LUT_SRC` (`y +=`, symbol
-/// `gemv_mq4g256v2_residual_lloyd`).
+/// `gemv_mq4g256v2_residual_lloyd`): dual-row residual body (2 rows/wave,
+/// hoisted float4 x reused across both rows, SRD buffer loads) with the LUT
+/// decode folded in. Same symbol and kernarg ABI as before.
 pub const GEMV_MQ4G256V2_RESIDUAL_LUT_SRC: &str = concat!(
-    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_lloyd\n",
-    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n#define HIPFIRE_RESIDUAL_KERNEL gemv_mq4g256v2_residual_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
 );
 /// MQ5G256V2: dual-scale 5-bit (qt=48). Same 168 B stride and 5-bit payload as MQ5G256, header dual fp16.
 pub const GEMV_MQ5G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256v2.hip");
@@ -7291,6 +7297,15 @@ pub const GEMV_MQ4G256V2_RESIDUAL_LANES_GFX1201_SRC: &str = concat!(
 /// alpha codebooks in row-source order). See `FUSED_GATE_UP_MQ4G256V2_LUT_SRC`.
 pub const FUSED_QKVZA_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
+);
+/// Lloyd LUT + R-hoist_x32 twin (D4): same as `FUSED_QKVZA_MQ4G256V2_LUT_SRC`
+/// plus the plain-float4 x-hoist schedule (K-agnostic; selected for exact
+/// gfx1100). Distinct symbol so the module cannot alias the generic one.
+pub const FUSED_QKVZA_MQ4G256V2_LUT_HOIST_X32_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_RDNA3_QKVZA_HOIST_X32 1\n#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_lloyd_hoist_x32_gfx1100\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")

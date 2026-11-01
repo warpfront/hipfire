@@ -43266,7 +43266,23 @@ impl Gpu {
             ));
         }
         let func_name = "fused_qkvza_mq4g256v2_lloyd";
-        self.ensure_kernel(func_name, kernels::FUSED_QKVZA_MQ4G256V2_LUT_SRC, func_name)?;
+        // D4: exact-gfx1100 takes the LUT-hoist twin (R-hoist_x32 schedule);
+        // other arches keep the generic LUT body. Same ABI, same arithmetic.
+        let (module, src, symbol) = if self.arch == "gfx1100" {
+            (
+                "fused_qkvza_mq4g256v2_lloyd_hoist_x32_gfx1100",
+                kernels::FUSED_QKVZA_MQ4G256V2_LUT_HOIST_X32_GFX1100_SRC,
+                "fused_qkvza_mq4g256v2_lloyd_hoist_x32_gfx1100",
+            )
+        } else {
+            (
+                "fused_qkvza_mq4g256v2_lloyd",
+                kernels::FUSED_QKVZA_MQ4G256V2_LUT_SRC,
+                "fused_qkvza_mq4g256v2_lloyd",
+            )
+        };
+        self.ensure_kernel(module, src, symbol)?;
+        let func_name = symbol;
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
         let ab = a_beta.buf.as_ptr();
