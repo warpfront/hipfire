@@ -133,7 +133,6 @@ pub mod serve_engine;
 pub mod serve_vmm;
 /// Cross-session host-snapshot prefix cache for the VMM multi-slot route.
 #[cfg(feature = "deltanet")]
-pub mod serve_vmm_prefix;
 /// Shared-weight host v1: typed export/import of a dense Qwen3.5 weight set
 /// as read-only POSIX-FD VMM allocations. Linux only.
 #[cfg(all(feature = "deltanet", target_os = "linux"))]

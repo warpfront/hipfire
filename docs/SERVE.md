@@ -328,10 +328,10 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    stays batched. MTP verify rows ride the batched decode step, and DFlash's
    draft context is seeded from the singleton prefill's extract-layer hidden
    capture (legacy DFlash drafts, which have no candidate selector, are still
-   refused). `serve.prefix_cache` runs on this route as a bounded
-   host-snapshot LRU (KV + DeltaNet at a committed prefill boundary; no page
-   table, no VA churn), and paged-pool selection is ignored on this route
-   (use the legacy backend with `--multi-slot-paged` for the shared pool).
+   refused). `serve.prefix_cache` runs on this route as the same
+   cross-session reuse of sealed 128-token pages plus Qwen hybrid checkpoints
+   as the arena route (this route's pool is the shared paged pool, so
+   `--kv-backend vmm` and `--multi-slot-paged` select the same cache).
    Every unservable combination is refused before any GPU allocation. On this route decode always runs the
    row-batched `_vmm` kernels, so a greedy comparison against the sequential
    route (or against a different batch composition) is expected to differ at
@@ -921,18 +921,12 @@ start cost on that first switched request).
 `serve.prefix_cache` is **off by default**. On the multi-slot engine
 (`serve.multi_slot=true`) the arena route (`kv_backend=legacy`) enables
 cross-session radix reuse of sealed 128-token KV pages plus Qwen hybrid
-checkpoints. The VMM route has no page table, so it keeps a bounded
-**host-snapshot LRU** instead: each entry is the exact KV prefix plus the
-DeltaNet state at a committed prefill boundary, restored into the request's
-own owner (no page sharing, no owner churn, no retired VA). Both routes skip
+checkpoints. Both routes skip
 vision requests. `.mtp` sidecars are probed as both `foo.mq4v2.mtp` and
 `foo.mtp` on the slot engine and the single-slot loader
 (`hipfire run --spec mtp`). Verified on gfx1101 / ROCm 10
 (`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR, and
-JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss. VMM
-host-snapshot reuse is checked by `scripts/check_slots_vmm_prefix.py`
-(shared 981-token prompt, 896 reused, warm text equals the cold control,
-different-prefix miss). Vision+prefix reuse stays off. Stop sequences are
+JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss. Vision+prefix reuse stays off. Stop sequences are
 supported on slots (the emitter withholds the stop bytes and ends the turn as
 `stop`; malformed shapes are 400s); `response_format: json_object` is
 enforced as a permissive object schema. `logprobs`/`top_logprobs` are supported

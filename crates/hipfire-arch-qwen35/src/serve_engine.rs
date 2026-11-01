@@ -47,7 +47,7 @@ use crate::qwen35::{
 use crate::serve_vmm::{
     slot_reserve_end, vmm_format_for_mode, vmm_slot_budget, VmmSlotKv, VMM_SNAPSHOT_TAG_BIT,
 };
-use crate::serve_vmm_prefix::{VmmPrefixCache, VMM_PREFIX_MIN_TOKENS};
+
 use crate::speculative::DeltaNetSnapshot;
 use hipfire_runtime::llama::{KvCache, VMode};
 use hipfire_runtime::prefix_index::{Handle, PinTicket, PrefixIndex};
@@ -472,13 +472,6 @@ struct ModelRig {
     /// The owners live in `k_arenas`/`v_arenas`; this maps granules on page
     /// allocation and unmaps them on release.
     paged_vmm: Option<VmmPageMapper>,
-    /// Cross-session host-snapshot prefix cache for the VMM route.
-    /// `None` on the arena route (which uses the radix `prefix_index`) or when
-    /// `serve.prefix_cache` is off.
-    vmm_prefix: Option<VmmPrefixCache>,
-    /// Last prompt boundary captured per slot, so an idle prefill step does
-    /// not re-copy the same prefix.
-    vmm_prefix_mark: Vec<usize>,
     /// Per-slot row offset of the LAST forward's contribution: the decode
     /// batch offset for a decoding slot, 0 for a prefilling slot (its hidden
     /// rows are packed from 0 in `mtp_prefill_hidden`), `usize::MAX` when the
@@ -2387,18 +2380,6 @@ impl Rig {
                     .to_string(),
             );
         }
-        // VMM has no page pool: keep a bounded host-snapshot cache instead of
-        // the arena radix. The two routes never share an entry (the stamp and
-        // the storage-specific code paths differ).
-        let vmm_prefix = if use_vmm && prefix_cache {
-            eprintln!(
-                "  [hipfire] vmm prefix cache enabled: host-snapshot LRU, {} MiB ceiling",
-                cfg.prefix_cache_max_bytes / (1024 * 1024)
-            );
-            Some(VmmPrefixCache::new(cfg.prefix_cache_max_bytes as usize))
-        } else {
-            None
-        };
         // Build the CacheDomain ONCE from available identities. When
         // prefix_cache is off, all three are None and the existing path is
         // bitwise unchanged.
@@ -2557,8 +2538,6 @@ impl Rig {
                 checkpoint_pool,
                 vmm,
                 paged_vmm: paged_vmm_mapper,
-                vmm_prefix,
-                vmm_prefix_mark: vec![0; cfg.n_slots],
                 vmm_row_offsets: vec![usize::MAX; cfg.n_slots],
             },
             out_tokens,
@@ -6298,12 +6277,6 @@ fn run_loop(
                 &dflash_prefill_slots,
             );
             let forward_ns = t_forward.elapsed().as_nanos() as u64;
-            // VMM prefix cache: retain a successful prompt boundary before the
-            // next chunk can overwrite it. Only when a suffix remains; a
-            // snapshot at the full prompt has no logits to continue from.
-            if fwd.is_ok() && rig.model.vmm_prefix.is_some() {
-                capture_vmm_prefixes(&mut rig, &slots, &work);
-            }
             // ── Publication (spec §4.6 C6) ──────────────────────────────────
             // After a SUCCESSFUL prefill chunk, publish sealed full pages at
             // committed page-aligned boundaries. Only when prefix_cache is on.
@@ -7399,14 +7372,6 @@ fn handle_command(
                     store.release_slot(s);
                 }
             }
-            // Drop prefix cache state so subsequent lookups miss (spec §4.6).
-            // The radix index owns cache leases taken at publication: it
-            // MUST release them into the pool before being replaced, or
-            // every published page strands CacheOnly and the pool drains to
-            // zero free pages within a few reset cycles (A20 leak).
-            if let Some(cache) = rig.model.vmm_prefix.as_mut() {
-                cache.clear();
-            }
             if rig.prefix_cache {
                 if let Some(pp) = rig.pool.page_pool_mut() {
                     if let Some(idx) = rig.prefix_index.as_mut() {
@@ -8340,65 +8305,6 @@ fn admit(
     // requests skip the radix entirely (spec X2: Vision+prefix reuse OFF).
     let mut prefix_reused: usize = 0;
     let mut prefix_hit = false;
-    // VMM prefix cache: a host snapshot keyed by the exact token prefix.
-    // Restore KV **and** DeltaNet state together, or discard the entry and
-    // cold-prefill. The owner was already mapped to this request's reserve
-    // end above; a hit reuses that owner (no fork, no VA churn).
-    if rig.model.vmm_prefix.is_some() && req.visual_data.is_none() {
-        rig.lookup_count += 1;
-        let hit = {
-            let cache = rig.model.vmm_prefix.as_mut().expect("checked above");
-            cache.lookup(&req.prompt_tokens, rig.stamp)
-        };
-        if let Some((n, snap)) = hit {
-            let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
-            let end = slot_reserve_end(req.prompt_tokens.len(), req.max_tokens, rig.cap_tokens);
-            let restored = rig
-                .model
-                .vmm
-                .as_mut()
-                .ok_or_else(|| "vmm prefix hit without a VMM store".to_string())
-                .and_then(|store| {
-                    store
-                        .restore_slot(&mut rig.gpu, slot.0, &snap, rig.stamp, &dn_refs, end)
-                        .map_err(|e| e.to_string())
-                });
-            drop(dn_refs);
-            match restored {
-                Ok(()) => {
-                    if let Err(e) = rig.pool.set_seq_len(slot, n) {
-                        // A failed publish is a hard inconsistency: the
-                        // owner holds a prefix the pool does not describe.
-                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
-                        if let Some(cache) = rig.model.vmm_prefix.as_mut() {
-                            cache.forget(&req.prompt_tokens[..n]);
-                        }
-                        eprintln!("[vmm-prefix] hit at {n} failed to publish: {e} — cold prefill");
-                    } else {
-                        prefix_reused = n;
-                        prefix_hit = true;
-                        if rig.gpu.slot_trace() {
-                            eprintln!(
-                                "[slot-trace] vmm prefix cache HIT: reused {n}/{} tokens",
-                                req.prompt_tokens.len()
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    // `restore_slot` validates before writing, but a partial
-                    // copy is still possible on a HIP failure. Reset the
-                    // recurrent state so a cold prefill cannot inherit a
-                    // half-restored state.
-                    let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
-                    if let Some(cache) = rig.model.vmm_prefix.as_mut() {
-                        cache.forget(&req.prompt_tokens[..n]);
-                    }
-                    eprintln!("[vmm-prefix] hit at {n} failed: {e} — cold prefill");
-                }
-            }
-        }
-    }
     // The lookup's pin on the matched radix path. Held until the request
     // terminates (released by release_pin_ticket on every exit path) or
     // released immediately below when the hit does not convert.
@@ -8648,9 +8554,6 @@ fn admit(
         };
         plan.reused
     };
-    // A restored/continued prefix is already materialized; capture only
-    // boundaries beyond it. A cold session starts at 0.
-    rig.model.vmm_prefix_mark[slot.0] = reused;
     if let Some(sess) = rig.sessions.get_mut(id) {
         sess.tokens = req.prompt_tokens.clone();
         sess.convo = req.convo.clone();
@@ -8970,76 +8873,6 @@ fn admit_cold(
         }
     }
     rig.sessions.open(&mut rig.pool, &mut rig.adm, grant_tokens)
-}
-
-/// Retain a prompt boundary in the VMM host-snapshot prefix cache.
-///
-/// Called once per successful engine step. Only prefilling slots with a
-/// remaining suffix qualify: a snapshot at the full prompt has no logits to
-/// continue from, and a decoding slot's prefix is no longer a prompt prefix.
-/// The copy is KV + DeltaNet at the same boundary, so a hit restores both.
-fn capture_vmm_prefixes(rig: &mut Rig, slots: &[Option<InFlight>], work: &[PendingWork]) {
-    let Rig {
-        model,
-        gpu,
-        sessions,
-        stamp,
-        ..
-    } = rig;
-    let ModelRig {
-        vmm,
-        vmm_prefix,
-        vmm_prefix_mark,
-        dn_states,
-        ..
-    } = model;
-    let Some(store) = vmm.as_ref() else { return };
-    let Some(cache) = vmm_prefix.as_mut() else {
-        return;
-    };
-    let stamp = *stamp;
-    for s in 0..work.len() {
-        if work[s].decoding || work[s].vl_prefill.is_some() {
-            continue;
-        }
-        let Some(f) = slots.get(s).and_then(Option::as_ref) else {
-            continue;
-        };
-        let Some(sess) = sessions.get(f.session) else {
-            continue;
-        };
-        let next = work[s].next_pos;
-        if next <= vmm_prefix_mark[s]
-            || next < VMM_PREFIX_MIN_TOKENS
-            || next >= sess.tokens.len()
-            || sess.has_image
-            || work[s].remaining_prompt.is_empty()
-        {
-            continue;
-        }
-        vmm_prefix_mark[s] = next;
-        let tokens = sess.tokens[..next].to_vec();
-        let dn_refs = dn_buffers(&dn_states[s]);
-        let snap = store.capture_slot(gpu, s, next, &dn_refs, &tokens, stamp);
-        drop(dn_refs);
-        match snap {
-            Ok(snapshot) => {
-                if cache.insert(tokens, snapshot, stamp) && gpu.slot_trace() {
-                    eprintln!(
-                        "[slot-trace] vmm prefix cache STORE: prefix={next}/{} ({} entries, {} KiB)",
-                        sess.tokens.len(),
-                        cache.len(),
-                        cache.used_bytes() / 1024
-                    );
-                }
-            }
-            Err(e) => {
-                if gpu.slot_trace() {
-                    eprintln!("[slot-trace] vmm prefix capture failed slot {s}: {e}");
-                }
-            }
-        }
-    }
 }
 
 /// Capture an idle session's state, park it, and free its slot.
