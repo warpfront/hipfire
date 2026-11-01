@@ -61,7 +61,7 @@ use crate::mesh_lane_protocol::{
     VerifyLane,
 };
 use crate::mtp_lanes::{
-    ar_synced_head, lane_call, prepare_lane_window_with, publish_lane_window, LaneFinish,
+    ar_synced_head, lane_call, prepare_lane_window_with, publish_lane_window, LaneEos, LaneFinish,
     PendingWindow, PreparedLaneWindow,
 };
 use crate::mtp_spec::{qwen4_ngram_take_cap, HeadLag, HeadTicket, TargetTicket};
@@ -913,6 +913,7 @@ pub(crate) fn prepare_rank_lane(
                 LaneFinish {
                     acceptance,
                     head_at_start,
+                    eos: LaneEos::Admitted(p.plan.eos),
                 },
             )?;
             let window = &prepared.result;

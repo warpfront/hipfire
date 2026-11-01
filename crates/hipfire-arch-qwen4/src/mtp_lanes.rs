@@ -518,6 +518,31 @@ pub(crate) struct LaneFinish {
     /// `NativeFinish.head_at_start` (`mesh_rank_copy::head_at_start(steps)`):
     /// no head Draft step is in effect, so the seed's row is appended.
     pub head_at_start: bool,
+    /// The end-of-stream rule of the greedy accept when `acceptance` is
+    /// `None`.
+    pub eos: LaneEos,
+}
+
+/// Which end-of-stream token a lane window's greedy accept stops at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaneEos {
+    /// The store's configured end of turn, else the model's EOS (the
+    /// singleton's rule).
+    Config,
+    /// The rule the root admitted the request with (`LanePlan::eos`; `None`
+    /// ignores EOS, as the lab oracle's fixed-count lanes do). A rank must
+    /// replay the root's decision, so it never re-derives the rule.
+    Admitted(Option<u32>),
+}
+
+impl LaneEos {
+    /// The EOS token the greedy accept stops at (`None`: never).
+    pub(crate) fn resolve(self, end_of_turn: Option<u32>, model_eos: u32) -> Option<u32> {
+        match self {
+            Self::Config => Some(end_of_turn.unwrap_or(model_eos)),
+            Self::Admitted(eos) => eos,
+        }
+    }
 }
 
 impl LaneFinish {
@@ -525,6 +550,7 @@ impl LaneFinish {
     pub(crate) const NATIVE: Self = Self {
         acceptance: None,
         head_at_start: false,
+        eos: LaneEos::Config,
     };
 }
 
@@ -644,12 +670,14 @@ pub(crate) fn prepare_lane_window_with(
     let mtp_ticket = window
         .head_ticket
         .ok_or_else(|| "finish_lane_window: no head ticket".to_string())?;
-    let eos = config.end_of_turn.unwrap_or(bundle.config.eos_token_id);
+    let eos = finish
+        .eos
+        .resolve(config.end_of_turn, bundle.config.eos_token_id);
     let drafts = window.drafts.clone();
     let forced = finish.acceptance.is_some();
     let acceptance = match finish.acceptance {
         Some(acceptance) => acceptance,
-        None => accept_native_greedy(&drafts, picks, Some(eos))?,
+        None => accept_native_greedy(&drafts, picks, eos)?,
     };
     let mut block = Vec::with_capacity(rows);
     block.push(window.seed);
@@ -876,6 +904,56 @@ mod tests {
     // contract structurally on the source and the signatures.
     const SPEC_SRC: &str = include_str!("mtp_spec.rs");
     const LANES_SRC: &str = include_str!("mtp_lanes.rs");
+
+    /// A rank replays the root's greedy decision, so its accept must stop at
+    /// the EOS the root admitted the request with. The lab oracle admits with
+    /// `eos: None` (fixed-count lanes ignore EOS) while the model's EOS is
+    /// 248044: a rank that re-derived the store's EOS finished a window as
+    /// [EOS] (accepted 1) where the root decided [EOS, x, y] (accepted 2).
+    #[test]
+    fn rank_accept_follows_the_admitted_eos_rule() {
+        use super::LaneEos;
+        use crate::mtp_spec::{accept_greedy_prefix, accept_native_greedy};
+        const MODEL_EOS: u32 = 248044;
+        let drafts = [248044, 248045];
+        let picks = [248044, 248045, 198];
+        // The root (None: EOS ignored) and the rank agree.
+        let root = accept_greedy_prefix(&drafts, &picks, None);
+        let rank_eos = LaneEos::Admitted(None).resolve(None, MODEL_EOS);
+        let rank = accept_native_greedy(&drafts, &picks, rank_eos).unwrap();
+        assert_eq!(
+            (rank.committed.clone(), rank.accepted),
+            (root.committed, root.accepted)
+        );
+        assert_eq!(
+            (rank.committed, rank.accepted, rank.hit_eos),
+            (vec![248044, 248045, 198], 2, false)
+        );
+        // The store-derived rule is what used to run on the rank.
+        let stale = accept_native_greedy(&drafts, &picks, LaneEos::Config.resolve(None, MODEL_EOS))
+            .unwrap();
+        assert_eq!(
+            (stale.committed, stale.accepted, stale.hit_eos),
+            (vec![248044], 1, true)
+        );
+        // An admitted EOS stops the rank where it stops the root.
+        for eos in [Some(MODEL_EOS), Some(248045), Some(7)] {
+            let root = accept_greedy_prefix(&drafts, &picks, eos);
+            let rank = accept_native_greedy(
+                &drafts,
+                &picks,
+                LaneEos::Admitted(eos).resolve(Some(1), MODEL_EOS),
+            )
+            .unwrap();
+            assert_eq!(
+                (rank.committed, rank.accepted, rank.hit_eos),
+                (root.committed, root.accepted, root.hit_eos)
+            );
+        }
+        // The singleton rule: the configured end of turn, else the model's.
+        assert_eq!(LaneEos::Config.resolve(Some(5), MODEL_EOS), Some(5));
+        assert_eq!(LaneEos::Config.resolve(None, MODEL_EOS), Some(MODEL_EOS));
+    }
 
     fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
         let head = format!("pub(crate) fn {name}(");
