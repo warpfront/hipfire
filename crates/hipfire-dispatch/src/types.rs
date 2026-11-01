@@ -1045,9 +1045,11 @@ impl KernelKey {
             // required for the match to compile.
             | BQ1G128 => ArchPredicate::Always,
             HFQ3G256 => ArchPredicate::HasHfq3G256Gemv,
-            // gemv_hfq3g128 is a generic [32,1,1] scalar kernel (no sdot4); its
-            // shuffle offsets stay within 32 lanes, so wave64 runs it too.
-            HFQ3G128 => ArchPredicate::Always,
+            // gemv_hfq3g128 is a WMMA-free, sdot4-free [32,1,1] wave32 scalar
+            // kernel (the MQ3G256 rationale below): HasWave32 newly admits
+            // RDNA1/2/3/4 incl. gfx1151; CDNA wave64 stays excluded until a
+            // wave64 run has exercised it.
+            HFQ3G128 => ArchPredicate::HasWave32,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline
             // `_=>` arms) and ALREADY run on RDNA1/2 via the qwen35 direct path.
