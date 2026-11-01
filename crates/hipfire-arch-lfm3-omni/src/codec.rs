@@ -613,6 +613,17 @@ fn codec_decoder_forward(
     let h = cfg.hidden_size;
     let eps = cfg.norm_eps;
     let base = st.n_tokens; // absolute position offset (carries across chunks)
+    // STREAM-1 (defense in depth): the KV cache is sized for `physical_cap`
+    // tokens (= max_frames * stft_frame_stack from `CodecStreamingCache::new`);
+    // a caller that feeds more frames than the cache was sized for used to
+    // write out of range silently (the same class the daemon's step budget
+    // closes). Refuse instead of corrupting GPU memory.
+    let cap = st.kv.physical_cap;
+    if base + n_tokens > cap {
+        return Err(format!(
+            "codec decoder: KV overflow: position {base} + {n_tokens} tokens exceeds the cache capacity ({cap} tokens) — the streaming cache was sized for fewer frames than this decode feeds"
+        ));
+    }
     let mut out = vec![0.0f32; n_tokens * h];
 
     for i in 0..n_tokens as u32 {
@@ -771,16 +782,30 @@ fn istft_overlap_add_raw(
         // (mirrors HF `torch.polar(log_magnitude.exp(), angle)` before
         // `torch.fft.irfft`; feeding magnitude/angle directly as re/im
         // injects the raw phase values as spectral samples — static.)
+        //
+        // CODEC-SMOKE-1: exp(log_mag) overflows f32 to +inf at log_mag ≳ 88.7
+        // and poisons the whole overlap-add region. Under the Q8-KV stochastic
+        // rounding the lin head can emit a runaway log-magnitude (observed:
+        // ~12% of codec_smoke batch decodes produced at least one non-finite
+        // frame). Clamp far above any legitimate speech spectrum (≈20) and map
+        // a NaN log-magnitude/phase to silence so every decoded waveform stays
+        // finite instead of emitting an inf/NaN frame.
         let re: Vec<f32> = (0..n_bins)
             .map(|k| {
-                let mag = log_mag[t * n_bins + k].exp();
-                mag * angle[t * n_bins + k].cos()
+                let lg = log_mag[t * n_bins + k];
+                let mag = if lg.is_nan() { 0.0 } else { lg.clamp(-120.0, 80.0).exp() };
+                let a = angle[t * n_bins + k];
+                let ca = if a.is_nan() { 1.0 } else { a.cos() };
+                mag * ca
             })
             .collect();
         let im: Vec<f32> = (0..n_bins)
             .map(|k| {
-                let mag = log_mag[t * n_bins + k].exp();
-                mag * angle[t * n_bins + k].sin()
+                let lg = log_mag[t * n_bins + k];
+                let mag = if lg.is_nan() { 0.0 } else { lg.clamp(-120.0, 80.0).exp() };
+                let a = angle[t * n_bins + k];
+                let sa = if a.is_nan() { 0.0 } else { a.sin() };
+                mag * sa
             })
             .collect();
         let frame = irfft_with(tw, &re, &im);

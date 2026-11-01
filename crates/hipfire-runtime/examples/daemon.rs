@@ -19955,7 +19955,12 @@ fn generate_lfm3_omni(
         // done. The budget is the same max_steps the CodecStreamingCache was
         // sized for, so total frames can never exceed the cache's capacity —
         // the previous mismatch (12-frame chunks vs a ≤200-frame cache) is
-        // closed by construction.
+        // closed by construction. The last chunk is CLAMPED to the remainder
+        // (`min(chunk_steps, steps_left)`): subtracting a full chunk while
+        // still generating a full chunk overshot the cache by up to
+        // chunk_steps-1 frames (max_steps=200, chunk=12 → 204 frames = 1224
+        // decoder tokens vs a 1200-token cache → out-of-range KV write, the
+        // exact class this budget was added to close).
         let mut steps_left = max_steps;
         let mut hit_step_budget = false;
         while !stream_state.finished {
@@ -19963,7 +19968,8 @@ fn generate_lfm3_omni(
                 hit_step_budget = true;
                 break;
             }
-            steps_left = steps_left.saturating_sub(chunk_steps);
+            let this_chunk = chunk_steps.min(steps_left);
+            steps_left -= this_chunk;
             let step_out = {
                 let bundle = match m.state.as_mut() {
                     Some(ModelState::Lfm3(b)) => b,
@@ -19983,7 +19989,7 @@ fn generate_lfm3_omni(
                     depth_weights,
                     gpu,
                     &mut stream_state,
-                    chunk_steps,
+                    this_chunk,
                     &mut rng,
                 ) {
                     Ok(o) => o,
@@ -20125,6 +20131,11 @@ fn generate_lfm3_omni(
         }
     };
     let gen_ms = t0.elapsed().as_millis();
+    // FINISH-1 (omni batch): same contract as the streaming path and the text
+    // routes — a natural stop (audio-eos / <|im_end|> / post-eos text_end)
+    // reports "stop"; exhausting max_steps reports "length". `finished` is
+    // exactly the natural-stop flag in both omni generate loops.
+    let finish_reason = if out.finished { "stop" } else { "length" };
     let n_emitted = out.n_audio_frames;
     eprintln!(
         "[lfm3-omni] generated {} text tokens + {n_emitted} audio frames (eos={}, finished={}) in {gen_ms}ms",
@@ -20157,7 +20168,7 @@ fn generate_lfm3_omni(
         let _ = writeln!(
             stdout,
             "{}",
-            serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"attempt_id":active_attempt_id()})
+            serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"finish_reason":finish_reason,"attempt_id":active_attempt_id()})
         );
         let _ = stdout.flush();
         return;
@@ -20229,7 +20240,7 @@ fn generate_lfm3_omni(
     let _ = writeln!(
         stdout,
         "{}",
-        serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"attempt_id":active_attempt_id()})
+        serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"finish_reason":finish_reason,"attempt_id":active_attempt_id()})
     );
     let _ = stdout.flush();
 }
