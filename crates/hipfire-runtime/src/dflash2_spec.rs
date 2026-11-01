@@ -35,11 +35,15 @@
 use crate::dflash::{draft_forward_based, propose_candidates_device, DflashConfig, DflashScratch};
 use crate::dflash::{DflashWeights, DFLASH_BLOCK_MAX};
 use crate::hfq::HfqFile;
+use crate::llama::argmax;
+use crate::sampler::{apply_logit_policy_cpu, SamplerConfig};
 use crate::spec::{
     accept_greedy_prefix, terminal_prefix_replay, PrefillOutcome, RowPick, SpecAdvance,
     SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
-use crate::spec_sampling::{accept_sampled_prefix, SampleSpec, SparseDist, SpecRng};
+use crate::spec_sampling::{
+    accept_sampled_prefix, PenaltyHistory, SampleSpec, SparseDist, SpecRng,
+};
 use rdna_compute::Gpu;
 use std::path::Path;
 
@@ -139,6 +143,13 @@ pub struct Dflash2Speculator {
     mask_row: Vec<f32>,
     request: SpecRequestConfig,
     rng: SpecRng,
+    /// The request's penalty history (window 0 while its penalties are
+    /// neutral): seeded at prefill, rebuilt from the loop's `emitted` at every
+    /// window ([`PenaltyHistory`]).
+    history: PenaltyHistory,
+    /// The request's penalty policy for [`apply_logit_policy_cpu`], the same
+    /// arithmetic AR's `sample_cpu` runs before its temperature stage.
+    penalty_cfg: SamplerConfig,
     /// The target's measured break-even line for this draft
     /// ([`SpecTarget::dflash_retire_break_even`]); `Some` arms the AR step.
     retire: Option<crate::spec_retire::BreakEven>,
@@ -160,6 +171,19 @@ impl Dflash2Speculator {
             self.request.top_k,
             self.request.min_p,
         )
+    }
+
+    /// One draw (sampled) or argmax (greedy) from the target row `logits`
+    /// after the request's penalties over `self.history.row(0)`: AR's
+    /// `sample_cpu` pick. The window ([`PenaltyHistory::begin_window`] /
+    /// `set_prompt`) must be open.
+    fn pick_penalized_row(&mut self, logits: &mut [f32]) -> Result<u32, String> {
+        apply_logit_policy_cpu(logits, self.history.row(0), &self.penalty_cfg);
+        if self.sampled() {
+            self.sample_row(logits)
+        } else {
+            Ok(argmax(logits))
+        }
     }
 
     /// One draw from the target row `logits` with the AR sampler's law.
@@ -276,7 +300,9 @@ impl Dflash2Speculator {
 
     /// One target token, no draft: the committed row `[seed]`
     /// ([`SpecTarget::commit_row`], no rollback snapshot needed) with its
-    /// feature capture, then the greedy or sampled pick.
+    /// feature capture, then the greedy or sampled pick, over the penalized
+    /// row when the request has penalties (history = the loop's `emitted`,
+    /// seed last, which the caller opened with `begin_window`).
     fn step_one_token(
         &mut self,
         gpu: &mut Gpu,
@@ -286,9 +312,18 @@ impl Dflash2Speculator {
     ) -> Result<SpecStep, String> {
         let mut rows = Vec::with_capacity(self.row_elems());
         let sampled = self.sampled();
+        let penalized = self.request.penalties_active();
         let vs = self.verify_scratch()?;
-        let pick = target.commit_row(gpu, seed, position, vs.as_mut(), Some(&mut rows), sampled)?;
+        let pick = target.commit_row(
+            gpu,
+            seed,
+            position,
+            vs.as_mut(),
+            Some(&mut rows),
+            sampled || penalized,
+        )?;
         let token = match pick {
+            RowPick::Logits(mut logits) if penalized => self.pick_penalized_row(&mut logits)?,
             RowPick::Logits(logits) => self.sample_row(&logits)?,
             RowPick::Argmax(token) => token,
         };
@@ -328,6 +363,15 @@ impl Speculator for Dflash2Speculator {
         _resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        // The penalty history of the request: the rendered prompt (the whole
+        // prompt, not the cache-fill suffix) unless the request penalizes
+        // generated tokens only; opens the window of the first token's row.
+        self.history
+            .set_prompt(if self.request.penalty_generated_only {
+                &[]
+            } else {
+                prompt_tokens
+            });
         // A cold prefill resets the target and a hit restores or continues
         // it: either way no verify ticket is outstanding.
         if let Some(vs) = self.verify_scratch.as_mut() {
@@ -359,13 +403,27 @@ impl Speculator for Dflash2Speculator {
         self.rebase_host(start + fill.len())?;
         self.host_tokens.extend_from_slice(fill);
         self.check_host_rows(start + fill.len())?;
-        let first_token = if self.sampled() {
-            let logits = last_logits.ok_or(
-                "Dflash2Speculator: a sampled prefill needs the target's final-row logits",
-            )?;
-            self.sample_row(&logits)?
-        } else {
-            last_argmax
+        let penalized = self.request.penalties_active();
+        let first_token = match last_logits {
+            // The first token sees the history's prompt tail; an empty one
+            // (generated-only) leaves the row untouched.
+            Some(mut logits) if penalized && !self.history.row(0).is_empty() => {
+                self.pick_penalized_row(&mut logits)?
+            }
+            Some(logits) if self.sampled() => self.sample_row(&logits)?,
+            None if self.sampled() => {
+                return Err(
+                    "Dflash2Speculator: a sampled prefill needs the target's final-row logits"
+                        .into(),
+                );
+            }
+            None if penalized && !self.history.row(0).is_empty() => {
+                return Err(
+                    "Dflash2Speculator: a penalized prefill needs the target's final-row logits"
+                        .into(),
+                );
+            }
+            _ => last_argmax,
         };
         Ok(PrefillOutcome::Ready { first_token })
     }
@@ -376,7 +434,7 @@ impl Speculator for Dflash2Speculator {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
-        _emitted: &[u32],
+        emitted: &[u32],
         _grammar: Option<&mut dyn SpecGrammar>,
         temp: f32,
         max_emit: usize,
@@ -384,9 +442,7 @@ impl Speculator for Dflash2Speculator {
         if max_emit == 0 {
             return Err("Dflash2Speculator: max_emit=0 (no remaining output budget)".into());
         }
-        if self.request.penalties_active() {
-            return Err("Dflash2Speculator: token penalties are not supported".into());
-        }
+        let penalized = self.request.penalties_active();
         if (temp > 1e-6) != self.sampled() {
             return Err(format!(
                 "Dflash2Speculator: step temperature {temp} differs from the request's {}",
@@ -394,6 +450,10 @@ impl Speculator for Dflash2Speculator {
             ));
         }
         self.check_host_rows(position)?;
+        if penalized {
+            // Row 0 of this window sees `prompt ‖ emitted` (seed included).
+            self.history.begin_window(emitted);
+        }
         if max_emit == 1 {
             let result = self.step_one_token(gpu, target, position, seed);
             return self.settle(gpu, target, result);
@@ -543,16 +603,24 @@ impl Speculator for Dflash2Speculator {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        emitted: &[u32],
     ) -> Result<u32, String> {
         if self.retire.is_none() {
             return Err("Dflash2Speculator: this target has no AR step".into());
         }
         self.check_host_rows(position)?;
+        if self.request.penalties_active() {
+            self.history.begin_window(emitted);
+        }
         let result = self.step_one_token(gpu, target, position, seed);
         self.settle(gpu, target, result).map(|step| step.next_seed)
     }
 
     fn supports_sampled_ar_step(&self) -> bool {
+        true
+    }
+
+    fn supports_penalties(&self) -> bool {
         true
     }
 
@@ -643,6 +711,14 @@ impl Speculator for Dflash2Speculator {
 
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.rng = SpecRng::new(cfg.rng_seed);
+        self.history = PenaltyHistory::new(cfg.penalty_window());
+        self.penalty_cfg = SamplerConfig {
+            repeat_penalty: cfg.repeat_penalty,
+            repeat_window: cfg.repeat_window,
+            presence_penalty: cfg.presence_penalty,
+            frequency_penalty: cfg.frequency_penalty,
+            ..SamplerConfig::greedy()
+        };
         self.request = cfg;
     }
 
@@ -677,10 +753,31 @@ impl Dflash2Speculator {
         let drafts = &block[1..];
         let mut rows = Vec::with_capacity(block.len() * self.row_elems());
         let mut vs = self.verify_scratch.take().ok_or("verify scratch freed")?;
-        let verdict = if self.sampled() {
+        let sampled = self.sampled();
+        let penalized = self.request.penalties_active();
+        let verdict = if sampled || penalized {
+            // Penalized rows come back as full logits for greedy too: the
+            // device argmax cannot see the penalties. Neutral requests keep
+            // their routes (sampled: logits; greedy: the device argmax).
+            let vocab = self.config.vocab_size;
             target
                 .verify_block_logits(gpu, block, position, vs.as_mut(), Some(&mut rows))
-                .and_then(|logits| self.accept_sampled(proposal, drafts, &logits))
+                .and_then(|mut logits| {
+                    if penalized {
+                        penalize_verify_rows(
+                            &mut logits,
+                            vocab,
+                            drafts,
+                            &mut self.history,
+                            &self.penalty_cfg,
+                        )?;
+                    }
+                    if sampled {
+                        self.accept_sampled(proposal, drafts, &logits)
+                    } else {
+                        accept_greedy_rows(drafts, &logits, vocab)
+                    }
+                })
         } else {
             target
                 .verify_block(gpu, block, position, vs.as_mut(), Some(&mut rows))
@@ -738,6 +835,56 @@ impl Dflash2Speculator {
             },
         )
     }
+}
+
+/// Penalize every row of a verify window's `logits` (`(drafts + 1) × vocab`)
+/// in place with AR's policy arithmetic ([`apply_logit_policy_cpu`]): row `r`
+/// is the target's row after `drafts[..r]`, so it sees the window's base
+/// history (`prompt ‖ emitted` or `emitted`, seed last) plus those drafts,
+/// trailing `repeat_window` tokens. `history` must be at its window's start
+/// ([`PenaltyHistory::begin_window`]) and is left there.
+fn penalize_verify_rows(
+    logits: &mut [f32],
+    vocab: usize,
+    drafts: &[u32],
+    history: &mut PenaltyHistory,
+    cfg: &SamplerConfig,
+) -> Result<(), String> {
+    if logits.len() != (drafts.len() + 1) * vocab {
+        return Err(format!(
+            "Dflash2Speculator: verify returned {} logits for {} rows of {vocab}",
+            logits.len(),
+            drafts.len() + 1
+        ));
+    }
+    for (row, logit_row) in logits.chunks_exact_mut(vocab).enumerate() {
+        apply_logit_policy_cpu(logit_row, history.row(row), cfg);
+        if let Some(&draft) = drafts.get(row) {
+            history.push_draft(draft);
+        }
+    }
+    history.rewind_drafts();
+    Ok(())
+}
+
+/// Greedy acceptance of one window against its target `logits` rows
+/// (`(drafts + 1) × vocab`, penalized or not): the per-row argmax, the rule
+/// AR's `sample_cpu` applies at temperature 0, then the shared accept-prefix
+/// rule.
+fn accept_greedy_rows(
+    drafts: &[u32],
+    logits: &[f32],
+    vocab: usize,
+) -> Result<crate::spec::GreedyAccept, String> {
+    if logits.len() != (drafts.len() + 1) * vocab {
+        return Err(format!(
+            "Dflash2Speculator: verify returned {} logits for {} rows of {vocab}",
+            logits.len(),
+            drafts.len() + 1
+        ));
+    }
+    let picks: Vec<u32> = logits.chunks_exact(vocab).map(argmax).collect();
+    Ok(accept_greedy_prefix(drafts, &picks, None))
 }
 
 /// The selector's per-row draft distributions of the first `rows` rows: row
@@ -913,6 +1060,8 @@ pub fn build_dflash2_speculator(
         mask_row: Vec::new(),
         request: SpecRequestConfig::default(),
         rng: SpecRng::new(0),
+        history: PenaltyHistory::default(),
+        penalty_cfg: SamplerConfig::greedy(),
         retire,
     }))
 }
@@ -1221,6 +1370,250 @@ mod tests {
         assert!(
             (biased - 0.42).abs() < 0.005,
             "the drawn-mass cut must show its bias: P(c | a) = {biased}"
+        );
+    }
+
+    fn penalty_cfg(window: usize) -> SamplerConfig {
+        SamplerConfig {
+            repeat_penalty: 1.1,
+            repeat_window: window,
+            presence_penalty: 1.5,
+            frequency_penalty: 0.25,
+            ..SamplerConfig::greedy()
+        }
+    }
+
+    /// The shared predicate and the generated-only switch: a neutral request
+    /// has no history window, a penalized one keeps `repeat_window`, and the
+    /// default penalizes the prompt too (existing MTP users are unchanged).
+    #[test]
+    fn penalty_request_defaults_keep_the_prompt_in_the_history() {
+        let neutral = SpecRequestConfig::default();
+        assert!(!neutral.penalty_generated_only);
+        assert_eq!(neutral.penalty_window(), 0);
+        let penalized = SpecRequestConfig {
+            presence_penalty: 1.5,
+            repeat_window: 64,
+            ..SpecRequestConfig::default()
+        };
+        assert!(penalized.penalties_active());
+        assert_eq!(penalized.penalty_window(), 64);
+        assert!(!penalized.penalty_generated_only);
+        // A window of 0 disables every penalty.
+        assert!(!SpecRequestConfig {
+            presence_penalty: 1.5,
+            ..SpecRequestConfig::default()
+        }
+        .penalties_active());
+    }
+
+    /// Greedy verify of a penalized window: each row's pick is the argmax of
+    /// the row `sample_cpu` would penalize against `suffix_W(base ‖
+    /// drafts[..r])`, a row whose raw argmax was already emitted flips to the
+    /// runner-up, and the accept rule keeps the draft prefix equal to those
+    /// picks.
+    #[test]
+    fn penalized_greedy_verify_flips_emitted_argmax_like_sample_cpu() {
+        use crate::sampler::sample_cpu;
+        let vocab = 6usize;
+        let seed = 2u32;
+        let base = [4u32, 4, seed]; // emitted so far, pending seed last
+        let raw: [[f32; 6]; 4] = [
+            [0.1, 0.2, 3.0, 2.6, 0.0, 0.3], // raw argmax 2, the pending seed
+            [0.0, 0.1, 0.2, 3.0, 2.9, 0.1], // raw argmax 3, row 0's draft
+            [0.0, 0.0, 0.1, 0.2, 3.0, 2.9], // raw argmax 4, emitted twice
+            [0.5, 2.0, 0.1, 0.2, 0.0, 0.3],
+        ];
+        for window in [2usize, 3, 8, 64] {
+            let cfg = penalty_cfg(window);
+            let mut logits: Vec<f32> = raw.iter().flatten().copied().collect();
+            let drafts = [3u32, 4, 5];
+            let mut history = PenaltyHistory::new(window);
+            history.set_prompt(&[]);
+            history.begin_window(&base);
+            penalize_verify_rows(&mut logits, vocab, &drafts, &mut history, &cfg).unwrap();
+            assert_eq!(
+                history.tokens(),
+                &base[base.len().saturating_sub(window)..],
+                "drafts rewound to the window's base"
+            );
+            let mut reference = Vec::new();
+            let mut picks = Vec::new();
+            for (r, row) in raw.iter().enumerate() {
+                let mut hist = base.to_vec();
+                hist.extend_from_slice(&drafts[..r.min(drafts.len())]);
+                let mut row = row.to_vec();
+                picks.push(sample_cpu(&mut row, &hist, &cfg));
+                reference.push(row);
+            }
+            for (r, row) in logits.chunks_exact(vocab).enumerate() {
+                assert_eq!(row, &reference[r][..], "window {window} row {r}");
+            }
+            let verdict = accept_greedy_rows(&drafts, &logits, vocab).unwrap();
+            // The expected window is rebuilt from `sample_cpu`'s own picks.
+            assert_eq!(
+                verdict.committed,
+                {
+                    let mut kept = Vec::new();
+                    for (i, &d) in drafts.iter().enumerate() {
+                        if picks[i] == d {
+                            kept.push(d);
+                        } else {
+                            break;
+                        }
+                    }
+                    kept.push(picks[kept.len()]);
+                    kept
+                },
+                "window {window}"
+            );
+        }
+        // With the full history the first row's raw argmax (the seed) is
+        // penalized to the runner-up, which then matches a draft of it.
+        let cfg = penalty_cfg(64);
+        let mut logits: Vec<f32> = raw[..2].iter().flatten().copied().collect();
+        let mut history = PenaltyHistory::new(64);
+        history.set_prompt(&[]);
+        history.begin_window(&base);
+        penalize_verify_rows(&mut logits, vocab, &[3], &mut history, &cfg).unwrap();
+        let verdict = accept_greedy_rows(&[3], &logits, vocab).unwrap();
+        assert_eq!(verdict.accepted, 1, "the runner-up draft is accepted");
+        // The raw argmax would have rejected it.
+        let raw_flat: Vec<f32> = raw[..2].iter().flatten().copied().collect();
+        assert_eq!(
+            accept_greedy_rows(&[3], &raw_flat, vocab).unwrap().accepted,
+            0
+        );
+        // A wrong-length buffer is refused.
+        assert!(penalize_verify_rows(&mut logits[..5], vocab, &[3], &mut history, &cfg).is_err());
+        assert!(accept_greedy_rows(&[3], &raw_flat[..5], vocab).is_err());
+    }
+
+    /// Sampled verify under presence + frequency + repeat penalties: the
+    /// first two emitted tokens follow `p0(t1) · p1(t2 | t1)` with `p` the
+    /// softmax of each row penalized against `emitted ‖ earlier drafts`; row 1
+    /// is penalized against the window's earlier accepted draft. Leaving the
+    /// drafts out of the history (the bug this guards) visibly breaks it.
+    #[test]
+    fn sampled_verify_follows_the_penalized_target_law() {
+        let vocab = 4usize;
+        let seed = 3u32;
+        let cfg = SamplerConfig {
+            repeat_penalty: 1.2,
+            repeat_window: 6,
+            presence_penalty: 1.5,
+            frequency_penalty: 0.5,
+            ..SamplerConfig::greedy()
+        };
+        let raw0 = [0.4f32, 0.1, 0.0, 1.2];
+        let raw1 = |prev: u32| -> [f32; 4] {
+            let mut r = [0.2f32, 0.5, 0.3, 0.1];
+            r[prev as usize] += 1.5;
+            r
+        };
+        // The target's raw row after `[.., seed, drafts[..r]]`.
+        let raw_rows = |drafts: &[u32]| -> Vec<f32> {
+            let mut rows = raw0.to_vec();
+            for r in 1..=drafts.len() {
+                rows.extend_from_slice(&raw1(drafts[r - 1]));
+            }
+            rows
+        };
+        let softmax = |row: &[f32]| -> Vec<f64> {
+            let max = row.iter().copied().fold(f32::MIN, f32::max) as f64;
+            let e: Vec<f64> = row.iter().map(|&v| (v as f64 - max).exp()).collect();
+            let z: f64 = e.iter().sum();
+            e.iter().map(|v| v / z).collect()
+        };
+        let penalized = |row: &[f32], history: &[u32]| -> Vec<f32> {
+            let mut row = row.to_vec();
+            apply_logit_policy_cpu(&mut row, history, &cfg);
+            row
+        };
+        // Exact law of two emitted tokens after the pending seed.
+        let p0 = softmax(&penalized(&raw0, &[seed]));
+        let expected = |t1: u32, t2: u32| -> f64 {
+            p0[t1 as usize] * softmax(&penalized(&raw1(t1), &[seed, t1]))[t2 as usize]
+        };
+        let dist = |e: &[(u32, f32)]| {
+            let mut s = SparseDist::default();
+            s.set_entries(e.iter().copied());
+            s
+        };
+        let q1 = [(0u32, 0.4f32), (1, 0.3), (2, 0.2), (3, 0.1)];
+        let q2 = |x: u32| -> [(u32, f32); 4] {
+            let mut q = [(0u32, 0.25f32); 4];
+            for (i, e) in q.iter_mut().enumerate() {
+                *e = (i as u32, if i as u32 == (x + 1) % 4 { 0.55 } else { 0.15 });
+            }
+            q
+        };
+        let spec = SampleSpec::cpu_ar(1.0, 1.0, None, 0.0);
+        let max_deviation = |with_drafts: bool| -> f64 {
+            let mut rng = SpecRng::new(23);
+            let mut history = PenaltyHistory::new(cfg.repeat_window);
+            history.set_prompt(&[]);
+            let (mut target, mut scratch) = (SparseDist::default(), Vec::new());
+            let mut pairs = std::collections::HashMap::<(u32, u32), u64>::new();
+            let n = 300_000u64;
+            for _ in 0..n {
+                let x1 = dist(&q1).sample(rng.next_f32());
+                let x2 = dist(&q2(x1)).sample(rng.next_f32());
+                // Depth by the earlier drafts only: a seed-equal first draft
+                // is verified alone.
+                let depth = if x1 == seed { 1 } else { 2 };
+                let drafts = &[x1, x2][..depth];
+                let q: Vec<SparseDist> = [dist(&q1), dist(&q2(x1))][..depth].to_vec();
+                let mut logits = raw_rows(drafts);
+                history.begin_window(&[seed]);
+                if with_drafts {
+                    penalize_verify_rows(&mut logits, vocab, drafts, &mut history, &cfg).unwrap();
+                } else {
+                    // The bug: every row sees the base history only.
+                    for row in logits.chunks_exact_mut(vocab) {
+                        apply_logit_policy_cpu(row, history.row(0), &cfg);
+                    }
+                }
+                let verdict =
+                    accept_sampled_prefix(drafts, &q, None, &mut rng, &mut target, |row, out| {
+                        out.build_from_logits(
+                            &logits[row * vocab..(row + 1) * vocab],
+                            spec,
+                            &mut scratch,
+                        )
+                    })
+                    .unwrap();
+                let t1 = verdict.committed[0];
+                let t2 = match verdict.committed.get(1) {
+                    Some(&t) => t,
+                    None => {
+                        // A one-token window continues as an AR step over
+                        // `emitted = [seed, t1]`.
+                        history.begin_window(&[seed, t1]);
+                        let mut row = raw1(t1).to_vec();
+                        apply_logit_policy_cpu(&mut row, history.row(0), &cfg);
+                        let mut p = SparseDist::default();
+                        p.build_from_logits(&row, spec, &mut scratch).unwrap();
+                        p.sample(rng.next_f32())
+                    }
+                };
+                *pairs.entry((t1, t2)).or_default() += 1;
+            }
+            let mut worst = 0.0f64;
+            for t1 in 0..vocab as u32 {
+                for t2 in 0..vocab as u32 {
+                    let freq = pairs.get(&(t1, t2)).copied().unwrap_or(0) as f64 / n as f64;
+                    worst = worst.max((freq - expected(t1, t2)).abs());
+                }
+            }
+            worst
+        };
+        let exact = max_deviation(true);
+        assert!(exact < 0.004, "penalized pair law deviates by {exact}");
+        let without = max_deviation(false);
+        assert!(
+            without > 0.01,
+            "a base-only history must show its bias, deviation {without}"
         );
     }
 }

@@ -981,6 +981,7 @@ impl Speculator for GenericDflashSpeculator {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        _emitted: &[u32],
     ) -> Result<u32, String> {
         self.step_one_token(gpu, target, position, seed, 0.0)
             .map(|step| step.next_seed)

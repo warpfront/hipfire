@@ -1709,6 +1709,11 @@ pub struct GenerationRouteInputs {
     /// The loaded speculator is the shared DFlash2 drafter (`name() ==
     /// "dflash2"`), the one non-MTP speculator a Qwen4 load admits.
     pub speculator_is_dflash2: bool,
+    /// The loaded speculator reproduces AR under non-neutral penalties
+    /// ([`hipfire_runtime::spec::Speculator::supports_penalties`]). Only the
+    /// Raon route reads it today: a penalized request stays on that arch's
+    /// AR producer unless the speculator penalizes its verify rows.
+    pub speculator_supports_penalties: bool,
     pub deepseek4_spec_requested: bool,
     pub ngram_can_sample: bool,
     pub temp: f32,
@@ -1854,14 +1859,18 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         // batching), so the choice is the AR producer or the DFlash2 spec
         // route. The shared DFlash2 drafter (`--spec dflash`, opt-in) verifies
         // greedy picks, or sampled rows with the selector-chain nucleus law,
-        // and applies no token penalties: `nonneutral_penalties` already
-        // counts the card's presence default that the AR producer adds to an
-        // unset sampled request (`RaonSampling::penalized_after_defaults`).
-        // Any other speculator keeps the request on AR.
+        // and penalizes every verify row with the generated-only history AR's
+        // sampler sees (`Speculator::supports_penalties`), so a penalized
+        // request keeps the spec route when the loaded speculator says so:
+        // `nonneutral_penalties` counts the card's presence default that the
+        // AR producer adds to an unset sampled request
+        // (`RaonSampling::penalized_after_defaults`), which is nearly every
+        // default request. A speculator without penalties keeps it on AR, as
+        // does any other speculator.
         19 => {
             let dflash2_ok = i.speculator_is_dflash2
                 && i.pp <= 1
-                && !i.nonneutral_penalties
+                && (!i.nonneutral_penalties || i.speculator_supports_penalties)
                 && (i.temp <= 1e-6 || (i.supports_temp_swor && i.supports_chain_nucleus_verify));
             let spec_ok = i.has_speculator
                 && dflash2_ok
@@ -2606,6 +2615,10 @@ pub fn generate(
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
+        speculator_supports_penalties: m
+            .speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_penalties()),
         deepseek4_spec_requested: deepseek4_spec_requested(m),
         ngram_can_sample,
         temp,
@@ -2613,7 +2626,7 @@ pub fn generate(
         min_p,
         // Raon: the AR producer adds the card's presence default to an unset
         // sampled request, so those are penalized as far as route selection
-        // (DFlash2 verifiers implement no penalties) is concerned.
+        // (which speculators may serve them) is concerned.
         nonneutral_penalties: repeat_penalty != 1.0
             || presence_penalty != 0.0
             || frequency_penalty != 0.0
@@ -7259,6 +7272,7 @@ mod qwen4_pp_route_tests {
             has_speculator: false,
             speculator_is_mtp: false,
             speculator_is_dflash2: false,
+            speculator_supports_penalties: false,
             deepseek4_spec_requested: false,
             ngram_can_sample: false,
             temp: 0.0,

@@ -27,6 +27,7 @@ fn base() -> GenerationRouteInputs {
         has_speculator: false,
         speculator_is_mtp: false,
         speculator_is_dflash2: false,
+        speculator_supports_penalties: false,
         deepseek4_spec_requested: false,
         ngram_can_sample: false,
         temp: 0.0,
