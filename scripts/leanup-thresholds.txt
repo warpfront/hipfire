@@ -104,9 +104,11 @@ daemon_lines                <= 5850
 # RATCHET-RAISE 67 -> 68: `rdna-compute/gdn_wy_repeat_check`, the synthetic GPU oracle for the Qwen GDN WY
 # T-inverse fix (repeated-token NaN); its gate runs it without `--features lab`.
 # RATCHET-RAISE 68 -> 69: Lloyd prefill PR evidence pair. `tmp_lloyd_i8_twin_t0`
-# (this branch) is gated behind `lab`; `tmp_lloyd_gfx11_t0` stays ungated while
-# the branch's measurement runs invoke it bare. Revisit at merge: gate or drop.
-ungated_examples            <= 69
+# (this branch) is gated behind `lab`; `tmp_lloyd_gfx11_t0` stayed ungated while
+# the branch's measurement runs invoked it bare. Resolved at merge prep:
+# `tmp_lloyd_gfx11_t0` gated behind `lab` (run with `--features lab`), ceiling
+# restored to 68. Lowering a ceiling is routine (no trade).
+ungated_examples            <= 68
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is
