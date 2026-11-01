@@ -23,10 +23,10 @@ use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache}
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy,
-    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
-    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence,
-    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx11DispatchInterleave, Gfx11ScratchRing, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer,
+    Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
+    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
+    QueuePolicy, Quiescence, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 use redline_dispatch::{
     AllocationPolicy, BindingRevision, KernargAbi, KernargField, Recorder, ReplayBindings,
@@ -297,6 +297,22 @@ impl Pm4Commands {
                 };
                 Self::Gfx12(commands)
             }
+        }
+    }
+
+    /// Back static private segments with `ring` (legacy GFX11 streams only).
+    fn with_scratch_ring(self, ring: Option<Gfx11ScratchRing>) -> Self {
+        match self {
+            Self::Legacy {
+                architecture,
+                commands,
+                dependency_mode,
+            } => Self::Legacy {
+                architecture,
+                commands: commands.with_scratch_ring(ring),
+                dependency_mode,
+            },
+            gfx12 => gfx12,
         }
     }
 
@@ -5145,6 +5161,8 @@ pub struct PreparedPm4Replay {
     /// through every replay; dropped only after queue quiescence via normal
     /// PreparedPm4Replay teardown (field order: graph first).
     _dependency_fence: Option<KernargBuffer>,
+    /// GFX11 scratch ring programmed into the IB; same lifetime as the fence.
+    _scratch_ring: Option<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
     dynamic_kernarg_bindings: Vec<(usize, ReplayKernargBinding)>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
@@ -6376,6 +6394,35 @@ impl ReplayController {
             kernargs.push(kernarg);
             geometries.push(geometry);
         }
+        // GFX11 retained IBs program their own scratch ring: the queue's
+        // ROCr scratch is sized only for AQL dispatches it has seen.
+        let max_private = kernels
+            .iter()
+            .map(|kernel| kernel.metadata().private_segment_size)
+            .max()
+            .unwrap_or(0);
+        let (scratch_ring, scratch_ring_buffer) = if max_private != 0
+            && pm4_architecture == Pm4Architecture::Gfx11
+        {
+            let (engines, waves) = device
+                .scratch_wave_geometry()
+                .map_err(|error| format!("query gfx11 scratch geometry: {error}"))?;
+            let ring = Gfx11ScratchRing::new(max_private, engines, waves).ok_or_else(|| {
+                    format!("gfx11 scratch ring does not fit TMPRING: private={max_private} engines={engines} waves={waves}")
+                })?;
+            let buffer = KernargPool::discover_device_local(&device)
+                .and_then(|pool| pool.allocate_fine_grained_bytes(ring.bytes() as usize, 256))
+                .map_err(|error| format!("allocate gfx11 scratch ring: {error}"))?;
+            let ring = ring.at(buffer.address() as u64).ok_or_else(|| {
+                format!(
+                    "gfx11 scratch ring {:#x} is null or unaligned",
+                    buffer.address() as u64
+                )
+            })?;
+            (Some(ring), Some(buffer))
+        } else {
+            (None, None)
+        };
         // GDN frames, synthesized position bindings and engine-declared
         // bindings, from the one builder the recorded-HIP oracle also uses. New
         // tapes leave the legacy `dynamic_gdn_frames` vector empty so replay has
@@ -6559,7 +6606,8 @@ impl ReplayController {
                 dispatch_interleave,
                 resource_limits_policy,
                 dependency_mode,
-            );
+            )
+            .with_scratch_ring(scratch_ring);
             let pacing = if dispatch_profile {
                 Gfx12DispatchPacing::None
             } else {
@@ -6768,6 +6816,7 @@ impl ReplayController {
                                 resource_limits_policy,
                                 LegacyDependencyMode::CsPartialFlush,
                             )
+                            .with_scratch_ring(scratch_ring)
                         };
                         let kernarg_images = kernargs
                             .iter_mut()
@@ -6913,7 +6962,8 @@ impl ReplayController {
                                 dispatch_initiator_policy,
                                 dispatch_interleave,
                                 resource_limits_policy,
-                            );
+                            )
+                            .with_scratch_ring(scratch_ring);
                             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                             commands
                         })
@@ -6997,7 +7047,8 @@ impl ReplayController {
                     dispatch_initiator_policy,
                     dispatch_interleave,
                     resource_limits_policy,
-                );
+                )
+                .with_scratch_ring(scratch_ring);
                 commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                 let mut resource_frontier = ResourceFrontier::default();
                 for (position, index) in phase.indices.iter().copied().enumerate() {
@@ -7147,6 +7198,7 @@ impl ReplayController {
                 .rposition(|kernarg| kernarg.is_device_local() && !kernarg.is_empty()),
             kernargs,
             _dependency_fence: dependency_fence,
+            _scratch_ring: scratch_ring_buffer,
             dynamic_gdn_frames,
             dynamic_kernarg_bindings,
             dynamic_grids,

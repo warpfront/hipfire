@@ -44,7 +44,7 @@ pub use pm4::{
 pub use pm4_gfx10::{
     Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer,
     Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
-    Gfx11Pm4CommandBuffer,
+    Gfx11Pm4CommandBuffer, Gfx11ScratchRing,
 };
 pub use runtime::DEFAULT_WAIT_TIMEOUT;
 pub use runtime::{

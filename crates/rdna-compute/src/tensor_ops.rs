@@ -17072,6 +17072,98 @@ mod tests {
         assert_eq!(gpu.vmm_allocation_count(), baseline_vmm);
     }
 
+    /// gfx1151's vocabulary-head MQ6 GEMV (`gemv_mq6g256v2_k2560_u2`) spills
+    /// to scratch. Its retained PM4 replay runs on the tape's own GFX11
+    /// scratch ring and must equal the plain HIP launch byte for byte; the
+    /// output is NaN-poisoned before each run so a skipped dispatch fails.
+    #[test]
+    fn retained_pm4_scratch_kernel_matches_hip_on_gfx1151() {
+        use crate::replay::{ReplayBackendRequest, ReplayController};
+
+        const M: usize = 248_320;
+        const K: usize = 2560;
+        const GROUP_BYTES: usize = 200;
+
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let gpu = &mut *gpu;
+        if gpu.arch != "gfx1151" {
+            eprintln!("skip: needs gfx1151, found {}", gpu.arch);
+            return;
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut weights: Vec<u8> = (0..M * K / 256 * GROUP_BYTES)
+            .map(|_| next() as u8)
+            .collect();
+        for group in weights.chunks_exact_mut(GROUP_BYTES) {
+            // Finite fp16 scales/zeros (exponent 2^-10..2^-3) keep outputs comparable.
+            for half in group[..8].chunks_exact_mut(2) {
+                half[1] = 0x14 + (half[0] & 0x1f);
+            }
+        }
+        let x: Vec<f32> = (0..K)
+            .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let a = gpu.upload_raw(&weights, &[weights.len()]).expect("weights");
+        let x = gpu.upload_f32(&x, &[K]).expect("x");
+        let y = gpu.zeros(&[M], DType::F32).expect("y");
+
+        let run = |gpu: &mut Gpu, replay: bool| -> Vec<u8> {
+            gpu.hip
+                .memcpy_htod(&y.buf, &f32::NAN.to_ne_bytes().repeat(M))
+                .expect("poison y");
+            gpu.hip.device_synchronize().expect("sync poison");
+            if replay {
+                // SAFETY: `a`, `x` and `y` stay live at their captured addresses.
+                unsafe { gpu.replay.replay_pm4(0) }
+                    .unwrap_or_else(|reason| panic!("PM4 replay: {reason}"));
+            } else {
+                let retained = std::mem::replace(
+                    &mut gpu.replay,
+                    ReplayController::new(ReplayBackendRequest::Hip),
+                );
+                gpu.gemv_mq6g256v2(&a, &x, &y, M, K).expect("HIP gemv");
+                gpu.replay = retained;
+            }
+            gpu.hip.device_synchronize().expect("sync run");
+            gpu.download_raw_bytes(&y).expect("read y")
+        };
+
+        gpu.replay = ReplayController::new_manual_pm4();
+        gpu.replay.begin_capture().expect("open recording window");
+        gpu.gemv_mq6g256v2(&a, &x, &y, M, K).expect("captured gemv");
+        gpu.hip.device_synchronize().expect("sync capture");
+        gpu.replay.finish_capture().expect("close recording window");
+        let launches = gpu.replay.recorded_launches();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].kernel, "gemv_mq6g256v2_k2560_u2");
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, 1)
+            .unwrap_or_else(|reason| panic!("PM4 prepare: {reason}"));
+
+        let reference = run(gpu, false);
+        assert!(
+            reference
+                .chunks_exact(4)
+                .all(|v| f32::from_ne_bytes(v.try_into().unwrap()).is_finite()),
+            "HIP reference has non-finite outputs"
+        );
+        for round in 0..3 {
+            assert!(
+                run(gpu, true) == reference,
+                "PM4 replay {round} differs from HIP"
+            );
+        }
+    }
+
     /// The retained-replay shape pin (a fixed grid or LDS bound larger than the
     /// active length) must not change a single output byte: the kernels mask, so
     /// a bigger reservation is never read. This is the premise the G3 shape

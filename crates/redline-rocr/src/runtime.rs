@@ -612,6 +612,29 @@ impl GpuDevice {
         Ok(count)
     }
 
+    /// `(shader engines, concurrent waves)` for sizing PM4 scratch rings
+    /// (`HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES`, CUs x
+    /// `HSA_AMD_AGENT_INFO_MAX_WAVES_PER_CU`).
+    pub fn scratch_wave_geometry(&self) -> Result<(u32, u32), RuntimeError> {
+        let mut engines = 0_u32;
+        let mut waves_per_cu = 0_u32;
+        for (attribute, out) in [
+            (abi::AMD_AGENT_INFO_NUM_SHADER_ENGINES, &mut engines),
+            (abi::AMD_AGENT_INFO_MAX_WAVES_PER_CU, &mut waves_per_cu),
+        ] {
+            query_agent(
+                &self.runtime.symbols,
+                self.gpu_agent(),
+                attribute,
+                (out as *mut u32).cast(),
+            )?;
+        }
+        Ok((
+            engines,
+            self.compute_unit_count()?.saturating_mul(waves_per_cu),
+        ))
+    }
+
     fn gpu_agent(&self) -> abi::Agent {
         self.gpu.handle
     }
