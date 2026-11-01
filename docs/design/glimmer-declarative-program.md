@@ -1,10 +1,10 @@
 # Muse Glimmer declarative layer program (#666 G11)
 
-Status: every Glimmer forward route runs typed dispatch steps except the
-continuous-batching decode (see below): single-lane decode (AR and the DFlash
-hidden-capture decode, slice 1), batched prefill, batched DFlash verify, the
-shared draft/verify LM head and the DFlash drafter (slice 2). Glimmer is
-refused for every parallel axis until the G13 dense axes.
+Status: every Glimmer forward route runs typed dispatch steps: single-lane
+decode (AR and the DFlash hidden-capture decode, slice 1), batched prefill,
+batched DFlash verify, the shared draft/verify LM head, the DFlash drafter
+(slice 2) and the continuous-batch lane decode (HIPF-248; no serve caller
+yet). Glimmer is refused for every parallel axis until the G13 dense axes.
 
 ## Semantic checkpoint
 
@@ -192,12 +192,18 @@ end of `kv_input_rot` once `fill_start + 5 * delta` exceeded its rows.
 
 ## Continuous-batching decode
 
-`batch.rs` / `forward_batch.rs` (`GlimmerDecodeBatchState`,
-`forward_decode_batch_glimmer`) keep their hand loop. Nothing outside the
-crate calls them (the harness that drove them was removed in `ff778990a`), and
-their layer omits the Q norm every other route applies, so beta's output is
-not an oracle for a port. Whether to remove the core or port it onto the
-layer program (gaining the Q norm) is an open decision.
+HIPF-90 removed the hand-loop core (`batch.rs` / `forward_batch.rs`). HIPF-248
+runs lanes through the same layer program: `lanes::GlimmerLanes::decode` binds
+`rows = B` with `LayerIo::lanes`, and the attention sublayer takes
+`KvRoute::Lanes` (dispatch `sandwich.rs`): masked per-lane Q8 K/V writes, then
+`attention_q8_0_kv_independent_masked_windowed` (bitwise the singleton
+per-head `attention_q8_0_kv_swa` on the lane's slice). Projections take the
+multi-row ladder, the post-norm residual the stream's kernel adds, and the LM
+head is `glimmer_lm_head_picks`. A lane is seeded by the singleton prefill and
+`GlimmerLanes::import`, a kernel copy of its KV rows. The per-head lane
+attention sizes its LDS by the lane capacity, so `GlimmerLanes::new` refuses
+lanes past `Gpu::attention_q8_0_kv_independent_max_lane_capacity` (about 16K
+rows on gfx1151).
 
 ## Single-only refusal
 
@@ -337,4 +343,4 @@ question (HIPF-80).
 
 Not covered: gfx1100, gfx1201 and gfx942 (no hardware on halo). The gfx12
 prefill routes (fused QKVZA, residual and Muse GEMMs) and the BF16 routes
-are moved code without a run. The continuous-batching decode is not ported.
+are moved code without a run.

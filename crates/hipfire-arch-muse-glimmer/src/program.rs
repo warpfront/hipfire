@@ -37,6 +37,7 @@ use hipfire_dispatch::pipeline::sandwich::{
 };
 use hipfire_dispatch::pipeline::{GemvInput, RowsRoute, Step};
 use hipfire_dispatch::types::RotationPlan;
+use hipfire_runtime::llama::KvCache;
 use rdna_compute::GpuTensor;
 
 /// Activations and scratch one layer program reads and writes, with the
@@ -71,6 +72,18 @@ pub(crate) struct LayerIo<'a> {
     pub bf16: Option<&'a GpuTensor>,
     pub tiled: Option<WindowedQ8Tiled<'a>>,
     pub rows_flash: Option<WindowedQ8RowsFlash<'a>>,
+    /// Continuous-batch lanes: row `r` is lane `r` of these caches at
+    /// `positions[r]`, instead of rows of `state`'s one sequence.
+    pub lanes: Option<LaneKv<'a>>,
+}
+
+/// Lane-major KV of a continuous-batch decode (see [`KvRoute::Lanes`]).
+#[derive(Clone, Copy)]
+pub(crate) struct LaneKv<'a> {
+    pub sliding: &'a KvCache,
+    pub full: &'a KvCache,
+    pub lane_capacity: usize,
+    pub active_mask: u64,
 }
 
 impl<'a> LayerIo<'a> {
@@ -98,6 +111,7 @@ impl<'a> LayerIo<'a> {
             bf16: None,
             tiled,
             rows_flash: None,
+            lanes: None,
         }
     }
 
@@ -156,9 +170,22 @@ pub(crate) fn layer_steps<'a>(
     state: &'a GlimmerState,
     io: &LayerIo<'a>,
 ) -> [Step<'a>; 2] {
-    let kv = match cfg.layer_types[layer] {
-        GlimmerLayerType::Sliding => &state.kv_sliding,
-        GlimmerLayerType::Full => &state.kv_full,
+    let (kv, lanes) = match (cfg.layer_types[layer], io.lanes) {
+        (GlimmerLayerType::Sliding, None) => (&state.kv_sliding, None),
+        (GlimmerLayerType::Full, None) => (&state.kv_full, None),
+        (GlimmerLayerType::Sliding, Some(l)) => (l.sliding, Some(l)),
+        (GlimmerLayerType::Full, Some(l)) => (l.full, Some(l)),
+    };
+    let route = match lanes {
+        Some(l) => KvRoute::Lanes {
+            lane_capacity: l.lane_capacity,
+            active_mask: l.active_mask,
+        },
+        None => KvRoute::WindowedQ8 {
+            tiled: io.tiled,
+            rows_flash: io.rows_flash,
+            wmma_flash: crate::forward::wmma_flash_enabled(),
+        },
     };
     let slot = state.kv_slot_for_layer[layer];
     let rope = Rope {
@@ -192,11 +219,7 @@ pub(crate) fn layer_steps<'a>(
                 v_cache: &kv.v_gpu[slot],
                 physical_cap: kv.physical_cap,
                 window: cfg.window_for(layer),
-                route: KvRoute::WindowedQ8 {
-                    tiled: io.tiled,
-                    rows_flash: io.rows_flash,
-                    wmma_flash: crate::forward::wmma_flash_enabled(),
-                },
+                route,
             },
             pos_buf: io.pos_buf,
             attend_through: None,

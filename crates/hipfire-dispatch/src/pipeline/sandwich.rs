@@ -818,6 +818,16 @@ pub enum KvRoute<'a> {
         kv_rows: usize,
         context: Option<DraftContext<'a>>,
     },
+    /// Continuous-batch lanes over a lane-major absolute-position Q8 cache:
+    /// row `r` is lane `r` at its own position `positions[r]`, and lane `r`'s
+    /// cache is the `lane_capacity` rows from row `r * lane_capacity`. Lanes
+    /// outside `active_mask` neither write nor attend. The per-head kernel
+    /// sizes its LDS by `lane_capacity` (see
+    /// `Gpu::attention_q8_0_kv_independent_max_lane_capacity`).
+    Lanes {
+        lane_capacity: usize,
+        active_mask: u64,
+    },
 }
 
 /// Context rows of a [`KvRoute::Draft`] attention: `delta` rows new since
@@ -1026,7 +1036,9 @@ impl SandwichAttentionOp<'_> {
         let kv = &self.kv;
         // Tier and windowed caches are position-indexed (row `t` holds
         // position `t`); a draft attends its own uncached rows.
-        if !matches!(kv.route, KvRoute::Draft { .. }) && self.position + rows > kv.physical_cap {
+        let position_indexed =
+            matches!(kv.route, KvRoute::Tier { .. } | KvRoute::WindowedQ8 { .. });
+        if position_indexed && self.position + rows > kv.physical_cap {
             return Err(invalid(format!(
                 "{L}: rows {}..{} outside a cache of {} rows",
                 self.position,
@@ -1097,6 +1109,31 @@ impl SandwichAttentionOp<'_> {
                 need(kv.v_cache, kv_all, L, "draft V")?;
                 if let Some(c) = context {
                     need(c.positions, c.rows, L, "context positions")?;
+                }
+                Ok(())
+            }
+            KvRoute::Lanes {
+                lane_capacity,
+                active_mask,
+            } => {
+                if s.steps_route().is_none() || !s.batched() || rows > 64 {
+                    return Err(invalid(format!(
+                        "{L}: lanes need 1..=64 batched rows on the steps route, got {rows}"
+                    )));
+                }
+                if !matches!(&self.kv_proj, Some(KvProjection { wv: Some(_), .. })) {
+                    return Err(invalid(format!("{L}: lanes need K and V projections")));
+                }
+                if *lane_capacity == 0 || rows * lane_capacity > kv.physical_cap {
+                    return Err(invalid(format!(
+                        "{L}: {rows} lanes of {lane_capacity} rows outside a cache of {} rows",
+                        kv.physical_cap
+                    )));
+                }
+                if rows < 64 && active_mask >> rows != 0 {
+                    return Err(invalid(format!(
+                        "{L}: active mask {active_mask:#x} names lanes past {rows}"
+                    )));
                 }
                 Ok(())
             }
@@ -1322,6 +1359,10 @@ impl SandwichAttentionOp<'_> {
             KvRoute::Draft { kv_rows, context } => {
                 self.attend_draft(gpu, ctx, *kv_rows, context.as_ref())
             }
+            KvRoute::Lanes {
+                lane_capacity,
+                active_mask,
+            } => self.attend_lanes(gpu, *lane_capacity, *active_mask),
         }
     }
 
@@ -1647,6 +1688,53 @@ impl SandwichAttentionOp<'_> {
             0,
             0,
             kv.window as i32,
+        )
+        .map_err(hip)
+    }
+
+    /// [`KvRoute::Lanes`]: masked per-lane K/V writes, then per-lane causal
+    /// attention, windowed on sliding layers.
+    fn attend_lanes(
+        &self,
+        gpu: &mut Gpu,
+        lane_capacity: usize,
+        active_mask: u64,
+    ) -> Result<(), DispatchError> {
+        let kv = &self.kv;
+        let (n_heads, n_kv, hd, rows) = (
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            self.stream.rows,
+        );
+        let positions = self.positions()?;
+        for (cache, src) in [(kv.k_cache, self.k), (kv.v_cache, self.v)] {
+            gpu.kv_cache_write_q8_0_independent_masked(
+                cache,
+                src,
+                positions,
+                n_kv,
+                hd,
+                rows,
+                lane_capacity,
+                active_mask,
+            )
+            .map_err(hip)?;
+        }
+        gpu.attention_q8_0_kv_independent_masked_windowed(
+            self.q,
+            kv.k_cache,
+            kv.v_cache,
+            self.attn_out,
+            positions,
+            n_heads,
+            n_kv,
+            hd,
+            lane_capacity,
+            lane_capacity,
+            rows,
+            active_mask,
+            kv.window,
         )
         .map_err(hip)
     }
@@ -2900,6 +2988,21 @@ mod validation_tests {
         position: usize,
         rows: usize,
     ) -> Result<(), DispatchError> {
+        let windowed = KvRoute::WindowedQ8 {
+            tiled: None,
+            rows_flash: None,
+            wmma_flash: false,
+        };
+        check_kv(route, kernels, position, rows, windowed)
+    }
+
+    fn check_kv(
+        route: RowsRoute,
+        kernels: SandwichRoute,
+        position: usize,
+        rows: usize,
+        kv_route: KvRoute<'_>,
+    ) -> Result<(), DispatchError> {
         let big = tensor(16 * DIM * CAP);
         let pos_buf = unsafe { DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4) };
         let op = SandwichAttentionOp {
@@ -2939,11 +3042,7 @@ mod validation_tests {
                 v_cache: &big,
                 physical_cap: CAP,
                 window: 0,
-                route: KvRoute::WindowedQ8 {
-                    tiled: None,
-                    rows_flash: None,
-                    wmma_flash: false,
-                },
+                route: kv_route,
             },
             pos_buf: &pos_buf,
             attend_through: None,
@@ -2996,6 +3095,27 @@ mod validation_tests {
         refused(
             check(RowsRoute::Decode, SandwichRoute::Wide, 8, 1),
             "windowed Q8 KV needs the steps route",
+        );
+    }
+
+    #[test]
+    fn lanes_stay_inside_their_cache_and_mask() {
+        let lanes = |lane_capacity, active_mask| KvRoute::Lanes {
+            lane_capacity,
+            active_mask,
+        };
+        assert!(check_kv(RowsRoute::Prefill, STEPS, 0, 4, lanes(CAP / 4, 0b1011)).is_ok());
+        refused(
+            check_kv(RowsRoute::Prefill, STEPS, 0, 4, lanes(CAP / 4 + 1, 0b1111)),
+            "4 lanes of 17 rows outside a cache of 64 rows",
+        );
+        refused(
+            check_kv(RowsRoute::Prefill, STEPS, 0, 4, lanes(CAP / 4, 0b10001)),
+            "names lanes past 4",
+        );
+        refused(
+            check_kv(RowsRoute::Decode, STEPS, 0, 1, lanes(CAP, 1)),
+            "lanes need 1..=64 batched rows",
         );
     }
 }

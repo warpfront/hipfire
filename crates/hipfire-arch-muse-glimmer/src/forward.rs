@@ -1133,9 +1133,9 @@ pub(crate) struct RowsScratch {
     ffn_hidden: GpuTensor,
     pub(crate) ffn_out: GpuTensor,
     rotation: GpuTensor,
-    positions: GpuTensor,
+    pub(crate) positions: GpuTensor,
     shifted_positions: GpuTensor,
-    token_ids: GpuTensor,
+    pub(crate) token_ids: GpuTensor,
 }
 
 impl RowsScratch {
@@ -1352,10 +1352,15 @@ pub(crate) fn rows_io<'a>(
                 shifted_positions: &s.shifted_positions,
                 partials,
             }),
+        lanes: None,
     }
 }
 
-fn htod_i32(gpu: &mut Gpu, t: &GpuTensor, values: impl Iterator<Item = i32>) -> Result<(), String> {
+pub(crate) fn htod_i32(
+    gpu: &mut Gpu,
+    t: &GpuTensor,
+    values: impl Iterator<Item = i32>,
+) -> Result<(), String> {
     let bytes: Vec<u8> = values.flat_map(i32::to_ne_bytes).collect();
     gpu.hip
         .memcpy_htod(&t.buf, &bytes)
