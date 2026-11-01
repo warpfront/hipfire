@@ -72,9 +72,14 @@ pub fn symbol_a8_gfx11(nt: usize, rf: usize) -> Option<&'static str> {
 /// down -7% against the former `nt2r1` there; 256 tokens, bound 3456, is 2-3% slower with `nt2r2`, so it stays
 /// `nt2r1`). gfx1151 (Strix Halo, bandwidth bound): `nt2r2` at >= 12288 grouped rows (4096 tokens: 8.00 / 5.01 ms),
 /// below it `nt4r1` (512 tokens: gate/up 2.12 ms, down 1.32 ms). `rf = 2` needs `m % 128 == 0`.
+// selector-receipt: receipts/selectors/gfx1100_a8_nt2r2_min_rows.json
 pub const GFX1100_NT2R2_MIN_ROWS: usize = 4_096;
 pub fn select_entry_a8_gfx11(arch: &str, m_total: usize, m: usize) -> (usize, usize) {
-    let rf2_from = if arch == "gfx1100" { GFX1100_NT2R2_MIN_ROWS } else { 12_288 };
+    let rf2_from = if arch == "gfx1100" {
+        GFX1100_NT2R2_MIN_ROWS
+    } else {
+        12_288
+    };
     if m_total >= rf2_from && m % 128 == 0 {
         (2, 2)
     } else if arch == "gfx1151" {

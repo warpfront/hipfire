@@ -1,0 +1,15 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "GFX1100_NT2R2_MIN_ROWS",
+  "value": 4096,
+  "covers": true,
+  "arch": "gfx1100",
+  "card": "RX 7900 XTX (fabric node-bench jobs j3288-j3295, j3309-j3313, confounded=false)",
+  "summary": "Node bench bench_moe_grouped_qt44_iu4 (gfx11 path), Raon routed experts E128/top6, gate/up [2176,2560] and down [2560,1280], grouped-row bound (the selector input) 1728..25552. nt2r2 (direct weights) vs nt2r1 at the bound: 512 tokens (bound 4048..4992) gate/up 635 vs 678-715 us, down 412 vs 428-458 us (-7..-10% against the former default nt2r1, uniform, skew and two real route histograms); 4096 tokens (bound 25.5k) nt2r2 was already the default and gains 5.4-6.5% from the kernel changes; 256 tokens (bound 2192..3456) nt2r2 is 2-3% SLOWER than nt2r1 (gate/up 544 vs 528 us, down 355 vs 348 us) and 64 tokens (bound 1728..2304) 3-4% slower, so the floor sits between 3456 and 4048 and is set at 4096. Every entry of every case is bit-identical to the first and to a CPU recompute of 128 sampled outputs; incumbent vs this kernel bit-identical on all 192 real 512-row histograms (Halo) and 48 (XTX).",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/gfx1100_a8_nt2r2_min_rows.txt",
+      "sha256": "9c898aedc221f025beaa6c742004eeaffbb52b06a2564989a31cc69def6bb5a5"
+    }
+  ]
+}

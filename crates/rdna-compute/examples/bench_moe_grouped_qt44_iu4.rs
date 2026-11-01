@@ -316,9 +316,20 @@ fn at(v: &[((usize, usize), f64)], e: (usize, usize)) -> f64 {
 /// ids of a `HIPFIRE_MOE_ROUTE_DUMP` file (`--route-file F --layer L --chunk C`, `tokens` rows per chunk).
 /// Timing is a batch of back-to-back launches over two weight sets (the 337 MB weight stream does not fit the
 /// 96 MB cache) after a long clock warm-up; the card is idle between cases otherwise and DPM drops.
-fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel: &str, out_path: &str, args: &[String]) {
+fn run_gfx11(
+    gpu: &mut Gpu,
+    tokens: &[usize],
+    reps: usize,
+    sigma: f32,
+    site_sel: &str,
+    out_path: &str,
+    args: &[String],
+) {
     let arg = |k: &str, d: &str| -> String {
-        args.iter().position(|a| a == k).map(|i| args[i + 1].clone()).unwrap_or_else(|| d.into())
+        args.iter()
+            .position(|a| a == k)
+            .map(|i| args[i + 1].clone())
+            .unwrap_or_else(|| d.into())
     };
     let warm: usize = arg("--warm", "100").parse().unwrap();
     let route_file = arg("--route-file", "");
@@ -326,7 +337,8 @@ fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel:
     let chunk: usize = arg("--chunk", "0").parse().unwrap();
     let entries_sel = arg("--entries", "");
     let arch = gpu.arch.clone();
-    let mut entries: Vec<(usize, usize)> = rdna_compute::moe_grouped_qt44_iu4::a8_entries(&arch).to_vec();
+    let mut entries: Vec<(usize, usize)> =
+        rdna_compute::moe_grouped_qt44_iu4::a8_entries(&arch).to_vec();
     if !entries_sel.is_empty() {
         entries.retain(|(nt, rf)| entries_sel.split(',').any(|e| e == format!("nt{nt}r{rf}")));
     }
@@ -366,12 +378,21 @@ fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel:
                 (slots + live * 15).div_ceil(16) * 16
             };
             let (topk_ids, route_name): (Vec<i32>, String) = if route_file.is_empty() {
-                (route(rows, e_n, top_k, sigma, 0x6D6F_655F_726F_7574).topk, if sigma == 0.0 { "uniform".into() } else { "skew".into() })
+                (
+                    route(rows, e_n, top_k, sigma, 0x6D6F_655F_726F_7574).topk,
+                    if sigma == 0.0 {
+                        "uniform".into()
+                    } else {
+                        "skew".into()
+                    },
+                )
             } else {
                 let b = std::fs::read(&route_file).expect("route file");
                 let (mut o, mut found) = (0usize, None);
                 while o + 16 <= b.len() {
-                    let u = |i: usize| u32::from_le_bytes(b[o + 4 * i..o + 4 * i + 4].try_into().unwrap());
+                    let u = |i: usize| {
+                        u32::from_le_bytes(b[o + 4 * i..o + 4 * i + 4].try_into().unwrap())
+                    };
                     let (l, r, tk) = (u(0), u(1) as usize, u(2) as usize);
                     let n = r * tk;
                     if l == layer && tk == top_k {
@@ -382,7 +403,8 @@ fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel:
                 }
                 let (off, r) = found.expect("layer not in route file");
                 assert!((chunk + 1) * rows <= r, "chunk beyond the record");
-                let ids: Vec<i32> = b[off + 4 * chunk * rows * top_k..off + 4 * (chunk + 1) * rows * top_k]
+                let ids: Vec<i32> = b
+                    [off + 4 * chunk * rows * top_k..off + 4 * (chunk + 1) * rows * top_k]
                     .chunks_exact(4)
                     .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
@@ -394,7 +416,10 @@ fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel:
             let sorted_t = gpu.zeros(&[bound], DType::F32).unwrap();
             let tiles_t = gpu.zeros(&[bound / 16], DType::F32).unwrap();
             let inv = gpu.zeros(&[slots], DType::F32).unwrap();
-            gpu.moe_scatter_fused_k8(&topk, &counts, &offsets, &sorted_t, &tiles_t, &inv, slots, e_n, bound, 16).unwrap();
+            gpu.moe_scatter_fused_k8(
+                &topk, &counts, &offsets, &sorted_t, &tiles_t, &inv, slots, e_n, bound, 16,
+            )
+            .unwrap();
             let sorted = dl_i32(gpu, &sorted_t);
             let tiles = dl_i32(gpu, &tiles_t);
             let offs = dl_i32(gpu, &offsets);
@@ -402,15 +427,28 @@ fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel:
             println!("== site {} tokens {rows} route {route_name} slots {slots} bound {bound} m_total {m_total} live_tiles {} arch {arch}", site.name, tiles.iter().filter(|&&t| t >= 0).count());
             for p in 0..2 {
                 let (proj, m, k) = site.projs[p];
-                let (x_row_div, x_rows) = if p == 0 { (top_k, rows) } else { (1usize, slots) };
+                let (x_row_div, x_rows) = if p == 0 {
+                    (top_k, rows)
+                } else {
+                    (1usize, slots)
+                };
                 let mut xr = Rng(0xABCD_EF01 ^ rows as u64 ^ m as u64);
                 let xf: Vec<f32> = (0..x_rows * k).map(|_| xr.normal()).collect();
                 let x32 = gpu.upload_f32(&xf, &[x_rows, k]).unwrap();
                 let xq8 = gpu.ensure_int8_mmq_x(&x32, x_rows, k).unwrap();
                 gpu.hip.device_synchronize().unwrap();
                 let mut xq8_host = vec![0u8; (k / 128) * x_rows * 136];
-                gpu.hip.memcpy_dtoh(&mut xq8_host, gpu.scratch.int8_mmq_x_scratch.as_ref().unwrap()).unwrap();
-                let default = rdna_compute::moe_grouped_qt44_iu4::select_entry_a8_gfx11(&arch, m_total.max(bound), m);
+                gpu.hip
+                    .memcpy_dtoh(
+                        &mut xq8_host,
+                        gpu.scratch.int8_mmq_x_scratch.as_ref().unwrap(),
+                    )
+                    .unwrap();
+                let default = rdna_compute::moe_grouped_qt44_iu4::select_entry_a8_gfx11(
+                    &arch,
+                    m_total.max(bound),
+                    m,
+                );
                 let live_ops = 2.0 * (m_total as f64) * m as f64 * k as f64;
                 let mut first_hash: Option<u64> = None;
                 let mut times: Vec<((usize, usize), f64)> = Vec::new();
@@ -421,7 +459,22 @@ fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel:
                     }
                     let y = gpu.zeros(&[bound, m], DType::F32).unwrap();
                     let mut launch = |gpu: &mut Gpu, set: usize| {
-                        gpu.gemm_mq4g256v2_moe_grouped_a8_sym(&ptr_t[p][set % NSET], &tiles_t, &offsets, &sorted_t, xq8, &y, m, k, x_row_div, bound, x_rows, nt, rf).unwrap();
+                        gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
+                            &ptr_t[p][set % NSET],
+                            &tiles_t,
+                            &offsets,
+                            &sorted_t,
+                            xq8,
+                            &y,
+                            m,
+                            k,
+                            x_row_div,
+                            bound,
+                            x_rows,
+                            nt,
+                            rf,
+                        )
+                        .unwrap();
                     };
                     for i in 0..warm {
                         launch(gpu, i);
@@ -472,8 +525,12 @@ fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel:
                         let mut sum = 0f32;
                         let rb = (k / 256) * 136;
                         for hh in 0..k / 128 {
-                            let gb = &whost[p][e][row * rb + (hh / 2) * 136..row * rb + (hh / 2) * 136 + 136];
-                            let sc = f16_to_f32(u16::from_le_bytes([gb[4 * (hh & 1)], gb[4 * (hh & 1) + 1]]));
+                            let gb = &whost[p][e]
+                                [row * rb + (hh / 2) * 136..row * rb + (hh / 2) * 136 + 136];
+                            let sc = f16_to_f32(u16::from_le_bytes([
+                                gb[4 * (hh & 1)],
+                                gb[4 * (hh & 1) + 1],
+                            ]));
                             let o = (hh * x_rows + xrow) * 136;
                             let blk = &xq8_host[o..o + 136];
                             let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
@@ -502,13 +559,28 @@ fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel:
                     }
                 }
                 let (be, bt) = best(&times);
-                println!("  {proj}: default nt{}r{} {:.0} us; best nt{}r{} {:.0} us", default.0, default.1, at(&times, default), be.0, be.1, bt);
+                println!(
+                    "  {proj}: default nt{}r{} {:.0} us; best nt{}r{} {:.0} us",
+                    default.0,
+                    default.1,
+                    at(&times, default),
+                    be.0,
+                    be.1,
+                    bt
+                );
                 results.push(serde_json::json!({"site": site.name, "tokens": rows, "route": route_name, "proj": proj, "m": m, "k": k, "m_total": m_total, "default": [default.0, default.1], "default_us": at(&times, default), "entries": rows_json}));
             }
         }
     }
     if !out_path.is_empty() {
-        std::fs::write(out_path, serde_json::to_string_pretty(&serde_json::json!({"arch": arch, "sigma": sigma, "results": results})).unwrap()).unwrap();
+        std::fs::write(
+            out_path,
+            serde_json::to_string_pretty(
+                &serde_json::json!({"arch": arch, "sigma": sigma, "results": results}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
     }
 }
 
