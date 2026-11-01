@@ -4345,7 +4345,7 @@ pub fn generate(
                 &new_tokens,
                 history,
                 tools,
-                hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
+                hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody,
                 "dense-ar",
                 // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
                 Some(&m.conversation_tokens),
