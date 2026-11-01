@@ -2323,8 +2323,7 @@ impl Gpu {
                 // stream does), and the rest is what is genuinely unledgered.
                 let beyond = vram.saturating_sub(own);
                 let ring = HIP_RING_BYTES.min(beyond);
-                cap.with_ring(ring)
-                    .with_unledgered(beyond - ring, true)
+                cap.with_ring(ring).with_unledgered(beyond - ring, true)
             }
             None => cap
                 .with_ring(if own > 0 { HIP_RING_BYTES } else { 0 })

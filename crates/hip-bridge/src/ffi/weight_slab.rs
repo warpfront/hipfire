@@ -160,9 +160,39 @@ pub struct SlabScopeSummary {
 struct SlabRec {
     size: usize,
     cursor: usize,
+    /// Highest byte ever handed out; bytes above it are still zero from the
+    /// slab's creation, bytes below it may be stale after a free.
+    hwm: usize,
     live: usize,
     sealed: bool,
     retired: bool,
+    /// Freed ranges below `cursor` of an open slab: offset -> aligned length,
+    /// coalesced. A load-time temporary (staged, converted, freed) leaves one;
+    /// a later view reuses it instead of the slab growing.
+    holes: BTreeMap<usize, usize>,
+}
+
+impl SlabRec {
+    /// Record `[off, off + len)` as free: coalesce with its neighbours, and
+    /// give a range that ends at the bump cursor back to it.
+    fn free_range(&mut self, mut off: usize, mut len: usize) {
+        if let Some((&poff, &plen)) = self.holes.range(..off).next_back() {
+            if poff + plen == off {
+                self.holes.remove(&poff);
+                off = poff;
+                len += plen;
+            }
+        }
+        if let Some(&nlen) = self.holes.get(&(off + len)) {
+            self.holes.remove(&(off + len));
+            len += nlen;
+        }
+        if off + len >= align_up(self.cursor) {
+            self.cursor = off;
+        } else {
+            self.holes.insert(off, len);
+        }
+    }
 }
 
 /// Placement and lifetime bookkeeping, independent of the device.
@@ -187,28 +217,51 @@ fn align_up(value: usize) -> usize {
 }
 
 impl SlabBook {
-    /// Best fit of `size` into the open slabs (the one left with the least
-    /// free space, the oldest on a tie): the view address.
-    pub(crate) fn place(&mut self, size: usize) -> Option<usize> {
-        let mut best: Option<(usize, usize, usize)> = None; // (leftover, base, start)
+    /// Best fit of `size` into the open slabs: a freed hole first (smallest
+    /// that holds it), else the slab left with the least free space (oldest on
+    /// a tie). Returns the view address and whether it reuses a hole (its
+    /// bytes are then stale, not zero).
+    pub(crate) fn place(&mut self, size: usize) -> Option<(usize, bool)> {
+        let need = align_up(size);
+        // (len, base, off) of the tightest hole.
+        let mut hole: Option<(usize, usize, usize)> = None;
+        // (leftover, base, start) of the tightest bump position.
+        let mut bump: Option<(usize, usize, usize)> = None;
         for &base in &self.open {
             let slab = self.slabs.get(&base)?;
+            for (&off, &len) in &slab.holes {
+                if len >= need && hole.is_none_or(|(l, _, _)| len < l) {
+                    hole = Some((len, base, off));
+                }
+            }
             let start = align_up(slab.cursor);
-            let Some(end) = start.checked_add(size).filter(|&end| end <= slab.size) else {
-                continue;
-            };
-            let leftover = slab.size - end;
-            if best.is_none_or(|(l, _, _)| leftover < l) {
-                best = Some((leftover, base, start));
+            if let Some(end) = start.checked_add(size).filter(|&end| end <= slab.size) {
+                let leftover = slab.size - end;
+                if bump.is_none_or(|(l, _, _)| leftover < l) {
+                    bump = Some((leftover, base, start));
+                }
             }
         }
-        let (_, base, start) = best?;
+        if let Some((len, base, off)) = hole {
+            let slab = self.slabs.get_mut(&base)?;
+            slab.holes.remove(&off);
+            if len > need {
+                slab.holes.insert(off + need, len - need);
+            }
+            slab.live += 1;
+            self.stats.views_created += 1;
+            self.stats.payload_bytes += size;
+            return Some((base + off, true));
+        }
+        let (_, base, start) = bump?;
         let slab = self.slabs.get_mut(&base)?;
+        let stale = start < slab.hwm;
         slab.cursor = start + size;
+        slab.hwm = slab.hwm.max(slab.cursor);
         slab.live += 1;
         self.stats.views_created += 1;
         self.stats.payload_bytes += size;
-        Some(base + start)
+        Some((base + start, stale))
     }
 
     /// Register a freshly allocated, zeroed slab and open it. Returns the
@@ -220,9 +273,11 @@ impl SlabBook {
             SlabRec {
                 size,
                 cursor: 0,
+                hwm: 0,
                 live: 0,
                 sealed: false,
                 retired: false,
+                holes: BTreeMap::new(),
             },
         );
         self.open.push(base);
@@ -261,7 +316,7 @@ impl SlabBook {
     }
 
     /// Drop one live view at `ptr`.
-    pub(crate) fn release(&mut self, ptr: usize) -> Result<Released, String> {
+    pub(crate) fn release(&mut self, ptr: usize, size: usize) -> Result<Released, String> {
         let base = self
             .locate(ptr)
             .ok_or_else(|| format!("slab view 0x{ptr:x} belongs to no live slab"))?;
@@ -272,6 +327,9 @@ impl SlabBook {
             ));
         }
         slab.live -= 1;
+        if !slab.sealed {
+            slab.free_range(ptr - base, align_up(size));
+        }
         if slab.live == 0 && slab.sealed && !slab.retired {
             slab.retired = true;
             return Ok(Released::Dead { base });
@@ -431,8 +489,16 @@ impl HipRuntime {
         if inner.depth == 0 || size == 0 || size > mode.max_tensor_bytes() {
             return Ok(None);
         }
-        if let Some(ptr) = inner.book.place(size) {
-            return Ok(Some(view(ptr, size)));
+        if let Some((ptr, stale)) = inner.book.place(size) {
+            let v = view(ptr, size);
+            if stale {
+                // Reused space held a freed tensor: restore the zero fill.
+                if let Err(error) = self.memset(&v, 0, size) {
+                    let _ = inner.book.release(ptr, size);
+                    return Err(error);
+                }
+            }
+            return Ok(Some(v));
         }
         // New slab: the mode's capacity, falling back to the smallest slab
         // that holds this tensor when the device cannot spare the full size.
@@ -453,7 +519,7 @@ impl HipRuntime {
         let base = buf.as_ptr() as usize;
         inner.owners.insert(base, buf);
         let dead = inner.book.open_slab(base, cap);
-        let ptr = inner
+        let (ptr, _) = inner
             .book
             .place(size)
             .ok_or_else(|| HipError::new(0, "weight slab: a fresh slab refused its first view"))?;
@@ -474,7 +540,7 @@ impl HipRuntime {
             let mut inner = self.slabs.lock();
             inner
                 .book
-                .release(buf.ptr as usize)
+                .release(buf.ptr as usize, buf.size)
                 .map_err(|e| HipError::new(0, &e))?
         };
         match outcome {
@@ -554,9 +620,9 @@ mod tests {
         let mut book = SlabBook::default();
         assert_eq!(book.place(100), None);
         let _ = book.open_slab(0x1000_0000, 4 * MIB);
-        let a = book.place(100).unwrap();
-        let b = book.place(5000).unwrap();
-        let c = book.place(MIB).unwrap();
+        let a = book.place(100).unwrap().0;
+        let b = book.place(5000).unwrap().0;
+        let c = book.place(MIB).unwrap().0;
         assert_eq!(a, 0x1000_0000);
         assert_eq!(b, 0x1000_0000 + 4096);
         assert_eq!(c, 0x1000_0000 + 4096 + 8192);
@@ -572,28 +638,56 @@ mod tests {
     fn sealed_slab_dies_with_its_last_view() {
         let mut book = SlabBook::default();
         let _ = book.open_slab(0x2000_0000, 2 * MIB);
-        let a = book.place(4096).unwrap();
-        let b = book.place(4096).unwrap();
+        let a = book.place(4096).unwrap().0;
+        let b = book.place(4096).unwrap().0;
         assert!(book.seal_all().is_empty());
-        assert_eq!(book.release(a), Ok(Released::Held));
+        assert_eq!(book.release(a, 4096), Ok(Released::Held));
         assert_eq!(
-            book.release(b),
+            book.release(b, 4096),
             Ok(Released::Dead { base: 0x2000_0000 })
         );
         assert_eq!(book.retired_bases(), vec![0x2000_0000]);
         book.remove(0x2000_0000);
         assert_eq!(book.snapshot().slabs, 0);
-        assert!(book.release(b).is_err());
+        assert!(book.release(b, 4096).is_err());
     }
 
     #[test]
     fn open_slab_survives_a_transient_free() {
         let mut book = SlabBook::default();
         let _ = book.open_slab(0x3000_0000, 2 * MIB);
-        let a = book.place(4096).unwrap();
+        let a = book.place(4096).unwrap().0;
         // Still open: freeing the only view must not retire the slab.
-        assert_eq!(book.release(a), Ok(Released::Held));
+        assert_eq!(book.release(a, 4096), Ok(Released::Held));
         assert!(book.place(4096).is_some());
+    }
+
+    #[test]
+    fn freed_temporaries_are_reused_not_leaked() {
+        let mut book = SlabBook::default();
+        let _ = book.open_slab(0x7000_0000, 4 * MIB);
+        let (a, _) = book.place(MIB).unwrap();
+        let (b, _) = book.place(MIB).unwrap();
+        let (c, _) = book.place(MIB).unwrap();
+        // Free the middle one: a hole, reused by an equal request, stale.
+        assert_eq!(book.release(b, MIB), Ok(Released::Held));
+        let (b2, stale) = book.place(MIB).unwrap();
+        assert_eq!(b2, b);
+        assert!(stale);
+        // Free the tail: the cursor rolls back and the space is stale too.
+        assert_eq!(book.release(c, MIB), Ok(Released::Held));
+        let (c2, stale) = book.place(MIB).unwrap();
+        assert_eq!(c2, c);
+        assert!(stale);
+        // Fresh space above the high-water mark is not stale.
+        let (d, stale) = book.place(MIB).unwrap();
+        assert_eq!(d, c + MIB);
+        assert!(!stale);
+        let _ = a;
+        // Coalescing: free two adjacent views, a double-size request fits.
+        assert_eq!(book.release(b2, MIB), Ok(Released::Held));
+        assert_eq!(book.release(a, MIB), Ok(Released::Held));
+        assert_eq!(book.place(2 * MIB).map(|p| p.0), Some(a));
     }
 
     #[test]
@@ -620,7 +714,7 @@ mod tests {
         let _ = book.open_slab(0x6000_0000, 32 * MIB);
         let mut spans = Vec::new();
         let mut size = 1usize;
-        while let Some(ptr) = book.place(size) {
+        while let Some((ptr, _)) = book.place(size) {
             spans.push((ptr, size));
             size = size * 3 % (MIB + 17) + 1;
             if spans.len() > 10_000 {

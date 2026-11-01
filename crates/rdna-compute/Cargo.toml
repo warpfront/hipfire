@@ -62,6 +62,12 @@ required-features = ["lab"]
 name = "device_wait_deadline"
 required-features = ["lab"]
 
+# Hardware smoke of weight slabs (HIPFIRE_WEIGHT_SLAB): packing, readback,
+# alignment, ledger split, free/unload cycles.
+[[example]]
+name = "weight_slab_smoke"
+required-features = ["lab"]
+
 # ---------------------------------------------------------------------------
 # Archived research probes.
 #

@@ -34,7 +34,10 @@ fn fdinfo_vram_mib(bdf: &str) -> f64 {
                         "drm-pdev" => pdev = Some(v.to_string()),
                         "drm-client-id" => id = Some(v.to_string()),
                         "drm-memory-vram" => {
-                            kib = v.split_whitespace().next().and_then(|n| n.parse::<f64>().ok())
+                            kib = v
+                                .split_whitespace()
+                                .next()
+                                .and_then(|n| n.parse::<f64>().ok())
                         }
                         _ => {}
                     }
@@ -77,7 +80,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init()?;
     let bdf = gpu.hip.device_pci_bus_id(gpu.device_id)?;
     let mode = gpu.hip.slab_mode();
-    println!("device {} ({bdf}) HIPFIRE_WEIGHT_SLAB -> {}", gpu.device_id, mode.name());
+    println!(
+        "device {} ({bdf}) HIPFIRE_WEIGHT_SLAB -> {}",
+        gpu.device_id,
+        mode.name()
+    );
     // Force the HIP queue/ring BOs into existence before the baseline.
     let warm = gpu.upload_raw(&[1u8; 4096], &[4096])?;
     gpu.free_tensor(warm)?;
@@ -169,12 +176,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu.drain_pool();
         let mid = gpu.hip.slab_stats();
         let kept_views = keep.iter().filter(|(t, _, _)| t.buf.is_slab_view()).count();
-        assert_eq!(mid.live_views, kept_views, "live slab views after the peer frees");
+        assert_eq!(
+            mid.live_views, kept_views,
+            "live slab views after the peer frees"
+        );
         for (t, size, seed) in &keep {
             let back = gpu.download_raw_bytes(t)?;
             let want = pattern(*size, *seed);
             let n_cmp = back.len().min(want.len());
-            assert!(back[..n_cmp] == want[..n_cmp], "kept tensor {seed} corrupted after peer frees");
+            assert!(
+                back[..n_cmp] == want[..n_cmp],
+                "kept tensor {seed} corrupted after peer frees"
+            );
         }
         for (t, _, _) in keep {
             gpu.free_tensor(t)?;
@@ -188,7 +201,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         assert_eq!(end.slabs, 0, "slabs leaked after unload");
         assert_eq!(end.live_views, 0);
-        assert!(after.abs() < 8.0, "VRAM did not return to baseline: {after:.1} MiB");
+        assert!(
+            after.abs() < 8.0,
+            "VRAM did not return to baseline: {after:.1} MiB"
+        );
     }
     println!("OK");
     Ok(())

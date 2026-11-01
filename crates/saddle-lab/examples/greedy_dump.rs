@@ -148,7 +148,10 @@ fn main() {
         if let Some(f) = file.as_mut() {
             // SAFETY: f32 has no padding and any alignment suffices for u8.
             let bytes = unsafe {
-                std::slice::from_raw_parts(logits.as_ptr() as *const u8, std::mem::size_of_val(logits))
+                std::slice::from_raw_parts(
+                    logits.as_ptr() as *const u8,
+                    std::mem::size_of_val(logits),
+                )
             };
             f.write_all(bytes).expect("write LOGITS_OUT");
         }
