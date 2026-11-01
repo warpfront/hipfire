@@ -1070,8 +1070,9 @@ pub trait Speculator {
     fn set_turn_boundary(&mut self, _boundary: Option<usize>) {}
 
     /// Whether the drafter can continue a target restored or continued live
-    /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The Qwen4
-    /// session planner prefills cold when it cannot.
+    /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The
+    /// session planner falls back to the deepest reuse point it can resume
+    /// ([`crate::arch_model::ArchModel::session_plan_resumable`]).
     fn can_resume_at(&self, _prompt: &[u32], _start: usize) -> bool {
         true
     }
