@@ -1576,6 +1576,19 @@ fn slots_moe_cohort(
             return Ok(false);
         }
     };
+    // Resolve the per-expert down-AWQ table here, before the first launch.
+    // Admission only reaches `down_awq` through `CohortDownScales::PerExpert`,
+    // which already requires the table, so this cannot be `None` in practice —
+    // but a serving daemon must fall back to the per-slot program rather than
+    // panic half-way through the layer's sequence if that invariant ever slips.
+    let down_awq_ptrs = if plan.down_awq {
+        match ffn.expert_down_awq_ptrs.as_ref() {
+            Some(ptrs) => Some(ptrs),
+            None => return Ok(false),
+        }
+    } else {
+        None
+    };
     let Some(logits) = pbs.moe_router_logits_batch.as_ref() else {
         return Ok(false);
     };
@@ -1682,11 +1695,7 @@ fn slots_moe_cohort(
     // exactly that, at the same flat slot order (`tok * 8 + rank`) the slots
     // gate/up GEMV wrote. Without scales this is the byte-identical plain
     // producer.
-    if plan.down_awq {
-        let ptrs = ffn
-            .expert_down_awq_ptrs
-            .as_ref()
-            .expect("cohort admitted per-expert down AWQ without its pointer table");
+    if let Some(ptrs) = down_awq_ptrs {
         gpu.fused_silu_mul_rotate_mq_awq_indexed_batched(
             gate,
             up,
