@@ -2106,10 +2106,10 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.5,
         "repeat_penalty": 1.0
       },
-      "desc": "KRAFTON Raon-1-mini-preview 28.8B/4.3B-active MoE (arch_id=19; RDA gated-delta + MLA + mHC, SiTU experts). MQ4 XTS v2 (~17.9GB): routed experts symmetric MQ4v2 qt44 with AWQ+GPTQ refit; the always-active shared-expert and dense layer-0 FFN, attention and lm_head Q8F16; 20 GB-card fit pending real-hardware measurement (32K+ context admitted under 7900 XT capacity emulation). Reasoning model (<think>, QwenJinja template; thinking on by default), XML <tool_call> tools. Card defaults temp=1.0/top_p=0.95/top_k=20/presence_penalty=1.5 (presence applies to generated tokens only).",
+      "desc": "KRAFTON Raon-1-mini-preview 28.8B/4.3B-active MoE (arch_id=19; RDA gated-delta + MLA + mHC, SiTU experts). MQ4 XTS v2 (~17.9GB): routed experts symmetric MQ4v2 qt44 with AWQ+GPTQ refit; the always-active shared-expert and dense layer-0 FFN, attention and lm_head Q8F16; 20 GB-card fit pending real-hardware measurement (32K+ context admitted under 7900 XT capacity emulation). Reasoning model (<think>, QwenJinja template; thinking on by default), XML <tool_call> tools. Registry defaults temp=1.0/top_p=0.95/top_k=20/presence_penalty=0.5 (KRAFTON card: 1.5; hipfire lowered it to 0.5 by a pre-registered sweep, loop and code-pass rates within noise; presence applies to generated tokens only).",
       "dflash": {
         "file": "raon-1-mini-preview-dflash2.mq4",
         "sha256": "f46b4257773afdfaf25370df47d558429e950b8825561a8f1c3ad5a0010758ee",
