@@ -143,6 +143,7 @@ v_bfe_i32	alu
 v_bfe_u32	alu
 v_bfi_b32	alu
 v_cmp_class_f32_e64	alu
+v_cmp_eq_u16_e64	alu
 v_cmp_eq_u32_e32	alu
 v_cmp_eq_u32_e64	alu
 v_cmp_ge_f32_e64	alu
@@ -369,6 +370,7 @@ global_load_u16	memory
 global_load_u8	memory
 global_store_b32	memory
 global_store_b128	memory
+global_store_b96	memory
 global_store_b16	memory
 global_store_b64	memory
 v_and_or_b32	alu

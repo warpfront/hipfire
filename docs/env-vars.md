@@ -517,6 +517,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | `HIPFIRE_GFX12_FA2_PREFILL` | GQA-fused FA2 prefill on exact gfx1201 (same Qwen NH24/NKV4/HD256 envelope) — default ON (`kernel.gfx12_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
 | `HIPFIRE_GFX12_FA_PACKET` | Packet-minimal Q128 FA2 body on exact gfx1201 (same Qwen envelope as `HIPFIRE_GFX12_FA2_PREFILL`) — default ON (`kernel.gfx12_fa_packet`); `=0` opts out to the byte-identical route-N body |
 | `HIPFIRE_ATTN_QRESIDENT_V2` | Bit-exact v2 schedule of the gfx1201 register-resident-Q FA2 prefill kernel (same Qwen envelope; only where `kernel.attn_qresident` selects the Q-resident route) — default ON (`kernel.attn_qresident_v2`); `=0` restores the byte-identical v1 Q-resident kernel |
+| `HIPFIRE_MOE_A8_XLDS` | GEN-MOE packet A winner M3 inside `Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` (W4A8 grouped routed experts, Raon prefill gate/up and down): symbol `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` (`kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip`, own module; the `nt{1,2}r{1,2}` module is untouched) — default **OFF** (developer); `1` opts in, `0` kills. Taken only on exact gfx1201 with `m_total >= MOE_A8_XLDS_MIN_ROWS` = 2304 (grouped rows, the launch bound, NOT tokens; receipt `receipts/selectors/moe_a8_xlds_min_rows.json`, `--row-key launch_rows`) and `M % 128 == 0`; everything else runs `select_entry_a8`'s incumbent entry. 256 threads (8 waves x one 16-row fragment = 128 weight rows), dynamic LDS 17920 (the X epoch tile of a 4-tile / 64-slot expert run staged once per CTA in a 2-stage ring), grid `[M/128, m_total/16, 1]`, same 72-byte kernarg image; bit-identical to the incumbent at every judged row class |
 | `HIPFIRE_ATTN_FA2_GENERIC` | GEN-FA2 F2a flash-prefill body (`kernels/src/latent_attention_flash_fa2.hip`, symbol `latent_attention_flash_prefill_fa2_q128w8`) inside the generic `Gpu::latent_attention_flash_prefill` (BF16 non-wide path) and `Gpu::latent_attention_flash_prefill_q8` (Q8 mirror path, symbol `latent_attention_flash_prefill_fa2_q8_q128w8`, `kernels/src/latent_attention_flash_fa2_q8.hip`); the wide path is unchanged — default **ON** (developer); `0` kills and restores the incumbent. Taken only on exact gfx1201 with `n_rows >= 17` (`FA2_MIN_ROWS`, receipt `receipts/selectors/fa2_min_rows.json`) and the judged geometry `wa 128 / wb 64 / dv 128`; everything else runs the incumbent. Block 256, dynamic LDS 44032, grid `[ceil(n_rows/128), n_heads, 1]`, same 21 kernargs; bit-identical to the incumbent on both the BF16 and Q8 mirror paths |
 | `HIPFIRE_GFX12_FA_PREP_FUSED` | Exact gfx1201 FA Q/K norm and RoPE fusion (`kernel.gfx12_fa_prep_fused`); default ON only on gfx1201, `=0` restores separate launches |
 | `HIPFIRE_GFX12_FA_PREP_FP8Q` | Preconvert Q to E4M3 codes for gfx1201 Q-resident v2 attention (`kernel.gfx12_fa_prep_fp8q`); default ON only on gfx1201, `=0` retains F32 Q; requires fused prep and Q-resident v2 |
@@ -976,7 +977,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1879
+**Count:** 1880
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1980,6 +1981,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MODEL_PATH` | autoresearch/ar/census.py | harness |
 | `HIPFIRE_MODEL_STORE` | scripts/baseline_quant_smoke.sh | harness |
 | `HIPFIRE_MODULE_LOAD_AUDIT` | crates/hip-bridge/src/ffi.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_MOE_A8_XLDS` | crates/hipfire-kernel-abi/src/families/generic_gemm.rs, crates/rdna-compute/src/moe_grouped_qt44_iu4.rs | developer |
 | `HIPFIRE_MOE_ACT_CAPTURE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_MOE_AWQ` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_MOE_COALESCED_WEIGHTS` | crates/rdna-compute/src/kernels.rs | developer |

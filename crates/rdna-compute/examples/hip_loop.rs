@@ -1459,6 +1459,7 @@ fn run_rowclasses(o: &Opts, mut rec: Value, shape: Option<String>) -> (Value, Ou
         let w = node.work();
         let mut entry = json!({
             "rows": r,
+            "launch_rows": node.launch_rows().unwrap_or(r),
             "shape": node.shape_label(),
             "shape_dims": node.shape_json(),
             "bytes_per_call": extra["bytes_per_call"],
@@ -3453,6 +3454,9 @@ mod contract_tests {
             rc[1]["bytes_per_call"],
             128 * 2560 * 2 + (512 * 2560 + 512 * 128) * 4
         );
+        // a dense contract: the launch size is the row class itself
+        assert_eq!(rc[0]["launch_rows"], rc[0]["rows"]);
+        assert_eq!(rc[1]["launch_rows"], rc[1]["rows"]);
         assert_eq!(rc[1]["regime"], "hot");
         assert!(rc[0]["timing"].is_null() && rc[0]["identical_to_baseline"].is_null());
         assert_eq!(rec["regime"], "hot");
