@@ -226,8 +226,9 @@ fn project_batched(
     Ok(())
 }
 
-/// `HIPFIRE_RAON_A8_FUSE_ROUND=0` runs the A8 projection's BF16 output round as its own pass
-/// (`bf16_round_trip_f32_strided`) instead of the GEMM epilogue; bit-identical either way. Read once.
+/// `HIPFIRE_RAON_A8_FUSE_ROUND=0` runs the Q8_0 projection's BF16 output round as its own pass
+/// (`bf16_round_trip_f32_strided`) instead of the GEMM epilogue (the W8A8 i8-MMQ `_bf16` entries on
+/// gfx1201 / gfx1100, the F16 wmma `gemm_q8_0_wmma_bf16` on gfx1100); bit-identical either way. Read once.
 fn a8_fuse_round_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         hipfire_config::developer_bool("HIPFIRE_RAON_A8_FUSE_ROUND", true)
@@ -414,9 +415,18 @@ pub fn project_shared_f16(
                 .into(),
         );
     }
-    q8_0_prefill_gemm_f16x(gpu, &w.buf, x16, y, w.m, w.k, rows)
-        .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;
-    if round == OutRound::Bf16 {
+    let fused = q8_0_prefill_gemm_f16x(
+        gpu,
+        &w.buf,
+        x16,
+        y,
+        w.m,
+        w.k,
+        rows,
+        round == OutRound::Bf16 && a8_fuse_round_enabled(),
+    )
+    .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;
+    if round == OutRound::Bf16 && !fused {
         round_bf16_rows(gpu, y, rows, w.m)?;
     }
     Ok(())

@@ -4340,6 +4340,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemm_q8_0_wmma"]
         );
         add!(
+            "gemm_q8_0_wmma_bf16",
+            kernels::GEMM_Q8_0_WMMA_BF16_SRC,
+            ["gemm_q8_0_wmma_bf16"]
+        );
+        add!(
             "gemm_qkv_hfq6g256_wmma",
             kernels::GEMM_QKV_HFQ6G256_WMMA_SRC,
             ["gemm_qkv_hfq6g256_wmma"]
