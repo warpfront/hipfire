@@ -261,3 +261,78 @@ HF (`modeling_lfm3_omni.py:1734-1745`) replaces the frame with eos codes, feeds 
 5. **Hardening/tests:** GRAPH-1, GRID-1 (gates VL-RESIZE-1), TEST-1, DEAD-1, NITS-1.
 
 **Merge gate:** ROPE-1, PROMPT-1, STREAM-1 must be resolved (or explicitly waived) before merge.
+
+---
+
+## Round 2 — residual findings from the post-fix verification (2026-11-03)
+
+A verification pass over the five fix commits (d1d1fc0..db4a3a8) surfaced seven
+residuals; all addressed in the round-2 commit(s):
+
+1. **STREAM-1 budget under-count (medium, KV overflow)** — the streaming loop
+   subtracted a full `chunk_steps` from the budget while always generating a
+   full chunk, so total frames = ceil(max_steps/chunk)·chunk (max_steps=200,
+   chunk=12 → 204 frames = 1224 decoder tokens vs a 1200-token cache; worst at
+   small max_steps). Fixed twice: the daemon now clamps the last chunk to
+   `min(chunk_steps, steps_left)`, and `codec_decoder_forward` gained a
+   defense-in-depth guard that refuses to write past the KV cache's
+   `physical_cap` instead of corrupting GPU memory.
+   *GPU-verified (gfx1151): max_tokens=13 → exactly 13 frames (pre-fix: 24),
+   max_tokens=200 → 155 frames, natural eos; streaming + batch `done` events
+   carry the right `finish_reason`.*
+2. **GRID-1 multi-tile path untested (medium-risk)** — the tiled
+   online-softmax rewrite only changes behavior for N > 2048 and nothing
+   exercised it. New GPU-gated integration test
+   `crates/rdna-compute/tests/vit_attention_gqa_multitile.rs` runs
+   `vit_attention_gqa_f32` at the VL GQA shape (16Q/8KV, head_dim 64) for
+   N=2048 (tile boundary) and N=3000 (partial tail) against an f64 CPU
+   reference softmax: max|gpu−cpu| ≈ 1.3e-6. *(Gracefully skips without an AMD
+   GPU, same convention as `pp_parity.rs`.)*
+3. **ASR streaming O(n²) CPU + unbounded host memory (perf)** —
+   `audio_forward_streaming` accumulated every raw sample and recomputed the
+   mel + downsampler over the whole stream per call. Now bounded with ZERO
+   output change: the cache keeps only the sample tail from
+   `frames_computed·hop` (each mel frame depends only on its own window —
+   no global normalization) and computes only NEW frames; the downsampler
+   runs on a bounded window starting at a multiple of 8 (token t depends only
+   on mel frames [8t−8, 8t+8); three k3s2p1 convs = ±8-frame receptive field).
+   Bit-identity of the window is pinned by
+   `downsampler_window_bit_identity` (real LFM3-Audio-2B fixture weights,
+   `assert_eq!` — including the final-flush partial token). Memory is now
+   O(1) in stream length (sample tail < n_fft samples + ≤32 retained mel
+   frames).
+   *GPU-verified: `asr_stream_smoke` 19==19 tokens vs batch at 4 chunk sizes
+   (1.6k/8k/16k/24k samples), all finite, `is_final` flush closes the stream.*
+   Note: run-to-run token hashes differ even on the OLD implementation — the
+   encoder's Q8-KV stochastic rounding is nondeterministic per run (the same
+   property documented for the codec decoder), so end-to-end bit comparison is
+   not a meaningful gate here; the downsampler-window unit test is the exact
+   gate.
+4. **FINISH-1 missed the omni batch done events (minor)** — the text-only
+   (`audio_codes.is_empty()`) and audio-result batch `done` events defaulted
+   to "stop" in the CLI. Both now emit `finish_reason` (`stop` on a natural
+   eos/im_end/text_end finish, `length` on max_steps exhaustion), matching the
+   streaming path's contract. *GPU-verified: batch TTS run reports
+   `stop` (169 frames, natural eos) and `length` (max_tokens=13 cap).*
+5. **codec non-finite waveforms (robustness)** — `exp(log_mag)` in the iSTFT
+   overflows f32 at log_mag ≳ 88.7 (observed ~12% of codec_smoke batch decodes
+   pre-fix). The polar construction now clamps log-magnitude to
+   [−120, 80] (far above any legitimate speech spectrum) and maps NaN
+   log-magnitude/phase to silence, so every decoded waveform is finite.
+   `codec_smoke` now asserts finiteness on EVERY waveform (batch runs 1+2 and
+   every streaming chunk) and uses a NaN-aware max|diff| (the old `f32::max`
+   fold silently swallowed NaNs). *GPU-verified: 4× codec_smoke PASS, zero
+   non-finite samples.*
+6. **argmax_text_token NaN overclaim (nit)** — the old `bv >= v` comparison
+   adopted a NaN whenever it was the current element, so a NaN in the LAST
+   non-suppressed position still won (the old test passed only because its
+   NaN wasn't last). NaNs are now skipped explicitly; new tests cover the
+   last-position NaN and the all-NaN fallback.
+7. **`RopeParams::n_rot` doc (nit)** — no longer says "dims actually rotated";
+   documents that on the zero-tail partial path the rotated dims are the
+   first `n_rot/2` pairs (d, d + head_dim/2), with only the full-rotary
+   halfsplit path being a contiguous prefix.
+
+Landing: round-2 fix commit(s) on `lfm3-port`. The merge gate (ROPE-1,
+PROMPT-1, STREAM-1) now stands fully closed — STREAM-1's budget arithmetic is
+clamped and guarded rather than merely documented.
