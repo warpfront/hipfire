@@ -1257,9 +1257,14 @@ band and a band never shrinks the canonical chunk: band 4 (layers 39..48) needs
 refused naming the bands. Because the chunk changes numerics, compare two PP
 runs (for example the PP gate's PP-N against its PP-(N−1) reference) at the
 **same** chunk: a load that negotiated down to 4096 equals a single card at
-`HIPFIRE_PREFILL_CHUNK_ROWS=4096`. The gate arms load independently, so pin
-`HIPFIRE_PREFILL_CHUNK_ROWS` in the gate's `EXTRA_ENV` when a box's bands are
-near the limit.
+`HIPFIRE_PREFILL_CHUNK_ROWS=4096`. The PP gate (`fn-ep-gate.sh --mode pp`)
+guarantees the pair loads one chunk: the reference arm runs first, the chunk
+it negotiated is read from its `PP canonical chunk` log line and pinned on the
+target arm, the MTP arms and every speed cell (a target that cannot admit it
+fails its load with the explicit-chunk refusal above), and a
+`HIPFIRE_PREFILL_CHUNK_ROWS` in `EXTRA_ENV` wins on every arm. The chunk and how
+it was chosen are in `receipt.json` (`config.pp_prefill_chunk`) and
+`summary.txt`.
 
 **What it changes in the output.** The chunk changes numerics: output equals a
 single-card run at the same chunk (see [What runs](#what-runs)), so a load the
