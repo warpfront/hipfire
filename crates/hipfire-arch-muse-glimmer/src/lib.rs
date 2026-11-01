@@ -32,5 +32,6 @@ pub mod config;
 pub mod drafter;
 pub mod forward;
 pub mod glimmer;
+pub mod lanes;
 pub mod mesh_tp;
 mod program;
