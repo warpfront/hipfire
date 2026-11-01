@@ -38,6 +38,16 @@
 //! small ragged defaults (`N=37`, `K=256`, `n_experts=8`, `topk=2`, `tokens=37`, the smallest of M in
 //! 32/64/128/256 the domain admits). Reserved keys (set by the CLI): `arch`, `vs`, `pool`.
 //!
+//! The grouped MoE combine (`ffn_moe_combine_f32`: operands `topk_idx` and `row_of_slot`, both `i32.flat`, told apart by
+//! name) is a DENSE contract (row class `rows`) with routed index planes: `route=uniform|hist:` picks the per-token expert
+//! ids (token `t` = recorded row `t % recorded`; E and `top_k` must match), `row_of_slot` is the `inverse_perm` of their
+//! `moe::scatter` (slot -> grouped row), and `n_down_rows` defaults per row class to `moe::m_total_bound(rows * top_k,
+//! n_experts)` (the production size of the down plane). `null=<operand>[+<operand>]` binds nullable operands as null
+//! addresses (`routed_out`: the production prefill call passes none; `row_of_slot`: the expanded decode / row-exact
+//! layout, where `down_rows` holds `rows * top_k` rows in slot order) and allocates them nowhere. `edge=<seed>`
+//! perturbs the planes with skipped and tied ranks (`edge_planes`: ids -1 / `n_experts` / `i32::MAX`, ties, unrouted and
+//! out-of-range `row_of_slot`, all-skipped tokens) for emulator identity runs.
+//!
 //! # Buffers and recipes
 //!
 //! One device buffer per operand, `eval(extent)` bytes (the larger of both arms' extents under `--vs`). Inputs
@@ -56,6 +66,7 @@
 //! | `block_i8_128.kb_x_n.136b` | `[K/128][x_src_rows]` records `{f32 d in [0.005, 0.05); i32 s = sum(qs); i8 qs[128]}` |
 //! | `block_i4_128.kb_x_n.72b` | `[K/128][x_src_rows]` records `{f32 d; i32 s = sum of the signed nibbles; u8 qs[64]}` ([INFERENCE]: `s` is not read by the symmetric kernels) |
 //! | `i32.token_ids` | ids uniform in `[0, vocab)` |
+//! | `i32.flat` (`topk_idx`, `row_of_slot` of the combine only) | `topk_idx`: the `rows x top_k` expert ids of the `route=` plan; `row_of_slot`: `inverse_perm` of its scatter (see Shape) |
 //! | `i32.device_scalar` (operands `pos_ptr`, `base_ptr`: a position) | one `i32` = `prefix=` (default 0). A contract with such an operand and a `max_rows` param refuses `prefix + <rows> > max_rows` (a clippable domain error, so `--rowclasses` drops the classes that do not fit). Any other device scalar (`slot_idx`, `n_dev`) has no recipe |
 //!
 //! `WriteOnly` operands are pre-poisoned (f32 -1234.5 pattern), `ReadWrite` ones start from their input recipe;
@@ -425,6 +436,12 @@ pub enum Recipe {
     DeviceScalar,
     /// Pre-poisoned output (any format).
     Poison,
+    /// `topk_idx` of the grouped combine: `rows x top_k` expert ids (the recorded `route=hist:` ids or the
+    /// uniform plan), in rank order.
+    RouteIds,
+    /// `row_of_slot` of the grouped combine: `rows x top_k` grouped-row indices, `inverse_perm` of the
+    /// scatter of `RouteIds` (slot -> sorted position).
+    RowOfSlot,
 }
 
 impl Recipe {
@@ -435,6 +452,8 @@ impl Recipe {
             Recipe::TileIds
                 | Recipe::SortedSlots
                 | Recipe::ExpertOffsets
+                | Recipe::RouteIds
+                | Recipe::RowOfSlot
                 | Recipe::TokenIds
                 | Recipe::DeviceScalar
         )
@@ -473,6 +492,16 @@ pub fn recipe_for(format: FormatId, access: Access) -> Result<Recipe> {
             ))
         }
     })
+}
+
+/// [`recipe_for`] with the operand name: `i32.flat` is a plain index plane of several contracts, so the
+/// grouped combine's `topk_idx` / `row_of_slot` are told apart by name (the only `i32.flat` operands with a recipe).
+pub fn operand_recipe(name: &str, format: FormatId, access: Access) -> Result<Recipe> {
+    match (format.0, name, access) {
+        ("i32.flat", "topk_idx", Access::ReadOnly) => Ok(Recipe::RouteIds),
+        ("i32.flat", "row_of_slot", Access::ReadOnly) => Ok(Recipe::RowOfSlot),
+        _ => recipe_for(format, access),
+    }
 }
 
 fn put_f32(out: &mut Vec<u8>, v: f32) {
@@ -552,6 +581,8 @@ fn gen_bytes(r: Recipe, bytes: usize, seed: u64, vocab: u64) -> Vec<u8> {
         | Recipe::SortedSlots
         | Recipe::ExpertOffsets
         | Recipe::DeviceScalar
+        | Recipe::RouteIds
+        | Recipe::RowOfSlot
         | Recipe::Q8Plane => {}
     }
     out.resize(bytes, 0);
@@ -581,6 +612,47 @@ fn i32s(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// `edge=<seed>` of the grouped combine: perturb the index planes with every case the kernel's skip rules and its stable
+/// sort must honour. Per slot (hash of seed and slot): an expert id of -1, of `n_experts`, or of `i32::MAX` (skipped
+/// rank); an id equal to the token's rank-0 or last-rank id (a tie: stable order); a `row_of_slot` of -1 (unrouted),
+/// `n_down_rows` (first row past the plane) or `i32::MIN`. Per token: every 13th (t % 13 == 5) has all ids invalid, every
+/// 13th (t % 13 == 7) all slots unrouted. The rows the surviving ranks point at stay valid grouped rows.
+fn edge_planes(
+    seed: u64,
+    top_k: usize,
+    n_experts: usize,
+    n_down_rows: usize,
+    ids: &mut [i32],
+    row_of_slot: &mut [i32],
+) {
+    for s in 0..ids.len() {
+        let (t, j) = (s / top_k, s % top_k);
+        match t % 13 {
+            5 => {
+                ids[s] = -1;
+                continue;
+            }
+            7 => {
+                row_of_slot[s] = -1;
+                continue;
+            }
+            _ => {}
+        }
+        let h = (seed ^ (s as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        match (h >> 33) % 24 {
+            0 => ids[s] = -1,
+            1 => ids[s] = n_experts as i32,
+            2 => ids[s] = i32::MAX,
+            3 => ids[s] = ids[s - j],
+            4 => ids[s] = ids[s - j + top_k - 1],
+            5 => row_of_slot[s] = -1,
+            6 => row_of_slot[s] = n_down_rows as i32,
+            7 => row_of_slot[s] = i32::MIN,
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The node
 
@@ -595,6 +667,23 @@ pub struct OperandPlan {
     pub bytes: usize,
     /// The explicit-image offset of the pointer field that carries it.
     pub field_offset: u32,
+    /// `null=<operand>`: the operand is bound as a null address (nullable operands only), allocated nowhere.
+    pub nulled: bool,
+}
+
+/// The grouped combine's index planes (`ffn_moe_combine_f32`): the expert ids of each token and the grouped row of
+/// every slot, as the scatter of those ids lays them (`inverse_perm`).
+#[derive(Clone, Debug)]
+struct CombinePlan {
+    /// `rows x top_k` expert ids (`topk_idx`), rank order.
+    ids: Vec<i32>,
+    /// `rows x top_k` grouped rows (`row_of_slot`).
+    row_of_slot: Vec<i32>,
+    /// Live (tile-padded) rows of the grouped plane.
+    live_rows: usize,
+    touched_experts: usize,
+    /// `edge=<seed>`: the plan was perturbed with skipped / tied ranks (see [`edge_planes`]).
+    edge: Option<u64>,
 }
 
 struct Set {
@@ -645,6 +734,8 @@ pub struct ContractNode {
     bytes_per_call: u64,
     work_flops: f64,
     st: Option<State>,
+    /// The grouped-combine plan (`topk_idx` / `row_of_slot` bytes), `Some` for a contract with a `topk_idx` operand.
+    combine: Option<CombinePlan>,
 }
 
 fn param_value(abi: &KernelAbiV1, params: &[u64], name: &str) -> Option<u64> {
@@ -846,6 +937,10 @@ impl ContractNode {
             .operands
             .iter()
             .any(|o| recipe_for(o.format, o.access).is_ok_and(|r| r.is_routing()));
+        // The grouped combine (`ffn_moe_combine_f32`): index planes from the recorded / uniform routing.
+        let combine = abi.operands.iter().any(|o| {
+            operand_recipe(o.name, o.format, o.access).is_ok_and(|r| r == Recipe::RouteIds)
+        });
         let rows_key_name: Option<String> = match rows_param_of(&node_arm) {
             Some(r) if abi.param_index(r).is_some() => Some(r.to_owned()),
             Some(_) if routed => Some("tokens".to_owned()),
@@ -882,7 +977,32 @@ impl ContractNode {
                 }
             },
         };
-        if hist.is_some() && !routed {
+        // `null=<operand>[+<operand>]`: bind those nullable operands as null addresses (the production call
+        // passes `routed_out = None`).
+        let null_ops: Vec<String> = kv
+            .remove("null")
+            .map(|v| v.split('+').map(|s| s.trim().to_owned()).collect())
+            .unwrap_or_default();
+        let edge = take_u64(&mut kv, "edge")?;
+        if edge.is_some() && !combine {
+            return Err(format!("{}: edge= is a knob of the grouped combine only", abi.id).into());
+        }
+        for n in &null_ops {
+            match abi.operands.iter().find(|o| o.name == n) {
+                Some(o) if o.nullable => {}
+                Some(_) => {
+                    return Err(format!(
+                        "--shape null={n}: {}'s operand {n} is not nullable",
+                        abi.id
+                    )
+                    .into())
+                }
+                None => {
+                    return Err(format!("--shape null={n}: {} has no operand {n}", abi.id).into())
+                }
+            }
+        }
+        if hist.is_some() && !routed && !combine {
             return Err(format!(
                 "{}: route= is a knob of routed (grouped) contracts only",
                 abi.id
@@ -891,7 +1011,16 @@ impl ContractNode {
         }
         if let Some(k) = kv.keys().next() {
             let mut known: Vec<&str> = abi.params.iter().map(|p| p.name).collect();
-            known.extend(["tokens", "topk", "rows", "route_seed", "route", "prefix"]);
+            known.extend([
+                "tokens",
+                "topk",
+                "rows",
+                "route_seed",
+                "route",
+                "prefix",
+                "null",
+                "edge",
+            ]);
             return Err(format!(
                 "--shape: unknown key `{k}` for {} (params and knobs: {})",
                 abi.id,
@@ -1072,6 +1201,28 @@ impl ContractNode {
             }
         }
 
+        // The grouped combine: `n_down_rows` defaults to the production bound of the routed down plane
+        // (`m_total_bound(rows * top_k, n_experts)`), so every row class carries its own plane size.
+        if combine {
+            for k in ["rows", "top_k", "n_experts", "hidden", "n_down_rows"] {
+                if abi.param_index(k).is_none() {
+                    return Err(
+                        format!("{}: the combine recipes need the param `{k}`", abi.id).into(),
+                    );
+                }
+            }
+            let at = |k: &str| vals[abi.param_index(k).expect("checked above")];
+            if let (Some(r), Some(k), Some(e)) = (at("rows"), at("top_k"), at("n_experts")) {
+                if r > 0 && k > 0 && e > 0 && r.saturating_mul(k) < i32::MAX as u64 / 2 {
+                    set_default(
+                        &mut vals,
+                        "n_down_rows",
+                        crate::moe::m_total_bound((r * k) as usize, e as usize) as u64,
+                    );
+                }
+            }
+        }
+
         let missing: Vec<String> = abi
             .params
             .iter()
@@ -1172,11 +1323,74 @@ impl ContractNode {
             load_source(arm.export)?;
         }
 
+        // ---- grouped combine: the recorded (or uniform) expert ids and their scatter's `inverse_perm`
+        let combine_plan = if combine {
+            let pv = |n: &str| -> Result<usize> {
+                param_value(base.abi, &params, n)
+                    .map(|v| v as usize)
+                    .ok_or_else(|| {
+                        format!("{}: the combine recipes need the param `{n}`", base.abi.id)
+                    })
+            };
+            let (rows_n, top_k, e, n_down) = (
+                pv("rows")?,
+                pv("top_k")?,
+                pv("n_experts")?,
+                pv("n_down_rows")?,
+            );
+            if n_down % 16 != 0 {
+                return Err(BuildError::Domain(format!(
+                    "n_down_rows = {n_down} is not a multiple of 16: the grouped plane is laid in 16-row tiles"
+                )));
+            }
+            let ids = match &hist {
+                Some(h) => {
+                    if h.n_experts != e || h.topk != top_k {
+                        return Err(format!(
+                            "route=hist: the recording has n_experts={} topk={}, the shape n_experts={e} top_k={top_k}",
+                            h.n_experts, h.topk
+                        )
+                        .into());
+                    }
+                    h.table(rows_n)
+                }
+                None => crate::moe::route_topk(
+                    rows_n,
+                    top_k,
+                    e,
+                    crate::moe::Route::Uniform,
+                    0.0,
+                    route_seed,
+                ),
+            };
+            let r = crate::moe::scatter(&ids, e, n_down)
+                .map_err(|err| BuildError::Other(format!("combine routing plan: {err}")))?;
+            let mut row_of_slot = vec![-1i32; ids.len()];
+            for (pos, &s) in r.sorted.iter().enumerate() {
+                if s >= 0 {
+                    row_of_slot[s as usize] = pos as i32;
+                }
+            }
+            let (mut ids, mut row_of_slot) = (ids, row_of_slot);
+            if let Some(seed) = edge {
+                edge_planes(seed, top_k, e, n_down, &mut ids, &mut row_of_slot);
+            }
+            Some(CombinePlan {
+                ids,
+                row_of_slot,
+                live_rows: r.live,
+                touched_experts: r.touched_experts(),
+                edge,
+            })
+        } else {
+            None
+        };
+
         // ---- operand plans: bytes = the larger extent of the arms; recipe per format
         let mut operands = Vec::new();
         let mut ptr_fields = Vec::new();
         for (i, o) in base.abi.operands.iter().enumerate() {
-            let recipe = recipe_for(o.format, o.access)
+            let recipe = operand_recipe(o.name, o.format, o.access)
                 .map_err(|e| format!("{} operand {}: {e}", base.abi.id, o.name))?;
             let mut bytes = 0u64;
             for arm in std::iter::once(&base).chain(cand.iter()) {
@@ -1208,6 +1422,7 @@ impl ContractNode {
                 bytes: usize::try_from(bytes)
                     .map_err(|_| format!("operand {} is {bytes} B", o.name))?,
                 field_offset: off,
+                nulled: null_ops.iter().any(|n| n == o.name),
             });
         }
         for o in operands.iter().filter(|o| o.recipe == Recipe::Q8Plane) {
@@ -1295,6 +1510,7 @@ impl ContractNode {
         // the routing touches (the work spec's `bytes` of a routed contract is a one-slab lower bound).
         let footprint_bytes: u64 = operands
             .iter()
+            .filter(|o| !o.nulled)
             .map(|o| match (o.recipe, &routing) {
                 (Recipe::ExpertPtrTable, Some(r)) => {
                     let m = param_value(base.abi, &params, "M").unwrap_or(0);
@@ -1307,7 +1523,7 @@ impl ContractNode {
         let pool_active = pool && bytes_per_call.max(footprint_bytes) > llc_bytes(arch)?;
         let pool_set_bytes: usize = operands
             .iter()
-            .filter(|o| o.access == Access::ReadOnly && !o.recipe.is_index())
+            .filter(|o| o.access == Access::ReadOnly && !o.recipe.is_index() && !o.nulled)
             .map(|o| {
                 if o.recipe == Recipe::ExpertPtrTable {
                     let m = param_value(base.abi, &params, "M").unwrap_or(0) as usize;
@@ -1339,6 +1555,12 @@ impl ContractNode {
         if routed {
             label.push_str(&format!("-tokens{tokens}-topk{topk}"));
         }
+        if combine {
+            label.push_str("-combine");
+            for n in &null_ops {
+                label.push_str(&format!("-null_{n}"));
+            }
+        }
         if prefix > 0 {
             label.push_str(&format!("-prefix{prefix}"));
         }
@@ -1357,6 +1579,7 @@ impl ContractNode {
             routing,
             route_seed,
             hist,
+            combine: combine_plan,
             prefix,
             operands,
             ptr_fields,
@@ -1492,6 +1715,11 @@ impl ContractNode {
         param_value(self.base.abi, &self.params, "n_experts").unwrap_or(0) as usize
     }
 
+    /// `top_k` param of the grouped combine.
+    fn topk_of_combine(&self) -> usize {
+        param_value(self.base.abi, &self.params, "top_k").unwrap_or(1) as usize
+    }
+
     /// One expert slab of set `set`.
     pub fn host_slab(&self, seed: u64, set: usize, e: usize) -> Vec<u8> {
         let (m, g) = self.slab_dims();
@@ -1517,6 +1745,13 @@ impl ContractNode {
             let mut b = (self.prefix as i32).to_le_bytes().to_vec();
             b.resize(o.bytes, 0);
             return b;
+        }
+        if let Some(c) = &self.combine {
+            match o.recipe {
+                Recipe::RouteIds => return i32s(&c.ids),
+                Recipe::RowOfSlot => return i32s(&c.row_of_slot),
+                _ => {}
+            }
         }
         if let Some(b) = self.routing_bytes(i) {
             debug_assert_eq!(b.len(), o.bytes, "{}: routing table vs extent", o.name);
@@ -1744,6 +1979,20 @@ impl Node for ContractNode {
         if self.prefix > 0 {
             v["prefix"] = json!(self.prefix);
         }
+        if let Some(c) = &self.combine {
+            let nulled: Vec<&str> = self
+                .operands
+                .iter()
+                .filter(|o| o.nulled)
+                .map(|o| o.name)
+                .collect();
+            v["routing"] = json!({
+                "kind": "combine", "tokens": c.ids.len() / self.topk_of_combine().max(1),
+                "topk": self.topk_of_combine(), "n_experts": self.n_experts(),
+                "route": self.info_route(), "route_seed": self.route_seed, "live_rows": c.live_rows,
+                "touched_experts": c.touched_experts, "null": nulled, "edge": c.edge,
+            });
+        }
         if let Some(r) = &self.routing {
             v["routing"] = json!({
                 "tokens": self.tokens, "topk": self.topk, "n_experts": self.n_experts(),
@@ -1830,7 +2079,7 @@ impl Node for ContractNode {
             .iter()
             .position(|o| o.recipe == Recipe::ExpertPtrTable);
         let outs: Vec<usize> = (0..self.operands.len())
-            .filter(|&i| self.operands[i].access != Access::ReadOnly)
+            .filter(|&i| self.operands[i].access != Access::ReadOnly && !self.operands[i].nulled)
             .collect();
         // Regions in mapping order: expert slabs, then every non-output operand in operand order, then the
         // outputs (one region each, or one packed region with poison pads when several).
@@ -1853,7 +2102,7 @@ impl Node for ContractNode {
         let n_slab_regions = regions.len();
         let mut region_of: Vec<Option<usize>> = vec![None; self.operands.len()];
         for i in 0..self.operands.len() {
-            if outs.contains(&i) {
+            if outs.contains(&i) || self.operands[i].nulled {
                 continue;
             }
             region_of[i] = Some(regions.len());
@@ -1910,6 +2159,10 @@ impl Node for ContractNode {
             match f.kind {
                 FieldKind::Pointer { operand } => {
                     let i = abi.operand_index(operand).expect("validated pointer field");
+                    if self.operands[i].nulled {
+                        args.push(EmuArg::U64(0));
+                        continue;
+                    }
                     let r = region_of[i].expect("every operand has a region");
                     args.push(match packed_off[i] {
                         Some(off) => EmuArg::BufOff(r, off),
@@ -1944,7 +2197,7 @@ impl Node for ContractNode {
             let mut bufs: Vec<Option<Buf>> = (0..n).map(|_| None).collect();
             let mut slabs = Vec::new();
             for i in 0..n {
-                if s > 0 && !self.pooled(i) {
+                if self.operands[i].nulled || (s > 0 && !self.pooled(i)) {
                     continue;
                 }
                 if Some(i) == table {
@@ -1973,7 +2226,7 @@ impl Node for ContractNode {
         }
         let mut pristine = Vec::new();
         for (i, o) in self.operands.iter().enumerate() {
-            if o.access != Access::ReadOnly {
+            if o.access != Access::ReadOnly && !o.nulled {
                 let b = Buf::alloc(gpu, o.bytes)?;
                 b.copy_from(
                     gpu,
@@ -2000,7 +2253,7 @@ impl Node for ContractNode {
         let addrs: Vec<u64> = s.sets[0]
             .bufs
             .iter()
-            .map(|b| b.as_ref().expect("set 0 holds every operand").ptr() as u64)
+            .map(|b| b.as_ref().map_or(0, |b| b.ptr() as u64))
             .collect();
         let img = self.kernarg_image(&self.base, &addrs)?;
         if let Some(c) = &self.cand {
@@ -3062,5 +3315,117 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("route"), "{e}");
+    }
+
+    const COMBINE: &str = "contract:ffn_moe_combine_f32";
+    const COMBINE_SHAPE: &str = "rows=7,hidden=512,top_k=2,n_experts=8,order=1,round_expert_outputs=1,round_routed_sum=1,round_final=1";
+
+    #[test]
+    fn combine_planes_come_from_the_recorded_routing_and_n_down_rows_defaults_to_the_bound() {
+        let p = hist_fixture("combine", false);
+        let n = node(
+            COMBINE,
+            &format!("{COMBINE_SHAPE},route=hist:{}", p.display()),
+        );
+        let ndr = n.params[n.base.abi.param_index("n_down_rows").unwrap()];
+        assert_eq!(ndr, crate::moe::m_total_bound(14, 8) as u64);
+        let ix = |name: &str| n.operands.iter().position(|o| o.name == name).unwrap();
+        assert_eq!(n.operands[ix("topk_idx")].recipe, Recipe::RouteIds);
+        assert_eq!(n.operands[ix("row_of_slot")].recipe, Recipe::RowOfSlot);
+        assert!(n.operands[ix("topk_idx")].recipe.is_index());
+        let ids: Vec<i32> = n
+            .host_operand(ix("topk_idx"), 3, 0)
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        // token t takes recorded row t % 5 (all layers, record order)
+        assert_eq!(&ids[..4], &[0, 1, 1, 2]);
+        assert_eq!(&ids[10..14], &[0, 1, 1, 2]);
+        let ros: Vec<i32> = n
+            .host_operand(ix("row_of_slot"), 3, 0)
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let r = crate::moe::scatter(&ids, 8, ndr as usize).unwrap();
+        assert_eq!(ros.len(), 14);
+        for (slot, &row) in ros.iter().enumerate() {
+            assert_eq!(r.sorted[row as usize], slot as i32, "slot {slot}");
+            assert_eq!(
+                r.tiles[row as usize / 16],
+                ids[slot],
+                "slot {slot} sits in its expert's tile"
+            );
+        }
+        assert_eq!(n.info_route()["kind"], "hist");
+        assert_eq!(n.shape_json()["routing"]["live_rows"], r.live);
+        // uniform stays the default, and an explicit n_down_rows wins
+        let u = node(COMBINE, COMBINE_SHAPE);
+        assert_eq!(u.info_route()["kind"], "uniform");
+        let big = node(COMBINE, &format!("{COMBINE_SHAPE},n_down_rows=256"));
+        assert_eq!(
+            big.params[big.base.abi.param_index("n_down_rows").unwrap()],
+            256
+        );
+        let e = build(COMBINE, &format!("{COMBINE_SHAPE},n_down_rows=24"))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("multiple of 16"), "{e}");
+    }
+
+    #[test]
+    fn combine_null_knob_binds_a_null_address_and_drops_the_operand_from_the_outputs() {
+        let n = node(COMBINE, &format!("{COMBINE_SHAPE},null=routed_out"));
+        let ix = |name: &str| n.operands.iter().position(|o| o.name == name).unwrap();
+        assert!(n.operands[ix("routed_out")].nulled && !n.operands[ix("out")].nulled);
+        let mut addrs = fake_addrs(&n);
+        addrs[ix("routed_out")] = 0;
+        let img = n.kernarg_image(&n.base, &addrs).unwrap();
+        assert_eq!(&img[40..48], &[0u8; 8], "routed_out pointer field is null");
+        assert_ne!(&img[48..56], &[0u8; 8], "out pointer field is bound");
+        assert!(n.label.contains("-null_routed_out"));
+        let e = build(COMBINE, &format!("{COMBINE_SHAPE},null=out"))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("not nullable"), "{e}");
+        let e = build(COMBINE, &format!("{COMBINE_SHAPE},null=nope"))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("no operand"), "{e}");
+    }
+
+    #[test]
+    fn combine_edge_knob_plants_skips_and_ties_deterministically() {
+        let shape = "rows=130,hidden=512,top_k=2,n_experts=8,order=1,round_expert_outputs=1,round_routed_sum=1,round_final=1,edge=3";
+        let n = node(COMBINE, shape);
+        let m = node(COMBINE, shape);
+        let ix = |name: &str| n.operands.iter().position(|o| o.name == name).unwrap();
+        let ids = n.host_operand(ix("topk_idx"), 1, 0);
+        let ros = n.host_operand(ix("row_of_slot"), 1, 0);
+        assert_eq!(
+            ids,
+            m.host_operand(ix("topk_idx"), 9, 0),
+            "deterministic, seed independent"
+        );
+        let w = |b: &[u8]| -> Vec<i32> {
+            b.chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let (ids, ros) = (w(&ids), w(&ros));
+        assert!(
+            ids.iter().any(|&e| e == -1)
+                && ids.iter().any(|&e| e == 8)
+                && ids.iter().any(|&e| e == i32::MAX)
+        );
+        assert!(ros.iter().any(|&r| r == -1) && ros.iter().any(|&r| r == i32::MIN));
+        // token 5: every id invalid; token 7: every slot unrouted
+        assert!(ids[10..12].iter().all(|&e| e == -1));
+        assert!(ros[14..16].iter().all(|&r| r == -1));
+        // a tie: some token has two equal valid ids
+        assert!(ids
+            .chunks_exact(2)
+            .any(|c| c[0] == c[1] && c[0] >= 0 && c[0] < 8));
+        assert_eq!(n.shape_json()["routing"]["edge"], 3);
+        assert!(build(QT44, &format!("{QT44_SHAPE},edge=1")).is_err());
     }
 }

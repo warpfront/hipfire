@@ -1258,6 +1258,8 @@ mod flash_fa2_q8 {
 
     /// Same encoding, operands, domain and numerics as `generic_seq.latent_attention_flash_prefill_q8`;
     /// only the schedule differs: 256 threads, 128 query rows per CTA, K/V streamed through 44032 bytes of LDS.
+    /// The next tile's global prefetch carries the raw F16 scale bits (unconditional loads from a clamped row) and the
+    /// F16 -> F32 widening and the partial-tile zero fill happen at the LDS store; the output bits are unchanged.
     pub static ABI: KernelAbiV1 = KernelAbiV1 {
         id: "generic_seq.latent_attention_flash_prefill_fa2_q8_q128w8",
         version: 1,

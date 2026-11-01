@@ -276,6 +276,7 @@ v_lshlrev_b32_e64	vop3	0x118	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_lshlre
 v_lshrrev_b16	vop3	0x339	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_lshrrev_b16 v2.l, 7, v6.l	D7390002 02020C87	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_mad_u32_u24	vop3	0x20b	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_mad_u32_u24 v4, v4, 34, s12	D60B0004 00314504	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_med3_i32	vop3	0x220	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_med3_i32 v35, s20, 1, 32	D6200023 02810214	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_med3_u32	vop3	0x221	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_med3_u32 v1, s2, v3, 7	D6210001 021E0602	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_min_u16	vop3	0x30b	VDST:16,SRC0:16,SRC1:16,literal@last	VDST	SRC0,SRC1	-	-	v_min_u16 v9.l, 0x7bfe, v11.l	D70B0009 020216FF 00007BFE	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_movreld_b32_e32	vop1	0x42	VDST:32,SRC0:32	VDST	SRC0	m0:r	-	v_movreld_b32_e32 v2, v21	7E048515	w0_extra:ignored:0x10000:0x0
 v_movrels_b32_e32	vop1	0x43	VDST:32,SRC0:32	VDST	SRC0,VDST	m0:r	-	v_movrels_b32_e32 v21, v2	7E2A8702	w0_extra:ignored:0x10000:0x0

@@ -1479,6 +1479,21 @@ fn vector(
             Class::Int,
             (raw(0)? as i32).min(raw(1)? as i32).min(raw(2)? as i32) as u32,
         ),
+        // The unsigned median of three (V_MED3_U32): max3/max chain of the ISA pseudocode over the raw operands.
+        "v_med3_u32" => {
+            let (a, b, c) = (raw(0)?, raw(1)?, raw(2)?);
+            let max3 = a.max(b).max(c);
+            (
+                Class::Int,
+                if max3 == a {
+                    b.max(c)
+                } else if max3 == b {
+                    a.max(c)
+                } else {
+                    a.max(b)
+                },
+            )
+        }
         // The ISA pseudocode: if max3(S0,S1,S2) == S0 then max(S1,S2) elif max3 == S1 then max(S0,S2) else max(S0,S1).
         "v_med3_i32" => {
             let (a, b, c) = (raw(0)? as i32, raw(1)? as i32, raw(2)? as i32);

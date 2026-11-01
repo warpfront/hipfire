@@ -274,6 +274,7 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "convert_f32_to_f16"),
     ("gfx1201", "embedding_q8_batched"),
     ("gfx1201", "ffn_moe_combine_f32"),
+    ("gfx1201", "ffn_moe_combine_f32_w2"),
     ("gfx1201", "ffn_moe_router_topk_f32"),
     ("gfx1201", "ffn_round_bf16_f32"),
     ("gfx1201", "ffn_single_expert_tables"),
