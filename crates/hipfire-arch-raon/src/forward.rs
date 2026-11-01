@@ -1098,8 +1098,7 @@ fn ffn_block(
 ) -> Result<(), String> {
     match &layer.ffn {
         RaonFfn::Dense(d)
-            if (2..=crate::projection::ROWS_EXACT_MAX).contains(&rows)
-                && crate::projection::rows_exact() =>
+            if crate::projection::rows_exact(&gpu.arch, rows) =>
         {
             // Row-exact verify: every row equals the decode step's MLP row bit for
             // bit: the decode weight copy (`projections(1)`), Q8 projections through
@@ -1136,8 +1135,7 @@ fn ffn_block(
         RaonFfn::Moe(m) => {
             // Row-exact verify blocks run every row as the decode step does,
             // shared expert included: its single-row weights.
-            let rows_exact = (2..=crate::projection::ROWS_EXACT_MAX).contains(&rows)
-                && crate::projection::rows_exact();
+            let rows_exact = crate::projection::rows_exact(&gpu.arch, rows);
             let (shared_gate, shared_up, shared_down) =
                 m.shared.projections(if rows_exact { 1 } else { rows });
             let refs = RaonMoeLayerRefs::from_parts(

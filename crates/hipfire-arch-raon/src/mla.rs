@@ -218,6 +218,10 @@ impl MlaPolicy {
 pub struct RaonMlaWork {
     policy: MlaPolicy,
     split_ws: GpuTensor,
+    /// Widest call that runs the row-exact decode-split route
+    /// ([`crate::projection::rows_exact_max`] of the device); `split_ws`
+    /// holds one workspace plane per row of it.
+    rows_exact_max: usize,
     absorb: Option<AbsorbWork>,
 }
 
@@ -272,13 +276,10 @@ impl RaonMlaWork {
         } else {
             cfg.v_head
         };
-        // Row-exact verify blocks run up to ROWS_EXACT_MAX decode problems in
+        // Row-exact verify blocks run up to `rows_exact_max` decode problems in
         // one launch, one workspace plane each.
-        let planes = if crate::projection::rows_exact() {
-            crate::projection::ROWS_EXACT_MAX
-        } else {
-            1
-        };
+        let rows_exact_max = crate::projection::rows_exact_max(&gpu.arch);
+        let planes = rows_exact_max.max(1);
         let ws = latent_attention_decode_workspace_elems(cfg.n_heads, v_width) * planes;
         let split_ws = gpu.zeros(&[ws], DType::F32).map_err(hip)?;
         let absorb = if policy.absorb {
@@ -307,6 +308,7 @@ impl RaonMlaWork {
         Ok(Self {
             policy,
             split_ws,
+            rows_exact_max,
             absorb,
         })
     }
@@ -403,7 +405,7 @@ impl RaonMlaWork {
 
     /// Attention route operands for MLA layer ordinal `mi` under `route`, for
     /// a call of `rows` rows. A row-exact verify block
-    /// ([`crate::projection::rows_exact`], `2..=ROWS_EXACT_MAX` rows) runs every
+    /// ([`crate::projection::rows_exact`], `2..=rows_exact_max` rows) runs every
     /// row as its own decode problem ([`MlaRowsRoute::DecodeExact`]).
     pub fn attention_route(
         &self,
@@ -413,9 +415,8 @@ impl RaonMlaWork {
     ) -> Result<AttentionRoute<'_>, String> {
         let policy = self.policy;
         let ws = Some(&self.split_ws);
-        let rows_route = ((2..=crate::projection::ROWS_EXACT_MAX).contains(&rows)
-            && crate::projection::rows_exact())
-        .then_some(MlaRowsRoute::DecodeExact);
+        let rows_route =
+            (2..=self.rows_exact_max).contains(&rows).then_some(MlaRowsRoute::DecodeExact);
         match (route, policy.tiled) {
             (MlaRoute::Decompressed, false) => Ok(AttentionRoute::Reference),
             (MlaRoute::Decompressed, true) => Ok(match rows_route {
