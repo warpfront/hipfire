@@ -5017,6 +5017,37 @@ fn load_qwen4_rank_scoped(
     pp_chunk_rows: Option<usize>,
     ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
 ) -> Result<Qwen4RankLoad, String> {
+    // Every rank (single device, EP rank thread, PP band) packs its small
+    // weight tensors into slabs on its own device (`HIPFIRE_WEIGHT_SLAB`);
+    // the scope closes, sealing the slabs, on success and on error alike.
+    gpu.weight_slab_scope_begin();
+    let loaded = load_qwen4_rank_unscoped(
+        gpu,
+        ep_seal,
+        shared,
+        expert_vram_layers,
+        session,
+        src,
+        band,
+        pp_chunk_rows,
+        ep_reserve,
+    );
+    gpu.weight_slab_scope_end();
+    loaded
+}
+
+/// [`load_qwen4_rank_scoped`] without the weight-slab scope.
+fn load_qwen4_rank_unscoped(
+    gpu: &mut rdna_compute::Gpu,
+    ep_seal: Option<hipfire_arch_qwen4::ep_seal::Qwen4EpRankSeal>,
+    shared: &Qwen4RankShared,
+    expert_vram_layers: Option<usize>,
+    session: Option<Qwen4SessionSeed<'_>>,
+    src: ModelSource,
+    band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
+    pp_chunk_rows: Option<usize>,
+    ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
+) -> Result<Qwen4RankLoad, String> {
     let backend = shared.backend;
     let vmm_granularity = shared.vmm_granularity;
     let max_k = shared.max_k;

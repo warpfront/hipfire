@@ -577,6 +577,7 @@ fn mock_runtime() -> HipRuntime {
         launch_grid_yz_limit: AtomicU32::new(u32::MAX),
         own_device_bytes: AtomicUsize::new(0),
         own_vmm_handles: Default::default(),
+        slabs: Default::default(),
         stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(0)),
         kernel_timing_control: std::sync::OnceLock::new(),
     }

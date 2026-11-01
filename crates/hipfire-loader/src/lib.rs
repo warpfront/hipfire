@@ -4311,7 +4311,13 @@ pub fn load_admitted_with_gemma4_drafter(
         xdna: None,
         batch_request,
     };
-    let mut result = match carrier.load(source, &mut ctx) {
+    // Weight uploads of this load are packed into slabs per
+    // `HIPFIRE_WEIGHT_SLAB` (a no-op when off); the scope closes — sealing
+    // every slab — whether or not the carrier succeeds.
+    ctx.gpu.weight_slab_scope_begin();
+    let carrier_result = carrier.load(source, &mut ctx);
+    ctx.gpu.weight_slab_scope_end();
+    let mut result = match carrier_result {
         Ok(result) => result,
         Err(error) => {
             // The carrier already unwound its resources; join any compile
@@ -6944,6 +6950,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+    if let Some(pinned) = gpu.pinned_weight_slabs() {
+        // A view that outlives its model keeps its whole slab allocated.
+        eprintln!(
+            "  weight-slab: {} slab(s) ({:.1} MiB) still allocated after unload, held by {} live view(s)",
+            pinned.slabs,
+            pinned.slab_bytes as f64 / (1024.0 * 1024.0),
+            pinned.live_views
+        );
+    }
     // After ordinary frees/pool drain, retry any VMM arenas retained by a
     // failed free_tensor. Success is reported only when none remain.
     note(gpu.ensure_vmm_cleaned().map_err(|e| e.to_string()));

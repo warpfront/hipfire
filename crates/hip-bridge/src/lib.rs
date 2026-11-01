@@ -33,6 +33,9 @@ pub use ffi::kernel_timing::{
 };
 pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
+pub use ffi::weight_slab::{
+    device_alloc_charge, SlabMode, SlabScopeSummary, SlabStats, ALLOC_GRANULE, DEFAULT_SLAB_MODE, SLAB_ALIGN,
+};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, HostAllocOwner,
@@ -118,6 +121,11 @@ enum DeviceBufferOwnership {
     /// is the whole point of the offload path using it.
     HostMapped,
     Borrowed,
+    /// Sub-allocation of a weight slab (see `ffi::weight_slab`). It owns its
+    /// range like a `hipMalloc` buffer — `is_hip_allocation` is true, so
+    /// ownership checks accept it — but `HipRuntime::free` only releases the
+    /// range; the slab's `hipFree` runs when its last view is gone.
+    SlabView,
 }
 
 impl DeviceBuffer {
@@ -129,8 +137,18 @@ impl DeviceBuffer {
         self.size
     }
 
+    /// Owning device allocation: a `hipMalloc` buffer or a weight-slab view.
     pub fn is_hip_allocation(&self) -> bool {
-        self.ownership == DeviceBufferOwnership::HipMalloc
+        matches!(
+            self.ownership,
+            DeviceBufferOwnership::HipMalloc | DeviceBufferOwnership::SlabView
+        )
+    }
+
+    /// Sub-allocation of a weight slab: free it through `HipRuntime::free`
+    /// (never pool it past the slab's lifetime).
+    pub fn is_slab_view(&self) -> bool {
+        self.ownership == DeviceBufferOwnership::SlabView
     }
 
     pub fn is_vmm_owner(&self) -> bool {
