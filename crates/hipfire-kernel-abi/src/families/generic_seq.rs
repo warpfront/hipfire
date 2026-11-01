@@ -1235,6 +1235,64 @@ mod flash_q8 {
 }
 
 // ================================================================================
+// latent_attention_flash_prefill_fa2_q8_q128w8 (GEN-FA2 F2a-Q8)
+// ================================================================================
+
+mod flash_fa2_q8 {
+    use super::*;
+
+    const EXPORTS: &[ExportV1] = &[ExportV1 {
+        symbol: "latent_attention_flash_prefill_fa2_q8_q128w8",
+        arch: Arch::Gfx1201,
+        object: ObjectRefV1::HipccSource {
+            module: "latent_attention_flash_fa2_q8",
+            source: "kernels/src/latent_attention_flash_fa2_q8.hip",
+        },
+        block: [256, 1, 1],
+        dynamic_lds: 44032,
+        group_segment_fixed: 0,
+        // 8 waves x 16 query rows per workgroup; grid z is 1 (dv pinned to 128).
+        grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
+        consts: &[],
+    }];
+
+    /// Same encoding, operands, domain and numerics as `generic_seq.latent_attention_flash_prefill_q8`;
+    /// only the schedule differs: 256 threads, 128 query rows per CTA, K/V streamed through 44032 bytes of LDS.
+    pub static ABI: KernelAbiV1 = KernelAbiV1 {
+        id: "generic_seq.latent_attention_flash_prefill_fa2_q8_q128w8",
+        version: 1,
+        wave: 32,
+        numeric: NumericContractId("latent_attention.flash_prefill_q8.int8_dequant_bf16_wmma_f32"),
+        params: flash_q8::PARAMS,
+        operands: flash_q8::OPERANDS,
+        fields: flash::FIELDS,
+        hidden: hidden_std!(112, dyn_lds 232),
+        explicit_bytes: 108,
+        segment_bytes: 368,
+        segment_align: 8,
+        domain: flash_q8::DOMAIN,
+        exports: EXPORTS,
+    };
+
+    const FA2_ADMIT: RowDomainV1 = RowDomainV1 {
+        min_rows: 17,
+        max_rows: None,
+        predicate: "crates/rdna-compute/src/latent_attention_flash.rs::FA2_Q8_MIN_ROWS",
+        kill_env: Some("HIPFIRE_ATTN_FA2_GENERIC"),
+    };
+
+    /// The Q8 incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default off).
+    pub static WORK: WorkSpecV1 = WorkSpecV1 {
+        abi: &ABI,
+        work: WorkV1 {
+            admit: FA2_ADMIT,
+            note: "FA2 Q8 route (default OFF, gfx1201): same work as the Q8 incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
+            ..flash_q8::WORK.work
+        },
+    };
+}
+
+// ================================================================================
 // raon_rda_prepare_f32
 // ================================================================================
 
@@ -2916,6 +2974,7 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &flash::ABI,
     &flash_fa2::ABI,
     &flash_q8::ABI,
+    &flash_fa2_q8::ABI,
     &rda_prepare::ABI,
     &gated_rms::ABI,
     &postmix::ABI,
@@ -2938,6 +2997,7 @@ pub static WORK: &[&WorkSpecV1] = &[
     &flash::WORK,
     &flash_fa2::WORK,
     &flash_q8::WORK,
+    &flash_fa2_q8::WORK,
     &rda_prepare::WORK,
     &gated_rms::WORK,
     &postmix::WORK,
@@ -3085,6 +3145,49 @@ mod tests {
         // 129 rows -> 2 tiles -> grid x 512 work items.
         let (x, _) = work_items(
             &flash_fa2::ABI,
+            &[
+                ("n_rows", 129),
+                ("n_heads", 40),
+                ("wa", 128),
+                ("wb", 64),
+                ("dv", 128),
+            ],
+        );
+        assert_eq!(x, 512);
+    }
+
+    #[test]
+    fn flash_fa2_q8_contract_and_grid_inversion() {
+        flash_fa2_q8::WORK.self_check().unwrap();
+        let e = &flash_fa2_q8::ABI.exports[0];
+        assert_eq!(e.block, [256, 1, 1]);
+        assert_eq!(e.dynamic_lds, 44032);
+        assert_eq!(
+            flash_fa2_q8::ABI.explicit_bytes,
+            flash_q8::ABI.explicit_bytes
+        );
+        assert_eq!(flash_fa2_q8::ABI.segment_bytes, flash_q8::ABI.segment_bytes);
+        assert_eq!(flash_fa2_q8::ABI.numeric, flash_q8::ABI.numeric);
+        let w = &flash_fa2_q8::WORK.work;
+        assert_eq!(w.admit.min_rows, 17);
+        assert_eq!(
+            w.admit.predicate,
+            "crates/rdna-compute/src/latent_attention_flash.rs::FA2_Q8_MIN_ROWS"
+        );
+        assert_eq!(w.admit.kill_env, Some("HIPFIRE_ATTN_FA2_GENERIC"));
+        let (x, y) = work_items(
+            &flash_fa2_q8::ABI,
+            &[
+                ("n_rows", 512),
+                ("n_heads", 40),
+                ("wa", 128),
+                ("wb", 64),
+                ("dv", 128),
+            ],
+        );
+        assert_eq!((x, y), (1024, 40));
+        let (x, _) = work_items(
+            &flash_fa2_q8::ABI,
             &[
                 ("n_rows", 129),
                 ("n_heads", 40),

@@ -299,6 +299,7 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "latent_attention_absorb_pack_bf16"),
     ("gfx1201", "latent_attention_flash_prefill"),
     ("gfx1201", "latent_attention_flash_prefill_fa2_q128w8"),
+    ("gfx1201", "latent_attention_flash_prefill_fa2_q8_q128w8"),
     ("gfx1201", "latent_attention_flash_prefill_q8"),
     ("gfx1201", "latent_attention_gate_bf16"),
     ("gfx1201", "latent_attention_gather_latent_f32"),
