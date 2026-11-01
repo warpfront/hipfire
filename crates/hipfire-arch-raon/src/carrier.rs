@@ -881,7 +881,10 @@ mod dflash_tests {
         let error = pp_option_refusal(2, Some("d.hfq"), off).unwrap_err();
         assert!(error.contains("speculation.dflash = off"), "{error}");
         // `auto` with the registry's paired draft loads the bands as plain AR.
-        assert_eq!(pp_option_refusal(2, Some("d.hfq"), SpecLoadCfg::default()), Ok(()));
+        assert_eq!(
+            pp_option_refusal(2, Some("d.hfq"), SpecLoadCfg::default()),
+            Ok(())
+        );
         // Plain AR and the single-device load are untouched.
         assert_eq!(pp_option_refusal(2, None, SpecLoadCfg::default()), Ok(()));
         assert_eq!(pp_option_refusal(1, Some("d.hfq"), on), Ok(()));
