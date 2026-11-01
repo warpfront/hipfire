@@ -21,17 +21,17 @@
 // wave; the host fails the step when it reads the block.
 
 extern "C" __global__ void ep_boundary_signal_wait(
-    unsigned int *__restrict__ own,
-    const unsigned int *__restrict__ e0,
-    const unsigned int *__restrict__ e1,
-    const unsigned int *__restrict__ e2,
-    const unsigned int *__restrict__ e3,
-    const unsigned int *__restrict__ e4,
-    const unsigned int *__restrict__ e5,
-    const unsigned int *__restrict__ e6,
-    const unsigned int *__restrict__ e7,
+    unsigned int *own,
+    const unsigned int *e0,
+    const unsigned int *e1,
+    const unsigned int *e2,
+    const unsigned int *e3,
+    const unsigned int *e4,
+    const unsigned int *e5,
+    const unsigned int *e6,
+    const unsigned int *e7,
     int ranks,
-    hf_device_wait_block *__restrict__ wait_block) {
+    hf_device_wait_block *wait_block) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     const unsigned int epoch =
         __hip_atomic_fetch_add(own, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM) + 1u;

@@ -751,13 +751,20 @@ fanned-out call meets the other ranks on the host (paired submission), so host s
 the bounded waits. Long prefill (the tile exchange) and the trunk split stay on the host barrier; the trunk split is
 refused with `kernel`.
 
-The contract is `railgun::mesh`: per rank a ledger of producer writes (all rows), boundaries (tag = kind, buffer,
-layer, rows, sequence), peer reads (rows the owner owns) and gather writes (rows other ranks own). After every
-fanned-out call `EpRowGather::check_step` requires the same boundaries in the same order on every rank (so no rank
-waits on an epoch nobody publishes) and no exchange buffer rewritten, read before it was produced, or retired in
-the epoch a peer reads it; a refusal poisons the mesh. A rank failure poisons every rank's bounded waits through
-its wait block (`EP boundary poisoned`), so peers stop at their next check instead of their deadline. Epoch words
-are transport state, never part of a model snapshot, and are freed only by `release` after every rank drained.
+**gfx12 only.** `kernel` is refused at EP attach unless every rank is gfx12. On gfx11 (gfx1100, gfx1151) the
+system-scope release and acquire do not write back or invalidate L2, so a peer could read stale rows without any
+error (the same limit as `tp2_graph_signal.gfx1100.hip`).
+
+The contract is `railgun::mesh`: per rank a ledger of the boundaries crossed (tag = kind, buffer, layer, rows,
+sequence) plus producer writes, peer reads and gather writes. In production `EpRowGather::check_step` (after every
+fanned-out call) proves only that every rank made the same exchange calls in the same order, so no rank waits on
+an epoch nobody publishes; the transport records each gather's writes and reads in a fixed order, so the
+rewrite/read-before-produce/retire refusals are exercised by the `railgun::mesh` unit tests, not by a live step. A
+refusal poisons the mesh. A rank failure poisons every rank's bounded waits through its wait block
+(`EP boundary poisoned`), so peers stop at their next check instead of their deadline. A stopped wait leaves its code
+in the rank's wait block, which the rank's next download reports, so a peer timeout can surface one fanned-out call
+late. Epoch words are transport state, never part of a model snapshot, and are freed only by `release` after every
+rank drained.
 
 **Retention census** (what still keeps a rank's EP decode step out of a retained Redline body; HIP API traces of
 emulated EP2 on gfx1151, every non-launch runtime call between two row gathers of one rank):
@@ -775,14 +782,15 @@ emulated EP2 on gfx1151, every non-launch runtime call between two row gathers o
   of `gated_delta_conv_params_bf16_f32`, and GFX10/11 PM4 refuses `gemv_mq6g256v2_k2560_u2`, which uses scratch),
   so retained per-rank rows need gfx1201.
 
-**Logical emulation limit.** The boundary spins on the device. Under `HIPFIRE_EMULATE_GPUS` every rank shares one
-device, so a device-wide runtime call one rank makes while another rank is parked on a boundary (a blocking
-null-stream copy, `hipDeviceSynchronize`, an allocation, a VMM map) waits for the parked rank, which waits for the
-caller: the wait stops at 500 ms and the step fails closed with `device wait timeout`. AR completes byte-identical
-to the single card in most runs (gfx1151, EP2 and EP4); native MTP always stops. EP4 also needs more ROCm
-hardware queues than the default (`GPU_MAX_HW_QUEUES=16`). On separate devices those calls are per device and do
-not couple ranks; that, peer-memory visibility and the launch/sync gain are not measured yet (no multi-GPU
-hardware in this work).
+**Logical emulation limit.** These runs predate the gfx12 gate (they ran on gfx1151, where `kernel` is now
+refused; `ep_row_gather_probe` still drives the transport directly). The boundary spins on the device.
+Under `HIPFIRE_EMULATE_GPUS` every rank shares one device, so a device-wide runtime call one rank makes while another
+rank is parked on a boundary (a blocking null-stream copy, `hipDeviceSynchronize`, an allocation, a VMM map) waits
+for the parked rank, which waits for the caller: the wait stops at 500 ms and the step fails closed with
+`device wait timeout`. AR completed byte-identical to the single card in most runs (EP2 and EP4); native MTP always
+stopped. EP4 also needs more ROCm hardware queues than the default (`GPU_MAX_HW_QUEUES=16`). On separate devices
+those calls are per device and do not couple ranks; that, peer-memory visibility and the launch/sync gain are not
+measured yet (no multi-GPU gfx12 hardware in this work).
 
 ### Flash-Next EP: EP reserve decoupling (default on, `=0` kill switch)
 
