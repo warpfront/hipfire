@@ -56,6 +56,12 @@ impl ArchModel for RaonBundle {
             .map_or(0, |session| session.plan_capped(self, prompt, route, cap))
     }
 
+    fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
+    }
+
     fn session_commit(&mut self) {
         if let Some(session) = self.session.as_mut() {
             session.commit();

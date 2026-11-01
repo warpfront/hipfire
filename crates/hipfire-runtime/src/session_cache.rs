@@ -3620,6 +3620,26 @@ fn plan_with_parked(base: usize, parked: Option<usize>) -> usize {
     }
 }
 
+/// The deepest reuse point of a `len`-token prompt that `resumable` accepts
+/// (e.g. one a speculator's draft context can restart from,
+/// [`crate::spec::Speculator::can_resume_at`]), else 0 (cold). `plan_capped(cap)`
+/// is the model's plan restricted to reuse points `<= cap`
+/// ([`crate::arch_model::ArchModel::session_plan_capped`]); the walk starts at
+/// its top plan and replans below each rejected hit. Host-only; each step is
+/// clamped below the previous hit, so it ends even if `plan_capped` ignores
+/// its cap.
+pub fn plan_resumable(
+    len: usize,
+    plan_capped: impl Fn(usize) -> usize,
+    resumable: impl Fn(usize) -> bool,
+) -> usize {
+    let mut start = plan_capped(len);
+    while start > 0 && !resumable(start) {
+        start = plan_capped(start - 1).min(start - 1);
+    }
+    start
+}
+
 /// The session machinery an architecture's bundle holds: the shared snapshot
 /// cache plus the committed live state of the current conversation.
 pub struct SessionDriver {
@@ -4322,6 +4342,30 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    /// Reuse points on a 4096 grid plus an off-grid live hit at 10000.
+    fn reuse_points(len: usize) -> impl Fn(usize) -> usize {
+        move |cap: usize| {
+            let top = cap.min(len - 1);
+            [12288, 10000, 8192, 4096]
+                .into_iter()
+                .find(|&p| p <= top)
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn unresumable_hit_falls_back_to_the_next_lower_reuse_point() {
+        let len = 13_000;
+        // Resumable only with >= 2048 rows left to prefill (a draft window).
+        let leaves_window = |s: usize| len - s >= 2048;
+        assert_eq!(plan_resumable(len, reuse_points(len), |_| true), 12288);
+        assert_eq!(plan_resumable(len, reuse_points(len), leaves_window), 10000);
+        assert_eq!(plan_resumable(len, reuse_points(len), |s| s <= 8192), 8192);
+        assert_eq!(plan_resumable(len, reuse_points(len), |_| false), 0);
+        // A plan that ignores its cap still ends.
+        assert_eq!(plan_resumable(len, |_| 300, |_| false), 0);
+    }
 
     #[test]
     fn first_written_row_is_the_lowest_non_empty_segment_start() {
