@@ -3502,7 +3502,9 @@ fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
 /// write). Each drop fires the userptr MMU notifier, so KFD evicts (preempts,
 /// CWSR-saves) and later restores every queue of the process. It drives the
 /// queue-preemption path without a profiler; it is a repro aid, not a
-/// production setting.
+/// production setting. Unix-only: it addresses anonymous memory with
+/// `mmap`/`madvise` and resolves `hipHostRegister` through `dlopen`.
+#[cfg(unix)]
 fn debug_force_evict_start() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     let Some(ms) = hipfire_config::process_value("HIPFIRE_DEBUG_FORCE_EVICT_MS")
@@ -3589,6 +3591,24 @@ fn debug_force_evict_start() {
             })
             .ok();
     });
+}
+
+/// Non-Unix twin of [`debug_force_evict_start`]: the repro drives KFD through
+/// `mmap`/`madvise`/`dlopen`, so the knob is inert here (named once, not
+/// silently).
+#[cfg(not(unix))]
+fn debug_force_evict_start() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let requested = hipfire_config::process_value("HIPFIRE_DEBUG_FORCE_EVICT_MS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|ms| ms > 0);
+    if requested {
+        ONCE.call_once(|| {
+            eprintln!(
+                "[force-evict] HIPFIRE_DEBUG_FORCE_EVICT_MS is a Unix-only repro knob; ignored"
+            )
+        });
+    }
 }
 
 fn gfx10_dispatch_initiator_policy(

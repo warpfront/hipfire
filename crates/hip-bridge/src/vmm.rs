@@ -3193,10 +3193,12 @@ mod tests {
         assert_eq!(arena.base_address(), 0);
     }
 
-    /// `hipMemUnmap` has exactly three call sites in the VMM module, each a
+    /// `hipMemUnmap` has exactly six call sites in the VMM module, each a
     /// teardown of a segment that is not live: import abort, the fresh segment
-    /// of a failed access call, and `release`'s teardown. A new call site must
-    /// extend this list on purpose.
+    /// of a failed access call (`map_at`) or a failed granule/handle map
+    /// (`map_granule_at`), the pre-use segment of `map_next`, `unmap_at`'s
+    /// tracked teardown, and `release`'s teardown. A new call site must extend
+    /// this list on purpose.
     #[test]
     fn mem_unmap_call_sites_in_the_vmm_module_are_the_audited_teardowns() {
         let source = include_str!("vmm.rs");
@@ -3223,7 +3225,14 @@ mod tests {
         sites.sort();
         assert_eq!(
             sites,
-            ["abort_import", "map_next", "teardown_segments"],
+            [
+                "abort_import",
+                "map_at",
+                "map_granule_at",
+                "map_next",
+                "teardown_segments",
+                "unmap_at"
+            ],
             "unreviewed hipMemUnmap call site in the VMM module"
         );
     }
