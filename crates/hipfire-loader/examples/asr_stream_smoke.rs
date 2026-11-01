@@ -116,6 +116,15 @@ fn main() {
     cache.free_gpu(&mut gpu);
     let stream_n = stream_tokens.len() / audio_cfg.proj.out_features;
     let stream_finite = stream_tokens.iter().all(|v| v.is_finite());
+    // REVIEW-3: chunk-boundary invariance checksum — the bounded mel tail +
+    // downsampler window must make the token stream INDEPENDENT of how the
+    // audio was chunked (the old full-recompute path guaranteed this by
+    // construction). FNV-1a over the f32 bit patterns.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for v in &stream_tokens {
+        hash ^= (v.to_bits()) as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
 
     eprintln!(
         "  batch:    {batch_n} tokens x {} dims (finite={batch_finite})",
@@ -136,7 +145,7 @@ fn main() {
         && stream_tokens.len() == stream_n * audio_cfg.proj.out_features
         && (batch_n as i64 - stream_n as i64).abs() <= 1;
     println!(
-        "batch_tokens={batch_n} stream_tokens={stream_n} chunks={n_chunks} dim={}",
+        "batch_tokens={batch_n} stream_tokens={stream_n} chunks={n_chunks} dim={} token_hash={hash:016x}",
         audio_cfg.proj.out_features
     );
     println!("RESULT: {}", if pass { "PASS" } else { "FAIL" });

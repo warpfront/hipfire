@@ -1180,25 +1180,53 @@ pub fn audio_forward(
 /// LM cache as chunks complete).
 ///
 /// ASR-STR-1: unlike the first cut (per-chunk mel + per-chunk downsample +
-/// permanent drop of every <8-frame tail), the cache now carries the raw
-/// sample tail and the token count so streaming matches the batch path:
-/// the mel and downsampler run over the FULL accumulated stream each call
-/// (their convs have ±1-frame receptive-field overlap, so per-chunk slicing
-/// shifted the phase at chunk boundaries), tokens are emitted only when
-/// their full 8-frame group exists, and `is_final` flushes the partial
-/// trailing group as one last token (HF: `(num_frames + 7) // 8`).
+/// permanent drop of every <8-frame tail), the cache carries enough history
+/// that streaming matches the batch path exactly: the mel and downsampler
+/// see the same inputs they would over the full stream, tokens are emitted
+/// only when their full 8-frame group exists, and `is_final` flushes the
+/// partial trailing group as one last token (HF: `(num_frames + 7) // 8`).
+///
+/// REVIEW-3 (bounded streaming): the first cut accumulated EVERY raw sample
+/// and recomputed the mel + downsampler over the whole stream on each call —
+/// bit-identical to batch, but O(n²) CPU in the stream length with unbounded
+/// host memory over a live session. Both stages are local in time, so the
+/// recompute is bounded now with ZERO output change:
+///   * mel frame f covers samples [f·hop, f·hop + n_fft) — independent per
+///     frame (no global normalization; the affine is per-element), so only
+///     the sample tail from `frames_computed · hop` onward is retained and
+///     only NEW frames are computed;
+///   * one downsampler output token depends only on mel frames
+///     [8t−8, 8t+8) (three k3s2p1 convs = ±8-frame receptive field), so the
+///     downsampler runs on a bounded window starting at a multiple of 8
+///     (the window's conv padding then matches the full stream exactly for
+///     every emitted token — see `downsampler_window_bit_identity`).
 pub struct AudioEncoderStreamingCache {
     pub state: AudioEncoderState,
-    /// Raw samples accumulated across all chunks (the mel + downsampler are
-    /// recomputed over the full stream per call — CPU, and it keeps chunk
-    /// boundaries bit-identical to the batch path).
+    /// Raw samples from absolute sample `frames_computed * hop` onward —
+    /// exactly the history future mel frames still need (< n_fft samples
+    /// between chunks, plus the just-arrived chunk). Bounded now.
     pub accum_samples: Vec<f32>,
+    /// Trailing mel frames stored FRAME-MAJOR (`[frame, n_mels]`, absolute
+    /// frames `[mel_frame_start, frames_computed)`) so a frame range is a
+    /// contiguous slice — NOTE this is the transpose of
+    /// `log_mel_spectrogram`'s `[n_mels, num_frames]` output layout. Capped
+    /// at [`DOWNSAMPLER_RETAIN_FRAMES`].
+    pub mel_cache: Vec<f32>,
+    /// Absolute frame index of `mel_cache[0]`.
+    pub mel_frame_start: usize,
+    /// Total mel frames computed so far (= absolute stream frame count).
+    pub frames_computed: usize,
     /// Tokens already emitted (HF `cache.num_tokens`).
     pub num_tokens_emitted: usize,
     /// Set by the `is_final` flush; further chunks are rejected (HF raises
     /// "This stream is finalized").
     pub finished: bool,
 }
+
+/// Mel frames retained for the downsampler windows. One window needs at most
+/// frames [8·t−8, 8·t+8) (24 frames for the longest final-flush window);
+/// 32 gives margin. Old frames can never enter a future window.
+const DOWNSAMPLER_RETAIN_FRAMES: usize = 32;
 
 impl AudioEncoderStreamingCache {
     pub fn new(gpu: &mut Gpu, cfg: &AudioConfig, max_tokens: usize) -> Result<Self, String> {
@@ -1207,6 +1235,9 @@ impl AudioEncoderStreamingCache {
         Ok(Self {
             state,
             accum_samples: Vec::new(),
+            mel_cache: Vec::new(),
+            mel_frame_start: 0,
+            frames_computed: 0,
             num_tokens_emitted: 0,
             finished: false,
         })
@@ -1240,11 +1271,33 @@ pub fn audio_forward_streaming(
         ));
     }
     let n_mels = cfg.mel.n_mels;
+    let hop = cfg.mel.hop_length;
+    let n_fft = cfg.mel.n_fft;
 
-    // 1. Accumulate + full-stream mel (batch-identical; center=False).
+    // 1. Accumulate the sample tail + compute only the NEW mel frames (REVIEW-3).
+    //    `accum_samples` starts at absolute sample `frames_computed·hop`, so its
+    //    frame j IS absolute frame `frames_computed + j` — each frame depends
+    //    only on its own [f·hop, f·hop + n_fft) window, making the incremental
+    //    frames bit-identical to the full-stream `log_mel_spectrogram`.
     cache.accum_samples.extend_from_slice(audio_chunk);
-    let mel = crate::mel::log_mel_spectrogram(&cache.accum_samples, &cfg.mel);
-    let num_frames = mel.len() / n_mels;
+    let new_mel = crate::mel::log_mel_spectrogram(&cache.accum_samples, &cfg.mel);
+    let new_frames = new_mel.len() / n_mels;
+    cache.frames_computed += new_frames;
+    // Transpose-append the new frames (log_mel is [n_mels, frames], the
+    // cache is frame-major).
+    for f in 0..new_frames {
+        for m in 0..n_mels {
+            cache.mel_cache.push(new_mel[m * new_frames + f]);
+        }
+    }
+    let num_frames = cache.frames_computed;
+
+    // Bound the sample tail: future frames start at frame `num_frames`, whose
+    // window begins at absolute sample `num_frames·hop`. Everything before it
+    // can no longer affect any output. (Bound: n_fft − hop + a sub-hop
+    // remainder between chunks.)
+    let drop_samples = new_frames * hop;
+    cache.accum_samples.drain(..drop_samples.min(cache.accum_samples.len()));
 
     // 2. Token accounting (HF `stream()`): a token needs its full 8-frame
     //    group, except on the final flush where the partial group emits one
@@ -1258,22 +1311,61 @@ pub fn audio_forward_streaming(
         return Ok(Vec::new());
     }
 
-    // 3. CPU downsampler over the FULL mel, then slice this call's tokens —
-    //    the k3s2p1 conv chain overlaps group boundaries, so per-chunk
-    //    downsampling shifted the phase (ASR-STR-1). Downsampling the whole
-    //    stream keeps every token bit-identical to the batch path.
-    let tokens_all = downsampler_forward(&mel, n_mels, num_frames, &weights.downsampler);
-    let avail = tokens_all.len() / cfg.enc.hidden_size;
-    let end_token = start_token + new_tokens;
-    if end_token > avail {
+    // 3. CPU downsampler over a BOUNDED window of the mel (REVIEW-3), then
+    //    slice this call's tokens — bit-identical to running it over the
+    //    full stream (see the struct doc + `downsampler_window_bit_identity`).
+    //    Token t depends only on mel frames [8t−8, 8t+8); a window starting
+    //    at a multiple of 8 has conv-padding behavior identical to the full
+    //    stream for every token it produces, and the window's token j maps to
+    //    the full stream's token `ws/8 + j`.
+    let win_start = 8 * start_token.saturating_sub(1); // multiple of 8
+    if win_start < cache.mel_frame_start {
         return Err(HipError::new(
             999,
             &format!(
-                "lfm3-audio: stream token accounting desync (want tokens {start_token}..{end_token}, downsample produced {avail})"
+                "lfm3-audio: downsampler window underflow (need frames from {win_start}, cache retains from {})",
+                cache.mel_frame_start
             ),
         ));
     }
-    let slice = &tokens_all[start_token * cfg.enc.hidden_size..end_token * cfg.enc.hidden_size];
+    let win_frames = num_frames - win_start;
+    // Materialize the window in downsampler layout ([n_mels, win_frames],
+    // mel-major) from the frame-major cache.
+    let mut win_mel = vec![0.0f32; n_mels * win_frames];
+    let cache_base = (win_start - cache.mel_frame_start) * n_mels;
+    for f in 0..win_frames {
+        let src = &cache.mel_cache[cache_base + f * n_mels..cache_base + (f + 1) * n_mels];
+        for m in 0..n_mels {
+            win_mel[m * win_frames + f] = src[m];
+        }
+    }
+    let tokens_win = downsampler_forward(&win_mel, n_mels, win_frames, &weights.downsampler);
+    // Bound the mel cache AFTER the window is materialized: frames can be
+    // dropped once they can never enter a future window — the next call's
+    // window starts at 8·(num_tokens−1), and this call's window started at
+    // `win_start`; nothing before min(those, num_frames−RETAIN) is needed.
+    let keep_from = num_frames
+        .saturating_sub(DOWNSAMPLER_RETAIN_FRAMES)
+        .min(8 * num_tokens.saturating_sub(1))
+        .min(win_start);
+    if keep_from > cache.mel_frame_start {
+        cache
+            .mel_cache
+            .drain(..(keep_from - cache.mel_frame_start) * n_mels);
+        cache.mel_frame_start = keep_from;
+    }
+    let avail = tokens_win.len() / cfg.enc.hidden_size;
+    let first_idx = start_token - win_start / 8;
+    let end_idx = first_idx + new_tokens;
+    if end_idx > avail {
+        return Err(HipError::new(
+            999,
+            &format!(
+                "lfm3-audio: stream token accounting desync (want window tokens {first_idx}..{end_idx}, downsample produced {avail})"
+            ),
+        ));
+    }
+    let slice = &tokens_win[first_idx * cfg.enc.hidden_size..end_idx * cfg.enc.hidden_size];
 
     // 4. GPU encoder forward (persistent state — position carries).
     let enc_out =
@@ -1371,5 +1463,98 @@ mod tests {
         // CPU f32 vs numpy f32 (BF16 weights → f32) → near-exact; allow tiny slack.
         assert!(max_err < 1e-3, "downsampler max abs err {max_err:e}");
         assert!(rel_err < 1e-3, "downsampler max rel err {rel_err:e}");
+    }
+
+    /// REVIEW-3: the bounded streaming downsampler window must be
+    /// BIT-IDENTICAL to the full-stream pass. Token t depends only on mel
+    /// frames [8t−8, 8t+8) (three k3s2p1 convs, ±8-frame receptive field);
+    /// a window starting at a multiple of 8 sees the same conv-padding
+    /// behavior as the full stream for every token it produces, with window
+    /// output j mapping to full-stream token `ws/8 + j`. Uses the real
+    /// LFM3-Audio-2B downsampler fixture weights.
+    #[test]
+    fn downsampler_window_bit_identity() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let mel = read_f32(&format!("{dir}/log_mel.bin"));
+
+        fn parse_meta(path: &str) -> std::collections::HashMap<String, usize> {
+            let txt = std::fs::read_to_string(path).unwrap();
+            txt.lines()
+                .filter_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    Some((k.trim().to_string(), v.trim().parse().ok()?))
+                })
+                .collect()
+        }
+        let m = parse_meta(&format!("{dir}/meta.txt"));
+        let n_mels = m["n_mels"];
+        let num_frames = m["num_frames"];
+
+        let dw = DownsamplerWeights {
+            conv_in_w: host_w("conv_in.weight", dir),
+            conv_in_b: read_f32(&format!("{dir}/dw_conv_in_bias.bin")),
+            conv_mid_w: host_w("conv_mid.weight", dir),
+            conv_mid_b: read_f32(&format!("{dir}/dw_conv_mid_bias.bin")),
+            lin_mid_w: host_w("lin_mid.weight", dir),
+            lin_mid_b: read_f32(&format!("{dir}/dw_lin_mid_bias.bin")),
+            conv_end_w: host_w("conv_end.weight", dir),
+            conv_end_b: read_f32(&format!("{dir}/dw_conv_end_bias.bin")),
+            lin_end_w: host_w("lin_end.weight", dir),
+            lin_end_b: read_f32(&format!("{dir}/dw_lin_end_bias.bin")),
+            lin_out_w: host_w("lin_out.weight", dir),
+            lin_out_b: read_f32(&format!("{dir}/dw_lin_out_bias.bin")),
+        };
+
+        let full = downsampler_forward(&mel, n_mels, num_frames, &dw);
+        // hidden from the fixture meta — NOT `num_frames/8`: three stride-2
+        // convs make the token count (num_frames−7)/8-ish, e.g. 149 frames →
+        // 19 tokens, not 149/8 = 18.
+        let dm = parse_meta(&format!("{dir}/downsample_meta.txt"));
+        let hidden = dm["hidden"];
+        let n_tokens = full.len() / hidden;
+        assert_eq!(n_tokens * hidden, full.len(), "fixture token grid must be exact");
+        assert!(n_tokens >= 2, "fixture too short to exercise windows");
+
+        // Window helper: materialize frames [ws, hi) of the mel fixture in
+        // downsampler layout ([n_mels, hi-ws], mel-major — the fixture is
+        // mel-major, so a frame range is NOT a contiguous slice).
+        let window = |mel: &[f32], num_frames: usize, ws: usize, hi: usize| {
+            let wf = hi - ws;
+            let mut win = vec![0.0f32; n_mels * wf];
+            for f in 0..wf {
+                for m in 0..n_mels {
+                    win[m * wf + f] = mel[m * num_frames + ws + f];
+                }
+            }
+            win
+        };
+
+        // Non-final tokens: window [8(t−1), num_frames), output index 1.
+        for t in 0..n_tokens {
+            let ws = 8 * t.saturating_sub(1);
+            let win = window(&mel, num_frames, ws, num_frames);
+            let win_tokens = downsampler_forward(&win, n_mels, num_frames - ws, &dw);
+            let j = t - ws / 8;
+            assert!(j < win_tokens.len() / hidden, "t={t}: window too short");
+            let got = &win_tokens[j * hidden..(j + 1) * hidden];
+            let want = &full[t * hidden..(t + 1) * hidden];
+            assert_eq!(got, want, "t={t}: window token diverged from full stream");
+        }
+
+        // Final-flush partial token: truncate 3 frames off the end (leaves a
+        // 5-frame partial group) and verify the flush token against a
+        // full-length pass over the truncated mel.
+        let trunc = num_frames - 3;
+        let trunc_mel = window(&mel, num_frames, 0, trunc);
+        let full_trunc = downsampler_forward(&trunc_mel, n_mels, trunc, &dw);
+        assert_eq!(full_trunc.len() / hidden, (trunc + 7) / 8, "flush token must exist");
+        let t = (trunc + 7) / 8 - 1;
+        let ws = 8 * t.saturating_sub(1);
+        let win = window(&mel, num_frames, ws, trunc);
+        let win_tokens = downsampler_forward(&win, n_mels, trunc - ws, &dw);
+        let j = t - ws / 8;
+        let got = &win_tokens[j * hidden..(j + 1) * hidden];
+        let want = &full_trunc[t * hidden..(t + 1) * hidden];
+        assert_eq!(got, want, "flush token t={t}: window diverged from full stream");
     }
 }
