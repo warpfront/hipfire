@@ -26,15 +26,15 @@
 //! (a templated opening) does not retire a drafter that pays for itself
 //! afterwards. Retirement is sticky for the rest of the request.
 //!
-//! A short answer (a few dozen tokens) never completes two windows, so the
+//! A short answer (a few dozen tokens) never completes two windows, and a
+//! drafter just below break-even rarely fails two windows in a row, so the
 //! request's first [`EARLY_CYCLES`] cycles get an early verdict: they retire
-//! the request at once when they commit fewer tokens than their cost by more
-//! than [`EARLY_MARGIN`] tokens per cycle (a drafter below break-even from
-//! the start; Raon-1-mini's short `creative_short` answers are 42-47 tokens
-//! over 22-30 cycles, and its prose drafts commit about 1.67 tokens per cycle
-//! against a 1.90-step cycle on the 7900 XTX). A drafter within the margin of
-//! break-even (where speculation and AR cost about the same) waits for the
-//! window verdicts.
+//! the request at once when they committed fewer tokens than their cost
+//! (`EARLY_MARGIN` tokens per cycle of slack, 0). Raon-1-mini's prose drafts
+//! commit about 1.77 tokens per cycle against a 1.85-step cycle on the 7900
+//! XTX: the window verdicts retired them after 64 cycles, the early verdict
+//! after 8. A drafter that pays from the start (code: about 4 tokens per
+//! cycle) never meets it, and later stretches are judged by the windows.
 //!
 //! Default break-even (`HIPFIRE_SPEC_RETIRE` unset, and the drafter states no
 //! measured line of its own, [`crate::spec::Speculator::retire_break_even`]):
@@ -53,7 +53,7 @@ pub const RETIRE_WINDOWS: usize = 2;
 pub const EARLY_CYCLES: usize = 8;
 /// Tokens per cycle below the break-even line that the early verdict needs
 /// (`emitted + EARLY_MARGIN * EARLY_CYCLES < cost`).
-pub const EARLY_MARGIN: f64 = 0.1;
+pub const EARLY_MARGIN: f64 = 0.0;
 
 /// Break-even tokens per spec cycle that verified `rows` target rows at
 /// context length `L`: `base + per_row * rows + per_1k_ctx * L / 1024`.
