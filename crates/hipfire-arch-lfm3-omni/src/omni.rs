@@ -23,6 +23,20 @@ use crate::depth::{get_audio_out_embeds, sample_audio_frame, DepthConfig, DepthR
 use hipfire_arch_lfm3::{decode_step, decode_step_with_embed, Lfm3Config, Lfm3State, Lfm3Weights};
 use rdna_compute::Gpu;
 
+/// Hidden-state checksum for the batch-vs-streaming divergence bisect
+/// (HIPFIRE_OMNI_DEBUG=1): a cheap order-sensitive fold over the hidden.
+fn hidden_cksum(hidden: &[f32]) -> f64 {
+    let mut acc = 0x9E3779B97F4A7C15u64.wrapping_add(hidden.len() as u64);
+    for (i, &v) in hidden.iter().enumerate() {
+        acc = acc.wrapping_add((v.to_bits() as u64).wrapping_mul((i as u64) | 1));
+    }
+    (acc >> 11) as f64
+}
+
+fn omni_debug() -> bool {
+    std::env::var("HIPFIRE_OMNI_DEBUG").is_ok()
+}
+
 // ─── Omni token ids (HF `Lfm3OmniConfig` defaults) ───────────────────────────
 pub const AUDIO_START_TOKEN: u32 = 125_012;
 pub const AUDIO_OUT_TOKEN: u32 = 125_032;
@@ -202,6 +216,13 @@ fn omni_generate_interleaved(
             hidden = gpu
                 .download_f32(&state.final_norm_buf)
                 .map_err(|e| format!("omni: download hidden: {e:?}"))?;
+            if omni_debug() {
+                eprintln!(
+                    "  [dbg-b] pos={position} AUDIO frame={n_audio_frames} cksum={:.0} logits_ck={:.0}",
+                    hidden_cksum(&hidden),
+                    hidden_cksum(prev_logits.as_ref().unwrap()),
+                );
+            }
             // In the audio tail (text_done), keep speaking until eos/max.
             // In an interleaved audio block, decrement + toggle to text at 0.
             if !text_done {
@@ -252,6 +273,13 @@ fn omni_generate_interleaved(
             hidden = gpu
                 .download_f32(&state.final_norm_buf)
                 .map_err(|e| format!("omni: download hidden: {e:?}"))?;
+            if omni_debug() {
+                eprintln!(
+                    "  [dbg-b] pos={position} TEXT token={token} cksum={:.0} logits_ck={:.0}",
+                    hidden_cksum(&hidden),
+                    hidden_cksum(prev_logits.as_ref().unwrap()),
+                );
+            }
             slots_left -= 1;
             if slots_left == 0 {
                 speaking = true;
@@ -387,8 +415,8 @@ pub fn omni_stream_step(
                 text_tokens.push(AUDIO_OUT_TOKEN);
                 let next_embed = get_audio_out_embeds(depth_cfg, depth_weights, &codes);
                 stream.position += 1;
-                decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
-                    .map_err(|e| format!("omni stream: audio step: {e}"))?;
+                stream.prev_logits = Some(decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
+                    .map_err(|e| format!("omni stream: audio step: {e}"))?);
                 stream.hidden = gpu.download_f32(&state.final_norm_buf)
                     .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
             }
@@ -408,10 +436,18 @@ pub fn omni_stream_step(
                     text_tokens.push(AUDIO_OUT_TOKEN);
                     let next_embed = get_audio_out_embeds(depth_cfg, depth_weights, &codes);
                     stream.position += 1;
-                    decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
-                        .map_err(|e| format!("omni stream: audio step: {e}"))?;
+                    stream.prev_logits = Some(decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
+                        .map_err(|e| format!("omni stream: audio step: {e}"))?);
                     stream.hidden = gpu.download_f32(&state.final_norm_buf)
                         .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
+                    if omni_debug() {
+                        eprintln!(
+                            "  [dbg-s] pos={} AUDIO frame={n_frames} cksum={:.0} logits_ck={:.0}",
+                            stream.position,
+                            hidden_cksum(&stream.hidden),
+                            hidden_cksum(stream.prev_logits.as_ref().unwrap()),
+                        );
+                    }
                     if !stream.text_done {
                         stream.slots_left -= 1;
                         if stream.slots_left == 0 {
@@ -435,6 +471,13 @@ pub fn omni_stream_step(
                             .map_err(|e| format!("omni stream: text_end step: {e}"))?);
                         stream.hidden = gpu.download_f32(&state.final_norm_buf)
                             .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
+                        if omni_debug() {
+                            eprintln!(
+                                "  [dbg-s] pos={} TEXT_END cksum={:.0}",
+                                stream.position,
+                                hidden_cksum(&stream.hidden)
+                            );
+                        }
                         continue;
                     }
                     if token == IM_END_TOKEN {
@@ -446,6 +489,14 @@ pub fn omni_stream_step(
                         .map_err(|e| format!("omni stream: text step: {e}"))?);
                     stream.hidden = gpu.download_f32(&state.final_norm_buf)
                         .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
+                    if omni_debug() {
+                        eprintln!(
+                            "  [dbg-s] pos={} TEXT token={token} cksum={:.0} logits_ck={:.0}",
+                            stream.position,
+                            hidden_cksum(&stream.hidden),
+                            hidden_cksum(stream.prev_logits.as_ref().unwrap()),
+                        );
+                    }
                     stream.slots_left -= 1;
                     if stream.slots_left == 0 {
                         stream.speaking = true;

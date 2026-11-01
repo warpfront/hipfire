@@ -19662,6 +19662,20 @@ fn generate_lfm3_audio(
 /// Triggered by `"tts": true` on an LFM3-Omni model (depth decoder present).
 /// The codec loads from `HIPFIRE_OMNI_CODEC_DIR` (the `audio_tokenizer/` dir).
 /// AUDIO mode only here; TEXT/INTERLEAVED + the eos refinement are open.
+/// Omni TTS seed: HIPFIRE_OMNI_SEED for reproducible runs (batch-vs-streaming
+/// equivalence testing), else time-based.
+fn omni_seed() -> u64 {
+    std::env::var("HIPFIRE_OMNI_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(42)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate_lfm3_omni(
     m: &mut LoadedModel,
@@ -19721,10 +19735,7 @@ fn generate_lfm3_omni(
     // ── Streaming TTS path: emit audio chunks as frames are generated ──
     if stream {
         let t0 = std::time::Instant::now();
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(42);
+        let seed = omni_seed();
         // Prefill once.
         let mut stream_state = {
             let bundle = match m.state.as_mut() {
@@ -19909,10 +19920,7 @@ fn generate_lfm3_omni(
             }
         };
         let depth_weights = m.lfm3_depth_weights.as_ref().unwrap();
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(42);
+        let seed = omni_seed();
         let mut rng = omni::DepthRng::new(seed);
         match omni::omni_generate(
             &bundle.config,
