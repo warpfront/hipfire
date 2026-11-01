@@ -2406,6 +2406,7 @@ fn main() {
                 let defer_prior_unload = load_tp > 1;
                 let max_seq = admission.max_seq;
                 let sequence_reason = admission.sequence_reason;
+                let legacy_measured = admission.legacy_measured;
                 // Exactly one legacy warning per admitted trunk; loader admitted
                 // path does not emit (daemon owns the boundary).
                 let pending_kv_diag = ResidentKvDiag::from_admission(
@@ -2520,6 +2521,8 @@ fn main() {
                         let seq_bound = resolved.map_or(
                             if requested_seq.is_some() {
                                 "user"
+                            } else if legacy_measured {
+                                "legacy-fit"
                             } else {
                                 "legacy"
                             },
