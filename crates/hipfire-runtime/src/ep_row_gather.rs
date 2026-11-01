@@ -57,12 +57,12 @@
 //! identical every step. The hazard argument above holds with "barrier" read
 //! as "boundary": a rank overwrites `buffer[b]` only after its next boundary,
 //! which every peer reaches only after its gather of `b`. The host keeps each
-//! rank's crossings in a ledger and [`EpRowGather::check_step`] proves the
-//! ranks crossed the same boundaries with no buffer rewritten while a peer
-//! reads it ([`railgun::mesh`]). A failure poisons every rank's waits
-//! ([`EpRowGather::abort`]); a waiter that stops (poison or the 500 ms
-//! deadline) leaves its code in the rank's wait block, which the rank's next
-//! download reports, failing the step. Epoch words are transport state: they
+//! rank's crossings in a ledger and [`EpRowGather::check_step`] proves every
+//! rank made the same exchange calls in the same order ([`railgun::mesh`]).
+//! A failure poisons every rank's waits ([`EpRowGather::abort`]); a waiter
+//! that stops (poison or the 500 ms deadline) leaves its code in the rank's
+//! wait block, which the rank's next download reports, so a peer timeout can
+//! surface one fanned-out call late. Epoch words are transport state: they
 //! are never part of a model snapshot, and they are freed only by `release`.
 //!
 //! # Band exchange (output-axis split, #862)
