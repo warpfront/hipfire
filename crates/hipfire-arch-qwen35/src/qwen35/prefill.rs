@@ -663,7 +663,18 @@ fn ordinary_prefill_static_ceiling(
     }
     let native_mq4 = native_mq4_widened_route(gpu, weights);
     let mq3 = mq3_wide_route(gpu, weights);
-    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !mq3 {
+    // Lloyd staged-i8 twin route (opt-in HIPFIRE_LLOYD_MMQ_A4=1, exact
+    // gfx1100): the twin SET consumes any N natively (descriptor bounds +
+    // tok<N masking, no padding) and the X128/BT arms cover every fallback
+    // shape, so the ceiling needs no N/K shape beyond the dense-27B gate
+    // above (all 27B K are K%256==0; per-launch gates fail closed).
+    let lloyd_twin_widened = gpu.arch.as_str() == "gfx1100"
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_A4")
+            .ok()
+            .as_deref()
+            == Some("1")
+        && dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd);
+    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !mq3 && !lloyd_twin_widened {
         return None;
     }
     // gfx1201 keeps all four FP8 projection routes for qt44; symmetric qt49
@@ -671,7 +682,8 @@ fn ordinary_prefill_static_ceiling(
     // gfx1100 A4 flag already implies the IU4 prefill gate. gfx11 substitutes
     // the existing IU4 K16 projection route; its full-attention layers remain
     // on Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
-    let projection_route_admitted = if native_mq4 || mq3 {
+    // The Lloyd twin is its own admitted projection route (same predicate).
+    let projection_route_admitted = if native_mq4 || mq3 || lloyd_twin_widened {
         true
     } else if gpu.arch == "gfx1201" {
         gpu.flags.gfx12_mq4v2_fp8_gateup
