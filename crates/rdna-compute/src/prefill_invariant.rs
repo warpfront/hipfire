@@ -310,7 +310,21 @@ pub(crate) fn route_rows_of(invariant: bool, cap: usize, rows: usize) -> usize {
 static QWEN4_WIDE_GROUPED_MOE: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_WIDE_GROUPED_MOE", false));
 
+/// `HIPFIRE_QWEN4_WIDE_GROUPED_DOWN` (developer, default off, `1` on, read once): on the
+/// grouped routed-MoE route, a 9..=`few_row_limit` verify runs the grouped,
+/// expert-unioned down (`gemm_mq4g128v2_moe_grouped_top10`) and the grouped combine
+/// instead of the per-slot indexed down. Takes effect only where the routed chain is
+/// grouped (`HIPFIRE_QWEN4_WIDE_GROUPED_MOE=1`).
+static QWEN4_WIDE_GROUPED_DOWN: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_WIDE_GROUPED_DOWN", false));
+
 impl Gpu {
+    /// See [`QWEN4_WIDE_GROUPED_DOWN`].
+    #[inline]
+    pub fn wide_grouped_down(&self) -> bool {
+        *QWEN4_WIDE_GROUPED_DOWN
+    }
+
     /// See [`QWEN4_WIDE_GROUPED_MOE`].
     #[inline]
     pub fn wide_grouped_moe(&self) -> bool {

@@ -2328,7 +2328,29 @@ fn activation_batch_extent(path2_done: bool, total_slots: usize, mi: usize) -> O
 /// faster.  Its per-slot dot is the grouped kernel's (bitwise), combined in
 /// slot order.
 fn indexed_down(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
-    use_path2 && gpu.route_rows(p.batch_size) <= gpu.few_row_limit() && !down_wmma(gpu, p)
+    indexed_down_for_rows(
+        use_path2,
+        gpu.route_rows(p.batch_size),
+        gpu.few_row_limit(),
+        gpu.wide_grouped_down(),
+        down_wmma(gpu, p),
+    )
+}
+
+/// `HIPFIRE_QWEN4_WIDE_GROUPED_DOWN` keeps the grouped, expert-unioned down (and the
+/// grouped combine) for the 9..=`few_row_limit` rows that would otherwise take the
+/// per-slot indexed down.
+fn indexed_down_for_rows(
+    use_path2: bool,
+    route: usize,
+    limit: usize,
+    wide_grouped_down: bool,
+    down_wmma: bool,
+) -> bool {
+    use_path2
+        && route <= limit
+        && !down_wmma
+        && !(wide_grouped_down && route > rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
 }
 
 /// Release the stage immediately after the routed down, before combine.
@@ -3912,6 +3934,20 @@ mod scratch_tests {
     const K_TOP: usize = 10;
     const N_EXP: usize = 512;
     const WORD: usize = 4;
+
+    #[test]
+    fn wide_grouped_down_only_changes_the_rows_above_eight() {
+        for limit in [8, 16, 32] {
+            for rows in 1..=40 {
+                let off = indexed_down_for_rows(true, rows, limit, false, false);
+                assert_eq!(off, rows <= limit);
+                let on = indexed_down_for_rows(true, rows, limit, true, false);
+                assert_eq!(on, rows <= limit.min(8));
+                assert!(!indexed_down_for_rows(false, rows, limit, true, false));
+                assert!(!indexed_down_for_rows(true, rows, limit, false, true));
+            }
+        }
+    }
 
     #[test]
     fn wide_grouped_moe_keeps_the_requested_grouped_route_at_every_row_count() {
