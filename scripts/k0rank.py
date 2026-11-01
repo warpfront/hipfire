@@ -401,6 +401,76 @@ def rh_provenance(rh):
                 x_miheat=rh["x_miheat"])
 
 
+POOL_ROWS = 32          # scores are reads per POOL_ROWS rows, as MS2's ranking scores
+POOL_SCALE = 10 ** 6    # counts are the rounded score x POOL_SCALE (u64, ordering preserved)
+
+
+def pool_scores(docs, weights):
+    """sum_i w_i * (c_i / rows_i) * POOL_ROWS, rows_i = sum(c_i) / (layers * top_k).
+
+    Each input is first turned into reads per row (a row = one token routed through every
+    layer), so inputs of different size and unit (K0 dump slots, MiHeat document tokens) weigh
+    by `weights` alone. This is the MS2 pooling recipe (`score = 0.5 * (miheat + k0)` on trunk
+    scores that were already `counts / rows * 32`).
+    """
+    first = docs[0]
+    out = [0.0] * len(first["counts"])
+    for doc, w in zip(docs, weights):
+        rows = sum(doc["counts"]) / (doc["layers"] * doc["top_k"])
+        if rows <= 0:
+            raise ValueError("an input has no slot reads")
+        for i, c in enumerate(doc["counts"]):
+            out[i] += w * c / rows * POOL_ROWS
+    return out
+
+
+def cmd_pool(args):
+    docs, weights, files = [], [], []
+    for spec in args.input:
+        path, sep, w = spec.rpartition(":")
+        if not sep or not w.replace(".", "", 1).isdigit():
+            path, w = spec, "1"
+        with open(path) as fh:
+            doc = json.load(fh)
+        validate_doc(doc)
+        docs.append(doc)
+        weights.append(float(w))
+        files.append(dict(file=path, sha256=sha256_file(path), weight=float(w),
+                          capture_tokens=doc["capture_tokens"], corpus=doc["corpus"],
+                          slot_reads=sum(doc["counts"]), counts_sha256=doc["counts_sha256"],
+                          provenance=read_sidecar(path)))
+    if len(docs) < 2:
+        raise SystemExit("pool needs at least two inputs")
+    bind = {k: docs[0][k] for k in BIND_KEYS}
+    for path, doc in zip(args.input, docs):
+        if {k: doc[k] for k in BIND_KEYS} != bind:
+            raise SystemExit(f"{path}: base binding differs from the first input's")
+    total_w = sum(weights)
+    weights = [w / total_w for w in weights]
+    for f, w in zip(files, weights):
+        f["weight"] = w
+    score = pool_scores(docs, weights)
+    counts = [int(s * POOL_SCALE + 0.5) for s in score]
+    corpus = args.corpus or ("pooled ranking: " + " + ".join(
+        f"{f['weight']:.3g} x [{f['corpus']}]" for f in files))
+    rule = (f"descending pooled score, ties by global id ascending; counts = round({POOL_SCALE} x "
+            f"sum_i w_i x reads_i / rows_i x {POOL_ROWS}), rows_i = slot reads_i / (layers x top_k), "
+            f"weights {[round(w, 6) for w in weights]}; global id = layer*experts_per_layer+expert"
+            + (f"; {args.label}" if args.label else ""))
+    emit(args, bind, bind["layers"], bind["top_k"], counts,
+         sum(d["capture_tokens"] for d in docs), corpus, rule,
+         dict(source_kind="pool", capture_label=args.label, pool_rows=POOL_ROWS,
+              pool_scale=POOL_SCALE, inputs=files))
+
+
+def read_sidecar(path):
+    side = path + ".provenance.json"
+    if not os.path.exists(side):
+        return None
+    with open(side) as fh:
+        return dict(json.load(fh), sidecar_sha256=sha256_file(side))
+
+
 def validate_doc(doc):
     """The same checks as HotsetSidecar::from_bytes (structure, permutation, ordering)."""
     if tuple(doc) != SCHEMA_KEYS:
@@ -537,8 +607,15 @@ def main(argv=None):
                    help="applies to manifest= held sources")
     c.add_argument("--per-rank-units", type=int, default=8448)
     c.add_argument("--layers-resident", type=int, default=33)
+    p = sub.add_parser("pool", help="equal-weight (or weighted) per-row-normalised pool of rankings")
+    p.add_argument("--input", action="append", required=True, metavar="FILE[:WEIGHT]",
+                   help="ranking files of the same base binding; weight defaults to 1")
+    p.add_argument("--out", required=True)
+    p.add_argument("--corpus")
+    p.add_argument("--label", default="")
     args = ap.parse_args(argv)
-    {"write": cmd_write, "validate": cmd_validate, "compare": cmd_compare}[args.cmd](args)
+    {"write": cmd_write, "validate": cmd_validate, "compare": cmd_compare,
+     "pool": cmd_pool}[args.cmd](args)
 
 
 if __name__ == "__main__":

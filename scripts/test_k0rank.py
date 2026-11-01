@@ -232,3 +232,45 @@ def test_static_hit_and_compare_on_route_hist(tmp_path, capsys):
     k0rank.main(["compare", "--ranking", str(ranking), "--held", f"route_hist={held_path}",
                  "--per-rank-units", "1", "--layers-resident", "1"])
     assert "| 58.33% | 50.00% |" in capsys.readouterr().out
+
+
+def make_ranking(tmp, name, counts):
+    out = tmp / f"{name}.expert-hotset"
+    k0rank.emit(
+        type("A", (), {"out": str(out)})(), dict(BIND), LAYERS, TOPK, counts, 7, "fixture " + name,
+        k0rank.RANKING_RULE, dict(source_kind="fixture"))
+    return str(out)
+
+
+def test_pool_normalises_each_input_to_reads_per_row(tmp_path, capsys):
+    # a: 2 layers x top_k 2 -> rows = sum / 4. b has 10x the reads of the same shape.
+    a = make_ranking(tmp_path, "a", [4, 0, 0, 0, 0, 0, 4, 0])      # rows 2: ids 0 and 6 at 2.0/row
+    b = make_ranking(tmp_path, "b", [0, 0, 0, 0, 0, 40, 0, 0])     # rows 10: id 5 at 4.0/row
+    out = tmp_path / "pool.expert-hotset"
+    k0rank.main(["pool", "--input", a, "--input", b, "--out", str(out), "--label", "unit test"])
+    doc = json.loads(out.read_text())
+    k0rank.validate_doc(doc)
+    s = k0rank.POOL_ROWS * k0rank.POOL_SCALE / 2          # weight 0.5
+    assert doc["counts"] == [round(2 * s), 0, 0, 0, 0, round(4 * s), round(2 * s), 0]
+    assert doc["rank"][:3] == [5, 0, 6]
+    assert doc["capture_tokens"] == 14
+    prov = json.loads((tmp_path / "pool.expert-hotset.provenance.json").read_text())
+    assert prov["source_kind"] == "pool" and [i["weight"] for i in prov["inputs"]] == [0.5, 0.5]
+    assert [i["sha256"] for i in prov["inputs"]] == [k0rank.sha256_file(a), k0rank.sha256_file(b)]
+
+
+def test_pool_weights_and_binding_checks(tmp_path):
+    a = make_ranking(tmp_path, "a", [4, 0, 0, 0, 0, 0, 4, 0])
+    b = make_ranking(tmp_path, "b", [0, 0, 0, 0, 0, 40, 0, 0])
+    out = tmp_path / "w.expert-hotset"
+    k0rank.main(["pool", "--input", f"{a}:3", "--input", f"{b}:1", "--out", str(out)])
+    doc = json.loads(out.read_text())
+    assert json.loads((tmp_path / "w.expert-hotset.provenance.json").read_text())["inputs"][0]["weight"] == 0.75
+    assert doc["rank"][:3] == [0, 6, 5]                   # 0.75 x 2 beats 0.25 x 4
+    other = json.loads(Path(b).read_text())
+    other["base_size"] += 1
+    Path(b).write_text(json.dumps(other))
+    with pytest.raises(SystemExit, match="binding differs"):
+        k0rank.main(["pool", "--input", a, "--input", b, "--out", str(out)])
+    with pytest.raises(SystemExit, match="at least two"):
+        k0rank.main(["pool", "--input", a, "--out", str(out)])
