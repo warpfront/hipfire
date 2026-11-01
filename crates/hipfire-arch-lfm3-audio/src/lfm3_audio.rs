@@ -752,6 +752,8 @@ pub struct AudioEncoderState {
     pub kv: KvCache,
     pub conv_states: Vec<GpuTensor>,
     pub pos_buf: hip_bridge::DeviceBuffer,
+    /// Absolute position counter (carries across chunks for streaming).
+    pub n_tokens: usize,
     pub h: GpuTensor,
     pub tmp: GpuTensor,
     pub fa_q: GpuTensor,
@@ -816,6 +818,7 @@ impl AudioEncoderState {
             kv,
             conv_states,
             pos_buf,
+            n_tokens: 0,
             h: alloc(gpu, hidden, "h")?,
             tmp: alloc(gpu, hidden, "tmp")?,
             fa_q: alloc(gpu, q_dim, "fa_q")?,
@@ -956,29 +959,31 @@ fn enc_attn_mixer(
 
 /// Run the 17-layer encoder over `tokens` (`[n_tokens, hidden]` host F32),
 /// returning `[n_tokens, hidden]` last_hidden_state (after embedding_norm).
+/// Uses the caller-provided `st` (which carries the KV cache + conv state +
+/// position across calls for streaming). The position starts at `st.n_tokens`
+/// and advances by `n_tokens`.
 pub fn encoder_forward(
     gpu: &mut Gpu,
     weights: &EncoderWeights,
     cfg: &EncoderConfig,
+    st: &mut AudioEncoderState,
     tokens: &[f32],
     n_tokens: usize,
 ) -> Result<Vec<f32>, String> {
     let hidden = cfg.hidden_size;
     let eps = cfg.norm_eps;
-    let max_seq = n_tokens.max(64);
-    let mut st = AudioEncoderState::new(gpu, cfg, max_seq)?;
-    st.reset(gpu)?;
+    let base = st.n_tokens; // absolute position offset (carries across chunks)
 
     let mut out = vec![0.0f32; n_tokens * hidden];
-    eprintln!("  LFM3-Audio encoder forward (GPU): {n_tokens} tokens, {} layers", cfg.num_hidden_layers);
 
-    for pos in 0..n_tokens as u32 {
+    for i in 0..n_tokens as u32 {
+        let pos = base as u32 + i;
         let seq_len = pos as usize + 1;
         gpu.hip.memcpy_htod(&st.pos_buf, &(pos as i32).to_ne_bytes())
             .map_err(|e| format!("lfm3-audio: htod pos: {e:?}"))?;
 
         // Input = downsampler token embedding (not a token-id lookup).
-        let embed = &tokens[pos as usize * hidden..(pos as usize + 1) * hidden];
+        let embed = &tokens[i as usize * hidden..(i as usize + 1) * hidden];
         let bytes: Vec<u8> = embed.iter().flat_map(|&f| f.to_le_bytes()).collect();
         gpu.hip.memcpy_htod(&st.h.buf, &bytes).map_err(|e| format!("lfm3-audio: htod embed: {e:?}"))?;
 
@@ -988,8 +993,8 @@ pub fn encoder_forward(
                 .map_err(|e| format!("lfm3-audio L{l}: operator rmsnorm: {e:?}"))?;
 
             match &layer.mixer {
-                EncMixer::Conv(c) => enc_conv_mixer(gpu, cfg, c, &st, l)?,
-                EncMixer::Attention(a) => enc_attn_mixer(gpu, cfg, a, &mut st, l, seq_len)?,
+                EncMixer::Conv(c) => enc_conv_mixer(gpu, cfg, c, st, l)?,
+                EncMixer::Attention(a) => enc_attn_mixer(gpu, cfg, a, st, l, seq_len)?,
             }
 
             // Residual (no sandwich norm in the audio encoder).
@@ -1010,10 +1015,10 @@ pub fn encoder_forward(
         gpu.rmsnorm_f32(&st.h, &weights.embedding_norm, &st.final_norm_buf, eps)
             .map_err(|e| format!("lfm3-audio: final rmsnorm: {e:?}"))?;
         let h = gpu.download_f32(&st.final_norm_buf).map_err(|e| format!("lfm3-audio: download hidden: {e:?}"))?;
-        out[pos as usize * hidden..(pos as usize + 1) * hidden].copy_from_slice(&h);
+        out[i as usize * hidden..(i as usize + 1) * hidden].copy_from_slice(&h);
     }
 
-    st.free_gpu(gpu);
+    st.n_tokens = base + n_tokens; // advance the absolute position
     Ok(out)
 }
 
@@ -1075,14 +1080,96 @@ pub fn audio_forward(
     let n_tokens = tokens.len() / cfg.enc.hidden_size;
 
     // 2. GPU encoder: [n_tokens, 768] → last_hidden_state [n_tokens, 768].
-    let enc_out = encoder_forward(gpu, &weights.encoder, &cfg.enc, &tokens, n_tokens)
-        .map_err(|e| HipError::new(999, &e))?;
+    let enc_out = {
+        let max_seq = n_tokens.max(64);
+        let mut st = AudioEncoderState::new(gpu, &cfg.enc, max_seq)
+            .map_err(|e| HipError::new(999, &format!("lfm3-audio: encoder state: {e}")))?;
+        st.reset(gpu).map_err(|e| HipError::new(999, &e))?;
+        let out = encoder_forward(gpu, &weights.encoder, &cfg.enc, &mut st, &tokens, n_tokens)
+            .map_err(|e| HipError::new(999, &e))?;
+        st.free_gpu(gpu);
+        out
+    };
 
     // 3. GPU projector: [n_tokens, 768] → [n_tokens, 2048] (text-hidden audio tokens).
     let proj = projector_forward(gpu, &weights.projector, &cfg.proj, &enc_out, n_tokens)
         .map_err(|e| HipError::new(999, &e))?;
 
     eprintln!("  LFM3-Audio forward done: {n_tokens} audio tokens x {} dims", cfg.proj.out_features);
+    Ok(proj)
+}
+
+// ─── Streaming ASR (Phase 4d) ────────────────────────────────────────────────
+
+/// Streaming ASR state: carries the encoder LFM2 KV cache + conv state +
+/// position across audio chunks. Mirrors HF `Lfm3OmniEncoderStreamingCache`
+/// (the Phase 3 deferred item) — enables `transcribe_live` (live
+/// transcription) and chunked `prefill_audio` (audio tokens appended to the
+/// LM cache as chunks complete).
+pub struct AudioEncoderStreamingCache {
+    pub state: AudioEncoderState,
+    /// Config (needed per-chunk for the mel + downsampler shapes).
+    pub mel_n_mels: usize,
+    pub enc_hidden: usize,
+}
+
+impl AudioEncoderStreamingCache {
+    pub fn new(gpu: &mut Gpu, cfg: &AudioConfig, max_tokens: usize) -> Result<Self, String> {
+        let mut state = AudioEncoderState::new(gpu, &cfg.enc, max_tokens.max(64))?;
+        state.reset(gpu)?;
+        Ok(Self {
+            state,
+            mel_n_mels: cfg.mel.n_mels,
+            enc_hidden: cfg.enc.hidden_size,
+        })
+    }
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.state.free_gpu(gpu);
+    }
+}
+
+/// Streaming audio forward: process one audio chunk (mono F32 @ 16 kHz),
+/// carrying the encoder state across chunks. Returns the projected audio
+/// tokens `[n_tokens, 2048]` for the COMPLETE tokens in this chunk (the
+/// downsampler groups 8 mel frames per token; an incomplete trailing group is
+/// dropped — pass the next chunk to continue). The mel is computed per chunk
+/// (`center=False`), so the chunk-boundary frames differ slightly from a
+/// global mel — audio chunks should be ≥ ~1 s to keep that error small.
+///
+/// Ground truth: HF `Lfm3OmniForConditionalGeneration.prefill_audio` /
+/// `transcribe_live` (streaming ASR).
+pub fn audio_forward_streaming(
+    gpu: &mut Gpu,
+    weights: &AudioWeights,
+    cfg: &AudioConfig,
+    cache: &mut AudioEncoderStreamingCache,
+    audio_chunk: &[f32],
+) -> HipResult<Vec<f32>> {
+    let n_mels = cfg.mel.n_mels;
+    // 1. CPU mel per chunk (center=False; partial trailing frames dropped).
+    let mel = crate::mel::log_mel_spectrogram(audio_chunk, &cfg.mel);
+    let num_frames = mel.len() / n_mels;
+
+    // 2. CPU downsampler: complete 8-mel-frame groups only.
+    let complete_frames = num_frames - (num_frames % 8);
+    if complete_frames == 0 {
+        return Ok(Vec::new());
+    }
+    let mel_complete = &mel[..complete_frames * n_mels];
+    let tokens = downsampler_forward(mel_complete, n_mels, complete_frames, &weights.downsampler);
+    let n_tokens = tokens.len() / cfg.enc.hidden_size;
+    if n_tokens == 0 {
+        return Ok(Vec::new());
+    }
+
+    // 3. GPU encoder forward (persistent state — position carries).
+    let enc_out = encoder_forward(gpu, &weights.encoder, &cfg.enc, &mut cache.state, &tokens, n_tokens)
+        .map_err(|e| HipError::new(999, &e))?;
+
+    // 4. GPU projector.
+    let proj = projector_forward(gpu, &weights.projector, &cfg.proj, &enc_out, n_tokens)
+        .map_err(|e| HipError::new(999, &e))?;
+
     Ok(proj)
 }
 
