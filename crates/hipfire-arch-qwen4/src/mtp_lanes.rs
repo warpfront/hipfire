@@ -913,7 +913,8 @@ mod tests {
     #[test]
     fn rank_accept_follows_the_admitted_eos_rule() {
         use super::LaneEos;
-        use crate::mtp_spec::{accept_greedy_prefix, accept_native_greedy};
+        use crate::mtp_spec::accept_native_greedy;
+        use hipfire_runtime::spec::accept_greedy_prefix;
         const MODEL_EOS: u32 = 248044;
         let drafts = [248044, 248045];
         let picks = [248044, 248045, 198];
