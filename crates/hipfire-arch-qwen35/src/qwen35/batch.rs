@@ -1922,6 +1922,7 @@ pub fn forward_decode_batch_prepared(
         },
         DflashFusionCtx::Off,
         None, // commit_stride: independent lanes keep legacy cadence
+        None, // extract_hidden: independent lanes do not seed a draft context
     )?;
 
     let logits = state.logits.sub_offset(0, n * config.vocab_size);

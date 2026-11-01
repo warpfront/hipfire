@@ -1129,6 +1129,30 @@ pub(crate) fn shared_down(
     {
         return Ok(());
     }
+    // Decode-width MQ4V2: one x-batch residual GEMV folds sigmoid(gate)*down
+    // into the residual. The incumbent is a temp GEMM plus
+    // `sigmoid_scaled_residual_add_batched_f32` (40 extra launches on a
+    // 4-slot retained tape). gfx1100 has no IU4 epilogue for n<=8; other
+    // arches keep the incumbent so their decode bytes stay unchanged.
+    if down.dtype == DType::MQ4G256V2
+        && gpu.arch_caps.is_gfx1100()
+        && hidden.dtype == DType::F32
+        && !p.recipe.bf16_round_trip()
+        && p.shared_down_out.is_none()
+        && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&p.batch_size)
+        && down.k.is_multiple_of(256)
+        && down.m == p.down_m
+    {
+        return hip(gpu.gemv_mq4g256v2_xbatch_residual_sigmoid(
+            down.buf,
+            &hidden,
+            target,
+            shared.scalar,
+            down.m,
+            down.k,
+            p.batch_size,
+        ));
+    }
     let out = f32_view(
         p.shared_down_out.unwrap_or(p.down_expanded),
         0,

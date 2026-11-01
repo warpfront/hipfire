@@ -132,6 +132,10 @@ pub struct SlotLoadParams {
     /// Display name of the tier the engine will run, for the loaded ACK and
     /// kv_mode diag.
     pub kv_mode_resolved: &'static str,
+    /// Shared `PagePool` for the multi-slot engine (auto-sized when pages=0).
+    pub multi_slot_paged: bool,
+    pub multi_slot_paged_pages: usize,
+    pub multi_slot_paged_backend: String,
     pub dflash_draft: Option<PathBuf>,
     pub dflash_required: bool,
     /// Optional `params.max_batch_tokens` override. When present it wins over
@@ -214,6 +218,17 @@ impl SlotLoadParams {
             kv_mode_raw,
             kv_backend,
             kv_mode_resolved,
+            multi_slot_paged: param("multi_slot_paged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            multi_slot_paged_pages: param("multi_slot_paged_pages")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(0),
+            multi_slot_paged_backend: param("multi_slot_paged_backend")
+                .and_then(|v| v.as_str())
+                .unwrap_or("arena")
+                .to_string(),
             dflash_draft,
             dflash_required: dflash_mode == "on",
             max_batch_tokens: param("max_batch_tokens")
@@ -538,6 +553,9 @@ impl SlotBackend {
         mtp_mode: hipfire_config::MtpMode,
         kv_mode_raw: &str,
         kv_backend: &str,
+        multi_slot_paged: bool,
+        multi_slot_paged_pages: usize,
+        multi_slot_paged_backend: &str,
         dflash_draft: Option<PathBuf>,
         dflash_required: bool,
         vision_mode: &str,
@@ -695,6 +713,9 @@ impl SlotBackend {
                 vision_mode: vision_mode.to_string(),
                 kv_mode_raw: kv_mode_raw.to_string(),
                 kv_backend: kv_backend.to_string(),
+                multi_slot_paged,
+                multi_slot_paged_pages,
+                multi_slot_paged_backend: multi_slot_paged_backend.to_string(),
                 prefix_cache,
                 prefix_cache_max_bytes,
                 max_batch_tokens,
@@ -1332,7 +1353,7 @@ impl SlotBackend {
             .find(|message| message.role == Role::User)
             .expect("projection requires a user message");
 
-        let slot_image = match extract_slot_image(msg) {
+        let slot_images = match extract_slot_images(msg) {
             Ok(image) => image,
             Err(reason) => {
                 hipfire_engine::emit::emit_active_attempt_error(
@@ -1347,7 +1368,7 @@ impl SlotBackend {
                 return Ok(());
             }
         };
-        if slot_image.is_some() && !self.is_vl() {
+        if !slot_images.is_empty() && !self.is_vl() {
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -1361,7 +1382,7 @@ impl SlotBackend {
         }
 
         let mut visual_data = None;
-        let (prompt_tokens, prefix) = if let Some(image) = slot_image {
+        let (prompt_tokens, prefix) = if !slot_images.is_empty() {
             // The projected message view carries the system text; fall back to
             // the top-level `system` field for prompt-only requests.
             let system = messages
@@ -1369,7 +1390,13 @@ impl SlotBackend {
                 .find(|m| m.role == Role::System)
                 .map(|m| m.content.as_str())
                 .or_else(|| msg.get("system").and_then(|v| v.as_str()));
-            match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix) {
+            match build_slot_vl_prompt(
+                self,
+                &slot_images,
+                system,
+                &last_user.content,
+                expected_prefix,
+            ) {
                 Ok((tokens, vd)) => {
                     // The VL builder frames the assistant turn itself from
                     // `expected_prefix`, so that is authoritative here.
@@ -1519,17 +1546,19 @@ impl SlotBackend {
         // schema was already compiled and validated in validate_generate_caps;
         // here we extract the raw schema Value to pass to the engine, which
         // recompiles it into a per-request SchemaMatcher on admit.
-        let json_schema = msg
+        let json_schema = match msg
             .get("response_format")
             .and_then(|v| v.get("type"))
             .and_then(|v| v.as_str())
-            .filter(|&t| t == "json_schema")
-            .and_then(|_| {
-                msg.get("response_format")
-                    .and_then(|v| v.get("json_schema"))
-                    .and_then(|v| v.get("schema"))
-                    .cloned()
-            });
+        {
+            Some("json_schema") => msg
+                .get("response_format")
+                .and_then(|v| v.get("json_schema"))
+                .and_then(|v| v.get("schema"))
+                .cloned(),
+            Some("json_object") => Some(serde_json::json!({ "type": "object" })),
+            _ => None,
+        };
         let continuation = if visual_data.is_some() {
             Continuation::Cold
         } else if let Some(claim) = tool_claim {
@@ -1587,6 +1616,13 @@ impl SlotBackend {
             presence_penalty,
             frequency_penalty,
             min_p,
+            logprobs_top_k: (msg.get("logprobs").and_then(|v| v.as_bool()) == Some(true)).then(
+                || {
+                    msg.get("top_logprobs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize
+                },
+            ),
             visual_data,
             json_schema,
             started_in_think,
@@ -1638,13 +1674,17 @@ impl SlotBackend {
         } else {
             ThinkMode::NonThink
         };
+        // `validate_generate_caps` already rejected a malformed field; this is
+        // the validated request-local list the streaming matcher consumes.
+        let stop =
+            hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")).unwrap_or_default();
         let mut emitter = Qwen35Emit::from_ctx(SpecEmitCtx {
             tokenizer: &self.tokenizer,
             eos: self.tokenizer.eos_id,
             im_end: self.tokenizer.special_token_id("<|im_end|>"),
             tools,
             enable_grammar: self.tool_grammar,
-            stop: Vec::new(),
+            stop,
             max_think: 0,
             max_tokens,
             assistant_prefix: prefix,
@@ -1652,10 +1692,39 @@ impl SlotBackend {
             decoded_vocab: None,
         });
         let render_events =
-            |events: Vec<ClientEvent>, stdout: &mut W, tool_calls: &mut Vec<ToolCall>| {
+            |events: Vec<ClientEvent>,
+             stdout: &mut W,
+             tool_calls: &mut Vec<ToolCall>,
+             logprob: &Option<(f32, Vec<(u32, f32)>)>,
+             tokenizer: &hipfire_runtime::tokenizer::Tokenizer| {
                 for event in events {
                     match event {
-                        ClientEvent::Token(text) => emit_visible_token(stdout, id, &text),
+                        ClientEvent::Token(text) => {
+                            if let Some((lp, top)) = logprob {
+                                let top_json: Vec<serde_json::Value> = top
+                                    .iter()
+                                    .map(|(tok_id, tok_lp)| {
+                                        serde_json::json!({
+                                            "token": tokenizer.decode(&[*tok_id]),
+                                            "logprob": tok_lp,
+                                            "bytes": tokenizer.decode_bytes(&[*tok_id]),
+                                        })
+                                    })
+                                    .collect();
+                                let envelope = serde_json::json!({
+                                    "type": "token",
+                                    "id": id,
+                                    "text": text,
+                                    "logprob": lp,
+                                    "top_logprobs": top_json,
+                                    "attempt_id": hipfire_engine::terminal::active_attempt_id(),
+                                });
+                                let _ = writeln!(stdout, "{}", envelope);
+                                let _ = stdout.flush();
+                            } else {
+                                emit_visible_token(stdout, id, &text);
+                            }
+                        }
                         ClientEvent::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
                         ClientEvent::Committed { .. } => {}
                         ClientEvent::ToolCalls(mut calls) => tool_calls.append(&mut calls),
@@ -1666,6 +1735,7 @@ impl SlotBackend {
         let mut first_token = true;
 
         let mut done_reason: Option<(DoneReason, usize)> = None;
+        let mut stop_matched = false;
         let mut rejected: Option<(hipfire_runtime::serve::RejectClass, String)> = None;
         // Set when the engine channel dropped without a terminal event —
         // the engine thread died (panic/GPU fault). Must NOT be reported as
@@ -1722,15 +1792,40 @@ impl SlotBackend {
                         accepted_ticket = Some(ticket);
                         let _ = batch_bind_active(id, attempt_id, admission, ticket);
                     }
-                    Event::Token { id: tok_id } => {
+                    Event::Token {
+                        id: tok_id,
+                        logprob,
+                        top_logprobs,
+                    } => {
                         let outcome = if first_token {
                             first_token = false;
                             emitter.begin(tok_id)
                         } else {
                             emitter.observe(tok_id)
                         };
-                        render_events(outcome.events, stdout, &mut terminal_tool_calls);
+                        let lp = logprob.map(|lp| (lp, top_logprobs.unwrap_or_default()));
+                        render_events(
+                            outcome.events,
+                            stdout,
+                            &mut terminal_tool_calls,
+                            &lp,
+                            &self.tokenizer,
+                        );
                         produced += 1;
+                        // A user stop matched in this token's visible text.
+                        // The matcher has already withheld the stop bytes;
+                        // end the turn as `stop` and close the session (the
+                        // KV now holds unrendered text past the stop, so a
+                        // later turn must cold-reprefill rather than extend
+                        // a history the client never saw).
+                        if matches!(
+                            outcome.stop,
+                            Some(hipfire_runtime::spec::StopReason::StopSequence)
+                        ) {
+                            stop_matched = true;
+                            done_reason = Some((DoneReason::Eos, produced));
+                            break;
+                        }
                     }
                     Event::Done { reason, generated } => {
                         done_reason = Some((reason, generated));
@@ -1780,18 +1875,18 @@ impl SlotBackend {
             } else if let Some(session) = claimed_session {
                 self.close_session(session);
             }
-            let kind = match class {
-                hipfire_runtime::serve::RejectClass::Overload => "overload",
-                hipfire_runtime::serve::RejectClass::Validation => "validation",
-                hipfire_runtime::serve::RejectClass::Internal => "internal",
-                hipfire_runtime::serve::RejectClass::Cancel => "cancel",
+            let (kind, retryable) = match class {
+                hipfire_runtime::serve::RejectClass::Overload => ("overload", true),
+                hipfire_runtime::serve::RejectClass::Validation => ("validation", false),
+                hipfire_runtime::serve::RejectClass::Internal => ("internal", false),
+                hipfire_runtime::serve::RejectClass::Cancel => ("cancel", false),
             };
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
                 &format!("multi_slot rejected: {reason}"),
                 kind,
-                false,
+                retryable,
                 false,
             );
             let _ = stdout.flush();
@@ -1812,8 +1907,24 @@ impl SlotBackend {
             let _ = stdout.flush();
             return Ok(());
         }
+        // A matched stop is terminal: release the session now (the engine
+        // cancels the in-flight request and frees the slot) so the client's
+        // next turn cannot extend KV past text that was never emitted.
+        if stop_matched {
+            if let Some(session) = accepted_session.take() {
+                self.close_session(session);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
+            }
+        }
         let summary = emitter.finish();
-        render_events(summary.events, stdout, &mut terminal_tool_calls);
+        render_events(
+            summary.events,
+            stdout,
+            &mut terminal_tool_calls,
+            &None,
+            &self.tokenizer,
+        );
         // Multi-slot keeps failing closed on an unfinished tool call at any
         // exit, under its previous `malformed_protocol` label.
         let unsafe_reason = match summary.finish_reason {
@@ -2330,12 +2441,26 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
         .filter(|v| !v.is_empty())
     {
         match v.parse::<KvBackend>() {
+            // Arena route: the fixed `SlotPool` slabs.
             Ok(KvBackend::Legacy) => {}
-            Ok(_) => {
-                return Some(
-                    "experimental multi-slot uses fixed slot arenas and requires kv_backend=legacy"
-                        .to_string(),
+            // VMM on this engine is the shared q8 page pool
+            // (`serve.multi_slot_paged_backend=vmm`), not a per-slot owner.
+            // That pool has no fp8 kernels.
+            Ok(KvBackend::Vmm) => {
+                let raw = params
+                    .and_then(|p| p.get("kv_mode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tier_ok = matches!(
+                    hipfire_runtime::kv_mode::resolve_qwen35_slots(raw, gpu_arch),
+                    Ok(r) if r.warning.is_none()
+                        && matches!(r.mode, hipfire_runtime::kv_mode::KvMode::Q8)
                 );
+                if !tier_ok {
+                    return Some(format!(
+                        "multi-slot kv_backend=vmm is the shared VMM page pool and supports kv_mode=q8 only; got kv_mode={raw:?}"
+                    ));
+                }
             }
             Err(e) => return Some(e.to_string()),
         }
@@ -2473,22 +2598,31 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
             "images and tools together are not supported in experimental multi-slot".to_string(),
         );
     }
-    // `stop` is unsupported, but an EMPTY stop (`[]` or `""`) is
-    // semantically neutral — OpenAI-legal and a no-op. Refusing it 400s a
-    // request that asks for nothing. Only a non-empty stop is refused.
-    let stop_nonempty = match msg.get("stop") {
-        None | Some(serde_json::Value::Null) => false,
-        Some(serde_json::Value::Array(a)) => !a.is_empty(),
-        Some(serde_json::Value::String(s)) => !s.is_empty(),
-        Some(_) => true,
-    };
-    if stop_nonempty {
-        return Some("custom stop not supported in experimental multi-slot".to_string());
+    // Stop sequences are honoured by the slot emitter's streaming matcher;
+    // validate the wire shape here (string / array, count and character caps)
+    // so a malformed field is a 400, not a silently dropped constraint.
+    if let Err(e) = hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")) {
+        return Some(e);
     }
-    if msg.get("logprobs").and_then(|v| v.as_bool()) == Some(true)
-        || msg.get("top_logprobs").is_some_and(|v| !v.is_null())
-    {
-        return Some("logprobs not supported in experimental multi-slot".to_string());
+    // logprobs/top_logprobs are supported on the slot path: the engine
+    // forces AR and attaches per-token log-probabilities. Validate the
+    // OpenAI contract here; malformed values remain 400s.
+    if let Some(v) = msg.get("logprobs") {
+        if !v.is_boolean() {
+            return Some("logprobs must be a boolean".to_string());
+        }
+    }
+    if let Some(v) = msg.get("top_logprobs").filter(|v| !v.is_null()) {
+        let n = match v.as_u64() {
+            Some(n) => n,
+            None => return Some("top_logprobs must be an integer between 0 and 20".to_string()),
+        };
+        if msg.get("logprobs").and_then(|v| v.as_bool()) != Some(true) {
+            return Some("top_logprobs requires logprobs to be true".to_string());
+        }
+        if n > 20 {
+            return Some("top_logprobs must be an integer between 0 and 20".to_string());
+        }
     }
     // response_format: the ONLY supported type is json_schema (spec §7.1:
     // "reject missing requested semantics. An optimization bypass is
@@ -2500,6 +2634,17 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str());
     match rf_type {
         None => {}
+        Some("json_object") => {
+            // Permissive JSON mode is enforced as the unconstrained object
+            // schema; the gateway forwards it as json_schema, and a direct
+            // daemon caller gets the same compiled mask.
+            let schema = serde_json::json!({ "type": "object" });
+            if let Err(e) =
+                saddle_core::grammar::json::json_schema::CompiledSchema::compile(&schema)
+            {
+                return Some(format!("response_format json_object: {e}"));
+            }
+        }
         Some("json_schema") => {
             // Compile the schema with the saddle-core JSON Schema subset
             // compiler (spec §7 G1). Unsupported keywords, refs, regex,
@@ -2978,6 +3123,10 @@ pub fn build_convo_from_messages(messages: &[Message]) -> Vec<u64> {
 
 /// Encoded base64 cap matching the sequential daemon (~40 MiB → ~30 MiB raw).
 const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
+/// Hard cap on images per request. Each image is a tower pass; more than a
+/// handful is outside the serving contract and multiplies VRAM for the
+/// per-image patch tensors.
+const MAX_IMAGES_PER_REQUEST: usize = 8;
 
 #[derive(Debug)]
 enum SlotImage {
@@ -2985,7 +3134,42 @@ enum SlotImage {
     Base64(String),
 }
 
-fn extract_slot_image(msg: &serde_json::Value) -> Result<Option<SlotImage>, String> {
+fn validate_slot_image_payload(which: &str, b64: &str) -> Result<SlotImage, String> {
+    if b64.len() > MAX_BASE64_ENCODED_LEN {
+        return Err(format!(
+            "{which} payload exceeds maximum encoded size ({} bytes)",
+            MAX_BASE64_ENCODED_LEN
+        ));
+    }
+    if b64.is_empty() {
+        return Err(format!("{which} is empty"));
+    }
+    Ok(SlotImage::Base64(b64.to_string()))
+}
+
+fn extract_slot_images(msg: &serde_json::Value) -> Result<Vec<SlotImage>, String> {
+    // OpenAI-style multi-image array (the CLI forwards one entry per
+    // image_url content part, in request order).
+    if let Some(items) = msg.get("images_base64") {
+        let items = items
+            .as_array()
+            .ok_or_else(|| "images_base64 must be an array of base64 strings".to_string())?;
+        if items.len() > MAX_IMAGES_PER_REQUEST {
+            return Err(format!(
+                "at most {MAX_IMAGES_PER_REQUEST} images are supported per request"
+            ));
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let b64 = item
+                .as_str()
+                .ok_or_else(|| format!("images_base64[{i}] must be a base64 string"))?;
+            out.push(validate_slot_image_payload("image", b64)?);
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
     let image = msg.get("image").and_then(|v| v.as_str());
     let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
     let image_url = msg.get("image_url").and_then(|v| v.as_str());
@@ -2993,16 +3177,10 @@ fn extract_slot_image(msg: &serde_json::Value) -> Result<Option<SlotImage>, Stri
         eprintln!("[daemon/vl] both image and image_base64 provided — using image_base64");
     }
     if let Some(b64) = image_base64 {
-        if b64.len() > MAX_BASE64_ENCODED_LEN {
-            return Err(format!(
-                "image payload exceeds maximum encoded size ({} bytes)",
-                MAX_BASE64_ENCODED_LEN
-            ));
-        }
-        return Ok(Some(SlotImage::Base64(b64.to_string())));
+        return Ok(vec![validate_slot_image_payload("image", b64)?]);
     }
     if let Some(path) = image {
-        return Ok(Some(SlotImage::Path(path.to_string())));
+        return Ok(vec![SlotImage::Path(path.to_string())]);
     }
     if let Some(url) = image_url {
         // Only data-URLs are meaningful here (the CLI validates and forwards
@@ -3025,67 +3203,82 @@ fn extract_slot_image(msg: &serde_json::Value) -> Result<Option<SlotImage>, Stri
                     .to_string(),
             );
         }
-        return Ok(Some(SlotImage::Base64(url.to_string())));
+        return Ok(vec![validate_slot_image_payload("image", url)?]);
     }
-    Ok(None)
+    Ok(Vec::new())
 }
 
 fn splice_vl_user_body(
     vision_start_id: u32,
     image_pad_id: u32,
     vision_end_id: u32,
-    n_visual_tokens: usize,
+    images: &[(usize, usize, usize)],
     nl: &[u32],
     q_tokens: &[u32],
 ) -> Vec<u32> {
-    let mut user_body = Vec::with_capacity(n_visual_tokens + q_tokens.len() + nl.len() + 2);
-    user_body.push(vision_start_id);
-    user_body.extend(std::iter::repeat(image_pad_id).take(n_visual_tokens));
-    user_body.push(vision_end_id);
-    user_body.extend_from_slice(nl);
+    let total_visual: usize = images.iter().map(|&(_, _, n)| n).sum();
+    let mut user_body =
+        Vec::with_capacity(total_visual + images.len() * (nl.len() + 2) + q_tokens.len());
+    for &(_, _, n_visual_tokens) in images {
+        user_body.push(vision_start_id);
+        user_body.extend(std::iter::repeat(image_pad_id).take(n_visual_tokens));
+        user_body.push(vision_end_id);
+        user_body.extend_from_slice(nl);
+    }
     user_body.extend_from_slice(q_tokens);
     user_body
 }
 
+/// Build the 3D M-RoPE table for one or more image spans. `images` carries
+/// `(grid_h, grid_w, n_visual_tokens)` in prompt order; the prompt's
+/// `<|image_pad|>` runs must match that order and shape exactly.
 fn build_slot_mrope(
     prompt_ids: &[u32],
     image_pad_id: u32,
-    n_visual: usize,
-    grid_h: usize,
-    grid_w: usize,
+    images: &[(usize, usize, usize)],
     spatial_merge_size: usize,
 ) -> Result<(Vec<[i32; 3]>, i32), String> {
-    if n_visual == 0 || spatial_merge_size == 0 {
+    if images.is_empty() || spatial_merge_size == 0 {
         return Err("VL request has no visual tokens".to_string());
     }
-    let start = prompt_ids
-        .iter()
-        .position(|&t| t == image_pad_id)
-        .ok_or_else(|| "no <|image_pad|> in the prompt despite n_visual > 0".to_string())?;
-    if start + n_visual > prompt_ids.len() {
-        return Err("image span runs past the prompt".to_string());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < prompt_ids.len() {
+        if prompt_ids[i] != image_pad_id {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < prompt_ids.len() && prompt_ids[i] == image_pad_id {
+            i += 1;
+        }
+        runs.push((start, i - start));
     }
-    if !prompt_ids[start..start + n_visual]
-        .iter()
-        .all(|&t| t == image_pad_id)
-    {
-        return Err("image-pad run is not contiguous".to_string());
-    }
-    if prompt_ids[start + n_visual..].contains(&image_pad_id) {
-        return Err("more than one image-pad run (multi-image not wired)".to_string());
-    }
-    let merged = (grid_h / spatial_merge_size) * (grid_w / spatial_merge_size);
-    if merged != n_visual {
+    if runs.len() != images.len() {
         return Err(format!(
-            "merged grid {merged} != spliced visual tokens {n_visual}"
+            "{} image-pad run(s) for {} image(s)",
+            runs.len(),
+            images.len()
         ));
     }
-    let spans = [hipfire_arch_qwen35_vl::mrope::ImageSpan {
-        start,
-        len: n_visual,
-        grid_h,
-        grid_w,
-    }];
+    let mut spans = Vec::with_capacity(images.len());
+    for ((start, len), &(grid_h, grid_w, n_visual)) in runs.iter().zip(images) {
+        if *len != n_visual {
+            return Err(format!("image-pad run {len} != visual tokens {n_visual}"));
+        }
+        let merged = (grid_h / spatial_merge_size) * (grid_w / spatial_merge_size);
+        if merged != n_visual {
+            return Err(format!(
+                "merged grid {merged} != spliced visual tokens {n_visual}"
+            ));
+        }
+        spans.push(hipfire_arch_qwen35_vl::mrope::ImageSpan {
+            start: *start,
+            len: *len,
+            grid_h,
+            grid_w,
+        });
+    }
     let built = hipfire_arch_qwen35_vl::mrope::build_mrope_positions(
         prompt_ids.len(),
         &spans,
@@ -3117,11 +3310,14 @@ fn decode_image_base64(b64: &str) -> Result<Vec<u8>, String> {
 
 fn build_slot_vl_prompt(
     backend: &SlotBackend,
-    image: &SlotImage,
+    images: &[SlotImage],
     system: Option<&str>,
     prompt: &str,
     assistant_prefix: AssistantPrefix,
 ) -> Result<(Vec<u32>, VisualData), String> {
+    if images.is_empty() {
+        return Err("VL request has no images".to_string());
+    }
     let vc = backend
         .vision_config
         .as_ref()
@@ -3137,28 +3333,46 @@ fn build_slot_vl_prompt(
         .special_token_id("<|vision_end|>")
         .ok_or_else(|| "VL tokenizer missing <|vision_end|>".to_string())?;
 
-    let (pixels, img_h, img_w) = match image {
-        SlotImage::Path(path) => hipfire_arch_qwen35_vl::image::load_and_preprocess(
-            std::path::Path::new(path),
-            vc.patch_size,
-            vc.spatial_merge_size,
-        )?,
-        SlotImage::Base64(b64) => {
-            let bytes = decode_image_base64(b64)?;
-            hipfire_arch_qwen35_vl::image::load_and_preprocess_from_bytes(
-                &bytes,
+    let mut prepared = Vec::with_capacity(images.len());
+    for image in images {
+        let (pixels, img_h, img_w) = match image {
+            SlotImage::Path(path) => hipfire_arch_qwen35_vl::image::load_and_preprocess(
+                std::path::Path::new(path),
                 vc.patch_size,
                 vc.spatial_merge_size,
-            )?
+            )?,
+            SlotImage::Base64(b64) => {
+                let bytes = decode_image_base64(b64)?;
+                hipfire_arch_qwen35_vl::image::load_and_preprocess_from_bytes(
+                    &bytes,
+                    vc.patch_size,
+                    vc.spatial_merge_size,
+                )?
+            }
+        };
+        let grid_h = img_h / vc.patch_size;
+        let grid_w = img_w / vc.patch_size;
+        let n_patches = grid_h * grid_w;
+        let n_visual_tokens = n_patches / (vc.spatial_merge_size * vc.spatial_merge_size);
+        if n_visual_tokens == 0 {
+            return Err("image produced no visual tokens".to_string());
         }
-    };
-    let grid_h = img_h / vc.patch_size;
-    let grid_w = img_w / vc.patch_size;
-    let n_patches = grid_h * grid_w;
-    let n_visual_tokens = n_patches / (vc.spatial_merge_size * vc.spatial_merge_size);
-    if n_visual_tokens == 0 {
-        return Err("image produced no visual tokens".to_string());
+        let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+            &pixels,
+            3,
+            img_h,
+            img_w,
+            vc.patch_size,
+            vc.temporal_patch_size,
+            vc.spatial_merge_size,
+        );
+        prepared.push((patches, grid_h, grid_w, n_visual_tokens));
     }
+    let shapes: Vec<(usize, usize, usize)> = prepared
+        .iter()
+        .map(|&(_, grid_h, grid_w, n)| (grid_h, grid_w, n))
+        .collect();
+    let total_visual: usize = shapes.iter().map(|&(_, _, n)| n).sum();
 
     let nl = tokenizer.encode("\n");
     let q_tokens = tokenizer.encode(prompt);
@@ -3166,7 +3380,7 @@ fn build_slot_vl_prompt(
         vision_start_id,
         image_pad_id,
         vision_end_id,
-        n_visual_tokens,
+        &shapes,
         &nl,
         &q_tokens,
     );
@@ -3179,34 +3393,49 @@ fn build_slot_vl_prompt(
     }
     .build_with_user_tokens(&user_body);
 
-    let (mrope_positions, rope_delta) = build_slot_mrope(
-        &prompt_tokens,
-        image_pad_id,
-        n_visual_tokens,
-        grid_h,
-        grid_w,
-        vc.spatial_merge_size,
-    )?;
-    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
-        &pixels,
-        3,
-        img_h,
-        img_w,
-        vc.patch_size,
-        vc.temporal_patch_size,
-        vc.spatial_merge_size,
-    );
-    Ok((
-        prompt_tokens,
-        VisualData {
-            patches,
-            grid_h,
-            grid_w,
-            n_visual_tokens,
-            mrope_positions,
-            rope_delta,
-        },
-    ))
+    let (mrope_positions, rope_delta) =
+        build_slot_mrope(&prompt_tokens, image_pad_id, &shapes, vc.spatial_merge_size)?;
+    let images = prepared
+        .into_iter()
+        .map(
+            |(patches, grid_h, grid_w, n_visual_tokens)| hipfire_runtime::serve::VisualImage {
+                patches,
+                grid_h,
+                grid_w,
+                n_visual_tokens,
+            },
+        )
+        .collect::<Vec<_>>();
+    // Preserve the historical single-image payload exactly; the engine's
+    // single-image fast path reads `patches`/`grid_*`.
+    if images.len() == 1 {
+        let image = images.into_iter().next().expect("one image");
+        Ok((
+            prompt_tokens,
+            VisualData {
+                patches: image.patches,
+                grid_h: image.grid_h,
+                grid_w: image.grid_w,
+                n_visual_tokens: total_visual,
+                images: Vec::new(),
+                mrope_positions,
+                rope_delta,
+            },
+        ))
+    } else {
+        Ok((
+            prompt_tokens,
+            VisualData {
+                patches: Vec::new(),
+                grid_h: 0,
+                grid_w: 0,
+                n_visual_tokens: total_visual,
+                images,
+                mrope_positions,
+                rope_delta,
+            },
+        ))
+    }
 }
 
 // ── Tests (pure, no GPU) ───────────────────────────────────────────────────
@@ -3360,15 +3589,27 @@ mod tests {
     #[test]
     fn extract_slot_image_prefers_base64() {
         let msg = json!({"image": "/tmp/a.png", "image_base64": "abcd"});
-        match extract_slot_image(&msg).unwrap() {
-            Some(SlotImage::Base64(s)) => assert_eq!(s, "abcd"),
+        match extract_slot_images(&msg).unwrap().as_slice() {
+            [SlotImage::Base64(s)] => assert_eq!(s, "abcd"),
             other => panic!("expected base64, got {other:?}"),
         }
     }
 
     #[test]
+    fn extract_slot_images_keeps_request_order() {
+        let msg = json!({"images_base64": ["aaaa", "bbbb"]});
+        match extract_slot_images(&msg).unwrap().as_slice() {
+            [SlotImage::Base64(a), SlotImage::Base64(b)] => {
+                assert_eq!(a, "aaaa");
+                assert_eq!(b, "bbbb");
+            }
+            other => panic!("expected two base64 images, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn splice_vl_user_body_wraps_pads() {
-        let body = splice_vl_user_body(1, 2, 3, 4, &[10], &[20, 21]);
+        let body = splice_vl_user_body(1, 2, 3, &[(4, 4, 4)], &[10], &[20, 21]);
         assert_eq!(body, vec![1, 2, 2, 2, 2, 3, 10, 20, 21]);
     }
 
@@ -3376,13 +3617,13 @@ mod tests {
     fn build_slot_mrope_marks_image_span() {
         let pad = 9u32;
         let mut ids = vec![1, 2, pad, pad, pad, pad, 3, 4];
-        let (pos, delta) = build_slot_mrope(&ids, pad, 4, 4, 4, 2).unwrap();
+        let (pos, delta) = build_slot_mrope(&ids, pad, &[(4, 4, 4)], 2).unwrap();
         assert_eq!(pos.len(), ids.len());
         assert_eq!(pos[0], [0, 0, 0]);
         assert_eq!(pos[2], [2, 2, 2]); // first visual: t=cursor, h=cursor+0, w=cursor+0
         assert_ne!(delta, 0);
         ids.push(pad);
-        assert!(build_slot_mrope(&ids, pad, 4, 4, 4, 2).is_err());
+        assert!(build_slot_mrope(&ids, pad, &[(4, 4, 4)], 2).is_err());
     }
 
     #[test]
@@ -3390,35 +3631,38 @@ mod tests {
         let pad = 9u32;
         let ids = vec![1, pad, pad, pad, pad, 3];
         // Merged grid ((8/2)*(8/2)=16) disagrees with the spliced token count (4).
-        assert!(build_slot_mrope(&ids, pad, 4, 8, 8, 2).is_err());
+        assert!(build_slot_mrope(&ids, pad, &[(8, 8, 4)], 2).is_err());
         // Zero visual tokens.
-        assert!(build_slot_mrope(&ids, pad, 0, 4, 4, 2).is_err());
+        assert!(build_slot_mrope(&ids, pad, &[(4, 4, 0)], 2).is_err());
         // Degenerate spatial merge size.
-        assert!(build_slot_mrope(&ids, pad, 4, 4, 4, 0).is_err());
-        // A second pad run after the first — multi-image is not wired.
+        assert!(build_slot_mrope(&ids, pad, &[(4, 4, 4)], 0).is_err());
+        // Two pad runs are two images; their spans are legal in request order.
         let split = vec![pad, pad, 5, pad, pad];
-        assert!(build_slot_mrope(&split, pad, 4, 4, 4, 2).is_err());
+        let (pos, _) = build_slot_mrope(&split, pad, &[(4, 2, 2), (4, 2, 2)], 2).unwrap();
+        assert_eq!(pos.len(), split.len());
+        assert_eq!(pos[0], [0, 0, 0]);
+        assert_eq!(pos[3], [3, 3, 3]);
         // A prompt with no pad at all.
         let no_pad = vec![1, 2, 3];
-        assert!(build_slot_mrope(&no_pad, pad, 4, 4, 4, 2).is_err());
+        assert!(build_slot_mrope(&no_pad, pad, &[(4, 4, 4)], 2).is_err());
     }
 
     #[test]
     fn extract_slot_image_wraps_top_level_image_url_as_base64() {
         let msg = json!({"image_url": "data:image/png;base64,aGVsbG8="});
-        match extract_slot_image(&msg).unwrap() {
-            Some(SlotImage::Base64(s)) => assert_eq!(s, "data:image/png;base64,aGVsbG8="),
+        match extract_slot_images(&msg).unwrap().as_slice() {
+            [SlotImage::Base64(s)] => assert_eq!(s, "data:image/png;base64,aGVsbG8="),
             other => panic!("expected base64, got {other:?}"),
         }
         let none = json!({"prompt": "hi"});
-        assert!(extract_slot_image(&none).unwrap().is_none());
+        assert!(extract_slot_images(&none).unwrap().is_empty());
     }
 
     #[test]
     fn extract_slot_image_rejects_oversized_base64() {
         let big = "A".repeat(MAX_BASE64_ENCODED_LEN + 1);
         let msg = json!({ "image_base64": big });
-        let err = extract_slot_image(&msg).unwrap_err();
+        let err = extract_slot_images(&msg).unwrap_err();
         assert!(err.contains("maximum encoded size"), "unexpected: {err}");
     }
 
@@ -3467,13 +3711,57 @@ mod tests {
     }
 
     #[test]
-    fn generate_caps_accepts_tools_and_rejects_stop_and_logprobs() {
+    fn generate_caps_accepts_tools_valid_stop_and_logprobs() {
         let m = json!({"tools": [{"type":"function"}], "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m).is_none());
-        let m2 = json!({"stop": ["END"], "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m2).is_some());
-        let m3 = json!({"logprobs": true, "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m3).is_some());
+        for rf in [
+            json!({"type": "json_object"}),
+            json!({"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}),
+        ] {
+            let m = json!({"response_format": rf, "experimental_multi_slot": true});
+            assert!(
+                validate_generate_caps(&m).is_none(),
+                "response_format {rf} must be accepted"
+            );
+        }
+        for stop in [json!(["END"]), json!("END"), json!([]), json!("")] {
+            let m = json!({"stop": stop, "experimental_multi_slot": true});
+            assert!(
+                validate_generate_caps(&m).is_none(),
+                "stop={stop:?} must be accepted (empty is neutral, non-empty is enforced)"
+            );
+        }
+        for bad in [
+            json!([1]),
+            json!("x".repeat(65)),
+            json!(["a", "b", "c", "d", "e"]),
+        ] {
+            let m = json!({"stop": bad, "experimental_multi_slot": true});
+            assert!(
+                validate_generate_caps(&m).is_some(),
+                "stop={bad:?} must be refused by the shared parser"
+            );
+        }
+        for logprobs in [
+            json!({"logprobs": true, "experimental_multi_slot": true}),
+            json!({"logprobs": true, "top_logprobs": 5, "experimental_multi_slot": true}),
+            json!({"logprobs": false, "experimental_multi_slot": true}),
+        ] {
+            assert!(
+                validate_generate_caps(&logprobs).is_none(),
+                "valid logprobs must be accepted: {logprobs}"
+            );
+        }
+        for bad in [
+            json!({"logprobs": "yes", "experimental_multi_slot": true}),
+            json!({"top_logprobs": 5, "experimental_multi_slot": true}),
+            json!({"logprobs": true, "top_logprobs": 21, "experimental_multi_slot": true}),
+        ] {
+            assert!(
+                validate_generate_caps(&bad).is_some(),
+                "malformed logprobs must be refused: {bad}"
+            );
+        }
         // Finite think caps are ENFORCED (the grammar cursor force-closes the
         // span at the budget) and are therefore never refused at the door —
         // including the `1` no-thinking sentinel, whose contradiction with an
@@ -3839,7 +4127,6 @@ mod tests {
         }
         for params in [
             json!({"kv_mode": "garbage"}),
-            json!({"kv_backend": "vmm"}),
             json!({"ngram_draft": true}),
             json!({"cask": true}),
             json!({"drafter": "some-drafter"}),
@@ -3850,6 +4137,32 @@ mod tests {
                 "unsupported params passed: {params}"
             );
         }
+        // The VMM KV route is admitted for q8; a rotated tier is refused by
+        // the route's own descriptor-kernel gate.
+        assert_eq!(
+            validate_load_caps(
+                &json!({"params": {"kv_backend": "vmm", "kv_mode": "q8"}}),
+                "gfx1100"
+            ),
+            None,
+            "vmm + q8 must be admitted"
+        );
+        assert!(
+            validate_load_caps(
+                &json!({"params": {"kv_backend": "vmm", "kv_mode": "fwht3"}}),
+                "gfx1100"
+            )
+            .is_some(),
+            "vmm + rotated KV must be refused"
+        );
+        assert!(
+            validate_load_caps(
+                &json!({"params": {"kv_backend": "vmm", "kv_mode": "fp8"}}),
+                "gfx1201"
+            )
+            .is_some(),
+            "the shared VMM page pool has no fp8 kernels"
+        );
         // MTP is now accepted in multi-slot (sequential per-slot path).
         assert_eq!(
             validate_load_caps(&json!({"params": {"mtp_mode": "on"}}), "gfx1100"),

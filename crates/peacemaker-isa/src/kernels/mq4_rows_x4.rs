@@ -1105,25 +1105,98 @@ fn fmac(b: &mut Builder, dst: u8, w: u8, x: u8) -> R {
 /// Pinned source-matched objects are recorded in PLAN's singleton-reference
 /// packet: Halo cache `gemv_mq4g256v2_mq4v2.92ecf66b777f981f` and XTX cache
 /// `gemv_mq4g256v2_rdna3_mq4v2.37cf66a5274c0003`. Their scalar fold is 01+32.
+///
+/// gfx11 VOPD dual-issues six of the eight terms across the two rows. Each
+/// row's own multiply/FMA sequence stays in this order, and the two `src1`
+/// registers of a packet sit in different VGPR banks, so the f32 bits match
+/// the scalar chain. The schedule (term index into `[1,0,2,3,4,5,6,7]`):
+/// row0:0, pair(row0:1, row1:0), row0:2, pair(row0:3, row1:1), row1:2,
+/// pair(row0:4, row1:3), pair(row0:5, row1:4), pair(row0:6, row1:5),
+/// pair(row0:7, row1:6), row1:7.
 fn scalar_dots(b: &mut Builder, x: u8, tail: bool) -> R {
-    for (r, &w) in W.iter().enumerate() {
-        let dst = DOT[r];
-        for (term, n) in [1, 0, 2, 3, 4, 5, 6, 7].into_iter().enumerate() {
-            let (lhs, rhs) = if tail { (x + n, w + n) } else { (w + n, x + n) };
-            if term == 0 {
-                valu(
-                    b,
-                    &format!("v_mul_f32_e32 v{dst}, v{lhs}, v{rhs}"),
-                    &[dst],
-                    &[lhs, rhs],
-                    &[],
-                )?;
-            } else {
-                fmac(b, dst, lhs, rhs)?;
-            }
+    const ORDER: [u8; 8] = [1, 0, 2, 3, 4, 5, 6, 7];
+    enum Step {
+        Row0(u8),
+        Row1(u8),
+        Pair(u8, u8),
+    }
+    const STEPS: [Step; 10] = [
+        Step::Row0(0),
+        Step::Pair(1, 0),
+        Step::Row0(2),
+        Step::Pair(3, 1),
+        Step::Row1(2),
+        Step::Pair(4, 3),
+        Step::Pair(5, 4),
+        Step::Pair(6, 5),
+        Step::Pair(7, 6),
+        Step::Row1(7),
+    ];
+    for step in STEPS {
+        match step {
+            Step::Row0(index) => scalar_one(b, x, tail, 0, index, ORDER)?,
+            Step::Row1(index) => scalar_one(b, x, tail, 1, index, ORDER)?,
+            Step::Pair(i0, i1) => scalar_pair(b, x, tail, i0, i1, ORDER)?,
         }
     }
     Ok(())
+}
+
+fn scalar_operands(x: u8, tail: bool, row: usize, n: u8) -> (u8, u8) {
+    let w = W[row] + n;
+    if tail {
+        (x + n, w)
+    } else {
+        (w, x + n)
+    }
+}
+
+fn scalar_one(b: &mut Builder, x: u8, tail: bool, row: usize, index: u8, order: [u8; 8]) -> R {
+    let n = order[index as usize];
+    let dst = DOT[row];
+    let (lhs, rhs) = scalar_operands(x, tail, row, n);
+    if index == 0 {
+        valu(
+            b,
+            &format!("v_mul_f32_e32 v{dst}, v{lhs}, v{rhs}"),
+            &[dst],
+            &[lhs, rhs],
+            &[],
+        )
+    } else {
+        fmac(b, dst, lhs, rhs)
+    }
+}
+
+fn scalar_pair(b: &mut Builder, x: u8, tail: bool, i0: u8, i1: u8, order: [u8; 8]) -> R {
+    let op = |index: u8| {
+        if index == 0 {
+            VopdF32::Mul
+        } else {
+            VopdF32::Fmac
+        }
+    };
+    let srcs = |row: usize, index: u8| {
+        let n = order[index as usize];
+        let (lhs, rhs) = scalar_operands(x, tail, row, n);
+        (Operand::V(lhs), rhs)
+    };
+    let (s0, s1) = srcs(0, i0);
+    let (t0, t1) = srcs(1, i1);
+    b.vopd(
+        VopdOp {
+            op: op(i0),
+            dst: DOT[0],
+            src0: s0,
+            src1: s1,
+        },
+        VopdOp {
+            op: op(i1),
+            dst: DOT[1],
+            src0: t0,
+            src1: t1,
+        },
+    )
 }
 
 fn columns(b: &mut Builder, nb: u8, s: u8, scalar_tail: Option<bool>) -> R {

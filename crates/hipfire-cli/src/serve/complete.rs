@@ -1794,17 +1794,29 @@ pub(crate) fn project_request_contract(
     })
 }
 
-/// Every serve route returns one completion per request: `n` other than 1
-/// is refused rather than silently answered with a single choice.
-fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
-    if let Some(n) = body.get("n").filter(|n| !n.is_null()) {
-        if n.as_u64() != Some(1) {
-            bail_invalid!(
-                "n != 1 is not supported on this serve route (one completion per request)"
-            );
+/// OpenAI `n`: one request may ask for up to [`MAX_CHOICES`] independent
+/// completions. The HTTP layer fans them out; each choice is a separate
+/// daemon attempt with its own sampler stream. Values outside the bound and
+/// non-integers are typed 400s, never silently clamped.
+pub(crate) const MAX_CHOICES: u64 = 8;
+
+pub(crate) fn request_choice_count(body: &serde_json::Value) -> Result<u64> {
+    match body.get("n").filter(|n| !n.is_null()) {
+        None => Ok(1),
+        Some(n) => {
+            let Some(n) = n.as_u64() else {
+                bail_invalid!("n must be an integer between 1 and {MAX_CHOICES}");
+            };
+            if n == 0 || n > MAX_CHOICES {
+                bail_invalid!("n must be an integer between 1 and {MAX_CHOICES}");
+            }
+            Ok(n)
         }
     }
-    Ok(())
+}
+
+fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
+    request_choice_count(body).map(drop)
 }
 
 /// Multi-slot request-field checks. Unsupported OpenAI request fields must be
@@ -1934,11 +1946,14 @@ pub(crate) fn validate_response_format(
         .ok_or_else(|| invalid_request!("response_format.type is required"))?;
     match ty {
         "json_object" => {
-            bail_invalid!(
-                "response_format type 'json_object' is not supported on this \
-                 serve route (no enforcement exists; only json_schema strict \
-                 output is supported)"
-            );
+            // OpenAI's permissive JSON mode: any JSON object, no schema.
+            // Enforce it with the same pre-sampling subset compiler by
+            // compiling `{"type":"object"}` — an unconstrained object is
+            // still a constraint (no prose, no array) and it is not a
+            // silent downgrade.
+            let schema = serde_json::json!({ "type": "object" });
+            validate_json_schema_subset(&schema, "$")?;
+            Ok(Some(ResponseFormat { schema, name: None }))
         }
         "json_schema" => {
             let js = value
@@ -2249,7 +2264,7 @@ pub(crate) fn complete_request_attempt(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| invalid_request!("model is required"))?
         .to_owned();
-    let image_base64 = request_image_base64(body.get("messages"))?;
+    let images_base64 = request_images_base64(body.get("messages"))?;
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
@@ -2262,6 +2277,11 @@ pub(crate) fn complete_request_attempt(
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
         let resolved = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
+        if !runtime.multi_slot_enabled && images_base64.len() > 1 {
+            return Err(invalid_request!(
+                "multiple images require experimental multi-slot serve"
+            ));
+        }
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
                 if force_reset {
@@ -2319,8 +2339,18 @@ pub(crate) fn complete_request_attempt(
         if contract.max_tokens_fit {
             generate["max_tokens_fit"] = serde_json::Value::Bool(true);
         }
-        if let Some(image) = image_base64 {
-            generate["image_base64"] = serde_json::Value::String(image);
+        if images_base64.len() == 1 {
+            // Keep the historical single-image wire field for the standard
+            // daemon, which does not know `images_base64`.
+            generate["image_base64"] =
+                serde_json::Value::String(images_base64.into_iter().next().expect("one image"));
+        } else if !images_base64.is_empty() {
+            generate["images_base64"] = serde_json::Value::Array(
+                images_base64
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
         }
         for (key, config_key) in [
             ("temperature", "generation.temperature"),
@@ -2878,26 +2908,16 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
             "images and tools together are not supported in experimental multi-slot".to_owned(),
         );
     }
-    // `stop` is unsupported, but an EMPTY stop (`[]` or `""`) is neutral —
-    // refusing it 400s a request that asks for nothing. Only a non-empty
-    // stop is refused (matches the daemon's `stop_nonempty` rule in
-    // slots.rs so the gateway and engine agree).
-    let stop_nonempty = match body.get("stop") {
-        Some(serde_json::Value::Array(a)) => !a.is_empty(),
-        Some(serde_json::Value::String(t)) => !t.is_empty(),
-        Some(v) => !v.is_null(),
-        None => false,
-    };
-    if stop_nonempty {
-        return Err("stop sequences are not supported".to_owned());
-    }
-    if body.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true)
-        || body
-            .get("top_logprobs")
-            .is_some_and(|value| !value.is_null())
-    {
-        return Err("logprobs are not supported".to_owned());
-    }
+    // `stop` is supported on the slot engine: the emitter's streaming matcher
+    // withholds the stop bytes and ends the turn. Validate the wire shape
+    // here (string / array, count and character caps) so every route agrees
+    // on what is a 400; an empty stop remains neutral.
+    hipfire_runtime::stop_sequence::parse_stop_field(body.get("stop"))
+        .map_err(|e| e.to_string())?;
+    // logprobs/top_logprobs: the slot engine forces AR and attaches
+    // per-token values, so this is not a refusal. Re-validate here so a
+    // direct caller of this gate gets the same 400 as the HTTP path.
+    validate_logprobs_request(body).map_err(|e| e.to_string())?;
     // Penalties are supported end-to-end on the slot engine (in-kernel
     // repeat/presence/frequency over a per-slot recent-token window, min_p in
     // the top-p tail), so non-neutral values are forwarded, not refused or
@@ -3110,11 +3130,12 @@ pub(crate) fn openai_content_text(content: Option<&serde_json::Value>) -> String
     }
 }
 
-pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
+pub(crate) fn request_images_base64(messages: Option<&serde_json::Value>) -> Result<Vec<String>> {
     let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let mut image = None;
+    const MAX_IMAGES: usize = 8;
+    let mut images = Vec::new();
     for message in messages {
         let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
             continue;
@@ -3144,12 +3165,13 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
             if payload.is_empty() {
                 bail_invalid!("image_url data URI has an empty base64 payload");
             }
-            if image.replace(payload.to_owned()).is_some() {
-                bail_invalid!("at most one image_url is supported per request");
+            if images.len() >= MAX_IMAGES {
+                bail_invalid!("at most {MAX_IMAGES} image_url parts are supported per request");
             }
+            images.push(payload.to_owned());
         }
     }
-    Ok(image)
+    Ok(images)
 }
 
 pub(crate) fn strip_inline_thinking(text: &str) -> String {
@@ -3480,6 +3502,41 @@ pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
         "hipfire": completion_hipfire(completion),
     })
 }
+/// Serialize `n` independent completions as one OpenAI response. The first
+/// completion supplies the response id/timings envelope; every choice keeps
+/// its own message and finish reason. Prompt usage is counted once (the
+/// choices share one request), completion usage is summed.
+pub(crate) fn completion_json_multi(completions: &[Completion]) -> serde_json::Value {
+    debug_assert!(!completions.is_empty());
+    let mut out = completion_json(&completions[0]);
+    let mut choices = Vec::with_capacity(completions.len());
+    let mut completion_tokens = 0u64;
+    for (index, completion) in completions.iter().enumerate() {
+        let mut one = completion_json(completion);
+        let mut choice = one["choices"][0].take();
+        choice["index"] = serde_json::json!(index);
+        choices.push(choice);
+        completion_tokens = completion_tokens.saturating_add(
+            completion
+                .done
+                .get("tokens")
+                .or_else(|| completion.done.get("completion_tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+    out["choices"] = serde_json::Value::Array(choices);
+    let first_usage = completion_usage(&completions[0]);
+    let prompt_tokens = first_usage["prompt_tokens"].as_u64().unwrap_or(0);
+    out["usage"] = serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens.saturating_add(completion_tokens),
+        "prompt_tokens_details": first_usage["prompt_tokens_details"].clone(),
+    });
+    out
+}
+
 /// `completion_tokens` is the daemon's `done.tokens` verbatim (committed
 /// tokens; drafted/rejected spec tokens never count). Terminator policy is
 /// per arch and pinned, not unified, for 0.4.1: Qwen AR/spec/batch count the
@@ -3675,6 +3732,27 @@ pub(crate) fn openai_stream_terminal_chunks(
     completion: &Completion,
     include_usage: bool,
 ) -> Vec<serde_json::Value> {
+    openai_stream_terminal_chunks_at(completion, include_usage, 0)
+}
+
+/// [`openai_stream_terminal_chunks`] for one choice index in an `n > 1`
+/// stream. The caller appends `[DONE]` only after the last choice.
+pub(crate) fn openai_stream_terminal_chunks_at(
+    completion: &Completion,
+    include_usage: bool,
+    index: usize,
+) -> Vec<serde_json::Value> {
+    openai_stream_terminal_chunks_usage(completion, include_usage, index, None)
+}
+
+/// [`openai_stream_terminal_chunks_at`] with an aggregate usage override for
+/// an `n > 1` stream's final choice.
+pub(crate) fn openai_stream_terminal_chunks_usage(
+    completion: &Completion,
+    include_usage: bool,
+    index: usize,
+    usage_override: Option<&serde_json::Value>,
+) -> Vec<serde_json::Value> {
     let finish_reason = openai_finish_reason(&completion.done);
     let mut chunks = Vec::new();
 
@@ -3689,7 +3767,7 @@ pub(crate) fn openai_stream_terminal_chunks(
             "created": completion.created,
             "model": completion.model,
             "choices": [{
-                "index": 0,
+                "index": index,
                 "delta": delta,
                 "finish_reason": null
             }],
@@ -3701,7 +3779,7 @@ pub(crate) fn openai_stream_terminal_chunks(
         "object": "chat.completion.chunk",
         "created": completion.created,
         "model": completion.model,
-        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
+        "choices": [{ "index": index, "delta": {}, "finish_reason": finish_reason }],
         "timings": completion_timings(completion),
         "hipfire": completion_hipfire(completion),
     }));
@@ -3713,7 +3791,7 @@ pub(crate) fn openai_stream_terminal_chunks(
             "created": completion.created,
             "model": completion.model,
             "choices": [],
-            "usage": completion_usage(completion),
+            "usage": usage_override.cloned().unwrap_or_else(|| completion_usage(completion)),
         }));
     }
 
@@ -4038,14 +4116,14 @@ mod tests {
             ]
         }]);
         assert_eq!(
-            request_image_base64(Some(&messages)).unwrap().as_deref(),
-            Some("YWJj")
+            request_images_base64(Some(&messages)).unwrap(),
+            vec!["YWJj".to_string()]
         );
         let remote = serde_json::json!([{
             "role": "user",
             "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
         }]);
-        assert!(request_image_base64(Some(&remote))
+        assert!(request_images_base64(Some(&remote))
             .unwrap_err()
             .to_string()
             .contains("remote"));
@@ -5007,6 +5085,30 @@ mod tests {
             serde_json::json!(r#"{"path":"README.md"}"#)
         );
         assert_eq!(mapped[1]["function"]["name"], "write_file");
+    }
+
+    #[test]
+    fn completion_json_multi_indexes_choices_and_sums_completion_usage() {
+        let a = sample_completion("red", Vec::new(), "stop");
+        let b = sample_completion("blue", Vec::new(), "length");
+        let json = completion_json_multi(&[a, b]);
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][1]["index"], 1);
+        assert_eq!(json["choices"][0]["message"]["content"], "red");
+        assert_eq!(json["choices"][1]["message"]["content"], "blue");
+        assert_eq!(json["choices"][1]["finish_reason"], "length");
+        // Prompt is counted once; completion tokens are the per-choice sum.
+        assert_eq!(json["usage"]["prompt_tokens"], 3);
+        assert_eq!(json["usage"]["completion_tokens"], 10);
+        assert_eq!(json["usage"]["total_tokens"], 13);
+    }
+
+    #[test]
+    fn openai_stream_terminal_chunks_carry_the_choice_index() {
+        let completion = sample_completion("red", Vec::new(), "stop");
+        let chunks = openai_stream_terminal_chunks_at(&completion, false, 3);
+        assert_eq!(chunks[0]["choices"][0]["index"], 3);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]
@@ -7972,13 +8074,13 @@ mod tests {
 
     /// Unsupported OpenAI request fields must be refused here — the daemon
     /// has typed refusals for them, but this gateway builds the generate
-    /// message from scratch and would strip the fields first (silent
-    /// semantic downgrade: `n: 2` returning one completion).
+    /// message from scratch and would strip the fields first (a silent
+    /// semantic downgrade). `n` is no longer in this set: the HTTP layer
+    /// fans it out and `request_choice_count` bounds it.
     #[test]
     fn project_request_contract_refuses_unsupported_fields() {
         let resolved = contract_resolved_with_system("");
         let cases = [
-            serde_json::json!({"n": 2}),
             serde_json::json!({"best_of": 2}),
             serde_json::json!({"logit_bias": {"5": 10}}),
             serde_json::json!({"echo": true}),
@@ -7999,7 +8101,7 @@ mod tests {
                 "unexpected error for {k}: {err}"
             );
         }
-        // n=1 is the only legal arity and must pass.
+        // n in range (and absent/null) must pass.
         let body = serde_json::json!({
             "max_tokens": 16, "n": 1,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -8007,15 +8109,16 @@ mod tests {
         assert!(project_request_contract(&body, &resolved, false, true).is_ok());
     }
 
-    /// `n != 1` is refused as a typed 400 on BOTH routes (standard and
-    /// multi-slot); `n: 1` and an absent/null `n` pass on both.
+    /// `n` is parsed at the gateway: 1..=MAX_CHOICES is legal (the HTTP layer
+    /// fans it out), while zero, over-max and non-integers are typed 400s on
+    /// both routes.
     #[test]
-    fn project_request_contract_refuses_n_on_every_route() {
+    fn project_request_contract_bounds_n_on_every_route() {
         let resolved = contract_resolved_with_system("");
         for multi_slot in [false, true] {
             for bad in [
-                serde_json::json!(2),
                 serde_json::json!(0),
+                serde_json::json!(9),
                 serde_json::json!("1"),
             ] {
                 let body = serde_json::json!({
@@ -8029,7 +8132,11 @@ mod tests {
                     "multi_slot={multi_slot} n={bad}: not a typed invalid request: {err}"
                 );
             }
-            for ok in [serde_json::json!(1), serde_json::Value::Null] {
+            for ok in [
+                serde_json::json!(1),
+                serde_json::json!(2),
+                serde_json::Value::Null,
+            ] {
                 let body = serde_json::json!({
                     "max_tokens": 16, "n": ok,
                     "messages": [{ "role": "user", "content": "hi" }]
@@ -8170,8 +8277,8 @@ mod tests {
         };
         let cases: Vec<(&str, Result<()>)> = vec![
             (
-                "experimental multi-slot does not support this request",
-                require_multi_slot_support(&serde_json::json!({"stop": ["\n"]})),
+                "invalid stop: every entry must be a string",
+                require_multi_slot_support(&serde_json::json!({"stop": [1]})),
             ),
             (
                 "top_logprobs requires logprobs to be true",
@@ -8195,18 +8302,17 @@ mod tests {
             ),
             (
                 "remote image_url values are unsupported",
-                request_image_base64(Some(&serde_json::json!([
+                request_images_base64(Some(&serde_json::json!([
                     {"role": "user", "content": [image("https://x/y.png")]}
                 ])))
                 .map(drop),
             ),
             (
-                "at most one image_url",
-                request_image_base64(Some(&serde_json::json!([
-                    {"role": "user", "content": [
-                        image("data:image/png;base64,AA"),
-                        image("data:image/png;base64,AA")
-                    ]}
+                "at most 8 image_url",
+                request_images_base64(Some(&serde_json::json!([
+                    {"role": "user", "content":
+                        (0..9).map(|_| image("data:image/png;base64,AA")).collect::<Vec<_>>()
+                    }
                 ])))
                 .map(drop),
             ),
@@ -8215,8 +8321,8 @@ mod tests {
                 contract(serde_json::json!({"max_tokens": 0})),
             ),
             (
-                "n != 1",
-                contract(serde_json::json!({"max_tokens": 8, "n": 2})),
+                "n must be an integer",
+                contract(serde_json::json!({"max_tokens": 8, "n": 9})),
             ),
             (
                 "temperature must be within",
@@ -8227,9 +8333,9 @@ mod tests {
                 contract(serde_json::json!({"max_tokens": 8, "messages": [{"role": "x"}]})),
             ),
             (
-                "response_format type 'json_object' is not supported",
+                "response_format.type 'yaml' is not supported",
                 contract(serde_json::json!({
-                    "max_tokens": 8, "response_format": {"type": "json_object"}
+                    "max_tokens": 8, "response_format": {"type": "yaml"}
                 })),
             ),
             (
@@ -8323,10 +8429,27 @@ mod tests {
             }),
             "images and tools",
         );
-        err_contains(serde_json::json!({ "stop": ["\n\n"] }), "stop");
-        err_contains(serde_json::json!({ "stop": "END" }), "stop");
-        err_contains(serde_json::json!({ "logprobs": true }), "logprobs");
-        err_contains(serde_json::json!({ "top_logprobs": 5 }), "logprobs");
+        // Stop sequences are supported: both wire forms validate and pass.
+        assert!(ok(serde_json::json!({ "stop": ["\n\n"] })));
+        assert!(ok(serde_json::json!({ "stop": "END" })));
+        // Malformed stop shapes/limits are 400s with the shared parser text.
+        err_contains(serde_json::json!({ "stop": [1] }), "invalid stop");
+        err_contains(
+            serde_json::json!({ "stop": "x".repeat(65) }),
+            "invalid stop",
+        );
+        assert!(ok(serde_json::json!({ "logprobs": true })));
+        assert!(ok(
+            serde_json::json!({ "logprobs": true, "top_logprobs": 5 })
+        ));
+        err_contains(
+            serde_json::json!({ "top_logprobs": 5 }),
+            "requires logprobs",
+        );
+        err_contains(
+            serde_json::json!({ "logprobs": "yes" }),
+            "must be a boolean",
+        );
         // Non-neutral penalties are supported end-to-end on the slot engine
         // (in-kernel repeat/presence/frequency over a per-slot recent-token
         // window), so they are forwarded — no error here.
@@ -8357,14 +8480,12 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // json_object → REJECTED (typed error). This serve route has no
-        // json_object enforcement; silently dropping the requested
-        // constraint and returning success would be the "silent semantic
-        // downgrade" the spec forbids (§7.1/X2). It used to pass through as
-        // None — an unconstrained 200.
-        assert!(
-            validate_response_format(Some(&serde_json::json!({"type": "json_object"}))).is_err()
-        );
+        // json_object → enforced as the permissive object schema, not
+        // dropped as None and not rejected.
+        let jf = validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
+            .expect("json_object is enforced")
+            .expect("json_object produces a schema");
+        assert_eq!(jf.schema, serde_json::json!({"type": "object"}));
 
         // Valid json_schema with a simple object schema.
         let rf = validate_response_format(Some(&serde_json::json!({

@@ -965,8 +965,8 @@ mod tests {
             ])
         );
         assert_eq!(
-            crate::serve::complete::request_image_base64(lowered.chat.get("messages")).unwrap(),
-            Some("AAAA".into())
+            crate::serve::complete::request_images_base64(lowered.chat.get("messages")).unwrap(),
+            vec!["AAAA".to_string()]
         );
     }
 

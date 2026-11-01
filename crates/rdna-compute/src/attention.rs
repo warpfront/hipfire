@@ -722,6 +722,21 @@ const Q8_DECODE_GQA_REDUCE_MAX_TILES: usize = 7680;
 /// [`DecodeGqaPair`] routes): its workgroups loop over tiles y, y + cap, ...
 const Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP: usize = 512;
 
+/// `HIPFIRE_REPLAY_STABLE_TILING=1` forces the eager route onto the same
+/// `max_tiles` superset grid a retained recording (or hipGraph capture) uses.
+/// Diagnostic A/B only: it exists to answer "does the capture grid change the
+/// result?" without a tape, and to give a tester an eager control that runs
+/// the retained geometry. Default off.
+fn replay_stable_tiling_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_REPLAY_STABLE_TILING")
+            .ok()
+            .as_deref()
+            .is_some_and(|v| matches!(v, "1" | "on" | "true"))
+    })
+}
+
 #[inline]
 fn replay_stable_tile_count(
     actual_tiles: usize,
@@ -729,7 +744,7 @@ fn replay_stable_tile_count(
     graph_capture: bool,
     redline_recording: bool,
 ) -> usize {
-    if graph_capture || redline_recording {
+    if graph_capture || redline_recording || replay_stable_tiling_forced() {
         max_tiles
     } else {
         actual_tiles
@@ -2705,6 +2720,22 @@ impl Gpu {
         Ok(func)
     }
 
+    /// Load the `_vmm_paged` variant of a descriptor kernel: the same body,
+    /// compiled against the 48-byte VMM-paged header. The arena `_paged`
+    /// module and its code object are never touched.
+    pub(crate) fn ensure_kv_vmm_paged_kernel(
+        &mut self,
+        symbol: &'static str,
+        vmm_paged_symbol: &'static str,
+        body: &str,
+    ) -> HipResult<&'static str> {
+        if !self.functions.contains_key(vmm_paged_symbol) {
+            let src = kernels::kv_slot_desc_vmm_paged_source(body, symbol, vmm_paged_symbol);
+            self.ensure_kernel(vmm_paged_symbol, &src, vmm_paged_symbol)?;
+        }
+        Ok(vmm_paged_symbol)
+    }
+
     /// Batched Q8_0 KV cache write: quantize multiple positions in one launch.
     ///
     /// `slot_descs` / `row_slot`: when both `Some`, `row_slot[b]` selects the
@@ -2713,7 +2744,7 @@ impl Gpu {
     /// disjoint KV slabs. When either is `None` the kernel falls back to
     /// legacy single-arena addressing derived from `positions`, byte-identical
     /// to the pre-slot kernel.
-    pub fn kv_cache_write_q8_0_batched_slots(
+    fn kv_cache_write_q8_0_batched_slots_impl(
         &mut self,
         dst: &GpuTensor,
         src: &GpuTensor,
@@ -2724,6 +2755,7 @@ impl Gpu {
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
         use_v_base: bool,
+        vmm_paged: bool,
     ) -> HipResult<()> {
         assert_eq!(
             slot_descs.is_some(),
@@ -2737,12 +2769,21 @@ impl Gpu {
         // also takes `use_v_base`; descriptor-less launches run the default
         // module, unchanged from before paging.
         let paged = slot_descs.is_some();
-        let func = self.ensure_kv_slot_kernel(
-            "kv_cache_write_q8_0_batched",
-            "kv_cache_write_q8_0_batched_paged",
-            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
-            paged,
-        )?;
+        debug_assert!(!vmm_paged || paged, "VMM-paged write needs a descriptor");
+        let func = if vmm_paged {
+            self.ensure_kv_vmm_paged_kernel(
+                "kv_cache_write_q8_0_batched",
+                "kv_cache_write_q8_0_batched_vmm_paged",
+                kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+            )?
+        } else {
+            self.ensure_kv_slot_kernel(
+                "kv_cache_write_q8_0_batched",
+                "kv_cache_write_q8_0_batched_paged",
+                kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+                paged,
+            )?
+        };
         let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
@@ -2805,6 +2846,46 @@ impl Gpu {
             )?;
         }
         Ok(())
+    }
+
+    /// Arena-paged q8 KV write entry point (unchanged behavior).
+    pub fn kv_cache_write_q8_0_batched_slots(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+        use_v_base: bool,
+    ) -> HipResult<()> {
+        self.kv_cache_write_q8_0_batched_slots_impl(
+            dst, src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            use_v_base, false,
+        )
+    }
+
+    /// VMM-paged q8 KV write entry point: same arguments and body as
+    /// [`Self::kv_cache_write_q8_0_batched_slots`], launched from the
+    /// `*_vmm_paged` module compiled against the 48-byte descriptor.
+    pub fn kv_cache_write_q8_0_batched_slots_vmm_paged(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+        use_v_base: bool,
+    ) -> HipResult<()> {
+        self.kv_cache_write_q8_0_batched_slots_impl(
+            dst, src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            use_v_base, true,
+        )
     }
 
     /// Legacy single-sequence entry point. Preserved so existing call sites are
@@ -4390,7 +4471,7 @@ impl Gpu {
     /// off `slot_descs`, so it would silently pin every row to slot 0's
     /// descriptor while still running descriptor addressing.
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_q8_0_kv_batched_masked_slots(
+    fn attention_q8_0_kv_batched_masked_slots_impl(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -4408,6 +4489,7 @@ impl Gpu {
         block_cols: usize,
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
+        vmm_paged: bool,
     ) -> HipResult<()> {
         assert_eq!(
             slot_descs.is_some(),
@@ -4426,12 +4508,20 @@ impl Gpu {
         // compile happens in a cache dir with no -I to kernels/src. Strip the
         // directive and prepend the header body instead (same pattern as
         // ensure_givens4_kernel's turbo_common/givens_common handling).
-        let func = self.ensure_kv_slot_kernel(
-            "attention_q8_0_kv_batched",
-            "attention_q8_0_kv_batched_paged",
-            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
-            slot_descs.is_some(),
-        )?;
+        let func = if vmm_paged {
+            self.ensure_kv_vmm_paged_kernel(
+                "attention_q8_0_kv_batched",
+                "attention_q8_0_kv_batched_vmm_paged",
+                kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            )?
+        } else {
+            self.ensure_kv_slot_kernel(
+                "attention_q8_0_kv_batched",
+                "attention_q8_0_kv_batched_paged",
+                kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+                slot_descs.is_some(),
+            )?
+        };
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -4519,6 +4609,90 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Arena-paged q8 LDS attention entry point (unchanged behavior).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_kv_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.attention_q8_0_kv_batched_masked_slots_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            tree_bias,
+            block_start,
+            block_cols,
+            slot_descs,
+            row_slot,
+            false,
+        )
+    }
+
+    /// VMM-paged q8 LDS attention entry point (48-byte descriptor variant).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_kv_batched_masked_slots_vmm_paged(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.attention_q8_0_kv_batched_masked_slots_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            tree_bias,
+            block_start,
+            block_cols,
+            slot_descs,
+            row_slot,
+            true,
+        )
     }
 
     /// Legacy single-sequence entry point. Preserved so existing call sites
@@ -6502,7 +6676,7 @@ impl Gpu {
     /// profile byte attribution (K/V re-read volume scales with context, not
     /// batch — see `attention_q8_0_flash_prefill_bytes`).
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_q8_0_flash_prefill_wmma_slots(
+    fn attention_q8_0_flash_prefill_wmma_slots_impl(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -6518,6 +6692,7 @@ impl Gpu {
         tile_slot: Option<&GpuTensor>,
         tile_row0: Option<&GpuTensor>,
         tile_qbase: Option<&GpuTensor>,
+        vmm_paged: bool,
     ) -> HipResult<()> {
         let multi_slot = slot_descs.is_some();
         assert_eq!(
@@ -6596,7 +6771,13 @@ impl Gpu {
         // module name varies by variant but the loaded function name does
         // not, so gate on that — mirrors the scalar port's guard.
         // Descriptor launches compile the paged module (see the scalar port).
-        let func = if multi_slot {
+        assert!(
+            !vmm_paged || multi_slot,
+            "VMM-paged WMMA prefill requires slot descriptors"
+        );
+        let func = if vmm_paged {
+            "attention_q8_0_flash_prefill_wmma_vmm_paged"
+        } else if multi_slot {
             "attention_q8_0_flash_prefill_wmma_paged"
         } else {
             "attention_q8_0_flash_prefill_wmma"
@@ -6607,7 +6788,13 @@ impl Gpu {
                 split_q as u32,
                 fixed_hd,
                 prefetch_v as u32,
-                if multi_slot {
+                if vmm_paged {
+                    kernels::kv_slot_desc_vmm_paged_source(
+                        kernel_src,
+                        "attention_q8_0_flash_prefill_wmma",
+                        func,
+                    )
+                } else if multi_slot {
                     kernels::kv_slot_desc_paged_source(
                         kernel_src,
                         "attention_q8_0_flash_prefill_wmma",
@@ -6617,7 +6804,9 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernel_src, false)
                 }
             );
-            let module = if multi_slot {
+            let module = if vmm_paged {
+                format!("{module}_vmm_paged")
+            } else if multi_slot {
                 format!("{module}_paged")
             } else {
                 module
@@ -6734,6 +6923,83 @@ impl Gpu {
         }
         result
     }
+
+    /// Arena-paged WMMA prefill entry point (unchanged behavior).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        tile_slot: Option<&GpuTensor>,
+        tile_row0: Option<&GpuTensor>,
+        tile_qbase: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.attention_q8_0_flash_prefill_wmma_slots_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            slot_descs,
+            tile_slot,
+            tile_row0,
+            tile_qbase,
+            false,
+        )
+    }
+
+    /// VMM-paged WMMA prefill entry point (48-byte descriptor variant).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma_slots_vmm_paged(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        tile_slot: Option<&GpuTensor>,
+        tile_row0: Option<&GpuTensor>,
+        tile_qbase: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.attention_q8_0_flash_prefill_wmma_slots_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            slot_descs,
+            tile_slot,
+            tile_row0,
+            tile_qbase,
+            true,
+        )
+    }
+
     /// gfx1201-only GQA-fused FA2 prefill, direct (research opt-in).
     ///
     /// Exact H24/KV4/D256, single-slot Q8 K/V, full causal, eager only.
@@ -11765,7 +12031,7 @@ impl Gpu {
     /// LDS context cap, unlike the LDS kernel that degenerates above
     /// `LDS_CTX_LIMIT`.
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_flash_q8_0_batched_masked_slots(
+    fn attention_flash_q8_0_batched_masked_slots_impl(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -11784,9 +12050,10 @@ impl Gpu {
         block_cols: usize,
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
+        vmm_paged: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.launch_asym_flash_batched(
+        self.launch_asym_flash_batched_variant(
             "attention_flash_q8_0_tile_batched",
             kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
             "attention_flash_q8_0_tile_batched",
@@ -11812,6 +12079,95 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             slot_descs,
             row_slot,
+            vmm_paged,
+        )
+    }
+
+    /// Arena-paged q8 tile attention entry point (unchanged behavior).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_batched_masked_slots_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            slot_descs,
+            row_slot,
+            false,
+        )
+    }
+
+    /// VMM-paged q8 tile attention entry point (48-byte descriptor variant).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_batched_masked_slots_vmm_paged(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_batched_masked_slots_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            slot_descs,
+            row_slot,
+            true,
         )
     }
 
@@ -13018,6 +13374,25 @@ impl Gpu {
         Ok(paged_func)
     }
 
+    /// Load the `_vmm_paged` variant of a givens4/turbo descriptor kernel.
+    pub(crate) fn ensure_givens4_kv_vmm_paged_kernel(
+        &mut self,
+        body_src: &str,
+        func_name: &'static str,
+    ) -> HipResult<&'static str> {
+        let vmm_func = kv_slot_vmm_paged_symbol(func_name).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("{func_name} has no VMM-paged (multi-slot) variant"),
+            )
+        })?;
+        if !self.functions.contains_key(vmm_func) {
+            let full_src = kernels::kv_slot_givens4_vmm_paged_source(body_src, func_name, vmm_func);
+            self.ensure_kernel(vmm_func, &full_src, vmm_func)?;
+        }
+        Ok(vmm_func)
+    }
+
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.
     pub(crate) fn ensure_givens4_kernel(
         &mut self,
@@ -14190,6 +14565,68 @@ impl Gpu {
         Ok(())
     }
 
+    /// Arena-paged/default tile launcher. Descriptor-less and arena-paged
+    /// callers keep this entry point; the VMM-paged variant is selected by
+    /// [`Self::launch_asym_flash_batched_variant`]'s flag.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_asym_flash_batched(
+        &mut self,
+        tile_key: &'static str,
+        tile_src: &'static str,
+        tile_func_name: &'static str,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        v_mode_bits: i32,
+        window: i32,
+        force_wmma_grid: bool,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.launch_asym_flash_batched_variant(
+            tile_key,
+            tile_src,
+            tile_func_name,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            v_mode_bits,
+            window,
+            force_wmma_grid,
+            slot_descs,
+            row_slot,
+            false,
+        )
+    }
+
     /// Shared helper: launch a batched asym flash tile + the shared asym reduce.
     ///
     /// `tree_bias` / `block_start` / `block_cols` activate DDTree tree-attention
@@ -14197,7 +14634,7 @@ impl Gpu {
     /// including the tree block). When `tree_bias` is None and `block_cols` is
     /// 0, behavior is byte-identical to the legacy causal path.
     #[allow(clippy::too_many_arguments)]
-    fn launch_asym_flash_batched(
+    fn launch_asym_flash_batched_variant(
         &mut self,
         tile_key: &'static str,
         tile_src: &'static str,
@@ -14255,7 +14692,12 @@ impl Gpu {
         // non-windowed tiers ignore `window`.
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
+        vmm_paged: bool,
     ) -> HipResult<()> {
+        assert!(
+            !vmm_paged || slot_descs.is_some(),
+            "launch_asym_flash_batched_variant: VMM-paged requires descriptors"
+        );
         assert_eq!(
             slot_descs.is_some(),
             row_slot.is_some(),
@@ -14382,12 +14824,16 @@ impl Gpu {
 
         // Descriptor launches never take the WMMA grid (asserted above), so
         // eff_tile_* is the scalar tile here and has a paged variant.
-        let eff_tile_func = self.ensure_givens4_kv_slot_kernel(
-            eff_tile_key,
-            eff_tile_src,
-            eff_tile_func,
-            slot_descs.is_some(),
-        )?;
+        let eff_tile_func = if vmm_paged {
+            self.ensure_givens4_kv_vmm_paged_kernel(eff_tile_src, eff_tile_func)?
+        } else {
+            self.ensure_givens4_kv_slot_kernel(
+                eff_tile_key,
+                eff_tile_src,
+                eff_tile_func,
+                slot_descs.is_some(),
+            )?
+        };
         if v_mode_bits != V_MODE_Q8 {
             self.ensure_givens4_kernel(
                 "attention_flash_lloyd_reduce_batched",
@@ -26522,6 +26968,22 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
     b.push_i32(bs);
     b.push_f32(scale);
     b
+}
+
+/// `*_vmm_paged` symbol of a q8/fp8 descriptor-aware kernel. Only the tiers
+/// the VMM-paged backend admits in phase 1 are listed.
+///
+/// `attention_q8_0_flash_prefill_wmma` is deliberately absent: its VMM-paged
+/// load goes through `attention_q8_0_flash_prefill_wmma_slots_impl` (module
+/// `..._gfx11_hd<d>[_splitq]_vmm_paged`), and the only caller of this helper
+/// asserts that a descriptor grid never takes the WMMA tile
+/// (`launch_asym_flash_batched_variant`), so a variant here could not be
+/// requested by either side.
+fn kv_slot_vmm_paged_symbol(func: &str) -> Option<&'static str> {
+    Some(match func {
+        "attention_flash_q8_0_tile_batched" => "attention_flash_q8_0_tile_batched_vmm_paged",
+        _ => return None,
+    })
 }
 
 /// `*_paged` symbol of a descriptor-aware kernel launched through the

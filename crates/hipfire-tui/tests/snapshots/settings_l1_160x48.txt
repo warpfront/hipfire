@@ -13,7 +13,7 @@
  │  Memory & context  32││  Flash-Next word table         — not used by 27B       Flash-Next only     restart       ││Options on this GPU                     │
  │  Speculation       35││  Thinking                      on                      default             new chat      ││  ● Fast (4-bit math)  built-in default │
  │  Hardware/devices   7││  Thinking effort               ● low                   you                 next message  ││  ○ Accurate (8-bit math)               │
- │  Advanced         225││  Thinking cap                  med                     default             next message  ││      43% closer · 1.6× slower          │
+ │  Advanced         228││  Thinking cap                  med                     default             next message  ││      43% closer · 1.6× slower          │
  │                      ││  reasoning.max_tokens          not set                 default             next message  ││                                        │
  │Filters               ││  reasoning.max_total_tokens    0                       default             next message  ││Why "Fast (4-bit math)"                 │
  │  Changed only (c) off││  — also affects quality —                                                                ││  1. built-in default · gfx1151         │

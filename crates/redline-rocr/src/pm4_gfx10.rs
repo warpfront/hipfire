@@ -222,7 +222,14 @@ pub struct Gfx10Pm4CommandBuffer {
     cond_exec_end: usize,
     dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
     resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
+    /// GFX11 CWSR requirement: set `COMPUTE_PGM_RSRC1.PRIV` on every PM4
+    /// dispatch. The AQL dispatch microcode sets it implicitly; raw PM4 must
+    /// set it itself or a wave save/restore during a dispatch can fault.
+    gfx11_cwsr_priv: bool,
 }
+
+/// `COMPUTE_PGM_RSRC1.PRIV` (bit 20, GFX10/GFX11 layout).
+const COMPUTE_PGM_RSRC1_PRIV: u32 = 1 << 20;
 
 /// GFX11 uses the same legacy compute-register map as GFX10. The replay API
 /// still selects the device family explicitly before submission.
@@ -261,7 +268,15 @@ impl Gfx10Pm4CommandBuffer {
             cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+            gfx11_cwsr_priv: false,
         }
+    }
+
+    /// Set `COMPUTE_PGM_RSRC1.PRIV` on subsequently encoded dispatches. Required
+    /// on GFX11 (CWSR), and only there: callers pass `architecture == Gfx11`.
+    pub fn with_gfx11_cwsr_priv(mut self, enabled: bool) -> Self {
+        self.gfx11_cwsr_priv = enabled;
+        self
     }
 
     /// Select the initiator bits used by subsequently encoded dispatches.
@@ -639,7 +654,12 @@ impl Gfx10Pm4CommandBuffer {
                 (image.code_entry >> 40) as u32,
             ],
         );
-        self.set_sh_regs(COMPUTE_PGM_RSRC1, &[image.compute_pgm_rsrc1, rsrc2]);
+        let rsrc1 = if self.gfx11_cwsr_priv {
+            image.compute_pgm_rsrc1 | COMPUTE_PGM_RSRC1_PRIV
+        } else {
+            image.compute_pgm_rsrc1
+        };
+        self.set_sh_regs(COMPUTE_PGM_RSRC1, &[rsrc1, rsrc2]);
         self.set_sh_regs(COMPUTE_PGM_RSRC3_GFX10, &[image.compute_pgm_rsrc3]);
         self.set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[0]);
         self.set_sh_regs(
@@ -994,6 +1014,22 @@ mod tests {
     }
 
     #[test]
+    fn gfx11_cwsr_priv_sets_rsrc1_bit20_only_when_enabled() {
+        let geometry = LaunchGeometry::new([256, 1, 1], [256, 1, 1]).unwrap();
+        let emits = |enabled, rsrc1: u32| {
+            let mut commands = Gfx10Pm4CommandBuffer::new().with_gfx11_cwsr_priv(enabled);
+            commands
+                .dispatch_image(&image(0x409), geometry, 0, &[0, 0, 0, 0, 4, 5])
+                .unwrap();
+            commands.dwords().windows(2).any(|w| w == [rsrc1, 0x22])
+        };
+        assert!(emits(true, 0x11 | (1 << 20)));
+        assert!(!emits(true, 0x11));
+        assert!(emits(false, 0x11));
+        assert!(!emits(false, 0x11 | (1 << 20)));
+    }
+
+    #[test]
     fn gfx11_dispatch_interleave_uses_queue_preamble_register() {
         let inherited = Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(None);
         assert!(inherited.is_empty());
@@ -1305,6 +1341,7 @@ mod tests {
             cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+            gfx11_cwsr_priv: false,
         };
         assert_eq!(empty_value.set_sh_reg_records(), Err(0));
 
@@ -1319,6 +1356,7 @@ mod tests {
             cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+            gfx11_cwsr_priv: false,
         };
         assert_eq!(truncated.set_sh_reg_records(), Err(0));
 
@@ -1329,6 +1367,7 @@ mod tests {
             cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+            gfx11_cwsr_priv: false,
         };
         assert_eq!(short_dispatch.set_sh_reg_records(), Err(0));
     }

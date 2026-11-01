@@ -34,6 +34,8 @@
 // resource gate fingerprints those, and this must not perturb their
 // VGPR/occupancy numbers. HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE selects
 // `y[b] += acc` (symbol named by HIPFIRE_MQ4G256V2_XBATCH_KERNEL).
+// HIPFIRE_MQ4G256V2_SIGMOID_RESIDUAL_EPILOGUE selects
+// `y[b] += sigmoid(c_buf[b]) * acc` with an extra `[B]` logit pointer.
 
 #ifndef HIPFIRE_MQ4G256V2_XBATCH_MAX
 #define HIPFIRE_MQ4G256V2_XBATCH_MAX 4
@@ -48,6 +50,9 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_XBATCH_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,   // [B x K]
     float* __restrict__ y,         // [B x M]
+#if defined(HIPFIRE_MQ4G256V2_SIGMOID_RESIDUAL_EPILOGUE)
+    const float* __restrict__ c_buf, // [B] pre-sigmoid logits
+#endif
     int M, int K, int B
 ) {
     const int row = blockIdx.x;
@@ -174,7 +179,12 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_XBATCH_KERNEL(
         float acc = (acc0[b] + acc1[b]) + (acc2[b] + acc3[b]);
         for (int offset = 16; offset > 0; offset >>= 1)
             acc += __shfl_down(acc, offset);
-#if defined(HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE)
+#if defined(HIPFIRE_MQ4G256V2_SIGMOID_RESIDUAL_EPILOGUE)
+        if (tid == 0) {
+            float gate = 1.0f / (1.0f + expf(-c_buf[b]));
+            y[(long long)b * M + row] += gate * acc;
+        }
+#elif defined(HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE)
         if (tid == 0) y[(long long)b * M + row] += acc;
 #else
         if (tid == 0) y[(long long)b * M + row] = acc;

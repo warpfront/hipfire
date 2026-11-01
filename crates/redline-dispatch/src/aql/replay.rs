@@ -1061,6 +1061,15 @@ impl PhasedMultiQueuePm4Ib {
             });
         }
 
+        // Phase lanes end at CS_PARTIAL_FLUSH so the semaphore WRITE_DATA is
+        // ordered. Flush GL2 once per queue before the terminal completion
+        // signal; a non-shader consumer (the host readback) does not see
+        // shader stores through a partial flush alone.
+        for stream in &mut streams {
+            stream.wait_compute_idle();
+            stream.acquire_system();
+        }
+
         let frequency_hz = device.gpu_timestamp_frequency_hz()?;
         let mut completions = Vec::with_capacity(queue_count);
         let mut indirects = Vec::with_capacity(queue_count);

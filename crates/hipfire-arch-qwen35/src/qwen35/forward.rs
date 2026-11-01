@@ -2681,7 +2681,7 @@ fn gate_up_via_execute_steps(
 }
 
 /// MoE FFN dispatch — mirrors the two-path logic from the original.
-fn moe_ffn_dispatch(
+pub(crate) fn moe_ffn_dispatch(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
     x: &GpuTensor,

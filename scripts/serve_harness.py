@@ -889,6 +889,8 @@ def _log_has_vmm_kv_marker(txt):
         re.search(r"KV cache:.*\bvmm\s*\(", txt, re.IGNORECASE)
         or re.search(r"KV cache:.*\bvmm\b", txt, re.IGNORECASE)
         or re.search(r"deepseek4 KV cache:\s+automatic VMM growth\b", txt)
+        # Multi-slot engine banner: `slot KV tier Q8 on vmm: N slots x ...`.
+        or re.search(r"slot KV tier .*\bon vmm\b", txt, re.IGNORECASE)
     )
 
 

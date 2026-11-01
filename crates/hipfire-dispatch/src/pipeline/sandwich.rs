@@ -319,6 +319,14 @@ pub fn gemm_rows(
         DType::MQ6G256 => gpu
             .gemm_mq6g256_batched_lmhead(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
+        // One row is the AR singleton, and the MQ4V2 GEMV writes Y outright.
+        // The plain GEMM below is zero + residual WMMA, and that zeroing is a
+        // host `hipMemset(&y)` — host work inside a forward body, which a
+        // retained PM4 tape cannot replay (`effect-incomplete capture`) and
+        // which the slots MoE body paid three times per layer. This mirrors
+        // `layer_ops::project_rotated`, whose one-row arm already keeps the
+        // GEMV for exactly the same reason. Multi-row keeps the WMMA GEMM.
+        DType::MQ4G256V2 if rows == 1 => gpu.gemv_mq4g256v2(w.buf, x, y, w.m, w.k).map_err(hip),
         DType::MQ4G256V2 => gpu.gemm_mq4g256v2(w.buf, x, y, w.m, w.k, rows).map_err(hip),
         // BF16 teachers (calibration): stage the F32 input to BF16 for the
         // MFMA GEMM, which resolves only where the arch has one.
