@@ -925,5 +925,8 @@ impl Lfm3State {
         let _ = gpu.free_tensor(self.sandwich_buf);
         let _ = gpu.free_tensor(self.final_norm_buf);
         let _ = gpu.free_tensor(self.logits);
+        // LEAK-1: the 4-byte position scalar buffer was allocated in the
+        // constructor but never freed (inherited from the lfm2moe template).
+        let _ = gpu.hip.free(self.pos_buf);
     }
 }

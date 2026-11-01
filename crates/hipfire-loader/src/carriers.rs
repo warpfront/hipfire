@@ -1463,10 +1463,16 @@ impl Carrier for Lfm3Carrier {
                     lfm3_vision_config = Some(vc);
                     lfm3_vision_weights = Some(vw);
                 }
-                // Detect the LFM3-Audio speech encoder by tensor presence
-                // (encoder.downsample.conv_in.weight). arch_id stays 13; audio
+                // Detect the LFM3-Audio speech encoder by tensor presence.
+                // AUDIO-NAME-1: Audio-2B names the subtree
+                // `encoder.downsample.*`; Omni-2B names it
+                // `model.audio_encoder.downsample.*`. arch_id stays 13; audio
                 // is opt-in by tensor presence, mirroring the VL precedent.
-                if hfq.tensor_data("encoder.downsample.conv_in.weight").is_some() {
+                if hfq.tensor_data("encoder.downsample.conv_in.weight").is_some()
+                    || hfq
+                        .tensor_data("model.audio_encoder.downsample.conv_in.weight")
+                        .is_some()
+                {
                     eprintln!("lfm3: LFM3-Audio speech encoder detected — loading downsampler + encoder + projector weights");
                     let ac = lfm3_audio::audio_config_from_hfq(&hfq)
                         .ok_or_else(|| "lfm3-audio: audio_config not found in HFQ metadata".to_string())?;

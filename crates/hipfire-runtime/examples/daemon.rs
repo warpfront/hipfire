@@ -5975,8 +5975,27 @@ fn main() {
                 // (depth decoder present) routes to generate_lfm3_omni.
                 let tts = msg.get("tts").and_then(|v| v.as_bool()).unwrap_or(false);
                 // Omni mode: "audio" (default, pure TTS) or "interleaved"
-                // (text + audio blocks via <|mixed_start|>).
-                let tts_mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("audio");
+                // (text + audio blocks via <|mixed_start|>). An unknown value
+                // errors instead of silently degrading to pure TTS — a typo
+                // like "interleave" previously selected audio with no hint.
+                let tts_mode = match msg.get("mode").and_then(|v| v.as_str()) {
+                    Some(m) if m == "audio" || m == "interleaved" => m,
+                    Some(other) => {
+                        emit_active_attempt_error(
+                            &mut stdout,
+                            Some(id),
+                            &format!(
+                                "invalid tts mode '{other}': expected \"audio\" or \"interleaved\""
+                            ),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    None => "audio",
+                };
                 // Streaming TTS: emit audio chunks as frames are generated.
                 let tts_stream = msg.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -18712,6 +18731,11 @@ fn generate_lfm2moe(
     } else {
         0.0
     };
+    // The loop's only breaks are the max_tokens cap, stop_toks, and the
+    // string-level EOS guard (all "stop"), so reaching the cap is the sole
+    // non-stop cause. The CLI defaults a missing finish_reason to "stop",
+    // which mislabeled token-cap truncation as a natural stop.
+    let finish_reason = if generated_count >= max_tokens { "length" } else { "stop" };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
@@ -18719,6 +18743,7 @@ fn generate_lfm2moe(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
@@ -19011,6 +19036,11 @@ fn generate_lfm3(
     } else {
         0.0
     };
+    // The loop's only breaks are the max_tokens cap, stop_toks, and the
+    // string-level EOS guard (all "stop"), so reaching the cap is the sole
+    // non-stop cause. The CLI defaults a missing finish_reason to "stop",
+    // which mislabeled token-cap truncation as a natural stop.
+    let finish_reason = if generated_count >= max_tokens { "length" } else { "stop" };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
@@ -19018,6 +19048,7 @@ fn generate_lfm3(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
@@ -19171,11 +19202,11 @@ fn generate_lfm3_vl(
     }
 
     // ── Prompt build: render the LFM3 chat template (exact framing — system /
-    // user / assistant `<|im_start|>assistant\n IMDA`), then splice the vision
+    // user / assistant `<|im_start|>assistant\n<think></think>`), then splice the vision
     // tokens [vision_start, image_pad×N, vision_end, \n] before the user
     // content. This matches generate_lfm3's Jinja path (which produces long
     // coherent thinking); the ChatFrame scaffold + OpenThink approximation
-    // mismatched LFM3's ` IMDA` (no trailing \n) and truncated early.
+    // mismatched LFM3's `<think></think>` (no trailing \n) and truncated early.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let nl = tokenizer.encode("\n");
     let q_tokens = tokenizer.encode(prompt);
@@ -19244,6 +19275,25 @@ fn generate_lfm3_vl(
 
     if prompt_tokens.is_empty() {
         write_error(stdout, id, "lfm3-vl: empty prompt after tokenize");
+        return;
+    }
+    // SPLICE-1: prefill embeds vision rows only at image_pad positions, so a
+    // prompt that lost its splice (anchor not found in the rendered template)
+    // would prefill with zero vision embeddings and "succeed" ungrounded.
+    // Hard-error instead of continuing past the warning above.
+    let n_pads = prompt_tokens.iter().filter(|&&t| t == image_pad_id).count();
+    if n_pads != n_visual_tokens {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "lfm3-vl: vision splice failed — prompt carries {n_pads} image_pad placeholders, expected {n_visual_tokens} (user content not found in rendered template)"
+            ),
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
         return;
     }
 
@@ -19342,7 +19392,7 @@ fn generate_lfm3_vl(
         };
         // Only break on a real EOS / turn-close token. The bare `""` frag case
         // (whitespace / the LFM3 think-close marker) is intentionally NOT a stop
-        // here — the model thinks ( IMDA… IMDA-close) then emits the visible
+        // here — the model thinks (<think>…</think>) then emits the visible
         // answer, and breaking on whitespace would truncate mid-think before the
         // answer. stop_toks (eos / <|im_end|>) handles the real turn end.
         if matches!(frag.trim(), "</s>" | "<|im_end|>") {
@@ -19384,6 +19434,11 @@ fn generate_lfm3_vl(
     } else {
         0.0
     };
+    // The loop's only breaks are the max_tokens cap, stop_toks, and the
+    // string-level EOS guard (all "stop"), so reaching the cap is the sole
+    // non-stop cause. The CLI defaults a missing finish_reason to "stop",
+    // which mislabeled token-cap truncation as a natural stop.
+    let finish_reason = if generated_count >= max_tokens { "length" } else { "stop" };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
@@ -19391,6 +19446,7 @@ fn generate_lfm3_vl(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
@@ -19546,7 +19602,24 @@ fn generate_lfm3_audio(
         write_error(stdout, id, "lfm3-audio: empty prompt after tokenize");
         return;
     }
+    // SPLICE-1: prefill embeds audio rows only at audio_pad positions, so a
+    // prompt that lost its splice would prefill with zero audio embeddings
+    // and "succeed" ungrounded. Hard-error instead of logging and continuing.
     let n_pad_in_prompt = prompt_tokens.iter().filter(|&&t| t == audio_pad_id).count();
+    if n_pad_in_prompt != n_audio_tokens {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "lfm3-audio: audio splice failed — prompt carries {n_pad_in_prompt} audio_pad placeholders, expected {n_audio_tokens} (user content not found in rendered template)"
+            ),
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
     eprintln!(
         "[lfm3-audio] prompt_tokens={} (audio_pad {n_pad_in_prompt} expected {n_audio_tokens}, audio_pad_id={audio_pad_id})",
         prompt_tokens.len()
@@ -19684,6 +19757,11 @@ fn generate_lfm3_audio(
     } else {
         0.0
     };
+    // The loop's only breaks are the max_tokens cap, stop_toks, and the
+    // string-level EOS guard (all "stop"), so reaching the cap is the sole
+    // non-stop cause. The CLI defaults a missing finish_reason to "stop",
+    // which mislabeled token-cap truncation as a natural stop.
+    let finish_reason = if generated_count >= max_tokens { "length" } else { "stop" };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
@@ -19691,6 +19769,7 @@ fn generate_lfm3_audio(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
@@ -19767,7 +19846,7 @@ fn generate_lfm3_omni(
     };
     let tok = m.tokenizer.as_ref().unwrap();
     let chatml = format!(
-        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n IMDTextWriter"
+        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>"
     );
     let mut prompt_tokens = tok.encode(&chatml);
     prompt_tokens.insert(0, 124_894); // BOS <|startoftext|>
@@ -19846,11 +19925,29 @@ fn generate_lfm3_omni(
         let chunk_steps = 12usize; // generate ~12 frames/steps per chunk
         let mut total_frames = 0usize;
         let mut n_chunks = 0usize;
+        // STREAM-1: total-step budget. `finished` only flips on audio-eos
+        // (AUDIO) or <|im_end|> (INTERLEAVED) and pure AUDIO may never reach
+        // eos, so without a cap this loop ran unbounded: KV/history grew past
+        // max_seq (silent GPU OOB) and the request never emitted a terminal
+        // done. The budget is the same max_steps the CodecStreamingCache was
+        // sized for, so total frames can never exceed the cache's capacity —
+        // the previous mismatch (12-frame chunks vs a ≤200-frame cache) is
+        // closed by construction.
+        let mut steps_left = max_steps;
+        let mut hit_step_budget = false;
         while !stream_state.finished {
+            if steps_left == 0 {
+                hit_step_budget = true;
+                break;
+            }
+            steps_left = steps_left.saturating_sub(chunk_steps);
             let step_out = {
                 let bundle = match m.state.as_mut() {
                     Some(ModelState::Lfm3(b)) => b,
                     _ => {
+                        // LEAK-1: free the codec GPU buffers on the error path.
+                        codec_cache.free_gpu(gpu);
+                        codec_weights.free_gpu(gpu);
                         write_error(stdout, id, "lfm3-omni: not an lfm3 model");
                         return;
                     }
@@ -19868,6 +19965,9 @@ fn generate_lfm3_omni(
                 ) {
                     Ok(o) => o,
                     Err(e) => {
+                        // LEAK-1: free the codec GPU buffers on the error path.
+                        codec_cache.free_gpu(gpu);
+                        codec_weights.free_gpu(gpu);
                         write_error(stdout, id, &format!("lfm3-omni: stream step: {e}"));
                         return;
                     }
@@ -19905,6 +20005,9 @@ fn generate_lfm3_omni(
                 ) {
                     Ok(a) => a,
                     Err(e) => {
+                        // LEAK-1: free the codec GPU buffers on the error path.
+                        codec_cache.free_gpu(gpu);
+                        codec_weights.free_gpu(gpu);
                         write_error(stdout, id, &format!("lfm3-omni: stream decode: {e}"));
                         return;
                     }
@@ -19925,34 +20028,43 @@ fn generate_lfm3_omni(
             }
         }
         // Flush the codec's held-back tail if not already finalized.
+        // LEAK-1 was also here: a failed tail flush used to be swallowed
+        // silently via `if let Ok` — surface it (the stream still terminates,
+        // but the operator sees why audio may be truncated).
         if !codec_cache.finished {
-            if let Ok(tail) =
-                omni::codec_decode_streaming(&codec_cfg, &codec_weights, gpu, &[], &mut codec_cache, true)
+            match omni::codec_decode_streaming(&codec_cfg, &codec_weights, gpu, &[], &mut codec_cache, true)
             {
-                if !tail.is_empty() {
-                    let wav = omni::wav_bytes(&tail, 24_000);
-                    use base64::Engine as _;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
-                    let _ = writeln!(
-                        stdout,
-                        "{}",
-                        serde_json::json!({"type":"audio_chunk","id":id,"audio":b64,"sample_rate":24000,"frames":0,"final":true,"attempt_id":active_attempt_id()})
-                    );
-                    let _ = stdout.flush();
-                    n_chunks += 1;
+                Ok(tail) => {
+                    if !tail.is_empty() {
+                        let wav = omni::wav_bytes(&tail, 24_000);
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type":"audio_chunk","id":id,"audio":b64,"sample_rate":24000,"frames":0,"final":true,"attempt_id":active_attempt_id()})
+                        );
+                        let _ = stdout.flush();
+                        n_chunks += 1;
+                    }
                 }
+                Err(e) => eprintln!("[lfm3-omni] warning: codec tail flush failed: {e}"),
             }
         }
         codec_cache.free_gpu(gpu);
         codec_weights.free_gpu(gpu);
         let gen_ms = t0.elapsed().as_millis();
         eprintln!(
-            "[lfm3-omni] streamed {total_frames} audio frames in {n_chunks} chunks in {gen_ms}ms"
+            "[lfm3-omni] streamed {total_frames} audio frames in {n_chunks} chunks in {gen_ms}ms (finish_reason={})",
+            if hit_step_budget { "length" } else { "stop" }
         );
+        // FINISH-1: distinguish budget-capped streams (length) from a natural
+        // eos/im_end finish (stop) — same contract as the text routes.
+        let finish_reason = if hit_step_budget { "length" } else { "stop" };
         let _ = writeln!(
             stdout,
             "{}",
-            serde_json::json!({"type":"done","id":id,"tokens":total_frames,"total_ms":gen_ms,"streamed":true,"attempt_id":active_attempt_id()})
+            serde_json::json!({"type":"done","id":id,"tokens":total_frames,"total_ms":gen_ms,"streamed":true,"finish_reason":finish_reason,"attempt_id":active_attempt_id()})
         );
         let _ = stdout.flush();
         return;
@@ -20058,6 +20170,8 @@ fn generate_lfm3_omni(
     let (waveform, sr) = match omni::codec_decode(&codec_cfg, &codec_weights, gpu, &out.audio_codes) {
         Ok(v) => v,
         Err(e) => {
+            // LEAK-1: free the codec weights on the error path.
+            codec_weights.free_gpu(gpu);
             write_error(stdout, id, &format!("lfm3-omni: codec decode: {e}"));
             return;
         }

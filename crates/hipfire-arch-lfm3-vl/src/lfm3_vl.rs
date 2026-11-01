@@ -32,7 +32,7 @@
 
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -262,29 +262,36 @@ impl VisionWeights {
 // vision 2D weights ship as F16 (qt=1) for gemm_f16; norms / conv-filter /
 // biases ship as F16 and are dequantized to F32 at load for the F32 kernels.
 
-fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
+// PANIC-1: a missing / wrong-dtype tensor is a loader error, not a bug in the
+// caller — a partially-quantized HFQ must fail the load cleanly instead of
+// crashing the daemon, so these helpers return Result.
+fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Result<Vec<f32>, String> {
     let (info, data) = hfq
         .tensor_data(name)
-        .unwrap_or_else(|| panic!("lfm3-vl: vision tensor not found: {name}"));
+        .ok_or_else(|| format!("lfm3-vl: vision tensor not found: {name}"))?;
     let mut vals: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         6 | 7 => dequant_hfq4(data, n, info.group_size as usize),
-        other => panic!("lfm3-vl: expected F16/F32/HFQ4 for {name}, got qt={other}"),
+        other => {
+            return Err(format!(
+                "lfm3-vl: expected F16/F32/HFQ4 for {name}, got qt={other}"
+            ))
+        }
     };
     vals.truncate(n);
-    vals
+    Ok(vals)
 }
 
 fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let vals = load_f32_cpu(hfq, name, n);
+    let vals = load_f32_cpu(hfq, name, n).map_err(|e| HipError::new(999, &e))?;
     gpu.upload_f32(&vals, &[n])
 }
 
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
-    let (info, data) = hfq
-        .tensor_data(name)
-        .unwrap_or_else(|| panic!("lfm3-vl: vision tensor not found: {name}"));
+    let (info, data) = hfq.tensor_data(name).ok_or_else(|| {
+        HipError::new(999, &format!("lfm3-vl: vision tensor not found: {name}"))
+    })?;
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match info.quant_type {
         1 => gpu.upload_raw(data, &[n]),
@@ -296,7 +303,10 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
                 .collect();
             gpu.upload_raw(&f16_bytes, &[n])
         }
-        other => panic!("lfm3-vl: {name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"),
+        other => Err(HipError::new(
+            999,
+            &format!("lfm3-vl: {name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"),
+        )),
     }
 }
 
@@ -364,7 +374,8 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
             // Conv layer: in_proj / out_proj / spatial_conv (3x3 depthwise).
             // spatial_conv weight is [hidden, 1, 3, 3] → flatten to [hidden*9] F32.
             let conv_spatial = {
-                let vals = load_f32_cpu(hfq, &format!("{lp}.conv.spatial_conv.weight"), h * 9);
+                let vals = load_f32_cpu(hfq, &format!("{lp}.conv.spatial_conv.weight"), h * 9)
+                    .map_err(|e| HipError::new(999, &e))?;
                 gpu.upload_f32(&vals, &[h * 9])?
             };
             (

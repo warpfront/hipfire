@@ -4792,7 +4792,9 @@ fn should_quantize(name: &str) -> bool {
     // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
     // `vision_tower.*`; LFM3-VL uses `model.vision_tower.*` /
     // `model.multi_modal_projector.*`. LFM3-Audio uses `encoder.downsample.*`
-    // (conv2d downsampler, CPU) + `mlp.model.*` (audio projector). All arches
+    // (conv2d downsampler, CPU) + `mlp.model.*` (audio projector);
+    // LFM3-Omni names the same towers `model.audio_encoder.*` /
+    // `model.audio_projector.*` (AUDIO-NAME-1). All arches
     // keep these F16 during bring-up so the per-stage diff against the HF
     // reference activations (`benchmarks/references/<image>_activations/`)
     // doesn't have to absorb both forward-pass implementation noise AND quant
@@ -4804,6 +4806,9 @@ fn should_quantize(name: &str) -> bool {
         || name.starts_with("model.multi_modal_projector.")
         || name.starts_with("encoder.downsample.")
         || name.starts_with("mlp.model.")
+        // LFM3-Omni audio tower (both subtree roots).
+        || name.starts_with("model.audio_encoder.")
+        || name.starts_with("model.audio_projector.")
         // LFM3-Omni (Phase 4): depth decoder + shared codebook embedding stay
         // F16 (small, not decode-hot-path; match the vision/audio towers).
         || name.starts_with("model.depth_decoder.")
@@ -7344,7 +7349,8 @@ fn main() {
         // and the text tensors' `model.language_model.` prefix is stripped to
         // `model.` so the existing Lfm3Weights loader finds them. The audio
         // variant (model_type "lfm3_audio") reuses arch_id 13 too — its
-        // downsampler (`encoder.downsample.*`) + projector (`mlp.model.*`)
+        // downsampler (`encoder.downsample.*` / `model.audio_encoder.*`) +
+        // projector (`mlp.model.*` / `model.audio_projector.*`)
         // are kept F16; the encoder backbone (`encoder.lfm.*`) quantizes Q8
         // like the text backbone; the text tensors sit at `lfm.model.*` and
         // are resolved by the Lfm3Weights loader's prefix fallback. The omni

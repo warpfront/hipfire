@@ -36,7 +36,9 @@ use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, Step};
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::model_source::ModelSource;
-use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
+// (DTYPE-1: the bf16 conversion helpers moved to the shared
+// `safetensors_source::source_bytes_to_*` converters, used via full paths
+// below.)
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::f32::consts::PI;
@@ -202,27 +204,19 @@ fn src_bytes<'a>(
 fn load_f16_source(source: &dyn ModelSource, gpu: &mut Gpu, name: &str) -> Result<GpuTensor, String> {
     let (dtype, data, shape) = src_bytes(source, name)?;
     let n: usize = shape.iter().product();
-    let f16_bytes: Vec<u8> = match dtype {
-        "F16" | "BF16" => bf16_bytes_to_f16(data),
-        "F32" => data
-            .chunks_exact(4)
-            .flat_map(|c| {
-                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                hipfire_runtime::llama::f32_to_f16(v).to_le_bytes()
-            })
-            .collect(),
-        other => return Err(format!("codec: {name}: unsupported dtype {other}")),
-    };
+    // DTYPE-1: delegate to the shared converter — it passes genuine F16
+    // through and converts BF16. The old `"F16" | "BF16" => bf16_bytes_to_f16`
+    // arm decoded every F16 tensor as if it were BF16 (garbled weights on any
+    // F16-stored codec artifact).
+    let f16_bytes = hipfire_runtime::safetensors_source::source_bytes_to_f16_stream(dtype, data);
     gpu.upload_raw(&f16_bytes, &[n]).map_err(|e| format!("codec: upload {name}: {e:?}"))
 }
 
 fn load_f32_source_host(source: &dyn ModelSource, name: &str, n: usize) -> Result<Vec<f32>, String> {
     let (dtype, data, _) = src_bytes(source, name)?;
-    let mut vals: Vec<f32> = match dtype {
-        "F16" | "BF16" => data.chunks_exact(2).map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        "F32" => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        other => return Err(format!("codec: {name}: unsupported dtype {other}")),
-    };
+    // DTYPE-1: shared converter (F16 decoded as F16, BF16 as BF16 — the old
+    // arm treated both as BF16).
+    let mut vals = hipfire_runtime::safetensors_source::source_bytes_to_f32_vec(dtype, data);
     vals.truncate(n);
     Ok(vals)
 }
@@ -497,6 +491,8 @@ impl CodecState {
         ] {
             let _ = gpu.free_tensor(t);
         }
+        // LEAK-1: the 4-byte position scalar buffer was never freed.
+        let _ = gpu.hip.free(self.pos_buf);
     }
 }
 

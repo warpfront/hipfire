@@ -23,7 +23,8 @@
 //!   * **Projector** (`Lfm3AudioProjector`) — LayerNorm(768) + GELU(erf) MLP
 //!     768→2048→2048. Runs on GPU (reuses `layernorm_batched` / `gelu_erf_f32`).
 //!
-//! arch_id stays 13 (audio detected by `encoder.downsample.*` tensor
+//! arch_id stays 13 (audio detected by `encoder.downsample.*` /
+//! `model.audio_encoder.downsample.*` tensors — see AUDIO-NAME-1 below).
 //! presence). The text decoder is owned by `hipfire-arch-lfm3::Lfm3`.
 
 use crate::mel::MelConfig;
@@ -114,18 +115,38 @@ pub struct AudioConfig {
 
 /// Parse the LFM3-Audio config from the HFQ metadata `config` envelope.
 ///
-/// The audio config.json nests: `preprocessor` (mel), `encoder`
-/// (downsampler + `encoder.lfm` backbone), `lfm` (text backbone — projector
-/// output = `lfm.hidden_size`). The encoder `intermediate_size` is taken from
-/// the actual `encoder.lfm.lfm.layers.0.feed_forward.w1.weight` tensor shape
-/// (the config value is pre-auto-adjust and unreliable).
+/// AUDIO-NAME-1: two artifact shapes are accepted.
+/// - LFM3-Audio-*: `preprocessor` (mel) + `encoder` {dim_in/dim_conv/dim_out +
+///   `lfm` backbone} + top `lfm` (text backbone — projector width).
+/// - LFM3-Omni-*: `audio_encoder_config` {num_mel_bins, conv_channels,
+///   hidden_size, sliding_window, `text_config` backbone} + top `text_config`
+///   (text backbone). There is no `preprocessor` block; the mel fields fall
+///   back to the shared defaults, which byte-match the Omni feature extractor
+///   (n_fft 400 / hop 160 / win 400 / sr 16k / floor -12 / norm 4±).
+///
+/// The encoder `intermediate_size` is taken from the actual
+/// `layers.0.feed_forward.w1.weight` tensor shape (the config value is
+/// pre-auto-adjust and unreliable).
 pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
     let config = meta.get("config").or(Some(&meta))?;
-    let pre = config.get("preprocessor")?;
-    let enc_cfg = config.get("encoder")?;
-    let lfm_cfg = enc_cfg.get("lfm")?;
-    let text_cfg = config.get("lfm").or_else(|| config.get("text_config"))?;
+    let (pre, enc_cfg, lfm_cfg, text_cfg) = if let Some(ae) = config.get("audio_encoder_config") {
+        // Omni shape.
+        (
+            ae,
+            ae,
+            ae.get("text_config")?,
+            config.get("text_config")?,
+        )
+    } else {
+        // Audio-standalone shape.
+        (
+            config.get("preprocessor")?,
+            config.get("encoder")?,
+            config.get("encoder")?.get("lfm")?,
+            config.get("lfm").or_else(|| config.get("text_config"))?,
+        )
+    };
 
     // Mel front-end (config.preprocessor).
     let mel = MelConfig {
@@ -150,9 +171,27 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
     };
 
     let down = DownsamplerConfig {
-        dim_in: enc_cfg.get("dim_in").and_then(|v| v.as_u64()).unwrap_or(128) as usize,
-        dim_conv: enc_cfg.get("dim_conv").and_then(|v| v.as_u64()).unwrap_or(256) as usize,
-        dim_out: enc_cfg.get("dim_out").and_then(|v| v.as_u64()).unwrap_or(768) as usize,
+        // Audio standalone: explicit dim_in/dim_conv/dim_out. Omni: derive from
+        // num_mel_bins / conv_channels / the encoder hidden size.
+        dim_in: enc_cfg
+            .get("dim_in")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(mel.n_mels),
+        dim_conv: enc_cfg
+            .get("dim_conv")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or_else(|| {
+                enc_cfg.get("conv_channels").and_then(|v| v.as_u64()).unwrap_or(256) as usize
+            }),
+        dim_out: enc_cfg
+            .get("dim_out")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or_else(|| {
+                enc_cfg.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(768) as usize
+            }),
     };
 
     let hidden = lfm_cfg.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(768) as usize;
@@ -193,8 +232,10 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
 
     // Intermediate size: derive from the actual w1 tensor shape (config value
     // is pre-`block_auto_adjust_ff_dim` and unreliable — 2560 vs real 1792).
+    // Probe both artifact namings (AUDIO-NAME-1).
     let intermediate = hfq
         .find_tensor_info("encoder.lfm.lfm.layers.0.feed_forward.w1.weight")
+        .or_else(|| hfq.find_tensor_info("model.audio_encoder.lfm.layers.0.feed_forward.w1.weight"))
         .and_then(|i| i.shape.first().copied())
         .map(|s| s as usize)
         .unwrap_or_else(|| {
@@ -204,7 +245,8 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
     let proj = ProjectorConfig {
         in_features: down.dim_out,
         out_features: text_cfg.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(2048) as usize,
-        norm_eps: 1e-6,
+        // HF `nn.LayerNorm(in_features)` default (modeling_lfm3_audio.py projector).
+        norm_eps: 1e-5,
     };
 
     Some(AudioConfig {
@@ -634,7 +676,16 @@ impl AudioWeights {
 // ─── Weight loading ──────────────────────────────────────────────────────────
 
 fn load_downsampler(hfq: &HfqFile) -> Result<DownsamplerWeights, String> {
-    let p = "encoder.downsample.";
+    // AUDIO-NAME-1: Audio-2B raw names the subtree `encoder.downsample.*`;
+    // Omni-2B names it `model.audio_encoder.downsample.*`.
+    let p = if hfq
+        .find_tensor_info("model.audio_encoder.downsample.conv_in.weight")
+        .is_some()
+    {
+        "model.audio_encoder.downsample."
+    } else {
+        "encoder.downsample."
+    };
     Ok(DownsamplerWeights {
         conv_in_w: load_host_w(hfq, &format!("{p}conv_in.weight"))?,
         conv_in_b: load_host_vec(hfq, &format!("{p}conv_in.bias"))?,
@@ -658,7 +709,16 @@ fn load_encoder(hfq: &HfqFile, cfg: &EncoderConfig, gpu: &mut Gpu) -> Result<Enc
     let head_dim = cfg.head_dim;
     let inter = cfg.intermediate_size;
     let k_conv = cfg.conv_kernel_size;
-    let pfx = "encoder.lfm.lfm";
+    // AUDIO-NAME-1: Audio-2B nests the backbone `encoder.lfm.lfm`; Omni-2B
+    // flattens it to `model.audio_encoder.lfm`.
+    let pfx = if hfq
+        .find_tensor_info("model.audio_encoder.lfm.layers.0.operator_norm.weight")
+        .is_some()
+    {
+        "model.audio_encoder.lfm"
+    } else {
+        "encoder.lfm.lfm"
+    };
 
     let embedding_norm = load_f32(hfq, gpu, &format!("{pfx}.embedding_norm.weight"), &[h])?;
 
@@ -705,9 +765,19 @@ fn load_encoder(hfq: &HfqFile, cfg: &EncoderConfig, gpu: &mut Gpu) -> Result<Enc
 }
 
 fn load_projector(hfq: &HfqFile, cfg: &ProjectorConfig, gpu: &mut Gpu) -> Result<ProjectorWeights, String> {
-    // Raw safetensors names the projector `mlp.model.*` (the HF WeightRenaming
-    // to `model.audio_projector.*` is a load-time transformers transform; the
-    // HFQ keeps the raw names). 0=LayerNorm, 1=linear_1, 3=linear_2 (GELU at 2).
+    // AUDIO-NAME-1: two projector namings. Audio-2B raw names it `mlp.model.*`
+    // with numeric indices 0=LayerNorm, 1=linear_1, 3=linear_2 (GELU at 2).
+    // Omni-2B names it `model.audio_projector.{layer_norm,linear_1,linear_2}`.
+    if hfq.find_tensor_info("model.audio_projector.linear_1.weight").is_some() {
+        let p = "model.audio_projector.";
+        let layer_norm_w = load_f32(hfq, gpu, &format!("{p}layer_norm.weight"), &[cfg.in_features])?;
+        let layer_norm_b = load_f32(hfq, gpu, &format!("{p}layer_norm.bias"), &[cfg.in_features])?;
+        let linear_1_w = load_f16_gpu_host(hfq, gpu, &format!("{p}linear_1.weight"))?;
+        let linear_1_b = load_f32(hfq, gpu, &format!("{p}linear_1.bias"), &[cfg.out_features])?;
+        let linear_2_w = load_f16_gpu_host(hfq, gpu, &format!("{p}linear_2.weight"))?;
+        let linear_2_b = load_f32(hfq, gpu, &format!("{p}linear_2.bias"), &[cfg.out_features])?;
+        return Ok(ProjectorWeights { layer_norm_w, layer_norm_b, linear_1_w, linear_1_b, linear_2_w, linear_2_b });
+    }
     let p = "mlp.model.";
     let layer_norm_w = load_f32(hfq, gpu, &format!("{p}0.weight"), &[cfg.in_features])?;
     let layer_norm_b = load_f32(hfq, gpu, &format!("{p}0.bias"), &[cfg.in_features])?;
@@ -861,6 +931,8 @@ impl AudioEncoderState {
         ] {
             let _ = gpu.free_tensor(t);
         }
+        // LEAK-1: the 4-byte position scalar buffer was never freed.
+        let _ = gpu.hip.free(self.pos_buf);
     }
 }
 

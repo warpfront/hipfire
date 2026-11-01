@@ -156,6 +156,7 @@ def log(msg: str) -> None:
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
 #   12 = Cohere2-MoE / North-Mini-Code
+#   13 = LFM3 family (text / VL / audio / omni variants)
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
 def arch_id_for(tag: str, entry: dict) -> int | None:
     file = entry.get("file", "")
@@ -174,6 +175,8 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 10
     if family == "lfm2.5":
         return 11
+    if family == "lfm3":
+        return 13
     if family == "north-mini-code":
         return 12
     if family == "vibethinker":

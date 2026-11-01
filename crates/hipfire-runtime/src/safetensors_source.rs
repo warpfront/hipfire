@@ -258,9 +258,11 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         // variant (model_type "lfm3_vl") reuses arch_id 13 — vision is detected
         // by tensor presence in Lfm3Carrier (the qwen35-vl precedent). The
         // audio variant (model_type "lfm3_audio") reuses arch_id 13 too — audio
-        // is detected by `encoder.downsample.*` tensor presence. The Omni text
-        // backbone (model_type "lfm3_omni") is phased later.
-        "lfm3" | "lfm3_vl" | "lfm3_audio" => 13,
+        // is detected by `encoder.downsample.*` tensor presence. The Omni
+        // checkpoint (model_type "lfm3_omni", matches its config.json) reuses
+        // arch_id 13 as well — same text backbone + depth decoder; vision /
+        // audio towers are detected by tensor presence.
+        "lfm3" | "lfm3_vl" | "lfm3_audio" | "lfm3_omni" => 13,
         _ => {
             // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
             // carrier matches, so `load_model` fails cleanly with "no carrier for
@@ -442,6 +444,9 @@ mod tests {
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "cohere2_moe" })), 12);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3" })), 13);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3_vl" })), 13);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3_audio" })), 13);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm3_omni" })), 13);
     }
 
     /// C1: an unrecognized model_type must NOT silently become Qwen35 (arch_id=5).

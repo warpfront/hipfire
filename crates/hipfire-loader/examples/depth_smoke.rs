@@ -50,7 +50,7 @@ fn main() {
 
     // Tokenize the prompt. The omni model was trained on ChatML + BOS
     // (<|startoftext|> = 124894); a bare prompt produces repetition collapse.
-    let chatml = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n IMDTextWriter");
+    let chatml = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>");
     let mut tokens = model
         .tokenizer
         .as_ref()

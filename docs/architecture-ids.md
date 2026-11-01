@@ -30,6 +30,7 @@ remain fail-closed for every route outside that exact row; source-derived routin
 | 10 | MiniMax-M2 | `hipfire-arch-minimax` | `MinimaxCarrier` | Mixtral-style MoE (GQA, per-layer QK-norm, partial rotate_half RoPE, sigmoid+bias expert route). EP via `load_model_ep`. |
 | 11 | LFM2.5 / LFM2.5-MoE | `hipfire-arch-lfm2moe` | `Lfm2MoeCarrier` | Hybrid short-conv + GQA; dense SwiGLU and/or top-4 MoE; tied embeddings. Dir `lfm2` / `lfm2_moe` → 11. |
 | 12 | Cohere2-MoE (North-Mini-Code) | `hipfire-arch-cohere2moe` | `Cohere2MoeCarrier` | Parallel block, interleaved sliding(RoPE)/global(NoPE) GQA, sigmoid MoE, dense layer-0, tied embeddings. |
+| 13 | LFM3 family (text / VL / audio / omni) | `hipfire-arch-lfm3` (+ `-vl` / `-audio` / `-omni` towers) | `Lfm3Carrier` | Hybrid conv + full-attn + sliding-attn with partial RoPE and sandwich norm. VL / audio / omni reuse 13 — towers are detected by tensor presence. Dir `lfm3` / `lfm3_vl` / `lfm3_audio` / `lfm3_omni` → 13. |
 
 Ids **2–4** are unused in the carrier registry (not claimed). Do not invent
 assignments without a carrier + source mapping.
@@ -51,7 +52,7 @@ them for ordinary dispatch.
 | Namespace | Origin | Examples |
 |---|---|---|
 | HFQ header | `HfqFile::arch_id` written at quantize/pack time | Primary table above; sidecars 20/21 |
-| Safetensors dir | `derive_arch_id(&config)` | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`→11, `cohere2_moe`→12 |
+| Safetensors dir | `derive_arch_id(&config)` | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`→11, `cohere2_moe`→12, `lfm3`/`lfm3_vl`/`lfm3_audio`/`lfm3_omni`→13 |
 
 `Carrier::claims_arch_id(arch_id, is_dir)` may distinguish the two namespaces.
 Today’s carriers are disjoint on bare id for the ids they claim; registry unit

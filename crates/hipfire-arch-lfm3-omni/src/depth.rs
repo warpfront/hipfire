@@ -276,7 +276,12 @@ fn bytes_to_f16(qt: u8, data: &[u8]) -> Vec<u16> {
     use hipfire_runtime::llama::f32_to_f16;
     match qt {
         1 => data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
-        16 => data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
+        // DTYPE-1: BF16 bits are not F16 bits — the old pass-through copied
+        // BF16 patterns into an F16 buffer (noise). Route through F32.
+        16 => data
+            .chunks_exact(2)
+            .map(|c| f32_to_f16(bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))))
+            .collect(),
         2 => data
             .chunks_exact(4)
             .map(|c| f32_to_f16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
@@ -291,9 +296,20 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
         hip_bridge::HipError::new(0, &format!("depth: tensor not found: {name}"))
     })?;
     let qt = info.quant_type;
-    let n: usize = data.len() / if qt == 2 { 4 } else { 2 };
+    // DTYPE-1: element count comes from the tensor shape. The old
+    // data.len()/2 derivation is wrong for HFQ4 (8-byte scale/zero header +
+    // group_size/2 nibbles per group) and mis-shaped the upload + dequant.
+    let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match qt {
-        1 | 16 => gpu.upload_raw(data, &[n]),
+        1 => gpu.upload_raw(data, &[n]),
+        // DTYPE-1: BF16 must be converted to F16 before upload, never copied.
+        16 => {
+            let f16_bytes: Vec<u8> = bytes_to_f16(qt, data)
+                .iter()
+                .flat_map(|&h| h.to_le_bytes())
+                .collect();
+            gpu.upload_raw(&f16_bytes, &[n])
+        }
         2 => {
             let f16_bytes: Vec<u8> = bytes_to_f16(qt, data)
                 .iter()
@@ -772,8 +788,10 @@ fn sample_code(
 /// `hidden`: LM hidden state at the position preceding the frame.
 /// `history`: previous frames' codes (each `[u32; num_codebooks]`), newest last,
 ///            for the repetition penalty (truncated to `audio_repetition_window`).
-/// Returns the 12 sampled codes. A frame holding `audio_eos_code` in every
-/// codebook ends the speech segment (the caller checks).
+/// Returns the 12 sampled codes. A frame holding `audio_eos_code` in ANY
+/// codebook ends the speech segment (the caller checks — HF
+/// `(codes == audio_eos_code).any()`, and the whole frame is then replaced
+/// with the eos code; see the omni.rs EOS-1 notes).
 pub fn sample_audio_frame(
     cfg: &DepthConfig,
     weights: &DepthWeights,
