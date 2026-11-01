@@ -585,9 +585,11 @@ struct ChunkAdmission {
 /// served, unless the whole reserved context is still covered); the 512-row
 /// rung is the floor and is always admitted, exactly as before. A forced rung
 /// ignores the mirror comparison but must fit `available`, else a named error.
+/// `policy` bounds the auto ladder (a forced rung ignores it): [`auto_policy`].
 fn select_prefill_rows(
     max_seq: usize,
     forced: Option<usize>,
+    policy: AutoPolicy,
     available: usize,
     extra: &mut dyn FnMut(usize) -> Result<usize, String>,
     mirror_rows: &dyn Fn(usize) -> usize,
@@ -629,16 +631,50 @@ fn select_prefill_rows(
         if rows <= base_rows {
             break;
         }
+        if rows > policy.cap {
+            continue;
+        }
         let e = extra(rows)?;
         if e > available {
             continue;
         }
         let adm = admit(rows, e);
-        if adm.mirror_rows >= baseline_mirror_rows {
+        if adm.mirror_rows >= baseline_mirror_rows.min(policy.mirror_floor) {
             return Ok(adm);
         }
     }
     Ok(admit(base_rows, base_extra))
+}
+
+/// Bounds of the auto ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoPolicy {
+    /// Widest rung tried.
+    cap: usize,
+    /// A rung is admitted when its mirror budget reaches
+    /// `min(512-row policy's budget, mirror_floor)`.
+    mirror_floor: usize,
+}
+
+/// Auto-ladder policy on `arch`. gfx1100 (7900 XTX) is measured only up to
+/// 1024 rows and with the expanded K/V mirror held: pp4096 5,335 -> 6,123 tok/s
+/// with 13,360 mirror rows (`wslab/ev/raon-xtx`; the pre-slab 512-row policy
+/// held 7,282). So it takes 1024 when the mirror still reaches 8,192 rows (or
+/// the whole reserved context, or the 512-row policy's budget if that is
+/// smaller) and 512 otherwise; every other arch keeps the whole ladder and the
+/// strict "never below the 512-row mirror" rule.
+fn auto_policy(arch: &str) -> AutoPolicy {
+    if arch.starts_with("gfx1100") {
+        AutoPolicy {
+            cap: 1024,
+            mirror_floor: 8192,
+        }
+    } else {
+        AutoPolicy {
+            cap: usize::MAX,
+            mirror_floor: usize::MAX,
+        }
+    }
 }
 
 /// Admit the prefill chunk rows against the device's free memory right now
@@ -660,9 +696,14 @@ fn admit_prefill_rows(
                 gpu.gated_delta_vector_chunked_arch_supported(),
             )?)
     };
-    let adm = select_prefill_rows(state.max_seq(), forced, available, &mut extra, &|usable| {
-        state.projected_mirror_budget_rows(usable)
-    })?;
+    let adm = select_prefill_rows(
+        state.max_seq(),
+        forced,
+        auto_policy(&gpu.arch),
+        available,
+        &mut extra,
+        &|usable| state.projected_mirror_budget_rows(usable),
+    )?;
     eprintln!(
         "raon1_mini: admission decision: prefill chunk rows from {cap}; requested={} admitted={} (scratch+work {:.0} MiB; \
          projected expanded K/V mirror budget {} rows of {} reserved context, 512-row policy {} rows)",
@@ -691,6 +732,7 @@ mod tests {
         select_prefill_rows(
             max_seq,
             forced,
+            auto_policy("gfx1201"),
             available_mib * MIB,
             &mut |rows| Ok(rows * MIB),
             &|usable| (usable / MIB).min(max_seq),
@@ -710,6 +752,42 @@ mod tests {
         assert_eq!(before.rows, 4096);
         assert_eq!(during.rows, before.rows);
         assert_eq!(during.mirror_rows, before.mirror_rows);
+    }
+
+    #[test]
+    fn gfx1100_auto_takes_1024_when_the_mirror_reaches_the_floor_else_512() {
+        assert_eq!(auto_policy("gfx1100").cap, 1024);
+        assert_eq!(auto_policy("gfx1201"), auto_policy("gfx9999"));
+        let on = |max_seq: usize, avail_mib: usize| {
+            select_prefill_rows(
+                max_seq,
+                None,
+                auto_policy("gfx1100"),
+                avail_mib * MIB,
+                &mut |rows| Ok(rows * MIB),
+                &|usable| (usable / MIB).min(max_seq),
+            )
+            .unwrap()
+        };
+        // Room for everything: 1024, not 4096.
+        assert_eq!(on(50000, 60000).rows, 1024);
+        // 512-row mirror 21,488 rows, 1024 leaves 20,976: still above the 8,192 floor.
+        assert_eq!(on(50000, 22000).rows, 1024);
+        // 1024 would leave 8,100 (< floor) of a 512-row 8,612: stay on 512.
+        assert_eq!(on(50000, 9124).rows, 512);
+        // The whole reserved context (4,000 rows) is still covered at 1024.
+        assert_eq!(on(4000, 5100).rows, 1024);
+        // A forced rung ignores the policy.
+        let forced = select_prefill_rows(
+            50000,
+            Some(2048),
+            auto_policy("gfx1100"),
+            60000 * MIB,
+            &mut |r| Ok(r * MIB),
+            &|u| (u / MIB).min(50000),
+        )
+        .unwrap();
+        assert_eq!(forced.rows, 2048);
     }
 
     #[test]
