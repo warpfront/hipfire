@@ -45,12 +45,41 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     const float* __restrict__ x,
     float* __restrict__ y,
     int M, int K
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    , const unsigned int LUT0, const unsigned int LUT1,
+    const unsigned int LUT2, const unsigned int LUT3,
+    const unsigned int LUT4, const unsigned int LUT5,
+    const unsigned int LUT6, const unsigned int LUT7
+#endif
 ) {
     const int row0 = blockIdx.x << 1;
     if (row0 >= M) return;
     const int row1 = row0 + 1;
     const bool have_row1 = row1 < M;
     const int tid = threadIdx.x;
+
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    // Centered-codebook LUT shared by both rows (same tensor A): 16 f16
+    // levels expanded once to 16 floats in LDS (lanes 0..7, disjoint slots),
+    // then decoded per nibble. Distinct 4-byte LDS banks per entry, no
+    // per-nibble __half2float. f16->f32 is exact: bit-identical FMA chain.
+    __shared__ float LUT_SMEM[16];
+    {
+        unsigned int d;
+        if (tid == 0) d = LUT0; else if (tid == 1) d = LUT1;
+        else if (tid == 2) d = LUT2; else if (tid == 3) d = LUT3;
+        else if (tid == 4) d = LUT4; else if (tid == 5) d = LUT5;
+        else if (tid == 6) d = LUT6; else d = LUT7;
+        if (tid < 8) {
+            LUT_SMEM[tid * 2] = __half2float(__ushort_as_half((unsigned short)(d & 0xFFFFu)));
+            LUT_SMEM[tid * 2 + 1] = __half2float(__ushort_as_half((unsigned short)(d >> 16)));
+        }
+    }
+    __syncthreads();
+    #define MQ4V2_W(q) (LUT_SMEM[(q)])
+#else
+    #define MQ4V2_W(q) ((float)(q))
+#endif
 
 #if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
     // Exact Qwen3.6 A3B decode contract. Making both quads static lets LLVM
@@ -78,14 +107,14 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     const int tail = groups_per_row & 3;
 
     #define DOG_X8(sc, zp, pk, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
-        (a) += ((sc) * (float)((pk) & 0xFu)         + (zp)) * (x0) \
-             + ((sc) * (float)(((pk) >> 4) & 0xFu)  + (zp)) * (x1) \
-             + ((sc) * (float)(((pk) >> 8) & 0xFu)  + (zp)) * (x2) \
-             + ((sc) * (float)(((pk) >> 12) & 0xFu) + (zp)) * (x3) \
-             + ((sc) * (float)(((pk) >> 16) & 0xFu) + (zp)) * (x4) \
-             + ((sc) * (float)(((pk) >> 20) & 0xFu) + (zp)) * (x5) \
-             + ((sc) * (float)(((pk) >> 24) & 0xFu) + (zp)) * (x6) \
-             + ((sc) * (float)(((pk) >> 28) & 0xFu) + (zp)) * (x7); \
+        (a) += ((sc) * MQ4V2_W(((pk)) & 0xFu)         + (zp)) * (x0) \
+             + ((sc) * MQ4V2_W((((pk)) >> 4) & 0xFu)  + (zp)) * (x1) \
+             + ((sc) * MQ4V2_W((((pk)) >> 8) & 0xFu)  + (zp)) * (x2) \
+             + ((sc) * MQ4V2_W((((pk)) >> 12) & 0xFu) + (zp)) * (x3) \
+             + ((sc) * MQ4V2_W((((pk)) >> 16) & 0xFu) + (zp)) * (x4) \
+             + ((sc) * MQ4V2_W((((pk)) >> 20) & 0xFu) + (zp)) * (x5) \
+             + ((sc) * MQ4V2_W((((pk)) >> 24) & 0xFu) + (zp)) * (x6) \
+             + ((sc) * MQ4V2_W((((pk)) >> 28) & 0xFu) + (zp)) * (x7); \
     } while (0)
 
     #if HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER

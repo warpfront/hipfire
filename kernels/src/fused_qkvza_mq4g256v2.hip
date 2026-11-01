@@ -102,7 +102,7 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
 ) {
     const int block_tid = threadIdx.x;
 #ifdef HIPFIRE_MQ4G256V2_LUT
-    __shared__ unsigned short LUT_SMEM[64];
+    __shared__ float LUT_SMEM[64];
     if (block_tid < 32) {
         unsigned int d;
         switch (block_tid) {
@@ -115,7 +115,8 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
             case 24: d = L24; break; case 25: d = L25; break; case 26: d = L26; break; case 27: d = L27; break;
             case 28: d = L28; break; case 29: d = L29; break; case 30: d = L30; break; default: d = L31; break;
         }
-        ((unsigned int*)LUT_SMEM)[block_tid] = d;
+        LUT_SMEM[block_tid * 2] = __half2float(__ushort_as_half((unsigned short)(d & 0xFFFFu)));
+        LUT_SMEM[block_tid * 2 + 1] = __half2float(__ushort_as_half((unsigned short)(d >> 16)));
     }
     __syncthreads();
 #endif
@@ -163,7 +164,7 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         A = A_alpha; y = y_alpha; row = gid - (qkv_m + z_m + beta_m);  lut_base = 48;
     }
 #ifdef HIPFIRE_MQ4G256V2_LUT
-    #define MQ4V2_DEQ(q) (__half2float(__ushort_as_half(LUT_SMEM[lut_base + (q)])))
+    #define MQ4V2_DEQ(q) (LUT_SMEM[lut_base + (q)])
 #else
     (void)lut_base;
     #define MQ4V2_DEQ(q) ((float)(q))
