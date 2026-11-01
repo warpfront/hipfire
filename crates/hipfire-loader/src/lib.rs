@@ -3247,9 +3247,13 @@ fn finish_qwen35_load(
                         },
                     );
                     // Further DeltaNet checkpoints yield to the admitted context.
+                    // The prefill scratch is already resident whenever a prefill takes a
+                    // checkpoint, and the checkpoint term is the ring's own two-snapshot
+                    // budget (the gate charges each extra snapshot separately), so neither
+                    // is charged again here.
                     ctx.gpu.kv_fit_floor = Some(rdna_compute::KvFitFloor {
                         admitted_tokens: ctx.max_seq.min(physical_cap),
-                        reserve_bytes: m.transient,
+                        reserve_bytes: m.transient.saturating_sub(m.prefill + m.checkpoints),
                     });
                 }
             }

@@ -2875,6 +2875,10 @@ pub fn plan_from_rendered(
                     rendered,
                 };
             }
+            eprintln!(
+                "[qwen-cache cold {trace_tag}] lcp={lcp} prior_len={prior_len} checkpoints={dflash_ckpt_positions:?}: none at or before lcp, cold-prefilling {} tokens",
+                rendered.len(),
+            );
         }
     }
     PromptCachePlan {
