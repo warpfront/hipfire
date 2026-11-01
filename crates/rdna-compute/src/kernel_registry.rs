@@ -1762,9 +1762,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     // `Gpu::select_regrid_enabled` routes the row selectors through these on
-    // gfx1201 and gfx1151 (measured: Halo 27B DFlash/MTP request them first
-    // on a host without hipcc).
-    if matches!(arch, "gfx1201" | "gfx1151") {
+    // gfx1201, gfx1151 and gfx1100 (measured: Halo 27B DFlash/MTP request them
+    // first on a host without hipcc).
+    if matches!(arch, "gfx1201" | "gfx1151" | "gfx1100") {
         add!(
             "select_regrid",
             crate::select_regrid::SELECT_REGRID_SRC,

@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Railgun E0 / L6d: re-gridded row selectors (gfx1201, gfx1151).
+//! Railgun E0 / L6d: re-gridded row selectors (gfx1201, gfx1151, gfx1100).
 //!
 //! `topk_values_batched_f32` (DFlash2 selector, raw top-K) and
 //! `argmax_f32_batched` (verify argmax) launch one 256-thread block per row;
-//! the top-K merges 256 x K candidates on a single thread. On exact gfx1201
-//! and gfx1151 (opt out with `HIPFIRE_SELECT_REGRID_OFF=1`) both route through
+//! the top-K merges 256 x K candidates on a single thread. On exact gfx1201,
+//! gfx1151 and gfx1100 (opt out with `HIPFIRE_SELECT_REGRID_OFF=1`) both route through
 //! `kernels/src/select_regrid.hip` instead: 1024 threads per row with wave32
 //! butterflies. Outputs are byte-identical to the shipping kernels for every
 //! input (see the kernel header for the argument; `test_select_regrid`
@@ -56,11 +56,13 @@ pub const TOPK_VALUES_FIXUP_SYMBOL: &str = "topk_values_fixup_f32";
 pub const SELECT_REGRID_BLOCK: u32 = 1024;
 
 impl Gpu {
-    /// Exact gfx1201 or gfx1151 (the archs `test_select_regrid` byte-checks),
-    /// not opted out, and no open Redline recording (the re-grid kernels are
-    /// not in Redline's kernel tables).
+    /// Exact gfx1201, gfx1151 or gfx1100 (the archs `test_select_regrid` and
+    /// `topk_tie_exact_gpu` byte-check; all three are wave32 and the kernels
+    /// use only `__shfl_xor` and 1024-thread blocks), not opted out, and no
+    /// open Redline recording (the re-grid kernels are not in Redline's kernel
+    /// tables).
     pub fn select_regrid_enabled(&self) -> bool {
-        (self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151())
+        (self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1100())
             && !self.flags.select_regrid_off
             && !self.replay.is_recording()
     }
@@ -178,6 +180,38 @@ impl Gpu {
                 b
             },
         )
+    }
+
+    /// The re-grid + tie-recompute raw top-K on ANY arch, bypassing
+    /// [`Self::select_regrid_enabled`] (parity gates only: lets
+    /// `topk_tie_exact_gpu` byte-compare the re-grid route against the shipping
+    /// kernel on an arch before that arch is admitted). Same contract as the
+    /// routed launch; `k` in `1..=16`.
+    pub fn topk_values_regrid_f32_forced(
+        &mut self,
+        logits: &GpuTensor,
+        top_idx: &GpuTensor,
+        top_values: &GpuTensor,
+        vocab: usize,
+        k: usize,
+        b: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!((1..=16).contains(&k), "topk: K={k} must be in [1,16]");
+        self.topk_values_regrid_f32(logits, top_idx, top_values, vocab, k, b)
+    }
+
+    /// The re-grid batched argmax on ANY arch, bypassing
+    /// [`Self::select_regrid_enabled`] (parity gates only).
+    pub fn argmax_f32_batched_regrid_forced(
+        &mut self,
+        data: &GpuTensor,
+        result: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.argmax_f32_batched_regrid(data, result, n, batch_size)
     }
 
     /// The shipping raw top-K launch (kept callable for the parity gate).
