@@ -787,7 +787,7 @@ that will stage MTP lanes (the mixed store, `ep_lane_store_device_bytes_mixed`) 
 load logs `qwen4 EP reserve decoupling: not applied (native-MTP EP lanes are staged ...)`) and keeps the ordinary reserve
 plus the mixed store (24 resident layers at the defaults). A spec store that still reaches a reserve-sharing load is
 refused at staging with a label (`native-MTP lanes are refused on an EP reserve-sharing load`) and the daemon stages AR
-lanes instead (`spec=off (...)`). Without `--spec mtp`, or with `HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes and
+lanes instead (`spec=off (...)`). Without `--spec mtp`, or without the opt-in `HIPFIRE_EP_MTP_LANES=1` (the default), the lanes are AR lanes and
 take the 32-layer decoupled placement.
 
 Lab override `HIPFIRE_EP_MTP_RESERVE_SHARE=1` (default off) lifts both refusals so an MTP lane store loads on the
@@ -1487,7 +1487,7 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   lanes are AR lanes (`continuous_batch_spec = false`,
   `continuous_batch_spec_mode = "off"`), whatever `speculation.mtp` requests.
   Under EP, with `serve.vmm_batch`, `serve.batch_spec` and the MTP head
-  attached (`--spec mtp`), concurrent greedy requests run as native-MTP lanes
+  attached (`--spec mtp`) and the opt-in `HIPFIRE_EP_MTP_LANES=1`, concurrent greedy requests run as native-MTP lanes
   with the singleton's default n-gram copy lane
   (`speculation.mtp_ngram_copy`): rank 0 is the root and alone chooses every
   window's route, depth and proposal source, reads the head's drafts and the
@@ -1496,8 +1496,8 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   gather has a peer. The load reserves the spec lane store before it splits
   the experts. The stage line reports `spec=mtp K=.. executor=ep-mesh
   copy=on|off`; a store that does not fit is a labeled refusal and AR lanes
-  (`spec=off (...)`), never a narrower MTP store. `HIPFIRE_EP_MTP_LANES=0` is
-  the kill switch (EP lanes are AR lanes, as before). Sampled requests
+  (`spec=off (...)`), never a narrower MTP store. Native-MTP lanes are opt-in
+  (`HIPFIRE_EP_MTP_LANES=1`; unset keeps AR lanes, as before). Sampled requests
   (`serve.batch_sampled`, neutral penalties) run on the same lanes: rank 0
   reads the head's exact candidates and its target logits rows, and the root
   alone draws every proposal and every Leviathan accept/residual/bonus.
