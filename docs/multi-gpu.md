@@ -1187,9 +1187,10 @@ qwen4: pipeline parallelism (topology.pp = 6): band does not fit device memory: 
 ```
 
 There is no spill to host-mapped experts. The canonical prefill chunk is the
-same on every band, and a band whose free VRAM cannot hold it at attach
-refuses instead of shrinking it. What changes how a short card is handled is
-the auto-fit below.
+same on every band, and it is decided once for the whole mesh before any band
+loads (see [Canonical chunk negotiation](#canonical-chunk-negotiation)); a band
+allocates exactly that chunk and refuses, naming the bytes, instead of
+shrinking it. What changes how a short card is handled is the auto-fit below.
 
 ##### Auto-fit (`HIPFIRE_PP_LAYERS` and `HIPFIRE_PREFILL_CHUNK_ROWS` unset)
 
@@ -1224,6 +1225,42 @@ and the default chunk are used as given and a short card refuses exactly as
 before. `HIPFIRE_PREFILL_CHUNK_ROWS=N` keeps the chunk (it is never stepped
 down) and only the split is searched.
 
+##### Canonical chunk negotiation
+
+Each band's VRAM admits a different largest chunk (the output band also holds
+the head and the MTP weights, the input band the PLE buffers), but every band
+must prefill the same chunk: an edge carries one chunk's streams and a
+different chunking changes the numerics. After the auto-fit chose the split
+and once the rank devices are open, **before any band loads**, the load
+settles the chunk for the whole mesh:
+
+- each band's **largest admissible rung** is the largest chunk (the auto-fit's
+  chunk, then 8192, 4096, 2048, 1536, 1024, 512, 256 below it) whose per-rank
+  census, with the band's own forward scratch, fits that card's capacity (the
+  smaller of its free VRAM and its open device's planned capacity, the figure
+  the band's own attach reads);
+- the canonical chunk is the **minimum** over the bands, so a band that is
+  tighter than the rest lowers the chunk for everyone instead of failing its
+  own load; every band, and the mesh's edge buffers, then use exactly it;
+- one log line names the outcome:
+
+  ```text
+  qwen4 PP canonical chunk: 4096 rows, lowered from 8192 for the whole mesh by band 4 (per-band largest admissible rung: band 0 (layers 0..10) 8192, band 1 (layers 10..19) 8192, …, band 4 (layers 39..48) 4096)
+  qwen4 PP canonical chunk: 8192 rows (every band admits it; per-band largest admissible rung: …)
+  ```
+
+An **explicit** `HIPFIRE_PREFILL_CHUNK_ROWS` is never lowered: a band that
+cannot admit it refuses the load, naming the band and its shortfall (`the
+explicit prefill chunk HIPFIRE_PREFILL_CHUNK_ROWS=8192 is not admitted by every
+band and a band never shrinks the canonical chunk: band 4 (layers 39..48) needs
+… MiB at 8192 rows but its device holds … MiB`), and a mesh no chunk fits is
+refused naming the bands. Because the chunk changes numerics, compare two PP
+runs (for example the PP gate's PP-N against its PP-(N−1) reference) at the
+**same** chunk: a load that negotiated down to 4096 equals a single card at
+`HIPFIRE_PREFILL_CHUNK_ROWS=4096`. The gate arms load independently, so pin
+`HIPFIRE_PREFILL_CHUNK_ROWS` in the gate's `EXTRA_ENV` when a box's bands are
+near the limit.
+
 **What it changes in the output.** The chunk changes numerics: output equals a
 single-card run at the same chunk (see [What runs](#what-runs)), so a load the
 auto-fit stepped down to chunk 1024 equals a single card at
@@ -1257,7 +1294,8 @@ measurement, is expected to land on `25,23` at chunk 256.
   previous chunk); the bands and the mesh planner share one chunk, the default
   chunk when every card holds it and otherwise the one the
   [auto-fit](#auto-fit-hipfire_pp_layers-and-hipfire_prefill_chunk_rows-unset)
-  chose. Output equals a
+  and the [canonical chunk negotiation](#canonical-chunk-negotiation) chose
+  (the largest chunk every band admits). Output equals a
   single-card run at the same chunk. Decode is unchanged (~54 tok/s). Measured
   2026-10-28, 4x R9700 (PP4), packed mq4-xts, beta c7c44097cc + explicit chunk
   env, greedy, one fresh process per arm:

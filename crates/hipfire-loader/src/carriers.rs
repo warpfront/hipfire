@@ -5473,8 +5473,9 @@ fn load_qwen4_rank_scoped(
     // (16384 rows under the compact plan, 4096 under `Full`). Under pipeline
     // parallelism (`band.is_some()`) the chunk is the one the PP load chose
     // once (`load_qwen4_pp_bundle`: the requested chunk, stepped down by the
-    // PP auto-fit when the cards cannot hold it) and handed to every band;
-    // bands refuse a chunk that differs from the mesh chunk. Every other
+    // PP auto-fit and the mesh-wide chunk negotiation when the cards cannot
+    // hold it) and handed to every band, which allocates exactly that chunk
+    // and refuses rather than shrink it. Every other
     // arch and any explicit value never probes.
     let placement_chunk = if band.is_some() {
         pp_chunk_rows.ok_or_else(|| {
@@ -7347,7 +7348,14 @@ fn load_qwen4_rank_scoped(
         Some(plan) => {
             bundle.attach_forward_ep_reserve(ctx.gpu, placement_chunk, scratch_mode, plan.clone())
         }
-        None => bundle.attach_forward(ctx.gpu, placement_chunk, scratch_mode),
+        // A PP band allocates exactly the mesh's canonical chunk (negotiated
+        // once before any band loaded) and never searches a smaller rung.
+        None => match band {
+            Some(scope) => {
+                bundle.attach_forward_canonical(ctx.gpu, placement_chunk, scratch_mode, scope)
+            }
+            None => bundle.attach_forward(ctx.gpu, placement_chunk, scratch_mode),
+        },
     };
     if let Err(error) = attached {
         let detail = error.to_string();
@@ -7365,17 +7373,16 @@ fn load_qwen4_rank_scoped(
         0,
     );
     if let Some(scope) = band {
-        // `attach_forward` searches smaller chunk rungs when the largest does
-        // not fit; a band never shrinks the canonical chunk on its own. A band
-        // keeps the placement chunk.
+        // Invariant: `attach_forward_canonical` allocates exactly the mesh's
+        // canonical chunk, so this can only trip on a forward that changed the
+        // chunk behind the attach (it never shrinks on its own).
         let canonical = placement_chunk;
         if bundle.spec_chunk_rows() != Some(canonical) {
             let got = bundle.spec_chunk_rows();
             let _ = bundle.free_gpu(ctx.gpu);
             return Err(format!(
                 "qwen4: topology.pp band {:?} allocated chunk rows {got:?} but the canonical \
-                 chunk is {canonical}; the rank's free VRAM cannot hold it and a band never \
-                 shrinks the canonical chunk",
+                 chunk is {canonical}; a band never shrinks the canonical chunk",
                 scope.band
             ));
         }
@@ -8571,7 +8578,7 @@ fn load_qwen4_pp_bundle(
             })?;
         free_per_rank.push(free as u64);
     }
-    let (chosen, scopes, edge_bytes, chunk_rows) = {
+    let (chosen, scopes, rung_tables, pinned_chunk, edge_bytes_by_rung) = {
         let ModelSource::Hfq(hfq) = &src else {
             return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
         };
@@ -8714,19 +8721,72 @@ fn load_qwen4_pp_bundle(
                 }
             );
         }
-        // From here the split and the chunk are fixed for every band, the
-        // edge buffers and the mesh.
-        let chunk_rows = fit.chunk_rows;
+        // From here the split is fixed for every band. The chunk is the
+        // auto-fit's at most; the mesh-wide negotiation below (after the rank
+        // devices are open, before any band loads) may lower it further, and
+        // the census of every rung it may settle on is taken now, while the
+        // artifact is open.
+        let pinned_chunk = q4::gpu_forward::qwen4_prefill_chunk_rows_pinned();
         let chosen = band_placement(&fit.counts)?;
         let scopes = (0..stages)
             .map(|stage| q4::weights::Qwen4BandScope::from_placement(&config, &chosen, stage))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("qwen4: topology.pp: {error}"))?;
-        let edge_bytes = crate::admission::qwen4_pp_edge_max_bytes(&config, chunk_rows)?;
-        (chosen, scopes, edge_bytes, chunk_rows)
+        let mut rung_tables = Vec::new();
+        let mut edge_bytes_by_rung = Vec::new();
+        for rows in crate::admission::qwen4_pp_chunk_ladder(fit.chunk_rows, pinned_chunk) {
+            let lines = if rows == fit.chunk_rows {
+                fit.fits.clone()
+            } else {
+                crate::admission::qwen4_pp_rank_lines(&crate::admission::Qwen4PpBudgetInputs {
+                    config: &config,
+                    placement: &chosen,
+                    weights: &receipt.manifest.weights,
+                    bytes_of: &bytes_of,
+                    format: state_format,
+                    context: &context,
+                    chunk_rows: rows,
+                    mode: scratch_mode,
+                    free_per_rank: &free_per_rank,
+                    reserve_bytes,
+                    native_mtp: native_mtp_inputs,
+                })?
+            };
+            edge_bytes_by_rung.push(crate::admission::qwen4_pp_edge_max_bytes(&config, rows)?);
+            rung_tables.push((rows, lines));
+        }
+        (
+            chosen,
+            scopes,
+            rung_tables,
+            pinned_chunk,
+            edge_bytes_by_rung,
+        )
     };
     let placement = &chosen;
     let mut gpus = init_qwen4_pp_gpus(admitted, placement)?;
+    // The one mesh-wide chunk decision, before any band loads: each band's
+    // largest admissible rung against the capacity of its own, now open,
+    // device (the smaller of its free VRAM before the open and the planned
+    // capacity the band's own admission reads: the open device's context and
+    // this process's residency count), then the minimum over the bands.
+    let mut capacity = Vec::with_capacity(stages);
+    for (stage, device) in gpus.devices.iter().enumerate() {
+        let planned = device.planned_capacity().map_err(|error| {
+            format!("qwen4: topology.pp rank {stage} planned capacity query: {error}")
+        })?;
+        capacity.push((planned.bytes as u64).min(free_per_rank[stage]));
+    }
+    let negotiation =
+        crate::admission::qwen4_pp_negotiate_chunk(&rung_tables, &capacity, pinned_chunk)?;
+    eprintln!("{}", negotiation.log_line());
+    let chunk_rows = negotiation.chunk_rows;
+    let edge_bytes = rung_tables
+        .iter()
+        .zip(&edge_bytes_by_rung)
+        .find(|((rows, _), _)| *rows == chunk_rows)
+        .map(|(_, bytes)| *bytes)
+        .ok_or("qwen4: topology.pp negotiated chunk is not on the ladder")?;
     gpus.provision_mesh_edges(admitted, placement, edge_bytes)
         .map_err(|error| format!("qwen4: topology.pp edge provisioning failed: {error}"))?;
     let mut bands: Vec<q4::bundle::Qwen4Bundle> = Vec::with_capacity(stages);

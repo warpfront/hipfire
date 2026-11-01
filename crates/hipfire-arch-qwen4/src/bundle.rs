@@ -1410,6 +1410,36 @@ impl Qwen4Bundle {
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
     ) -> Result<(), BundleError> {
+        self.attach_forward_impl(gpu, max_chunk, mode, None)
+    }
+
+    /// [`Self::attach_forward`] for a pipeline-parallel band: the forward is
+    /// allocated at EXACTLY `chunk` rows, the mesh's canonical prefill chunk
+    /// (decided once, before any band loaded, by the PP chunk negotiation).
+    /// The band never re-derives a chunk of its own: not from its own
+    /// measured host link, not from the PLE row store, not from a rung search
+    /// against its own free memory. A card that cannot hold `chunk` (or whose
+    /// PLE store cannot stage it) refuses the attach before any chunk-sized
+    /// allocation, naming the bytes, instead of shrinking. The forward bytes
+    /// it checks are the band's own (`scope`: the same band-scoped census the
+    /// negotiation charged), not the whole model's.
+    pub fn attach_forward_canonical(
+        &mut self,
+        gpu: &mut Gpu,
+        chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        scope: &crate::weights::Qwen4BandScope,
+    ) -> Result<(), BundleError> {
+        self.attach_forward_impl(gpu, chunk, mode, Some(scope))
+    }
+
+    fn attach_forward_impl(
+        &mut self,
+        gpu: &mut Gpu,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        canonical: Option<&crate::weights::Qwen4BandScope>,
+    ) -> Result<(), BundleError> {
         if self.execution.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 forward resources are already attached".to_string(),
@@ -1436,9 +1466,18 @@ impl Qwen4Bundle {
         let s1_tile = self.slowlink.profile.map(|profile| profile.tile_rows);
         let requested =
             session_pair::attach_chunk_request(s1_tile, max_chunk, ple_rows_cap, || {
-                qwen4_prefill_chunk_requested(gpu, max_chunk, mode)
+                if canonical.is_some() {
+                    max_chunk
+                } else {
+                    qwen4_prefill_chunk_requested(gpu, max_chunk, mode)
+                }
             })
             .map_err(BundleError::Forward)?;
+        if canonical.is_some() && requested != max_chunk {
+            return Err(BundleError::Forward(format!(
+                "the mesh's canonical prefill chunk is {max_chunk} rows but this band's PLE row store stages at most {requested} rows per prefetch; a band never shrinks the canonical chunk"
+            )));
+        }
         if requested == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 PLE row store cannot stage one chunk row".to_string(),
@@ -1561,13 +1600,8 @@ impl Qwen4Bundle {
                 }
                 requested
             }
-            None => qwen4_prefill_chunk_rungs(requested)
-                .find(|&rows| {
-                    qwen4_forward_device_bytes(&self.config, rows, mode)
-                        .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
-                        .is_some_and(|bytes| bytes <= free as u64)
-                })
-                .unwrap_or_else(|| requested.min(1536)),
+            None => attach_chunk_rows(&self.config, requested, mode, free as u64, canonical)
+                .map_err(BundleError::Forward)?,
         };
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
         hipfire_config::load_summary::note(
@@ -1598,7 +1632,12 @@ impl Qwen4Bundle {
                 if s1_tile.is_none() && mode == Qwen4ForwardScratchMode::FnSymGfx1201 =>
             {
                 let free = gpu.planned_capacity().map_err(BundleError::Hip)?.bytes;
-                let rows = full_fallback_rows(&self.config, requested, free as u64);
+                // A canonical chunk is never re-planned smaller.
+                let rows = if canonical.is_some() {
+                    requested
+                } else {
+                    full_fallback_rows(&self.config, requested, free as u64)
+                };
                 eprintln!(
                     "  qwen4 forward scratch: compact plan refused by the GPU symmetry check ({verified}/{total} layers verified); re-planned Full at {rows} rows"
                 );
@@ -6234,6 +6273,50 @@ impl fmt::Display for BundleError {
 }
 
 impl std::error::Error for BundleError {}
+
+/// The chunk rows one attach settles on against `free` planned device bytes
+/// (pure; the part of [`Qwen4Bundle::attach_forward`] that picks the rung).
+///
+/// Ordinary attach (`canonical = None`): the largest rung of
+/// [`qwen4_prefill_chunk_rungs`]`(requested)` whose chunk-sized whole-model
+/// forward bytes plus [`QWEN4_FORWARD_HEADROOM_BYTES`] fit, `requested.min(1536)`
+/// when none does. Pipeline-parallel band (`canonical = Some(scope)`):
+/// `requested` is the mesh's canonical chunk, decided once before any band
+/// loaded; there is no search, the forward bytes are the band's own
+/// (`forward_census_scope`, the term the PP census and the chunk negotiation
+/// charge: a band without the PLE input or the output head does not allocate
+/// their buffers), and a card whose `free` cannot hold them refuses with the
+/// bytes instead of shrinking, so no band can differ from the mesh.
+pub fn attach_chunk_rows(
+    config: &Qwen4Config,
+    requested: usize,
+    mode: Qwen4ForwardScratchMode,
+    free: u64,
+    canonical: Option<&crate::weights::Qwen4BandScope>,
+) -> Result<usize, String> {
+    if let Some(scope) = canonical {
+        let forward = crate::expert_residency::forward_census_scope(config, requested, mode, scope)
+            .and_then(|census| census.total())?;
+        let need = forward
+            .checked_add(QWEN4_FORWARD_HEADROOM_BYTES)
+            .ok_or("canonical chunk forward bytes overflow")?;
+        if need > free {
+            return Err(format!(
+                "the mesh's canonical prefill chunk of {requested} rows needs {} MiB of forward resources plus headroom but only {} MiB are planned free on this band's device; a band never shrinks the canonical chunk",
+                need >> 20,
+                free >> 20
+            ));
+        }
+        return Ok(requested);
+    }
+    Ok(qwen4_prefill_chunk_rungs(requested)
+        .find(|&rows| {
+            qwen4_forward_device_bytes(config, rows, mode)
+                .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                .is_some_and(|bytes| bytes <= free)
+        })
+        .unwrap_or_else(|| requested.min(1536)))
+}
 
 /// The chunk rows of the Full-plan re-attach after the GPU symmetry check
 /// refused the compact plan: the largest rung of
