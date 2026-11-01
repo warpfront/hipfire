@@ -278,9 +278,14 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "ffn_round_bf16_f32"),
     ("gfx1201", "ffn_single_expert_tables"),
     ("gfx1201", "ffn_situ_grouped_f32"),
+    ("gfx1201", "ffn_situ_grouped_rotate_i8_gfx1201"),
     ("gfx1201", "ffn_situ_rows_f32"),
+    ("gfx1201", "ffn_situ_rows_rotate_i8_gfx1201"),
     ("gfx1201", "gated_delta_net_vector_serial_f32"),
+    ("gfx1201", "gated_delta_vector_chunk_prep_gfx12"),
+    ("gfx1201", "gated_delta_vector_chunk_scan_gfx12"),
     ("gfx1201", "gated_rmsnorm_sigmoid_rows_f32"),
+    ("gfx1201", "gated_rmsnorm_sigmoid_rows_w128_f32"),
     ("gfx1201", "gemm_bf16_xbf16_small_rows_s1"),
     ("gfx1201", "gemm_bf16_xbf16_small_rows_s4"),
     ("gfx1201", "gemm_bf16_xbf16_small_rows_s8"),
@@ -294,6 +299,8 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "gemm_mq4g256v2_moe_grouped_wmma_gfx12"),
     ("gfx1201", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx12"),
     ("gfx1201", "gemm_mq6g256v2_mmq_i8_set_gfx12"),
+    ("gfx1201", "gemm_q8_0_mmq_i8_t128x128_ps"),
+    ("gfx1201", "gemm_q8_0_mmq_i8_t128x128_ps_bf16"),
     ("gfx1201", "gemm_q8_0_wmma_gfx12"),
     ("gfx1201", "gemv_q8_0"),
     ("gfx1201", "latent_attention_absorb_pack_bf16"),
@@ -305,6 +312,7 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "latent_attention_gather_latent_f32"),
     ("gfx1201", "latent_attention_rms_rows_bf16"),
     ("gfx1201", "latent_attention_scatter_expanded_bf16"),
+    ("gfx1201", "latent_attention_scatter_expanded_q8"),
     ("gfx1201", "latent_attention_split_kv_bf16"),
     ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt1r1"),
     ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt1r2"),
@@ -317,12 +325,17 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt4r1"),
     ("gfx1201", "moe_scatter_fused_k8"),
     ("gfx1201", "mq_rotate_x"),
+    ("gfx1201", "quantize_int8_mmq_ds128"),
+    ("gfx1201", "quantize_x_q8_blk32"),
+    ("gfx1201", "raon_rda_conv_prepare_w128_f32"),
     ("gfx1201", "raon_rda_prepare_f32"),
     ("gfx1201", "rotate_x_mq_awq"),
     ("gfx1201", "stream_mix_aggregate"),
     ("gfx1201", "stream_mix_broadcast"),
     ("gfx1201", "stream_mix_mean"),
     ("gfx1201", "stream_mix_postmix"),
+    ("gfx1201", "stream_mix_postmix_bf16"),
+    ("gfx1201", "stream_mix_route_aggregate_n4_k10_bf16"),
     ("gfx1201", "stream_mix_route_helmert"),
 ];
 
@@ -1254,6 +1267,14 @@ fn runtime_source(module: &str, source: &str) -> Result<String, String> {
         "gemm_mq6g256v2_mmq_i8_gfx11_t256" => format!(
             "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n#define I8_TILE 256\n{}{body}",
             read("kernels/src/block_i8_128_quant.hip")?
+        ),
+        "ffn_grouped_activation_rotate_i8_gfx1201" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n\
+             #define HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE 1\n{}{}{}{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?,
+            read("kernels/src/block_i8_128_emit.hip")?,
+            read("kernels/src/mq_fwht256.h")?,
+            read("kernels/src/ffn_grouped_activation_pad.hip")?
         ),
         _ => body,
     })
