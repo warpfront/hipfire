@@ -324,7 +324,12 @@ pub(crate) fn try_a8_rmsnorm_prepared(
     eps: f32,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
-    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k) || next.dtype != DType::MQ4G256V2 {
+    // Lloyd (qt=52) rides the staged-i8 twin route: the A4 predicate replaces
+    // the symmetric-file requirement (the producer is weight-independent; the
+    // twin consumer enforces the same A4 predicate).
+    let lloyd_next = next.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
+    let next_is_a8 = next.dtype == DType::MQ4G256V2 || lloyd_next;
+    if !gpu.flags.a8_fused_prod || (!gpu.a8_prefill_active(n, k) && !lloyd_next) || !next_is_a8 {
         return Ok(None);
     }
     // The norm reads `x`: land any residual add a folded GEMM left owed to it.
@@ -341,7 +346,12 @@ fn try_a8_hin_prepared(
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
-    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k) || down.dtype != DType::MQ4G256V2 {
+    // AWQ-only (mirrors the uniform arm): base mq4l without AWQ sidecars
+    // keeps the rotate + standalone-quantize path, same as uniform non-AWQ.
+    // Lloyd rides the A4 predicate in place of the symmetric-file requirement.
+    let lloyd_down = down.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
+    let down_is_a8 = down.dtype == DType::MQ4G256V2 || lloyd_down;
+    if !gpu.flags.a8_fused_prod || (!gpu.a8_prefill_active(n, k) && !lloyd_down) || !down_is_a8 {
         return Ok(None);
     }
     let Some(awq) = down.awq_scale else {
@@ -461,6 +471,33 @@ pub(crate) fn out_proj_residual_i8_prepared(
     }
     let result =
         gpu.gemm_mq4g256v2_residual_wmma_i8_prepared(&wo.buf, prep, &pbs.x_batch, wo.m, wo.k, n);
+    if fold {
+        gpu.disarm_residual_fold();
+    }
+    result
+}
+
+/// Lloyd twin of [`out_proj_residual_i8_prepared`]: same residual-fold dance,
+/// Lloyd ADD twin with the weight's codebook. Callers admit Lloyd preps only
+/// under `lloyd_mmq_a4_route` (the sigmoid/gdn producers enforce the same
+/// predicate), so the twin's K%256/arch gates always hold here.
+pub(crate) fn out_proj_residual_i8_prepared_lloyd(
+    gpu: &mut Gpu,
+    pbs: &BatchScratch<'_>,
+    wo: &WeightRef<'_>,
+    w_gate: &WeightRef<'_>,
+    prep: &rdna_compute::Int8MmqPrepared,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> HipResult<()> {
+    let fold = residual_fold_consumer_ready(gpu, w_gate, fusion, n, wo.m);
+    if fold {
+        gpu.arm_residual_fold(&pbs.gate_ffn_batch)?;
+    }
+    let xq = gpu.int8_mmq_prepared_ptr(prep, wo.k, n)?;
+    let c16 = lloyd_c16_or_fail(wo, "out_proj_residual_i8_prepared_lloyd")?;
+    let result =
+        gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(&wo.buf, xq, &pbs.x_batch, wo.m, wo.k, n, c16);
     if fold {
         gpu.disarm_residual_fold();
     }
@@ -1402,6 +1439,14 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     );
                 }
                 if lloyd_mmq_lut_route(gpu) {
+                    if lloyd_mmq_a4_route(gpu, n, k) {
+                        // Staged i8 twin ADD into the zeroed Y (== plain GEMM).
+                        let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                        let xq = gpu.ensure_int8_mmq_x(input, n, k)?;
+                        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
+                            &w.buf, xq, &out_n, m, k, n, c16,
+                        );
+                    }
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                     return gpu
                         .gemm_hfq4g256_residual_mmq_lloyd(&w.buf, input, &out_n, m, k, n, c16);
@@ -1663,7 +1708,9 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
 /// K%256, N>=64, eager-only (no replay/capture — same bar as the twin
 /// worker's siblings). Explicit opt-in `HIPFIRE_LLOYD_MMQ_A4=1`; distinct
 /// from the fail-closed `HIPFIRE_LLOYD_MMQ_OFF` and the uniform
-/// `HIPFIRE_IU4_PREFILL`. qkv/qkvza have no twin entries and stay X128.
+/// `HIPFIRE_IU4_PREFILL`. qkv/qkvza/partial/single-weight ride the existing
+/// single-matrix SET/ADD entries (no new TU); only gate/up has a fused SILU
+/// twin entry.
 #[inline]
 pub(crate) fn lloyd_mmq_a4_route(gpu: &Gpu, n: usize, k: usize) -> bool {
     gpu.arch.as_str() == "gfx1100"
@@ -2059,6 +2106,21 @@ fn swiglu_ffn_gate_up_batched(
             norm_eps,
             n,
         )?
+    } else if ffn_is_mq4v2_lloyd
+        && lloyd_mmq_a4_route(gpu, n, layer.w_gate.k)
+        && layer.w_gate.m == layer.w_up.m
+        && layer.w_gate.m % 128 == 0
+    {
+        // Lloyd twin producer: same conditions as the twin consumer below.
+        try_a8_rmsnorm_prepared(
+            gpu,
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            dim,
+            norm_eps,
+            n,
+        )?
     } else {
         None
     };
@@ -2144,6 +2206,22 @@ fn swiglu_ffn_gate_up_batched(
     // re-derives it from gpu.arch_caps.has_wmma() (== arch_has_wmma).
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.w_gate.k, n)?;
+        if ffn_is_mq4v2_lloyd {
+            // Lloyd twin: same prepared int8 X into the fused SILU twin.
+            // (f1lite is uniform-only, so no interaction.)
+            gpu.gemm_gate_up_silu_mq4g256v2_i8_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                xq,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+                lloyd_c16_or_fail(&layer.w_gate, "swiglu_ffn_gate_up_batched")?,
+                lloyd_c16_or_fail(&layer.w_up, "swiglu_ffn_gate_up_batched")?,
+            )?;
+            return Ok(FfnGateOutput::LloydA8H);
+        }
         if f1lite {
             gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
                 &layer.w_gate.buf,
@@ -2651,15 +2729,23 @@ fn swiglu_ffn_down_batched(
         && lloyd_mmq_a4_route(gpu, n, hidden_dim)
     {
         let c16 = lloyd_c16_or_fail(&layer.w_down, "swiglu_ffn_down_batched")?;
-        rotate_x_mq_batched_for(
-            gpu,
-            &layer.w_down,
-            &pbs.gate_ffn_batch,
-            &pbs.ffn_hidden_batch,
-            hidden_dim,
-            n,
-        )?;
-        let xq = gpu.ensure_int8_mmq_x(&pbs.ffn_hidden_batch, n, hidden_dim)?;
+        // Fused hin producer when admitted (AWQ sidecars only, mirroring
+        // the uniform A8H arm); otherwise the rotate + standalone quantize.
+        let xq = if let Some(prep) =
+            try_a8_hin_prepared(gpu, &layer.w_down, &pbs.gate_ffn_batch, hidden_dim, n)?
+        {
+            gpu.int8_mmq_prepared_ptr(&prep, hidden_dim, n)?
+        } else {
+            rotate_x_mq_batched_for(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.ffn_hidden_batch,
+                hidden_dim,
+                n,
+            )?;
+            gpu.ensure_int8_mmq_x(&pbs.ffn_hidden_batch, n, hidden_dim)?
+        };
         return gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
             &layer.w_down.buf,
             xq,
