@@ -28,7 +28,8 @@
 //! # Shape (`--shape k=v,...`)
 //!
 //! Every contract param by name (`M`, `K`, `N`, `n_experts`, ...), plus the recipe knobs `tokens` (activation
-//! rows of a ROUTED contract), `topk`, `route_seed`, and `rows=` (an alias of the activation-row key: for a
+//! rows of a ROUTED contract), `topk`, `route_seed`, `prefix` (the value of a position device scalar, default 0),
+//! and `rows=` (an alias of the activation-row key: for a
 //! dense contract the `WorkV1.rows` param, for a routed one the routed rows = `tokens * topk`). A missing
 //! param is an error listing every param; the `WorkV1.rows` param (the row class) is what `--rowclasses`
 //! injects per class. `m_total`, `x_src_rows`, `x_row_div` of a routed contract default from the routing plan
@@ -46,13 +47,14 @@
 //! |---|---|
 //! | `f32.flat`, `f32.rows_n_k`, `f32.rows_x_s01`, `f32.m`, `f32.n_x_m` | uniform f32 in [-1, 1) |
 //! | `f16.flat` | uniform f16 in [-1, 1) |
-//! | `bf16.flat` | uniform bf16 in [-1, 1) |
+//! | `bf16.flat`, `bf16.token_head_view` | uniform bf16 in [-1, 1) over the whole extent (a strided view's padding included) |
 //! | `ggml.q8_0.34` | blocks of 34 B: f16 scale in [0.001, 0.021) + 32 random i8 codes |
 //! | `moe_grouped.expert_ptr_table.u64` | `n_experts` slabs of `M x K/256` MQ4G256V2 groups (136 B, symmetric `zp = f16(-8 sc)`, `moe::synth_rows`), the table holds their device addresses |
 //! | `moe_grouped.expert_tile_ids.i32.per_tile16`, `...sorted_slot_index.i32.minus1_padding`, `...expert_offsets.i32.e_plus_1` | the ONE grouped routing plan: `tokens` tokens routed to `topk` of `n_experts` experts (uniform Gumbel-top-k, shape-seeded), scattered like `moe_scatter_fused_k8` (`moe::scatter`) |
 //! | `block_i8_128.kb_x_n.136b` | `[K/128][x_src_rows]` records `{f32 d in [0.005, 0.05); i32 s = sum(qs); i8 qs[128]}` |
 //! | `block_i4_128.kb_x_n.72b` | `[K/128][x_src_rows]` records `{f32 d; i32 s = sum of the signed nibbles; u8 qs[64]}` ([INFERENCE]: `s` is not read by the symmetric kernels) |
 //! | `i32.token_ids` | ids uniform in `[0, vocab)` |
+//! | `i32.device_scalar` (operands `pos_ptr`, `base_ptr`: a position) | one `i32` = `prefix=` (default 0). A contract with such an operand and a `max_rows` param refuses `prefix + <rows> > max_rows` (a clippable domain error, so `--rowclasses` drops the classes that do not fit). Any other device scalar (`slot_idx`, `n_dev`) has no recipe |
 //!
 //! `WriteOnly` operands are pre-poisoned (f32 -1234.5 pattern), `ReadWrite` ones start from their input recipe;
 //! `reset` restores both from a pristine device copy; `read_output` concatenates the outputs in operand order.
@@ -414,6 +416,8 @@ pub enum Recipe {
     BlockI8,
     BlockI4,
     TokenIds,
+    /// A position device scalar (`pos_ptr`, `base_ptr`): one `i32` = the `prefix=` knob.
+    DeviceScalar,
     /// Pre-poisoned output (any format).
     Poison,
 }
@@ -423,7 +427,11 @@ impl Recipe {
     fn is_index(self) -> bool {
         matches!(
             self,
-            Recipe::TileIds | Recipe::SortedSlots | Recipe::ExpertOffsets | Recipe::TokenIds
+            Recipe::TileIds
+                | Recipe::SortedSlots
+                | Recipe::ExpertOffsets
+                | Recipe::TokenIds
+                | Recipe::DeviceScalar
         )
     }
     fn is_routing(self) -> bool {
@@ -442,7 +450,7 @@ pub fn recipe_for(format: FormatId, access: Access) -> Result<Recipe> {
     Ok(match format.0 {
         "f32.flat" | "f32.rows_n_k" | "f32.rows_x_s01" | "f32.m" | "f32.n_x_m" => Recipe::F32,
         "f16.flat" => Recipe::F16,
-        "bf16.flat" => Recipe::Bf16,
+        "bf16.flat" | "bf16.token_head_view" => Recipe::Bf16,
         "ggml.q8_0.34" => Recipe::Q8_0,
         "moe_grouped.expert_ptr_table.u64" => Recipe::ExpertPtrTable,
         "moe_grouped.expert_tile_ids.i32.per_tile16" => Recipe::TileIds,
@@ -451,6 +459,7 @@ pub fn recipe_for(format: FormatId, access: Access) -> Result<Recipe> {
         "block_i8_128.kb_x_n.136b" => Recipe::BlockI8,
         "block_i4_128.kb_x_n.72b" => Recipe::BlockI4,
         "i32.token_ids" => Recipe::TokenIds,
+        "i32.device_scalar" => Recipe::DeviceScalar,
         other => {
             return Err(format!(
                 "no input recipe for format {other} ({access:?} operand): hip_loop's generic node does not \
@@ -531,7 +540,12 @@ fn gen_bytes(r: Recipe, bytes: usize, seed: u64, vocab: u64) -> Vec<u8> {
             let pat = SENTINEL.to_le_bytes();
             out.extend((0..bytes).map(|i| pat[i % 4]));
         }
-        Recipe::ExpertPtrTable | Recipe::TileIds | Recipe::SortedSlots | Recipe::ExpertOffsets => {}
+        // Routing tables and the position scalar are built by `host_operand`, never here.
+        Recipe::ExpertPtrTable
+        | Recipe::TileIds
+        | Recipe::SortedSlots
+        | Recipe::ExpertOffsets
+        | Recipe::DeviceScalar => {}
     }
     out.resize(bytes, 0);
     out
@@ -588,6 +602,8 @@ pub struct ContractNode {
     routed: bool,
     routing: Option<crate::moe::Routing>,
     route_seed: u64,
+    /// Value of a position device scalar operand (`prefix=`).
+    prefix: u64,
     operands: Vec<OperandPlan>,
     /// `(explicit-image offset, operand)` of every pointer field.
     ptr_fields: Vec<(u32, usize)>,
@@ -675,9 +691,10 @@ impl ContractNode {
         let topk_kv = take_u64(&mut kv, "topk")?;
         let rows_alias = take_u64(&mut kv, "rows")?;
         let route_seed = take_u64(&mut kv, "route_seed")?.unwrap_or(DEFAULT_ROUTE_SEED);
+        let prefix = take_u64(&mut kv, "prefix")?.unwrap_or(0);
         if let Some(k) = kv.keys().next() {
             let mut known: Vec<&str> = abi.params.iter().map(|p| p.name).collect();
-            known.extend(["tokens", "topk", "rows", "route_seed"]);
+            known.extend(["tokens", "topk", "rows", "route_seed", "prefix"]);
             return Err(format!(
                 "--shape: unknown key `{k}` for {} (params and knobs: {})",
                 abi.id,
@@ -860,6 +877,42 @@ impl ContractNode {
         }
         let params: Vec<u64> = vals.into_iter().map(|v| v.unwrap()).collect();
 
+        // Position device scalars: `prefix=` is their value; the rest have no recipe.
+        let mut has_position = false;
+        for o in abi.operands {
+            if recipe_for(o.format, o.access).is_ok_and(|r| r == Recipe::DeviceScalar) {
+                if !matches!(o.name, "pos_ptr" | "base_ptr") {
+                    return Err(format!(
+                        "{} operand {}: an i32.device_scalar other than a position (pos_ptr, base_ptr) has no input recipe",
+                        abi.id, o.name
+                    )
+                    .into());
+                }
+                has_position = true;
+            }
+        }
+        if prefix > 0 && !has_position {
+            return Err(format!(
+                "{}: prefix={prefix}, but the contract has no position device scalar (pos_ptr, base_ptr)",
+                abi.id
+            )
+            .into());
+        }
+        if prefix > i32::MAX as u64 {
+            return Err(format!("prefix={prefix} does not fit the i32 device scalar").into());
+        }
+        if has_position {
+            if let (Some(max_rows), Some(rows)) =
+                (param_value(abi, &params, "max_rows"), rows_value)
+            {
+                if prefix.saturating_add(rows) > max_rows {
+                    return Err(BuildError::Domain(format!(
+                        "prefix {prefix} + rows {rows} exceeds max_rows {max_rows}: the keys of the last rows would lie outside the K/V views"
+                    )));
+                }
+            }
+        }
+
         // Launcher rule: `gemm_bf16_xf32_tiled_rows` at M <= 32 launches the mp4 entry.
         let mut resolved_from = None;
         if node_arm.export.symbol == "gemm_bf16_xf32_tiled_rows"
@@ -968,6 +1021,7 @@ impl ContractNode {
         }
         env.insert("topk".into(), topk);
         env.insert("tokens".into(), tokens);
+        env.insert("prefix".into(), prefix);
         let stack = param_value(base.abi, &params, "n_experts").unwrap_or(1);
         env.insert("stack".into(), stack);
         if let Some(w) = base.work {
@@ -1047,6 +1101,9 @@ impl ContractNode {
         if routed {
             label.push_str(&format!("-tokens{tokens}-topk{topk}"));
         }
+        if prefix > 0 {
+            label.push_str(&format!("-prefix{prefix}"));
+        }
         Ok(Self {
             spec: spec.to_owned(),
             label,
@@ -1061,6 +1118,7 @@ impl ContractNode {
             routed,
             routing,
             route_seed,
+            prefix,
             operands,
             ptr_fields,
             pool,
@@ -1205,6 +1263,11 @@ impl ContractNode {
     /// emulator matter). Deterministic in `seed` and `set`.
     pub fn host_operand(&self, i: usize, seed: u64, set: usize) -> Vec<u8> {
         let o = &self.operands[i];
+        if o.recipe == Recipe::DeviceScalar {
+            let mut b = (self.prefix as i32).to_le_bytes().to_vec();
+            b.resize(o.bytes, 0);
+            return b;
+        }
         if let Some(b) = self.routing_bytes(i) {
             debug_assert_eq!(b.len(), o.bytes, "{}: routing table vs extent", o.name);
             return b;
@@ -1405,6 +1468,9 @@ impl Node for ContractNode {
             "params": params, "operands": ops, "arch": self.arch.name(),
             "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
         });
+        if self.prefix > 0 {
+            v["prefix"] = json!(self.prefix);
+        }
         if let Some(r) = &self.routing {
             v["routing"] = json!({
                 "tokens": self.tokens, "topk": self.topk, "n_experts": self.n_experts(),
@@ -2368,6 +2434,108 @@ mod tests {
         // the emu preset on the routed contract
         let e = node("contract:moe_grouped_qt44_a8_sym_gfx1201_nt1r2", "emu");
         assert_eq!((e.params[0], e.rows()), (128, Some(("tokens", 37))));
+    }
+
+    const FLASH: &str = "contract:latent_attention_flash_prefill";
+    /// The Raon expanded-mirror layout (kb the latent cache's shared 64-wide tail: token stride 576,
+    /// head stride 0), 2 heads.
+    const FLASH_SHAPE: &str = "n_heads=2,wa=128,wb=64,dv=128,pos_offset=0,max_rows=200,ka_tok=256,\
+        ka_head=128,kb_tok=576,kb_head=0,v_tok=256,v_head=128,scale_bits=1033096506,round_y=1";
+
+    fn flash(extra: &str) -> String {
+        format!("{FLASH_SHAPE},{extra}")
+    }
+
+    #[test]
+    fn flash_view_and_position_recipes() {
+        let n = node(FLASH, &flash("n_rows=48,prefix=100"));
+        let by_name = |s: &str| n.operands.iter().position(|o| o.name == s).unwrap();
+        for (name, extent) in [
+            ("ka", ((200 - 1) * 256 + 128 + 128) * 2),
+            ("kb", ((200 - 1) * 576 + 64) * 2),
+            ("vv", ((200 - 1) * 256 + 128 + 128) * 2),
+        ] {
+            let i = by_name(name);
+            assert_eq!(n.operands[i].recipe, Recipe::Bf16, "{name}");
+            assert_eq!(n.operands[i].bytes, extent, "{name} extent");
+            let b = n.host_operand(i, 3, 0);
+            assert_eq!(b.len(), extent, "{name} fill covers the whole view extent");
+            assert_eq!(b, n.host_operand(i, 3, 0), "{name} deterministic");
+            assert!(b.chunks_exact(2).any(|c| c != [0, 0]), "{name} is filled");
+            for c in b.chunks_exact(2) {
+                let v = half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+                assert!(v.is_finite() && (-1.0..=1.0).contains(&v), "{name}: {v}");
+            }
+        }
+        let p = by_name("pos_ptr");
+        assert_eq!(n.operands[p].recipe, Recipe::DeviceScalar);
+        assert_eq!(n.host_operand(p, 3, 0), 100i32.to_le_bytes().to_vec());
+        // the default prefix is 0; the scalar is an index-like operand, never replicated into a pool
+        let z = node(FLASH, &flash("n_rows=48"));
+        assert_eq!(z.host_operand(p, 9, 0), 0i32.to_le_bytes().to_vec());
+        assert!(n.operands[p].recipe.is_index());
+        assert_eq!(n.shape_json()["prefix"], 100);
+        assert!(z.shape_json().get("prefix").is_none());
+        assert!(n.shape_label().ends_with("-prefix100"));
+        // the scalar reaches the emulator case as its own region
+        let c = n.emu_case(1).unwrap();
+        let r = c.bufs.iter().find(|b| b.name == "pos_ptr").unwrap();
+        assert_eq!(r.bytes, 100i32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn flash_prefix_is_bounded_by_max_rows_and_counts_work() {
+        // prefix + rows <= max_rows (a clippable domain error: --rowclasses drops the class)
+        for shape in [
+            flash("n_rows=48,prefix=153"),
+            FLASH_SHAPE.replace("max_rows=200", "max_rows=48") + ",n_rows=48,prefix=1",
+        ] {
+            assert!(
+                matches!(build(FLASH, &shape), Err(BuildError::Domain(_))),
+                "{shape}"
+            );
+        }
+        assert!(build(FLASH, &flash("n_rows=48,prefix=152")).is_ok());
+        // the row class rebuilds with `rows=`: a class that no longer fits is clipped
+        assert!(matches!(
+            build(FLASH, &flash("prefix=152,rows=49")),
+            Err(BuildError::Domain(_))
+        ));
+        assert!(build(FLASH, &flash("prefix=100,rows=100")).is_ok());
+        // causal-triangle work with the prefix: H * (wa + wb + dv) * (rows * prefix + rows (rows + 1) / 2)
+        let n = node(FLASH, &flash("n_rows=48,prefix=100"));
+        let macs = 2.0 * 320.0 * (48.0 * 100.0 + 48.0 * 49.0 / 2.0);
+        assert_eq!(n.work().flops, 2.0 * macs);
+        assert_eq!(n.rows(), Some(("n_rows", 48)));
+        // a prefix is meaningless without a position scalar; it never exceeds i32
+        let e = build(BF16_BATCHED, "M=128,K=2560,N=512,prefix=4")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("no position device scalar"), "{e}");
+        let e = build(FLASH, &flash("n_rows=48,prefix=4294967296"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("i32"), "{e}");
+    }
+
+    #[test]
+    fn a_non_position_device_scalar_has_no_recipe() {
+        // gated_delta_net: `slot_idx` / `n_dev` are i32.device_scalar operands, not positions
+        let e = build(
+            "contract:gated_delta_net_vector_serial_f32",
+            "n_tokens=4,n_heads=2,qk_group=1,decay_per_key=0,round_out_bf16=0,slot=0,q_row_stride=256,\
+             k_row_stride=256,v_row_stride=256,decay_row_stride=2,beta_row_stride=2,out_row_stride=256,\
+             state_head_stride=16384,state_row_stride=128,state_slot_stride=32768,n_qk_heads=2",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            e.contains("slot_idx") && e.contains("no input recipe"),
+            "{e}"
+        );
     }
 
     #[test]
