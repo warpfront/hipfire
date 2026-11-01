@@ -384,6 +384,7 @@ fn small_rows_route(
 /// Smallest row count that takes the tiled kernel: the measured prefill region
 /// (pp512 and up). Decode (n = 1) and speculative verify (n <= 16) stay on
 /// `gemm_bf16_xf32_batched`.
+// selector-receipt: receipts/selectors/bf16_tiled_rows_min_n.json
 pub(crate) const BF16_TILED_ROWS_MIN_N: usize = 512;
 
 /// True for a device tensor the selector / router GEMMs accept as the weight:
