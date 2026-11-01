@@ -8,10 +8,10 @@
 //! raon_dflash_oracle capture  --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--max-seq N]
 //! raon_dflash_oracle emit     --model M.hfq --draft D.hfq --prompt-file P.txt --out DIR [--block N] [--max-seq N]
 //! raon_dflash_oracle rowexact --model M.hfq --prompt-file P.txt [--out DIR] [--max-seq N] [--census on [--census-k 2,4]]
-//! raon_dflash_oracle greedy   --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W]
+//! raon_dflash_oracle greedy   --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off]
 //! raon_dflash_oracle rollback  --model M.hfq [--draft D.hfq] --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
 //! raon_dflash_oracle verifygraph --model M.hfq --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
-//! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--out DIR]
+//! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off] [--out DIR]
 //! raon_dflash_oracle costs    --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
 //! raon_dflash_oracle draftgraph --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--block B] [--tokens N] [--out DIR] [--max-seq N]
 //! ```
@@ -120,6 +120,13 @@
 //!   so a generation never forgets its early tokens; here `--tokens` is the generation length, so
 //!   the default window always covers the whole oracle generation. Absent flags leave the
 //!   neutral path unchanged.
+//! * `--draft-penalty on|off` (`sampled`, `greedy`; default: follow `HIPFIRE_DFLASH_DRAFT_PENALTY`,
+//!   itself default on): whether the DFlash2 selector scores its candidates after the request's
+//!   penalties (history = emitted prefix plus the drafts selected for earlier rows, the history
+//!   of the verify row that will judge the draft) or from the raw target head. Output is the
+//!   AR stream / law either way; only tau changes, printed as `tau` (greedy: mean
+//!   tokens/step, sampled: mean tokens/window). A/B it with the same penalty flags:
+//!   `greedy ... --presence 1.5 --draft-penalty on` against `... --draft-penalty off`.
 //! * `costs` (spec-retire policy): device-synced median/mean ms of AR `decode_step`,
 //!   `verify_block` / `verify_block_logits` per row count 1..=`--max-rows` (9), partial
 //!   `commit_prefix` (k = 2 and k = max-rows), the draft sequence and its head, over
@@ -162,7 +169,7 @@ use hipfire_runtime::dflash::{
 };
 use hipfire_runtime::dflash2_spec::{
     build_dflash2_speculator, last_draft_graph_stats, new_draft_scratch, set_draft_graph_override,
-    trace_windows_begin, trace_windows_take, DraftWindowTrace,
+    set_draft_penalty_override, trace_windows_begin, trace_windows_take, DraftWindowTrace,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
@@ -182,10 +189,10 @@ const USAGE: &str = "usage:
   raon_dflash_oracle capture  --model M --draft D --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle emit     --model M --draft D --prompt-file P --out DIR [--block N] [--max-seq N]
   raon_dflash_oracle rowexact --model M --prompt-file P [--out DIR] [--max-seq N] [--census on [--census-k 2,4]]
-  raon_dflash_oracle greedy   --model M --draft D --prompt-file P [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W]
+  raon_dflash_oracle greedy   --model M --draft D --prompt-file P [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off]
   raon_dflash_oracle rollback --model M [--draft D] --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle verifygraph --model M --prompt-file P [--out DIR] [--chat on] [--max-seq N]
-  raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--out DIR]
+  raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off] [--out DIR]
   raon_dflash_oracle costs    --model M --draft D --prompt-file P [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
   raon_dflash_oracle draftgraph --model M --draft D --prompt-file P [--chat on] [--block B] [--tokens N] [--fc-compare on|off] [--out DIR] [--max-seq N]
 common: [--chat on|off] [--think on|off]   (raw text tokens by default)";
@@ -275,6 +282,9 @@ struct PenaltyOpts {
     presence: f32,
     frequency: f32,
     window: usize,
+    /// `--draft-penalty on|off`: the selector scores its candidates after the request's
+    /// penalties (`HIPFIRE_DFLASH_DRAFT_PENALTY`); `None` follows the env var (default on).
+    draft_penalty: Option<bool>,
 }
 
 impl PenaltyOpts {
@@ -286,6 +296,10 @@ impl PenaltyOpts {
             presence: opt_f32(opts, "presence", 0.0)?,
             frequency: opt_f32(opts, "frequency", 0.0)?,
             window: opt_usize(opts, "repeat-window", DEFAULT_REPEAT_WINDOW.max(tokens))?,
+            draft_penalty: match opts.get("draft-penalty") {
+                Some(_) => Some(on_off(opts, "draft-penalty", true)?),
+                None => None,
+            },
         };
         if !(p.repeat_penalty > 0.0 && p.repeat_penalty.is_finite()) {
             return Err("--repeat-penalty must be finite and > 0".into());
@@ -331,11 +345,25 @@ impl PenaltyOpts {
         }
     }
 
+    /// Apply `--draft-penalty` to every speculator built from now on.
+    fn arm_draft_penalty(&self) {
+        set_draft_penalty_override(self.draft_penalty);
+    }
+
+    /// `on` / `off` for the print lines: the flag, else the env var (default on).
+    fn draft_penalty_label(&self) -> &'static str {
+        match self.draft_penalty {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "env",
+        }
+    }
+
     fn json(&self) -> Value {
         json!({
             "repeat_penalty": self.repeat_penalty, "presence_penalty": self.presence,
             "frequency_penalty": self.frequency, "repeat_window": self.window,
-            "generated_only": true,
+            "generated_only": true, "draft_penalty": self.draft_penalty,
         })
     }
 }
@@ -2002,6 +2030,7 @@ fn run_greedy(
     // with --profile, timing) wrapper.
     bundle.reset(gpu)?;
     let ctx_capacity = bundle.max_seq();
+    pen.arm_draft_penalty();
     let prof: SharedProf = Rc::new(RefCell::new(Prof::default()));
     let request = pen.active().then(|| {
         let mut cfg = SpecRequestConfig::default();
@@ -2060,6 +2089,11 @@ fn run_greedy(
         run.steps,
         run.accepted as f64 / run.steps.max(1) as f64,
         run.proposed as f64 / run.steps.max(1) as f64
+    );
+    println!(
+        "  tau {tokens_per_step:.3} tokens/step  draft penalty {} (penalties {})",
+        pen.draft_penalty_label(),
+        if pen.active() { "active" } else { "neutral" }
     );
     let profile_json = if profile {
         report_profile(&run, ar_decode_ms, ar_decode_tokens)
@@ -3271,6 +3305,7 @@ fn run_sampled(
     // verify row's law, so each emitted token is judged against the row it
     // was accepted or resampled from (emitted token j of a window = verify
     // row j: the accepted drafts, then the residual or bonus draw).
+    pen.arm_draft_penalty();
     let t_df = Instant::now();
     let ctx_capacity = bundle.max_seq();
     let vocab = bundle.config.vocab;
@@ -3469,6 +3504,12 @@ fn run_sampled(
         tests.len(),
         proposed_sum as f64 / windows.max(1) as f64,
         accepted_sum as f64 / windows.max(1) as f64,
+    );
+    println!(
+        "  tau {:.3} tokens/window  draft penalty {} (penalties {})",
+        (accepted_sum + windows) as f64 / windows.max(1) as f64,
+        pen.draft_penalty_label(),
+        if penalized { "active" } else { "neutral" }
     );
 
     if let Some(dir) = out {
