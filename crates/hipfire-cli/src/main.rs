@@ -16632,7 +16632,10 @@ effort = "high"
 
     #[test]
     fn config_profile_helpers_merge_layer_and_are_global_only() {
-        assert_eq!(CONFIG_PROFILE_NAMES, &["default", "dev", "hip", "quality", "redline"]);
+        assert_eq!(
+            CONFIG_PROFILE_NAMES,
+            &["default", "dev", "hip", "quality", "redline"]
+        );
         let root = env::temp_dir().join(format!("hipfire-cli-profile-{}", std::process::id()));
         let config_paths = ConfigPaths::under(&root);
         let mut layer = ConfigLayer::default();
