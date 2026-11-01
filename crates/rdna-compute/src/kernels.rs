@@ -4120,6 +4120,12 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
 
+/// LFM3 zero-tail partial RoPE (`full_attention` layers, partial rotary
+/// factor < 1.0) — pairs (d, d + head_dim/2) at freq base^(-2d/head_dim),
+/// zero tail pass-through. See the kernel header for the HF layout.
+#[cfg(feature = "deltanet")]
+pub const ROPE_ZERO_TAIL_SRC: &str = include_str!("../../../kernels/src/rope_zero_tail.hip");
+
 /// Exact gfx1100 Qwen3.6 full-attention decode preparation: deinterleave Q and
 /// gate, RMS-normalize Q/K, then apply partial half-split RoPE head-locally.
 #[cfg(feature = "deltanet")]

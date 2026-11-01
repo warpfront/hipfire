@@ -703,7 +703,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
         "rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
-        "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
+        "rope_partial_halfsplit_f32" | "rope_zero_tail_f32" => Some(vec![write(0), write(8), read(16)]),
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
         }
@@ -858,7 +858,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
-        | "rope_partial_halfsplit_f32" => Some(48),
+        | "rope_partial_halfsplit_f32"
+        | "rope_zero_tail_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
@@ -1716,10 +1717,14 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     }
     matches!(
         previous,
-        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+        "repeat_interleave_qk_f32"
+            | "rope_partial_halfsplit_f32"
+            | "rope_zero_tail_f32"
     ) || matches!(
         current,
-        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+        "repeat_interleave_qk_f32"
+            | "rope_partial_halfsplit_f32"
+            | "rope_zero_tail_f32"
     )
 }
 
@@ -1736,6 +1741,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
                 | "fused_silu_mul_mq_rotate"
                 | "mq_rotate_x"
                 | "rope_partial_halfsplit_f32"
+                | "rope_zero_tail_f32"
         ))
         || (Some(current) != excluded
             && matches!(
@@ -1743,6 +1749,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
                 "repeat_interleave_qk_f32"
                     | "fused_silu_mul_mq_rotate"
                     | "rope_partial_halfsplit_f32"
+                    | "rope_zero_tail_f32"
             ))
 }
 

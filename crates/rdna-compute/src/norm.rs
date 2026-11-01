@@ -799,6 +799,69 @@ impl Gpu {
         result
     }
 
+    /// LFM3 zero-tail partial RoPE (`full_attention` layers,
+    /// partial_rotary_factor < 1.0): rotates pairs (d, d + head_dim/2) for
+    /// d < rope_angles with freq base^(-2d/head_dim) — HF
+    /// modeling_lfm3.py `compute_default_rope_parameters`. Dims in
+    /// [rope_angles, head_dim/2) and their rotate_half partners pass through.
+    /// `rope_partial_halfsplit_f32` cannot express this layout (see the
+    /// kernel header); full-rotary layers (partial = 1.0) keep the halfsplit
+    /// kernel, where the two coincide.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_zero_tail_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &hip_bridge::DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        rope_angles: usize,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rope_zero_tail", kernels::ROPE_ZERO_TAIL_SRC, "rope_zero_tail_f32")?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let ra = rope_angles as i32;
+        let fb = freq_base;
+        let n_pairs = rope_angles as u32;
+        let block = 32u32.min(n_pairs).max(1);
+        let grid = [(n_pairs + block - 1) / block, 1, 1];
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_zero_tail_f32", bytes);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ra as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob("rope_zero_tail_f32", grid, [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp);
+            b.push_ptr(kp);
+            b.push_ptr(pp);
+            b.push_i32(nhq);
+            b.push_i32(nhk);
+            b.push_i32(hd);
+            b.push_i32(ra);
+            b.push_f32(fb);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Exact gfx1100 Qwen3.6-35B full-attention preparation. Replaces the
     /// dependent deinterleave, Q RMS, K RMS, and partial half-split RoPE
     /// dispatches with one head-local launch. Admission is enforced by the

@@ -252,22 +252,46 @@ fn attn_mixer(
         .map_err(|e| format!("lfm3 L{l}: k_norm: {e:?}"))?;
 
     // Per-type RoPE: full_attention → partial 0.5, theta 1e6;
-    // sliding_attention → full rotary, theta 1e4. `rope_partial_interleaved_f32`
-    // dispatches to the rotate_half (halfsplit) kernel by default — the
-    // mathematically-correct match for HF-converted weights (see norm.rs).
+    // sliding_attention → full rotary, theta 1e4.
+    //
+    // ROPE-1: LFM3's full-attention layers use HF's ZERO-TAIL partial rotary
+    // (modeling_lfm3.py compute_default_rope_parameters): pairs
+    // (d, d + head_dim/2) at freq base^(-2d/head_dim) for the first
+    // rope_angles pairs, the rest pass-through. The halfsplit kernel cannot
+    // express that layout — it pairs (i, i + n_rot/2) INSIDE the rotated
+    // prefix at 2× the frequency (HF's every-other frequency on the wrong
+    // dims), which is what shipped here and mismatched HF on every
+    // full_attention layer. Partial layers route to `rope_zero_tail_f32`;
+    // full-rotary layers (partial = 1.0) keep the halfsplit kernel, where
+    // the two conventions coincide.
     let rope = cfg.rope_for(l);
     let n_rot = rope.n_rot(head_dim);
-    gpu.rope_partial_interleaved_f32(
-        &state.fa_q,
-        &state.fa_k,
-        &state.pos_buf,
-        n_heads,
-        n_kv,
-        head_dim,
-        n_rot,
-        rope.theta,
-    )
-    .map_err(|e| format!("lfm3 L{l}: rope: {e:?}"))?;
+    if rope.partial_rotary_factor < 1.0 {
+        let rope_angles = n_rot / 2;
+        gpu.rope_zero_tail_f32(
+            &state.fa_q,
+            &state.fa_k,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            rope_angles,
+            rope.theta,
+        )
+        .map_err(|e| format!("lfm3 L{l}: rope: {e:?}"))?;
+    } else {
+        gpu.rope_partial_interleaved_f32(
+            &state.fa_q,
+            &state.fa_k,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            n_rot,
+            rope.theta,
+        )
+        .map_err(|e| format!("lfm3 L{l}: rope: {e:?}"))?;
+    }
 
     // KV cache write (Q8).
     let kv_idx = a.kv_idx;
@@ -366,5 +390,174 @@ fn apply_sandwich_residual(
     } else {
         gpu.add_f32(proj_out, h, h)
             .map_err(|e| format!("lfm3 L{l}: {label} residual add: {e:?}"))
+    }
+}
+
+#[cfg(test)]
+mod rope_zero_tail_tests {
+    /// ROPE-1: pin the zero-tail partial-RoPE dim-pair/frequency mapping
+    /// against an independent construction of HF's
+    /// `compute_default_rope_parameters` + `apply_rotary_pos_emb`
+    /// (modeling_lfm3.py). The kernel mirrors the "kernel-mapping" reference
+    /// below; the "hf-construction" reference derives the same rotation from
+    /// HF's inv_freq zero-pad + full-length rotate_half instead. If the two
+    /// agree, the kernel's pairing/frequencies match HF's layout.
+
+    /// Kernel-mapping reference: mirrors `rope_zero_tail_f32`
+    /// (kernels/src/rope_zero_tail.hip) — pairs (d, d + head_dim/2) for
+    /// d < rope_angles at freq base^(-2d/head_dim), rest pass-through.
+    fn rope_zero_tail_kernel_ref(
+        x: &mut [f32],
+        n_heads: usize,
+        head_dim: usize,
+        rope_angles: usize,
+        pos: u32,
+        theta: f32,
+    ) {
+        let half = head_dim / 2;
+        let shift = half;
+        for i in 0..rope_angles {
+            let freq = 1.0f32 / theta.powf((2.0 * i as f32) / head_dim as f32);
+            let angle = pos as f32 * freq;
+            let (c, s) = (angle.cos(), angle.sin());
+            for h in 0..n_heads {
+                let base = h * head_dim;
+                let x0 = x[base + i];
+                let x1 = x[base + i + shift];
+                x[base + i] = x0 * c - x1 * s;
+                x[base + i + shift] = x0 * s + x1 * c;
+            }
+        }
+    }
+
+    /// HF-construction reference: inv_freq (zero-padded) → freqs →
+    /// cat(freqs, freqs) → q*cos + rotate_half(q)*sin, written exactly in
+    /// HF's shape vocabulary so a layout mistake cannot cancel out.
+    fn rope_zero_tail_hf_ref(
+        x: &mut [f32],
+        n_heads: usize,
+        head_dim: usize,
+        partial_rotary_factor: f32,
+        pos: u32,
+        theta: f32,
+    ) {
+        let dim = head_dim;
+        let rope_angles = ((partial_rotary_factor * dim as f32) as usize) / 2;
+        // inv_freq: arange(0, 2*rope_angles, 2) / dim, then zero-pad to dim/2.
+        let mut inv_freq = vec![0.0f32; dim / 2];
+        for (i, f) in inv_freq.iter_mut().enumerate().take(rope_angles) {
+            *f = 1.0 / theta.powf((2.0 * i as f32) / dim as f32);
+        }
+        // freqs = pos * inv_freq; emb = cat(freqs, freqs) → cos/sin [dim].
+        let mut cos = vec![0.0f32; dim];
+        let mut sin = vec![0.0f32; dim];
+        for d in 0..dim / 2 {
+            let angle = pos as f32 * inv_freq[d];
+            cos[d] = angle.cos();
+            sin[d] = angle.sin();
+            cos[d + dim / 2] = angle.cos();
+            sin[d + dim / 2] = angle.sin();
+        }
+        // rotate_half(x) = cat(-x[half:], x[:half]).
+        for h in 0..n_heads {
+            let base = h * head_dim;
+            let half = head_dim / 2;
+            let mut out = vec![0.0f32; head_dim];
+            for d in 0..head_dim {
+                let rot = if d < half { -x[base + d + half] } else { x[base + d - half] };
+                out[d] = x[base + d] * cos[d] + rot * sin[d];
+            }
+            x[base..base + head_dim].copy_from_slice(&out);
+        }
+    }
+
+    fn sample_input(n_heads: usize, head_dim: usize) -> Vec<f32> {
+        (0..n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 * 0.25) - 2.0 + (i / 7) as f32 * 0.125)
+            .collect()
+    }
+
+    #[test]
+    fn kernel_mapping_matches_hf_construction() {
+        let (n_heads, head_dim) = (8usize, 128usize);
+        let partial = 0.5f32;
+        let theta = 1_000_000.0f32;
+        let rope_angles = ((partial * head_dim as f32) as usize) / 2;
+        assert_eq!(rope_angles, 32, "LFM3 full-attn partial 0.5 on head_dim=128 → 32 pairs");
+
+        for pos in [0u32, 1, 7, 1234] {
+            let mut a = sample_input(n_heads, head_dim);
+            let mut b = a.clone();
+            rope_zero_tail_kernel_ref(&mut a, n_heads, head_dim, rope_angles, pos, theta);
+            rope_zero_tail_hf_ref(&mut b, n_heads, head_dim, partial, pos, theta);
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "pos={pos} dim={i}: kernel-mapping {x} vs hf-construction {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_tail_leaves_tail_and_lowrot_dims_unrotated() {
+        let (n_heads, head_dim) = (4usize, 128usize);
+        let rope_angles = 32usize;
+        let mut x = sample_input(n_heads, head_dim);
+        let before = x.clone();
+        rope_zero_tail_kernel_ref(&mut x, n_heads, head_dim, rope_angles, 9, 1e6);
+        for h in 0..n_heads {
+            let base = h * head_dim;
+            // Zero tail of the lower half: dims [rope_angles, head_dim/2).
+            for d in rope_angles..head_dim / 2 {
+                assert_eq!(x[base + d], before[base + d], "dim {d} must pass through");
+            }
+            // rotate_half partners: dims [head_dim/2 + rope_angles, head_dim).
+            for d in head_dim / 2 + rope_angles..head_dim {
+                assert_eq!(x[base + d], before[base + d], "dim {d} must pass through");
+            }
+        }
+    }
+
+    #[test]
+    fn frequencies_use_full_head_dim_denominator() {
+        // HF inv_freq[1] = theta^(-2/128) ≈ 0.80588 for theta 1e6 — the plan's
+        // "{1.0, 0.806, ...}". The OLD halfsplit mapping produced
+        // theta^(-4/128) (every-other frequency, ≈0.64938) on a different dim
+        // pairing; assert the correct one and that the old one differs.
+        let theta = 1_000_000.0f32;
+        let head_dim = 128usize;
+        let f1 = 1.0 / theta.powf(2.0 / head_dim as f32);
+        assert!((f1 - 0.805_88).abs() < 1e-4, "f1={f1}");
+        let old_halfsplit_f1 = 1.0 / theta.powf(4.0 / head_dim as f32);
+        assert!((f1 - old_halfsplit_f1).abs() > 0.1, "regression guard");
+    }
+
+    #[test]
+    fn full_rotary_layer_matches_hf_full_rope() {
+        // sliding_attention (partial = 1.0) has no zero tail; the halfsplit
+        // kernel with n_rot = head_dim must stay identical to HF full rope.
+        let (n_heads, head_dim) = (8usize, 128usize);
+        let theta = 10_000.0f32;
+        let mut a = sample_input(n_heads, head_dim);
+        let mut b = a.clone();
+        rope_zero_tail_hf_ref(&mut a, n_heads, head_dim, 1.0, 5, theta);
+        // halfsplit at n_rot=head_dim: pairs (i, i+n_rot/2), freq base^(-2i/n_rot).
+        let n_rot = head_dim;
+        let half = n_rot / 2;
+        for i in 0..half {
+            let freq = 1.0f32 / theta.powf((2.0 * i as f32) / n_rot as f32);
+            let angle = 5.0f32 * freq;
+            let (c, s) = (angle.cos(), angle.sin());
+            for h in 0..n_heads {
+                let base = h * head_dim;
+                let (x0, x1) = (b[base + i], b[base + i + half]);
+                b[base + i] = x0 * c - x1 * s;
+                b[base + i + half] = x0 * s + x1 * c;
+            }
+        }
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!((x - y).abs() < 1e-4, "dim={i}: {x} vs {y}");
+        }
     }
 }
