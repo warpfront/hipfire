@@ -651,6 +651,9 @@ pub struct Tokenizer {
     /// it emits this, not `eos_id` — stop-loops must check both via
     /// `is_terminator()`. None if the vocab only has one terminator.
     pub eot_id: Option<u32>,
+    /// Every id of a multi-eos `generation_config.eos_token_id` array (Llama-3.x:
+    /// `<|end_of_text|>`, `<|eom_id|>`, `<|eot_id|>`); `is_terminator()` stops on all.
+    gen_eos_ids: Vec<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
     /// Exact merge-rank BPE for ▁-style (SentencePiece-derived) HF BPE
@@ -978,6 +981,7 @@ impl Tokenizer {
             eos_id,
             add_bos: false,
             eot_id,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe,
             ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix,
@@ -1165,6 +1169,7 @@ impl Tokenizer {
             eos_id,
             add_bos: false,
             eot_id,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe,
             ignore_merges_max_chunk_bytes,
             sp_dummy_prefix,
@@ -1204,19 +1209,46 @@ impl Tokenizer {
             // to `<|endoftext|>`), which is WRONG for models whose BOS differs —
             // e.g. LFM2.5 bos = `<|startoftext|>` (id 1), not `<|endoftext|>`
             // (id 2). `generation_config.{bos,eos}_token_id` is the authoritative
-            // HF source; override from it when present + scalar (an array eos =
-            // multi-eos: keep the heuristic). Embedded by the quantizer at convert
-            // time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
+            // HF source; override from it when present. An array eos (multi-eos,
+            // Llama-3.x) feeds `gen_eos_ids`, see below. Embedded by the quantizer
+            // at convert time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
             if let Some(gc) = meta.get("generation_config") {
                 if let Some(b) = gc.get("bos_token_id").and_then(|v| v.as_u64()) {
                     if (b as usize) < t.vocab.len() {
                         t.bos_id = b as u32;
                     }
                 }
-                if let Some(e) = gc.get("eos_token_id").and_then(|v| v.as_u64()) {
-                    if (e as usize) < t.vocab.len() {
-                        t.eos_id = e as u32;
+                match gc.get("eos_token_id") {
+                    Some(serde_json::Value::Array(ids)) => {
+                        let ids: Vec<u32> = ids
+                            .iter()
+                            .filter_map(|v| v.as_u64())
+                            .filter(|&e| (e as usize) < t.vocab.len())
+                            .map(|e| e as u32)
+                            .collect();
+                        // A heuristic eos outside the list is not an eos at all
+                        // (Llama-3 has no `</s>`, so it fell back to id 2 = "#"):
+                        // take HF's primary, tokenizer_config.eos_token, else the
+                        // first listed id. A heuristic eos inside the list is kept.
+                        if !ids.contains(&t.eos_id) {
+                            let primary = meta
+                                .get("tokenizer_config")
+                                .and_then(|tc| tc.get("eos_token"))
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| t.token_to_id.get(s).copied())
+                                .filter(|id| ids.contains(id));
+                            if let Some(e) = primary.or(ids.first().copied()) {
+                                t.eos_id = e;
+                            }
+                        }
+                        t.gen_eos_ids = ids;
                     }
+                    Some(e) => {
+                        if let Some(e) = e.as_u64().filter(|&e| (e as usize) < t.vocab.len()) {
+                            t.eos_id = e as u32;
+                        }
+                    }
+                    None => {}
                 }
             }
             // Honor HF `add_bos_token` from the embedded tokenizer_config (e.g.
@@ -1354,6 +1386,7 @@ impl Tokenizer {
             eos_id,
             add_bos: false,
             eot_id,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe,
             ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix,
@@ -1380,7 +1413,7 @@ impl Tokenizer {
     /// attractor loop (bench findings 2026-04-24 §3.5).
     #[inline]
     pub fn is_terminator(&self, id: u32) -> bool {
-        id == self.eos_id || self.eot_id == Some(id)
+        id == self.eos_id || self.eot_id == Some(id) || self.gen_eos_ids.contains(&id)
     }
 
     /// Look up a special token's ID by literal content. Returns `None`
@@ -2056,9 +2089,10 @@ impl Tokenizer {
         h.finalize().to_vec()
     }
 
-    /// SHA-256 of tokenizer configuration that affects encoding: merge
-    /// ranks, special tokens, BOS/EOS/EOT, and the GPT-2 / SentencePiece
-    /// flags (spec §4.1 C1). Independent of [`Self::vocab_digest`].
+    /// SHA-256 of tokenizer configuration that affects encoding or where
+    /// generation stops: merge ranks, special tokens, BOS/EOS/EOT, the
+    /// `generation_config` eos ids and the GPT-2 / SentencePiece flags
+    /// (spec §4.1 C1). Independent of [`Self::vocab_digest`].
     pub fn config_digest(&self) -> Vec<u8> {
         use sha2::{Digest as Sha256Digest, Sha256};
         let mut h = Sha256::new();
@@ -2075,6 +2109,9 @@ impl Tokenizer {
         h.update(self.bos_id.to_le_bytes());
         h.update(self.eos_id.to_le_bytes());
         h.update(self.eot_id.unwrap_or(u32::MAX).to_le_bytes());
+        for id in &self.gen_eos_ids {
+            h.update(id.to_le_bytes());
+        }
         h.update([
             u8::from(self.add_bos),
             u8::from(self.is_gpt2_bpe),
@@ -2860,6 +2897,7 @@ mod token_text_stream_tests {
             eos_id: 0,
             add_bos: false,
             eot_id: None,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe: false,
             sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
@@ -3012,6 +3050,7 @@ mod bpe_tests {
             eos_id: 0,
             add_bos: false,
             eot_id: None,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe: true,
             sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
@@ -3903,6 +3942,7 @@ mod sp_tests {
             eos_id: 0,
             add_bos: false,
             eot_id: None,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe: false,
             sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
@@ -4498,6 +4538,22 @@ mod lfm2_bos_tests {
             root["tokenizer_config"]["add_bos_token"] = json!(ab);
         }
         root.to_string()
+    }
+
+    #[test]
+    fn multi_eos_array_stops_on_every_id_and_replaces_foreign_heuristic() {
+        // Llama-3.x shape: generation_config lists several eos ids, none of
+        // them the vocab heuristic's pick; tokenizer_config names the primary.
+        let meta = json!({
+            "tokenizer": minimal_tok_json(),
+            "generation_config": {"eos_token_id": [3, 4]},
+            "tokenizer_config": {"eos_token": "i"}
+        })
+        .to_string();
+        let tok = Tokenizer::from_hfq_metadata(&meta).expect("meta");
+        assert_eq!(tok.eos_id, 4);
+        assert!(tok.is_terminator(3) && tok.is_terminator(4));
+        assert!(!tok.is_terminator(2), "heuristic eos outside the list");
     }
 
     #[test]

@@ -865,9 +865,8 @@ pub fn probe_effort_capability(tokenizer: &Tokenizer, template: &str) -> EffortC
 /// slice can be passed straight into the Jinja `messages` context var via
 /// `Value::from_serialize(...)`. Templates probe `message['role']`,
 /// `message['content']`, `message['tool_calls']`, and (less commonly)
-/// `message['tool_call_id']` under strict-undefined mode; all four fields
-/// are always present (defaults: empty content, empty tool_calls vec, no
-/// tool_call_id) so probes never raise.
+/// `message['tool_call_id']`; the render env is lenient-undefined, so the
+/// omitted empty `tool_calls` and absent `tool_call_id` read as falsy.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -901,7 +900,9 @@ pub struct Message {
         rename = "name"
     )]
     pub rendered_name: Option<String>,
-    #[serde(default)]
+    /// Omitted when empty, as OpenAI clients do: Llama-3.x tests
+    /// `'tool_calls' in message` and raises on a list whose length is not 1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     /// Set on Tool-role messages to identify which assistant tool_call
     /// this is responding to. Qwen3.5/3.6 templates currently ignore
@@ -1307,9 +1308,9 @@ impl<'a> JinjaChatFrame<'a> {
     /// context for templates that opt into per-call rendering switches;
     /// pass `None` for the default empty map.
     ///
-    /// Strict-undefined empty defaults still apply when args are `None`,
-    /// so templates that probe `tools` / `documents` / `tool_call_kwargs`
-    /// don't raise.
+    /// `tools = None` binds `none` (as HF does: Llama-3.x tests
+    /// `tools is not none`); `documents` / `tool_call_kwargs` keep
+    /// strict-undefined empty defaults so templates probing them don't raise.
     pub fn render_messages(
         &self,
         messages: &[Message],
@@ -1401,14 +1402,19 @@ impl<'a> JinjaChatFrame<'a> {
                 String::from_utf8_lossy(&bytes).to_string()
             }
         };
-        // Strict-undefined empty defaults so templates that probe
-        // `tools` / `documents` / `tool_call_kwargs` on plain turns
-        // don't raise. Caller-provided values override the empties.
+        // HF passes every special token; Mistral v0.3 / Zephyr-style templates append
+        // `eos_token` to each assistant turn and fail on an undefined one.
+        let eos_token =
+            String::from_utf8_lossy(&self.tokenizer.decode_bytes(&[self.tokenizer.eos_id]))
+                .to_string();
+        // HF passes `tools=None` on plain turns: Llama-3.x renders its tool
+        // preamble on `tools is not none`, so an empty list is not neutral.
+        // `documents` / `tool_call_kwargs` keep empty defaults.
         let empty_list: Vec<serde_json::Value> = Vec::new();
         let empty_map = serde_json::Map::new();
         let tools_val = match tools {
             Some(t) => Value::from_serialize(t),
-            None => Value::from_serialize(&empty_list),
+            None => Value::from(()),
         };
         let kwargs_val = match tool_call_kwargs {
             Some(k) => Value::from_serialize(k),
@@ -1460,6 +1466,7 @@ impl<'a> JinjaChatFrame<'a> {
             add_generation_prompt => true,
             enable_thinking => self.enable_thinking,
             bos_token => bos_token,
+            eos_token => eos_token,
             reasoning_strength => reasoning_strength_val,
             reasoning_effort => reasoning_effort_val,
             tools => tools_val,
@@ -3261,6 +3268,83 @@ mod tests {
         assert!(
             without_tools.contains("MSGS:user=hi;"),
             "messages must still render w/o tools: got {without_tools:?}",
+        );
+    }
+
+    #[test]
+    fn llama3_tool_probes_see_hf_none_shapes() {
+        // Llama-3.1/3.2 template predicates: `tools is not none` gates the
+        // tool preamble; `'tool_calls' in message` requires exactly one call.
+        let t = make_tokenizer();
+        let template = "{% if tools is not none %}PREAMBLE;{% endif %}{% for m in messages %}{% if 'tool_calls' in m %}{% if m.tool_calls|length != 1 %}{{ raise_exception('single tool-calls') }}{% endif %}CALL;{% else %}{{ m.role }}={{ m.content }};{% endif %}{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let msg = |role, content: &str| Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let history = vec![
+            msg(Role::User, "a"),
+            msg(Role::Assistant, "b"),
+            msg(Role::User, "c"),
+        ];
+        let rendered = frame.render_messages(&history, None, None).unwrap();
+        assert_eq!(rendered, "user=a;assistant=b;user=c;");
+    }
+
+    #[test]
+    fn mistral_v03_assistant_turns_end_with_eos_token() {
+        // Mistral v0.3 plain-assistant branch appends `eos_token`; HF passes it,
+        // and an undefined one makes `+` raise (Plain fallback).
+        let t = make_tokenizer();
+        let eos = String::from_utf8_lossy(&t.decode_bytes(&[t.eos_id])).to_string();
+        assert!(!eos.is_empty());
+        let template = "{%- for message in messages %}{%- if message['role'] == 'user' %}{{- '[INST] ' + message['content'] + '[/INST]' }}{%- elif message.tool_calls is defined and message.tool_calls is not none %}{{- '[TOOL_CALLS] [' }}{%- elif message['role'] == 'assistant' %}{{- ' ' + message['content']|trim + eos_token }}{%- endif %}{%- endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let msg = |role, content: &str| Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let history = vec![
+            msg(Role::User, "a"),
+            msg(Role::Assistant, "b"),
+            msg(Role::User, "c"),
+            msg(Role::Assistant, "d"),
+            msg(Role::User, "e"),
+        ];
+        let rendered = frame.render_messages(&history, None, None).unwrap();
+        assert_eq!(
+            rendered,
+            format!("[INST] a[/INST] b{eos}[INST] c[/INST] d{eos}[INST] e[/INST]")
         );
     }
 
