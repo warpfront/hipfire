@@ -4302,14 +4302,6 @@ impl Qwen4Bundle {
             .map_or(0, |session| session.plan_capped(self, prompt, route, cap))
     }
 
-    /// Whether a planned reuse continues current or parked live state rather
-    /// than a pool/resident boundary. Used by request-source tracing.
-    pub fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
-    }
-
     /// The host-visible request configuration every EP rank must share.
     pub(crate) fn ep_replication_fingerprint(&self) -> ReplicaFingerprint {
         ReplicaFingerprint {
@@ -5644,6 +5636,16 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
             Some(mesh) => mesh.sessions_enabled(),
             None => self.session.is_some(),
         }
+    }
+
+    fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
+    }
+
+    fn spec_session_reuse(&self) -> bool {
+        true
     }
 
     fn session_request_write_limit(&mut self, through: usize) {

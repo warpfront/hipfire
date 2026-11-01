@@ -10000,6 +10000,10 @@ struct MtpPrefillRun<'a> {
 }
 
 impl MtpDrafter for Qwen4MtpDrafter {
+    fn session_route(&self) -> Option<SessionRoute> {
+        Some(SessionRoute::Mtp)
+    }
+
     fn mtp_prefill(
         &mut self,
         gpu: &mut Gpu,

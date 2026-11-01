@@ -94,13 +94,16 @@ pub trait ArchModel: Send + std::any::Any {
     }
 
     /// Prompt tokens the next prefill on `route` can restore instead of
-    /// computing; 0 when nothing is cached.
+    /// computing; 0 when nothing is cached. Do not override: an arch
+    /// implements only [`Self::session_plan_capped`], which this and the
+    /// resumable walk ([`crate::session_cache::plan_resumable`]) both read.
     fn session_plan(&self, prompt: &[u32], route: crate::session_cache::SessionRoute) -> usize {
         self.session_plan_capped(prompt, route, prompt.len())
     }
 
-    /// [`Self::session_plan`] restricted to reuse points `<= cap`. The one
-    /// method a model with a session cache implements; default no cache.
+    /// [`Self::session_plan`] restricted to reuse points `<= cap`; never
+    /// returns more than `cap`. The one plan method a model with a session
+    /// cache implements (mesh routing included); default no cache.
     fn session_plan_capped(
         &self,
         _prompt: &[u32],
@@ -110,20 +113,23 @@ pub trait ArchModel: Send + std::any::Any {
         0
     }
 
-    /// The deepest reuse point `resumable` accepts (e.g. one a speculator's
-    /// draft context can restart from, [`crate::spec::Speculator::can_resume_at`]):
-    /// an unaccepted hit falls back to the next lower reuse point, else 0.
-    fn session_plan_resumable(
+    /// Whether a planned reuse of `reused` tokens continues live (or parked)
+    /// state rather than restoring a snapshot. Request tracing only.
+    fn session_plan_is_live(
         &self,
-        prompt: &[u32],
-        route: crate::session_cache::SessionRoute,
-        resumable: &dyn Fn(usize) -> bool,
-    ) -> usize {
-        let mut start = self.session_plan(prompt, route);
-        while start > 0 && !resumable(start) {
-            start = self.session_plan_capped(prompt, route, start - 1);
-        }
-        start
+        _prompt: &[u32],
+        _route: crate::session_cache::SessionRoute,
+        _reused: usize,
+    ) -> bool {
+        false
+    }
+
+    /// Whether the speculative target restores a session reuse point: a
+    /// speculative request whose speculator names a session route
+    /// ([`crate::spec::Speculator::session_route`]) then prefills from the
+    /// deepest point it can resume instead of cold. Default `false`.
+    fn spec_session_reuse(&self) -> bool {
+        false
     }
 
     /// Publish the snapshots the last prefill captured. Call once the turn's
@@ -282,53 +288,5 @@ mod tests {
         let m: Box<dyn ArchModel> = Box::new(Minimal { dim: 4 });
         assert_eq!(m.n_layers(), 2);
         assert_eq!(m.vocab_size(), 32);
-    }
-
-    /// Reuse points at 4096, 8192 and 12288.
-    struct Snapshots;
-
-    impl ArchModel for Snapshots {
-        fn dim(&self) -> usize {
-            8
-        }
-        fn n_layers(&self) -> usize {
-            2
-        }
-        fn vocab_size(&self) -> usize {
-            32
-        }
-        fn arch_key(&self) -> &'static str {
-            "snapshots"
-        }
-        fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
-            None
-        }
-        fn session_plan_capped(
-            &self,
-            prompt: &[u32],
-            _route: crate::session_cache::SessionRoute,
-            cap: usize,
-        ) -> usize {
-            let top = cap.min(prompt.len() - 1);
-            top / 4096 * 4096
-        }
-        fn free_gpu(self: Box<Self>, _gpu: &mut Gpu) {}
-    }
-
-    #[test]
-    fn unresumable_hit_falls_back_to_the_next_lower_reuse_point() {
-        let prompt = vec![0u32; 13_000];
-        let route = crate::session_cache::SessionRoute::Ar;
-        let m = Snapshots;
-        assert_eq!(m.session_plan(&prompt, route), 12288);
-        // Resumable only with >= 2048 rows left to prefill: 12288 and 8192 leave
-        // too few / enough.
-        let leaves_window = |s: usize| prompt.len() - s >= 2048;
-        assert_eq!(
-            m.session_plan_resumable(&prompt, route, &leaves_window),
-            8192
-        );
-        assert_eq!(m.session_plan_resumable(&prompt, route, &|_| false), 0);
-        assert_eq!(m.session_plan_resumable(&prompt, route, &|_| true), 12288);
     }
 }
