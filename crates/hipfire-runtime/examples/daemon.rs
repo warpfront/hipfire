@@ -5974,6 +5974,9 @@ fn main() {
                 // Omni TTS (audio OUTPUT): `"tts": true` on an LFM3-Omni model
                 // (depth decoder present) routes to generate_lfm3_omni.
                 let tts = msg.get("tts").and_then(|v| v.as_bool()).unwrap_or(false);
+                // Omni mode: "audio" (default, pure TTS) or "interleaved"
+                // (text + audio blocks via <|mixed_start|>).
+                let tts_mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("audio");
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -6307,6 +6310,7 @@ fn main() {
                 if tts && m.lfm3_depth_weights.is_some() {
                     generate_lfm3_omni(
                         m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens,
+                        tts_mode,
                     );
                     continue;
                 }
@@ -19667,6 +19671,7 @@ fn generate_lfm3_omni(
     _temp: f32,
     _top_p: f32,
     max_tokens: usize,
+    mode: &str,
 ) {
     use hipfire_arch_lfm3_omni as omni;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
@@ -19687,23 +19692,32 @@ fn generate_lfm3_omni(
         }
     };
 
-    // Build the prompt: BOS + ChatML user turn + assistant prefix + thinking-end + <|audio_start|>.
+    // Build the prompt: BOS + ChatML user turn + assistant prefix + thinking-end + mode marker.
+    // "audio" → <|audio_start|> (pure TTS); "interleaved" → <|mixed_start|> (text+audio blocks).
+    let marker = if mode == "interleaved" {
+        omni::MIXED_START_TOKEN
+    } else {
+        omni::AUDIO_START_TOKEN
+    };
     let tok = m.tokenizer.as_ref().unwrap();
     let chatml = format!(
-        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n IMDTextWriter"
     );
     let mut prompt_tokens = tok.encode(&chatml);
     prompt_tokens.insert(0, 124_894); // BOS <|startoftext|>
-    prompt_tokens.push(125_012); // <|audio_start|>
-    eprintln!("[lfm3-omni] tts prompt: {} tokens", prompt_tokens.len());
+    prompt_tokens.push(marker);
+    eprintln!(
+        "[lfm3-omni] tts prompt (mode={mode}): {} tokens, marker={marker}",
+        prompt_tokens.len()
+    );
 
-    // max_tokens bounds the audio frames (1 LM step per frame). Cap at 200 (16s).
-    let max_frames = max_tokens.max(1).min(200);
+    // max_tokens bounds the generation steps (1 LM step per text token or audio frame). Cap at 200.
+    let max_steps = max_tokens.max(1).min(200);
     let depth_cfg = m.lfm3_depth_config.as_ref().unwrap().clone();
 
-    // Omni generate loop (AUDIO mode).
+    // Omni generate loop (AUDIO or INTERLEAVED, inferred from the prompt marker).
     let t0 = std::time::Instant::now();
-    let (frames, n_emitted, hit_eos) = {
+    let out = {
         let bundle = match m.state.as_mut() {
             Some(ModelState::Lfm3(b)) => b,
             _ => {
@@ -19717,7 +19731,7 @@ fn generate_lfm3_omni(
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(42);
         let mut rng = omni::DepthRng::new(seed);
-        match omni::omni_generate_audio(
+        match omni::omni_generate(
             &bundle.config,
             &bundle.weights,
             &mut bundle.state,
@@ -19725,7 +19739,7 @@ fn generate_lfm3_omni(
             depth_weights,
             gpu,
             &prompt_tokens,
-            max_frames,
+            max_steps,
             &mut rng,
         ) {
             Ok(v) => v,
@@ -19736,15 +19750,45 @@ fn generate_lfm3_omni(
         }
     };
     let gen_ms = t0.elapsed().as_millis();
+    let n_emitted = out.n_audio_frames;
     eprintln!(
-        "[lfm3-omni] generated {n_emitted} audio frames (eos={hit_eos}) in {gen_ms}ms"
+        "[lfm3-omni] generated {} text tokens + {n_emitted} audio frames (eos={}, finished={}) in {gen_ms}ms",
+        out.text_tokens.len(),
+        out.hit_eos,
+        out.finished,
     );
-    if frames.is_empty() {
-        write_error(stdout, id, "lfm3-omni: no audio frames generated");
+
+    // Decode the text tokens (skip audio_out placeholders) for the response.
+    let text_out: String = if out.text_tokens.is_empty() {
+        String::new()
+    } else {
+        let tok = m.tokenizer.as_ref().unwrap();
+        let text_ids: Vec<u32> = out
+            .text_tokens
+            .iter()
+            .filter(|&&t| t != omni::AUDIO_OUT_TOKEN)
+            .copied()
+            .collect();
+        tok.decode(&text_ids)
+    };
+
+    if out.audio_codes.is_empty() {
+        // Text-only result (e.g., interleaved produced no audio before finishing).
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type":"token","id":id,"text":text_out,"attempt_id":active_attempt_id()})
+        );
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"attempt_id":active_attempt_id()})
+        );
+        let _ = stdout.flush();
         return;
     }
 
-    // Load the codec + decode.
+    // Load the codec + decode the audio frames.
     let source = match SafetensorsSource::open(std::path::Path::new(&codec_dir)) {
         Ok(s) => s,
         Err(e) => {
@@ -19771,7 +19815,7 @@ fn generate_lfm3_omni(
             return;
         }
     };
-    let (waveform, sr) = match omni::codec_decode(&codec_cfg, &codec_weights, gpu, &frames) {
+    let (waveform, sr) = match omni::codec_decode(&codec_cfg, &codec_weights, gpu, &out.audio_codes) {
         Ok(v) => v,
         Err(e) => {
             write_error(stdout, id, &format!("lfm3-omni: codec decode: {e}"));
@@ -19780,25 +19824,35 @@ fn generate_lfm3_omni(
     };
     codec_weights.free_gpu(gpu);
 
-    // Emit the audio (base64 WAV) + done.
+    // Emit the text (if any) + audio (base64 WAV) + done.
+    if !text_out.is_empty() {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type":"token","id":id,"text":text_out,"attempt_id":active_attempt_id()})
+        );
+    }
     let wav = omni::wav_bytes(&waveform, sr);
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
-    let envelope = serde_json::json!({
-        "type": "audio",
-        "id": id,
-        "audio": b64,
-        "sample_rate": sr,
-        "frames": n_emitted,
-        "duration_s": (waveform.len() as f64 / sr as f64 * 100.0).round() / 100.0,
-        "eos": hit_eos,
-        "attempt_id": active_attempt_id(),
-    });
-    let _ = writeln!(stdout, "{}", envelope);
     let _ = writeln!(
         stdout,
         "{}",
-        serde_json::json!({"type":"done","id":id,"tokens":n_emitted,"total_ms":gen_ms,"attempt_id":active_attempt_id()})
+        serde_json::json!({
+            "type": "audio",
+            "id": id,
+            "audio": b64,
+            "sample_rate": sr,
+            "frames": n_emitted,
+            "duration_s": (waveform.len() as f64 / sr as f64 * 100.0).round() / 100.0,
+            "eos": out.hit_eos,
+            "attempt_id": active_attempt_id(),
+        })
+    );
+    let _ = writeln!(
+        stdout,
+        "{}",
+        serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"attempt_id":active_attempt_id()})
     );
     let _ = stdout.flush();
 }

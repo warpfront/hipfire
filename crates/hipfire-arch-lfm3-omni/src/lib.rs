@@ -47,4 +47,4 @@ pub use depth::{
     DepthConfig, DepthRng, DepthWeights,
 };
 #[cfg(feature = "deltanet")]
-pub use omni::omni_generate_audio;
+pub use omni::{omni_generate, omni_generate_audio, OmniOutput, AUDIO_OUT_TOKEN, AUDIO_START_TOKEN, MIXED_START_TOKEN, TEXT_END_TOKEN};

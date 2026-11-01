@@ -3,27 +3,82 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! LFM3-Omni generate loop (Phase 4c): the interleaved audio/text state
-//! machine. AUDIO mode here (TEXT / INTERLEAVED land with the daemon route).
+//! machine. AUDIO + INTERLEAVED modes.
 //!
 //! Ground truth: transformers `modeling_lfm3_omni.py`
 //! `Lfm3OmniForConditionalGeneration._generate` (read 2026-10-31).
 //!
-//! AUDIO-mode loop:
-//!   1. Prefill the prompt (ChatML + BOS + `<|audio_start|>`) via `decode_step`.
-//!   2. `hidden = last_hidden_state` (`state.final_norm_buf`) at the
-//!      `<|audio_start|>` position.
-//!   3. For each frame: `sample_audio_frame(hidden)` → 12 codes →
-//!      `get_audio_out_embeds(codes)` → `decode_step_with_embed` at the next
-//!      position → new `hidden`. Collect frames until `audio_eos_code` (2016)
-//!      in any codebook or `max_frames`.
+//! AUDIO mode (prompt ends with `<|audio_start|>`): MaskGIT-sample audio
+//! frames, feeding each frame's `codebook_embedding` back to the LM, until
+//! `audio_eos_code` or `max_frames`.
 //!
-//! Returns the collected codes `[n_frames * num_codebooks]`, the frame count,
-//! and whether end-of-audio was hit. The caller runs `codec_decode` on the
-//! codes to produce the 24 kHz waveform.
+//! INTERLEAVED mode (prompt ends with `<|mixed_start|>`): alternate text
+//! blocks (`interleaved_n_text` = 6 tokens, greedy argmax) and audio blocks
+//! (`interleaved_n_audio` = 12 frames, MaskGIT). `<|text_end|>` ends the text
+//! and starts the audio tail (until eos / max). The block alternation uses
+//! FIXED block lengths — it does NOT rely on the (currently non-firing) eos;
+//! only the audio tail does, and that is bounded by `max_steps`.
 
 use crate::depth::{get_audio_out_embeds, sample_audio_frame, DepthConfig, DepthRng, DepthWeights};
 use hipfire_arch_lfm3::{decode_step, decode_step_with_embed, Lfm3Config, Lfm3State, Lfm3Weights};
 use rdna_compute::Gpu;
+
+// ─── Omni token ids (HF `Lfm3OmniConfig` defaults) ───────────────────────────
+pub const AUDIO_START_TOKEN: u32 = 125_012;
+pub const AUDIO_OUT_TOKEN: u32 = 125_032;
+pub const TEXT_END_TOKEN: u32 = 125_014;
+pub const MIXED_START_TOKEN: u32 = 125_015;
+pub const IM_END_TOKEN: u32 = 124_900; // <|im_end|> (eos)
+/// Interleaved block sizes (HF `interleaved_n_text` / `interleaved_n_audio`).
+pub const INTERLEAVED_N_TEXT: usize = 6;
+pub const INTERLEAVED_N_AUDIO: usize = 12;
+
+/// Omni generation output.
+pub struct OmniOutput {
+    /// Generated text tokens (text slots + one `AUDIO_OUT_TOKEN` per audio frame).
+    pub text_tokens: Vec<u32>,
+    /// Audio codes `[n_audio_frames * num_codebooks]` (caller runs `codec_decode`).
+    pub audio_codes: Vec<u32>,
+    pub n_audio_frames: usize,
+    pub hit_eos: bool,
+    pub finished: bool,
+}
+
+/// Run the omni generate loop. The mode is inferred from the prompt's last
+/// token: `<|audio_start|>` → AUDIO, `<|mixed_start|>` → INTERLEAVED.
+pub fn omni_generate(
+    cfg: &Lfm3Config,
+    weights: &Lfm3Weights,
+    state: &mut Lfm3State,
+    depth_cfg: &DepthConfig,
+    depth_weights: &DepthWeights,
+    gpu: &mut Gpu,
+    prompt_tokens: &[u32],
+    max_steps: usize,
+    rng: &mut DepthRng,
+) -> Result<OmniOutput, String> {
+    let last = *prompt_tokens.last().unwrap_or(&0);
+    if last == AUDIO_START_TOKEN {
+        let (codes, n, eos) = omni_generate_audio(
+            cfg, weights, state, depth_cfg, depth_weights, gpu, prompt_tokens, max_steps, rng,
+        )?;
+        Ok(OmniOutput {
+            text_tokens: vec![AUDIO_OUT_TOKEN; n],
+            audio_codes: codes,
+            n_audio_frames: n,
+            hit_eos: eos,
+            finished: eos,
+        })
+    } else if last == MIXED_START_TOKEN {
+        omni_generate_interleaved(
+            cfg, weights, state, depth_cfg, depth_weights, gpu, prompt_tokens, max_steps, rng,
+        )
+    } else {
+        Err(format!(
+            "omni: prompt must end with <|audio_start|> ({AUDIO_START_TOKEN}) or <|mixed_start|> ({MIXED_START_TOKEN}), got {last}"
+        ))
+    }
+}
 
 /// Run the omni AUDIO-mode generate loop. `prompt_tokens` must end with the
 /// `<|audio_start|>` token (125012). Returns `(codes, n_frames, hit_eos)`.
@@ -77,4 +132,138 @@ pub fn omni_generate_audio(
             .map_err(|e| format!("omni: download hidden: {e:?}"))?;
     }
     Ok((frames, n_emitted, hit_eos))
+}
+
+/// Run the omni INTERLEAVED-mode generate loop. `prompt_tokens` must end with
+/// `<|mixed_start|>` (125015). Alternates text blocks (greedy argmax, 6 tokens)
+/// and audio blocks (MaskGIT, 12 frames). `<|text_end|>` starts the audio tail.
+fn omni_generate_interleaved(
+    cfg: &Lfm3Config,
+    weights: &Lfm3Weights,
+    state: &mut Lfm3State,
+    depth_cfg: &DepthConfig,
+    depth_weights: &DepthWeights,
+    gpu: &mut Gpu,
+    prompt_tokens: &[u32],
+    max_steps: usize,
+    rng: &mut DepthRng,
+) -> Result<OmniOutput, String> {
+    let eos_code = depth_cfg.audio_eos_code;
+    let n_text = INTERLEAVED_N_TEXT;
+    let n_audio = INTERLEAVED_N_AUDIO;
+
+    // ── Prefill ──
+    let mut prev_logits: Option<Vec<f32>> = None;
+    for (i, &t) in prompt_tokens.iter().enumerate() {
+        prev_logits = Some(
+            decode_step(cfg, weights, state, gpu, t, i as u32)
+                .map_err(|e| format!("omni: prefill decode_step @ {i}: {e}"))?,
+        );
+    }
+    let mut position = prompt_tokens.len() as u32 - 1;
+    let mut hidden = gpu
+        .download_f32(&state.final_norm_buf)
+        .map_err(|e| format!("omni: download hidden: {e:?}"))?;
+
+    // ── Interleaved state machine ──
+    let mut text_tokens: Vec<u32> = Vec::new();
+    let mut audio_codes: Vec<u32> = Vec::new();
+    let mut history: Vec<Vec<u32>> = Vec::new();
+    let mut n_audio_frames = 0usize;
+    let mut hit_eos = false;
+    let mut finished = false;
+    let mut slots_left = n_text;
+    let mut speaking = false;
+    let mut text_done = false;
+
+    for step in 0..max_steps {
+        if speaking {
+            // Audio slot: MaskGIT-sample one frame.
+            let codes =
+                sample_audio_frame(depth_cfg, depth_weights, gpu, &hidden, &history, rng)
+                    .map_err(|e| format!("omni: sample @ {step}: {e}"))?;
+            let is_eos = codes.iter().any(|&c| c == eos_code);
+            if is_eos {
+                hit_eos = true;
+                finished = true;
+                break;
+            }
+            history.push(codes.clone());
+            audio_codes.extend_from_slice(&codes);
+            n_audio_frames += 1;
+            text_tokens.push(AUDIO_OUT_TOKEN);
+
+            let next_embed = get_audio_out_embeds(depth_cfg, depth_weights, &codes);
+            position += 1;
+            prev_logits = Some(
+                decode_step_with_embed(cfg, weights, state, gpu, &next_embed, position)
+                    .map_err(|e| format!("omni: audio step @ {step}: {e}"))?,
+            );
+            hidden = gpu
+                .download_f32(&state.final_norm_buf)
+                .map_err(|e| format!("omni: download hidden: {e:?}"))?;
+            // In the audio tail (text_done), keep speaking until eos/max.
+            // In an interleaved audio block, decrement + toggle to text at 0.
+            if !text_done {
+                slots_left -= 1;
+                if slots_left == 0 {
+                    speaking = false;
+                    slots_left = n_text;
+                }
+            }
+        } else {
+            // Text slot: greedy argmax of the previous step's logits.
+            let logits = prev_logits
+                .as_ref()
+                .ok_or_else(|| "omni: no prev logits for text slot".to_string())?;
+            let token = logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap()
+                .0 as u32;
+            text_tokens.push(token);
+
+            if token == TEXT_END_TOKEN {
+                // End the text → start the audio tail (until eos/max).
+                text_done = true;
+                speaking = true;
+                slots_left = n_audio;
+                position += 1;
+                prev_logits = Some(
+                    decode_step(cfg, weights, state, gpu, token, position)
+                        .map_err(|e| format!("omni: text_end step @ {step}: {e}"))?,
+                );
+                hidden = gpu
+                    .download_f32(&state.final_norm_buf)
+                    .map_err(|e| format!("omni: download hidden: {e:?}"))?;
+                continue; // next step is audio (speaking=true)
+            }
+            if token == IM_END_TOKEN {
+                finished = true;
+                break;
+            }
+
+            position += 1;
+            prev_logits = Some(
+                decode_step(cfg, weights, state, gpu, token, position)
+                    .map_err(|e| format!("omni: text step @ {step}: {e}"))?,
+            );
+            hidden = gpu
+                .download_f32(&state.final_norm_buf)
+                .map_err(|e| format!("omni: download hidden: {e:?}"))?;
+            slots_left -= 1;
+            if slots_left == 0 {
+                speaking = true;
+                slots_left = n_audio;
+            }
+        }
+    }
+    Ok(OmniOutput {
+        text_tokens,
+        audio_codes,
+        n_audio_frames,
+        hit_eos,
+        finished,
+    })
 }
