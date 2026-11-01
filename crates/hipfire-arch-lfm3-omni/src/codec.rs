@@ -385,6 +385,8 @@ pub struct CodecState {
     pub conv_states: Vec<GpuTensor>,
     pub pos_buf: hip_bridge::DeviceBuffer,
     pub max_seq: usize,
+    /// Absolute position counter (carries across chunks for streaming decode).
+    pub n_tokens: usize,
     pub h: GpuTensor,
     pub tmp: GpuTensor,
     pub fa_q: GpuTensor,
@@ -450,6 +452,7 @@ impl CodecState {
             conv_states,
             pos_buf,
             max_seq,
+            n_tokens: 0,
             h: alloc(gpu, h, "h")?,
             tmp: alloc(gpu, h, "tmp")?,
             fa_q: alloc(gpu, q_dim, "fa_q")?,
@@ -606,27 +609,28 @@ fn codec_attn_mixer(
 
 /// Run the 8-layer decoder over `inputs` (`[n_tokens, hidden]` host F32),
 /// returning `[n_tokens, hidden]` last_hidden_state (after embedding_norm).
+/// Uses the caller-provided `st` (which carries the KV cache + conv state +
+/// position across calls for streaming). The position starts at `st.n_tokens`
+/// and advances by `n_tokens`.
 fn codec_decoder_forward(
     gpu: &mut Gpu,
     weights: &CodecWeights,
     cfg: &CodecConfig,
+    st: &mut CodecState,
     inputs: &[f32],
     n_tokens: usize,
 ) -> Result<Vec<f32>, String> {
     let h = cfg.hidden_size;
     let eps = cfg.norm_eps;
-    let max_seq = n_tokens.max(64);
-    let mut st = CodecState::new(gpu, cfg, max_seq)?;
-    st.reset(gpu)?;
-
+    let base = st.n_tokens; // absolute position offset (carries across chunks)
     let mut out = vec![0.0f32; n_tokens * h];
-    eprintln!("  codec decoder forward: {n_tokens} tokens, {} layers", cfg.num_hidden_layers);
 
-    for pos in 0..n_tokens as u32 {
+    for i in 0..n_tokens as u32 {
+        let pos = base as u32 + i; // absolute position (RoPE + KV write)
         let seq_len = pos as usize + 1;
         gpu.hip.memcpy_htod(&st.pos_buf, &(pos as i32).to_ne_bytes()).map_err(|e| format!("codec: htod pos: {e:?}"))?;
 
-        let embed = &inputs[pos as usize * h..(pos as usize + 1) * h];
+        let embed = &inputs[i as usize * h..(i as usize + 1) * h];
         let bytes: Vec<u8> = embed.iter().flat_map(|&f| f.to_le_bytes()).collect();
         gpu.hip.memcpy_htod(&st.h.buf, &bytes).map_err(|e| format!("codec: htod embed: {e:?}"))?;
 
@@ -634,8 +638,8 @@ fn codec_decoder_forward(
             gpu.rmsnorm_f32(&st.h, &layer.operator_norm, &st.tmp, eps).map_err(|e| format!("codec: operator rmsnorm: {e:?}"))?;
 
             match &layer.mixer {
-                CodecMixer::Conv(c) => codec_conv_mixer(gpu, cfg, c, &st, 0)?,
-                CodecMixer::Attn(a) => codec_attn_mixer(gpu, cfg, a, &st, 0, seq_len)?,
+                CodecMixer::Conv(c) => codec_conv_mixer(gpu, cfg, c, st, 0)?,
+                CodecMixer::Attn(a) => codec_attn_mixer(gpu, cfg, a, st, 0, seq_len)?,
             }
 
             // Sandwich norm (post_operator) + residual.
@@ -657,10 +661,9 @@ fn codec_decoder_forward(
         // Final embedding_norm → last_hidden_state for this token.
         gpu.rmsnorm_f32(&st.h, &weights.embedding_norm, &st.final_norm_buf, eps).map_err(|e| format!("codec: final norm: {e:?}"))?;
         let hidden = gpu.download_f32(&st.final_norm_buf).map_err(|e| format!("codec: download hidden: {e:?}"))?;
-        out[pos as usize * h..(pos as usize + 1) * h].copy_from_slice(&hidden);
+        out[i as usize * h..(i as usize + 1) * h].copy_from_slice(&hidden);
     }
-
-    st.free_gpu(gpu);
+    st.n_tokens = base + n_tokens; // advance the absolute position
     Ok(out)
 }
 
@@ -735,19 +738,20 @@ fn irfft(re: &[f32], im: &[f32], n: usize) -> Vec<f32> {
 /// iSTFT overlap-add: `(log_mag, angle)` `[num_frames, n_bins]` → waveform.
 /// Returns the trimmed 24 kHz mono samples (one `frame_samples` per codec frame
 /// after the ×6 upsample).
-fn istft_overlap_add(
+/// Raw iSTFT overlap-add: returns `(audio, envelope)` of length
+/// `(num_frames-1)*hop + win` (NOT trimmed). The caller divides + trims.
+fn istft_overlap_add_raw(
     cfg: &CodecConfig,
     window: &[f32],
     log_mag: &[f32], // [num_frames, n_bins]
     angle: &[f32],   // [num_frames, n_bins]
     num_frames: usize,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<f32>) {
     let n_fft = cfg.stft_n_fft;
     let hop = cfg.stft_hop;
     let win = cfg.stft_win;
     let n_bins = n_fft / 2 + 1;
     let output_size = (num_frames.saturating_sub(1)) * hop + win;
-    let trim = (win - hop) / 2;
 
     let mut audio = vec![0.0f32; output_size];
     let mut envelope = vec![0.0f32; output_size];
@@ -768,8 +772,22 @@ fn istft_overlap_add(
             }
         }
     }
+    (audio, envelope)
+}
 
-    // Trim + divide by envelope (non-streaming path).
+/// iSTFT overlap-add + trim + divide (non-streaming path).
+fn istft_overlap_add(
+    cfg: &CodecConfig,
+    window: &[f32],
+    log_mag: &[f32],
+    angle: &[f32],
+    num_frames: usize,
+) -> Vec<f32> {
+    let win = cfg.stft_win;
+    let hop = cfg.stft_hop;
+    let trim = (win - hop) / 2;
+    let (audio, envelope) = istft_overlap_add_raw(cfg, window, log_mag, angle, num_frames);
+    let output_size = audio.len();
     let lo = trim;
     let hi = output_size.saturating_sub(trim);
     audio[lo..hi]
@@ -829,7 +847,13 @@ pub fn codec_decode(
     }
 
     // 4. 8-layer decoder forward → [n_up, 512] last_hidden_state.
-    let hidden = codec_decoder_forward(gpu, weights, cfg, &upsampled, n_up)?;
+    let hidden = {
+        let mut st = CodecState::new(gpu, cfg, n_up.max(64))?;
+        st.reset(gpu)?;
+        let h_out = codec_decoder_forward(gpu, weights, cfg, &mut st, &upsampled, n_up)?;
+        st.free_gpu(gpu);
+        h_out
+    };
 
     // 5. lin Linear(512→2*n_bins) (batched) → (log_mag, angle).
     let hidden_gpu = gpu.upload_f32(&hidden, &[n_up * h]).map_err(|e| format!("codec: upload hidden: {e:?}"))?;
@@ -857,6 +881,149 @@ pub fn codec_decode(
         waveform.iter().all(|v| v.is_finite())
     );
     Ok((waveform, 24_000))
+}
+
+// ─── Streaming decode (Phase 4d) ─────────────────────────────────────────────
+
+/// Streaming codec decode state: carries the decoder LFM3 KV cache + conv
+/// state + the iSTFT overlap-add tail across chunks. Mirrors HF
+/// `LiquidCodecStreamingCache`. `codec_decode_streaming` decodes one chunk of
+/// frames at a time, enabling low-latency TTS (audio emitted as frames are
+/// generated, not after the full sequence).
+pub struct CodecStreamingCache {
+    pub state: CodecState,
+    tail_audio: Vec<f32>,
+    tail_envelope: Vec<f32>,
+    started: bool,
+    pub finished: bool,
+}
+
+impl CodecStreamingCache {
+    /// `max_frames` bounds the total frames expected (for the KV-cache +
+    /// flash-partials allocation). Pass an upper bound (e.g. the request's
+    /// max_tokens).
+    pub fn new(gpu: &mut Gpu, cfg: &CodecConfig, max_frames: usize) -> Result<Self, String> {
+        let max_seq = (max_frames * cfg.stft_frame_stack).max(64);
+        let mut state = CodecState::new(gpu, cfg, max_seq)?;
+        state.reset(gpu)?;
+        Ok(Self {
+            state,
+            tail_audio: Vec::new(),
+            tail_envelope: Vec::new(),
+            started: false,
+            finished: false,
+        })
+    }
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.state.free_gpu(gpu);
+    }
+}
+
+/// Decode one chunk of audio frames with a streaming cache. Returns the
+/// chunk's waveform samples (divided by the envelope, tail-overlap-added with
+/// the previous chunk). `finalize=true` on the last chunk flushes the held-back
+/// tail; pass an empty `codes` with `finalize=true` to flush after the last
+/// frame chunk. Concatenating all chunks' output == `codec_decode` on the full
+/// codes.
+pub fn codec_decode_streaming(
+    cfg: &CodecConfig,
+    weights: &CodecWeights,
+    gpu: &mut Gpu,
+    codes_chunk: &[u32],
+    cache: &mut CodecStreamingCache,
+    finalize: bool,
+) -> Result<Vec<f32>, String> {
+    let n_q = cfg.n_q;
+    let h = cfg.hidden_size;
+    let fs = cfg.stft_frame_stack;
+    let n_bins = cfg.stft_n_fft / 2 + 1;
+    let win = cfg.stft_win;
+    let hop = cfg.stft_hop;
+    let trim = (win - hop) / 2;
+    let tail = 2 * trim;
+    let n_chunk = codes_chunk.len() / n_q;
+
+    // Produce (audio, envelope) for this chunk (or zeros for a finalize flush).
+    let (mut audio, mut envelope) = if n_chunk > 0 {
+        // FSQ + project_out + from_quantizer + upsample.
+        let cb_dim = cfg.fsq_levels.len();
+        let fsq_in = n_q * cb_dim;
+        let latents = fsq_decode(cfg, codes_chunk)?;
+        let lat_gpu = gpu.upload_f32(&latents, &[n_chunk * fsq_in]).map_err(|e| format!("codec-str: upload lat: {e:?}"))?;
+        let proj = linear_f16_bias_batched(gpu, &weights.project_out_w, &lat_gpu, &weights.project_out_b, cfg.quantizer_dim, fsq_in, n_chunk)?;
+        gpu.free_tensor(lat_gpu).map_err(|e| format!("codec-str: free lat: {e:?}"))?;
+        let emb = linear_f16_bias_batched(gpu, &weights.from_quantizer_w, &proj, &weights.from_quantizer_b, h, cfg.quantizer_dim, n_chunk)?;
+        gpu.free_tensor(proj).map_err(|e| format!("codec-str: free proj: {e:?}"))?;
+        let emb_host = gpu.download_f32(&emb).map_err(|e| format!("codec-str: dl emb: {e:?}"))?;
+        gpu.free_tensor(emb).map_err(|e| format!("codec-str: free emb: {e:?}"))?;
+        let n_up = n_chunk * fs;
+        let mut upsampled = vec![0.0f32; n_up * h];
+        for f in 0..n_chunk {
+            for r in 0..fs {
+                let src = f * h;
+                let dst = (f * fs + r) * h;
+                upsampled[dst..dst + h].copy_from_slice(&emb_host[src..src + h]);
+            }
+        }
+        // Decoder forward (persistent state) + lin.
+        let hidden = codec_decoder_forward(gpu, weights, cfg, &mut cache.state, &upsampled, n_up)?;
+        let hidden_gpu = gpu.upload_f32(&hidden, &[n_up * h]).map_err(|e| format!("codec-str: upload hidden: {e:?}"))?;
+        let lin_out = linear_f16_bias_batched(gpu, &weights.lin_w, &hidden_gpu, &weights.lin_b, 2 * n_bins, h, n_up)?;
+        gpu.free_tensor(hidden_gpu).map_err(|e| format!("codec-str: free hidden: {e:?}"))?;
+        let lin_host = gpu.download_f32(&lin_out).map_err(|e| format!("codec-str: dl lin: {e:?}"))?;
+        gpu.free_tensor(lin_out).map_err(|e| format!("codec-str: free lin: {e:?}"))?;
+        let mut log_mag = vec![0.0f32; n_up * n_bins];
+        let mut angle = vec![0.0f32; n_up * n_bins];
+        for t in 0..n_up {
+            for k in 0..n_bins {
+                log_mag[t * n_bins + k] = lin_host[t * (2 * n_bins) + k];
+                angle[t * n_bins + k] = lin_host[t * (2 * n_bins) + n_bins + k];
+            }
+        }
+        istft_overlap_add_raw(cfg, &weights.istft_window, &log_mag, &angle, n_up)
+    } else {
+        // Finalize flush with no new frames: zeros of the tail length.
+        (vec![0.0f32; tail], vec![0.0f32; tail])
+    };
+
+    // Overlap-add the previous chunk's tail into this chunk's leading edge.
+    if !cache.tail_audio.is_empty() {
+        let n = cache.tail_audio.len().min(audio.len());
+        for i in 0..n {
+            audio[i] += cache.tail_audio[i];
+            envelope[i] += cache.tail_envelope[i];
+        }
+    }
+
+    // First chunk: trim the leading edge.
+    let lead_trim = if !cache.started {
+        cache.started = true;
+        trim
+    } else {
+        0
+    };
+
+    // Finalize: trim the trailing edge + clear the tail. Else: hold back the tail.
+    let trail_trim = if finalize {
+        cache.tail_audio.clear();
+        cache.tail_envelope.clear();
+        cache.finished = true;
+        trim
+    } else {
+        let tlen = tail.min(audio.len());
+        cache.tail_audio = audio[audio.len() - tlen..].to_vec();
+        cache.tail_envelope = envelope[envelope.len() - tlen..].to_vec();
+        tlen
+    };
+
+    // Emit [lead_trim .. len - trail_trim], divided by the envelope.
+    let lo = lead_trim;
+    let hi = audio.len().saturating_sub(trail_trim);
+    let mut out = Vec::with_capacity(hi.saturating_sub(lo));
+    for i in lo..hi {
+        out.push(if envelope[i] > 1e-8 { audio[i] / envelope[i] } else { 0.0 });
+    }
+    Ok(out)
 }
 
 // ─── WAV writer (16-bit PCM mono) ────────────────────────────────────────────
