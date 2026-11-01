@@ -995,6 +995,47 @@ pub struct LaneSpecStats {
     pub copy_missed: u64,
     /// Forced advances executed.
     pub forced_windows: u64,
+    /// Native windows' per-position draft counts, index `d - 1` for depth `d`:
+    /// windows that offered at least `d` drafts.
+    pub depth_offered: [u64; SPEC_DEPTHS],
+    /// Windows that offered at least `d` drafts and accepted the first `d - 1`
+    /// (the conditional trials of position `d`; `accepted[d] / reached[d]` is
+    /// the per-position acceptance `a_d`).
+    pub depth_reached: [u64; SPEC_DEPTHS],
+    /// Windows that accepted at least the first `d` drafts.
+    pub depth_accepted: [u64; SPEC_DEPTHS],
+}
+
+/// Draft positions a lane's per-depth counters resolve: one lane window holds
+/// at most [`crate::gpu_forward_lanes::LANE_MAX_ROWS`] rows, so at most 7
+/// drafts; the eighth bin only bounds the arrays.
+pub const SPEC_DEPTHS: usize = 8;
+
+impl LaneSpecStats {
+    /// Fold one native window that offered `offered` drafts and accepted the
+    /// first `accepted` of them into the per-position counters. Depths beyond
+    /// [`SPEC_DEPTHS`] fold into the last bin.
+    pub fn record_depths(&mut self, offered: usize, accepted: usize) {
+        let accepted = accepted.min(offered);
+        for d in 1..=offered {
+            let bin = (d - 1).min(SPEC_DEPTHS - 1);
+            self.depth_offered[bin] += 1;
+            if d <= accepted + 1 {
+                self.depth_reached[bin] += 1;
+            }
+            if d <= accepted {
+                self.depth_accepted[bin] += 1;
+            }
+        }
+    }
+
+    /// The per-position acceptance `a_d = accepted_d / reached_d` (`None`
+    /// before any window reached depth `d`; `d` is 1-based).
+    pub fn position_rate(&self, d: usize) -> Option<f64> {
+        let bin = d.checked_sub(1)?.min(SPEC_DEPTHS - 1);
+        (self.depth_reached[bin] != 0)
+            .then(|| self.depth_accepted[bin] as f64 / self.depth_reached[bin] as f64)
+    }
 }
 
 /// Where a lane's head stands against its target and the root's record
@@ -2796,6 +2837,61 @@ impl Qwen4LaneStore {
 mod tests {
     use super::*;
     use crate::expert_arena::ArenaExpert;
+
+    /// A window that offered `o` drafts and accepted the first `a` reaches
+    /// depths `1..=min(o, a + 1)` and accepts depths `1..=a`.
+    #[test]
+    fn record_depths_counts_offered_reached_and_accepted_per_position() {
+        let mut s = LaneSpecStats::default();
+        s.record_depths(3, 3); // all accepted
+        s.record_depths(3, 1); // miss at depth 2
+        s.record_depths(2, 0); // miss at depth 1
+        s.record_depths(1, 1);
+        s.record_depths(0, 0); // no drafts: nothing
+        assert_eq!(&s.depth_offered[..4], &[4, 3, 2, 0]);
+        assert_eq!(&s.depth_reached[..4], &[4, 2, 1, 0]);
+        assert_eq!(&s.depth_accepted[..4], &[3, 1, 1, 0]);
+        assert_eq!(s.position_rate(1), Some(0.75));
+        assert_eq!(s.position_rate(2), Some(0.5));
+        assert_eq!(s.position_rate(3), Some(1.0));
+        assert_eq!(s.position_rate(4), None);
+        assert_eq!(s.position_rate(0), None);
+    }
+
+    /// Conservation: `reached[d] == accepted[d - 1]` whenever every window
+    /// offered at least `d` drafts, and `accepted <= reached <= offered`
+    /// always, over every (offered, accepted) the lane protocol can produce.
+    #[test]
+    fn record_depths_invariants_hold_for_every_window_shape() {
+        let mut s = LaneSpecStats::default();
+        for offered in 0..=7usize {
+            for accepted in 0..=offered {
+                s.record_depths(offered, accepted);
+            }
+        }
+        for d in 0..SPEC_DEPTHS {
+            assert!(s.depth_accepted[d] <= s.depth_reached[d]);
+            assert!(s.depth_reached[d] <= s.depth_offered[d]);
+        }
+        // windows that offered >= 3: offered 3..=7 -> 4+5+6+7+8 = 30
+        assert_eq!(s.depth_offered[2], 30);
+        // of those, the ones that accepted the first 2 (accepted >= 2)
+        let reached3: u64 = (3..=7).map(|o| (o - 2 + 1) as u64).sum();
+        assert_eq!(s.depth_reached[2], reached3);
+        // an accepted count above the offer is clamped, not trusted
+        let mut t = LaneSpecStats::default();
+        t.record_depths(2, 9);
+        assert_eq!(&t.depth_accepted[..3], &[1, 1, 0]);
+    }
+
+    /// Depths past the last bin fold into it instead of indexing out.
+    #[test]
+    fn record_depths_folds_overlong_windows_into_the_last_bin() {
+        let mut s = LaneSpecStats::default();
+        s.record_depths(SPEC_DEPTHS + 2, SPEC_DEPTHS + 2);
+        assert_eq!(s.depth_offered[SPEC_DEPTHS - 1], 3);
+        assert_eq!(s.depth_accepted[SPEC_DEPTHS - 1], 3);
+    }
 
     struct TestCell {
         host: LaneHost,

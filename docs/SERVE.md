@@ -996,8 +996,16 @@ and the lane-store receipt:
 `fn_lanes_mapped_bytes`, `fn_lanes_stage_policy` (the per-stage sharing
 policy) and `fn_lanes_stage_evidence` (the G0 receipt id for the production
 policy). Each lane's `done` event carries the singleton's MTP counters
-(`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`) plus `mtp_drafts` and
-`mtp_accepted`. Under PP/EP the ack also reports `fn_lanes_topology`
+(`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`, `tau` = accepted drafts per
+verify window, `cycles`) plus `mtp_drafts` and `mtp_accepted` and the per-position
+arrays `mtp_depth_offered`, `mtp_depth_reached`, `mtp_depth_accepted` (index
+`d - 1` is draft depth `d`; `reached` counts windows that offered >= d drafts and
+accepted the first d-1, so `accepted[d] / reached[d]` is the per-position
+acceptance a_d over native windows). `GET /stats` sums them across requests as
+`draft_positions` (`depth`, `offered`, `reached`, `accepted`, `rate`) with
+`spec_cycles` and `spec_committed_tokens`; `/metrics` adds
+`hipfire_spec_draft_position_total{depth,kind}` and `hipfire_spec_cycles_total`
+once a lane window has run. Under PP/EP the ack also reports `fn_lanes_topology`
 (`"single"`, `"ep"` or `"pp"`) and `fn_lanes_device_receipts`, one entry per
 card (EP rank order; PP input band to output band); the scalar `fn_lanes_*`
 receipt is the root's (rank 0, or the output band), and

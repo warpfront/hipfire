@@ -74,7 +74,7 @@ use crate::batch::{
 use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
-use hipfire_arch_qwen4::lane::{LaneSampling, LaneStatus};
+use hipfire_arch_qwen4::lane::{LaneSampling, LaneSpecStats, LaneStatus};
 use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute, Qwen4LaneExecutor};
 use hipfire_engine::emit::*;
 use hipfire_engine::scheduler::*;
@@ -971,24 +971,13 @@ fn finish_lane(
         lane.max_active_lanes.max(1),
     );
     // Per-stream MTP counters (before `release` drops the lane), under the
-    // singleton's done keys; `mtp_drafts`/`mtp_accepted` are lane-only.
+    // singleton's done keys; `mtp_drafts`/`mtp_accepted` and the per-position
+    // `mtp_depth_*` arrays are lane-only.
     if let Some(stats) = model
         .qwen4()
         .and_then(|b| b.lane_spec_stats_for(&ctl.epoch))
     {
-        done["mtp"] = serde_json::json!(true);
-        if stats.windows != 0 || stats.ar_windows != 0 || stats.copy_windows != 0 || stats.retired {
-            done["mtp_windows"] = serde_json::json!(stats.windows);
-            done["ar_windows"] = serde_json::json!(stats.ar_windows);
-            done["mtp_retired"] = serde_json::json!(stats.retired);
-            done["mtp_drafts"] = serde_json::json!(stats.drafts);
-            done["mtp_accepted"] = serde_json::json!(stats.accepted);
-            if stats.copy_windows != 0 {
-                done["mtp_copy_windows"] = serde_json::json!(stats.copy_windows);
-                done["mtp_copy_drafts"] = serde_json::json!(stats.copy_drafts);
-                done["mtp_copy_accepted"] = serde_json::json!(stats.copy_accepted);
-            }
-        }
+        attach_mtp_lane_stats(&mut done, &stats);
     }
     let action = qwen_ar_cache_action(&finish, &visible);
     if action.store {
@@ -1638,9 +1627,52 @@ pub fn drive_qwen4_lane_batch(
     Ok(())
 }
 
+/// A lane's MTP counters on its done event, under the singleton's keys
+/// (`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`, `tau`, `cycles`) plus
+/// the lane-only `mtp_drafts`, `mtp_accepted` and the per-position arrays
+/// `mtp_depth_offered` / `mtp_depth_reached` / `mtp_depth_accepted` (index
+/// `d - 1` is depth `d`, trimmed after the last non-zero bin;
+/// `mtp_depth_accepted[d] / mtp_depth_reached[d]` is the per-position
+/// acceptance `a_d` over native windows). `cycles` counts verify windows
+/// (native, `ArSynced` and copy) and `tau` is accepted drafts per cycle, the
+/// singleton's definitions. Nothing but the lane's own window counters feeds
+/// them; a lane that ran no window reports only `mtp: true`.
+fn attach_mtp_lane_stats(done: &mut serde_json::Value, stats: &LaneSpecStats) {
+    done["mtp"] = serde_json::json!(true);
+    if stats.windows == 0 && stats.ar_windows == 0 && stats.copy_windows == 0 && !stats.retired {
+        return;
+    }
+    done["mtp_windows"] = serde_json::json!(stats.windows);
+    done["ar_windows"] = serde_json::json!(stats.ar_windows);
+    done["mtp_retired"] = serde_json::json!(stats.retired);
+    done["mtp_drafts"] = serde_json::json!(stats.drafts);
+    done["mtp_accepted"] = serde_json::json!(stats.accepted);
+    if stats.copy_windows != 0 {
+        done["mtp_copy_windows"] = serde_json::json!(stats.copy_windows);
+        done["mtp_copy_drafts"] = serde_json::json!(stats.copy_drafts);
+        done["mtp_copy_accepted"] = serde_json::json!(stats.copy_accepted);
+    }
+    let cycles = stats.windows + stats.copy_windows;
+    if cycles != 0 {
+        let tau = (stats.accepted + stats.copy_accepted) as f64 / cycles as f64;
+        done["cycles"] = serde_json::json!(cycles);
+        done["tau"] = serde_json::json!((tau * 100.0).round() / 100.0);
+    }
+    let bins = stats
+        .depth_offered
+        .iter()
+        .rposition(|&n| n != 0)
+        .map_or(0, |last| last + 1);
+    if bins != 0 {
+        done["mtp_depth_offered"] = serde_json::json!(&stats.depth_offered[..bins]);
+        done["mtp_depth_reached"] = serde_json::json!(&stats.depth_reached[..bins]);
+        done["mtp_depth_accepted"] = serde_json::json!(&stats.depth_accepted[..bins]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{forwarded_tokens, LaneCtl};
+    use super::{attach_mtp_lane_stats, forwarded_tokens, LaneCtl, LaneSpecStats};
     use hipfire_runtime::emit_text::ThinkBudget;
     use hipfire_runtime::external_rows::FetchActivity;
     use hipfire_runtime::slot_batch::RequestEpoch;
@@ -1700,6 +1732,64 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(activity.in_flight(), 0);
+    }
+
+    /// The per-position arrays come from the windows' (offered, accepted)
+    /// pairs: windows (3, 3), (3, 1), (2, 0), (1, 1) give offered 4/3/2,
+    /// reached 4/2/1 (a window reaches depth d when its first d-1 drafts
+    /// matched) and accepted 3/1/1, and the done keys carry the singleton's
+    /// `cycles`/`tau` over the same windows.
+    #[test]
+    fn lane_done_carries_per_position_acceptance_and_cycles() {
+        let mut stats = LaneSpecStats::default();
+        for (offered, accepted) in [(3usize, 3usize), (3, 1), (2, 0), (1, 1)] {
+            stats.windows += 1;
+            stats.drafts += offered as u64;
+            stats.accepted += accepted as u64;
+            stats.record_depths(offered, accepted);
+        }
+        let mut done = serde_json::json!({});
+        attach_mtp_lane_stats(&mut done, &stats);
+        assert_eq!(done["mtp"], true);
+        assert_eq!(done["mtp_windows"], 4);
+        assert_eq!(done["mtp_drafts"], 9);
+        assert_eq!(done["mtp_accepted"], 5);
+        assert_eq!(done["mtp_depth_offered"], serde_json::json!([4, 3, 2]));
+        assert_eq!(done["mtp_depth_reached"], serde_json::json!([4, 2, 1]));
+        assert_eq!(done["mtp_depth_accepted"], serde_json::json!([3, 1, 1]));
+        assert_eq!(done["cycles"], 4);
+        assert_eq!(done["tau"], 1.25);
+        assert!(done.get("mtp_copy_windows").is_none());
+    }
+
+    /// A lane that ran no window reports only `mtp: true` (no zero arrays, no
+    /// tau): the gateway must not fold a zero into its distributions.
+    #[test]
+    fn lane_without_windows_reports_no_counters() {
+        let mut done = serde_json::json!({});
+        attach_mtp_lane_stats(&mut done, &LaneSpecStats::default());
+        assert_eq!(done, serde_json::json!({ "mtp": true }));
+    }
+
+    /// AR-synced windows (no drafts) are cycles but add no depth; a copy
+    /// window adds to cycles and tau, not to the native per-position arrays.
+    #[test]
+    fn ar_and_copy_windows_count_as_cycles_not_depths() {
+        let mut stats = LaneSpecStats::default();
+        stats.windows = 2; // one native (2 offered, 2 accepted), one ArSynced
+        stats.drafts = 2;
+        stats.accepted = 2;
+        stats.record_depths(2, 2);
+        stats.copy_windows = 1;
+        stats.copy_drafts = 4;
+        stats.copy_accepted = 1;
+        let mut done = serde_json::json!({});
+        attach_mtp_lane_stats(&mut done, &stats);
+        assert_eq!(done["cycles"], 3);
+        assert_eq!(done["tau"], 1.0);
+        assert_eq!(done["mtp_depth_offered"], serde_json::json!([1, 1]));
+        assert_eq!(done["mtp_depth_accepted"], serde_json::json!([1, 1]));
+        assert_eq!(done["mtp_copy_accepted"], 1);
     }
 
     /// Source-level: every lane control carries the guard, and the driver

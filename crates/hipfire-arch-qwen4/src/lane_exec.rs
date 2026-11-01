@@ -1353,6 +1353,7 @@ fn commit_with_proto(
                         stats.windows += 1;
                         stats.drafts += d.source.offered as u64;
                         stats.accepted += d.source.accepted as u64;
+                        stats.record_depths(d.source.offered, d.source.accepted);
                     }
                     (ProposalSource::None, LaneRoute::ArSynced) => stats.windows += 1,
                     (ProposalSource::None, LaneRoute::ArRetired) => stats.ar_windows += 1,

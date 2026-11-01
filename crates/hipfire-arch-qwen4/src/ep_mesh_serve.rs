@@ -394,6 +394,7 @@ impl Qwen4Bundle {
                         stats.windows += 1;
                         stats.drafts += out.source.offered as u64;
                         stats.accepted += out.source.accepted as u64;
+                        stats.record_depths(out.source.offered, out.source.accepted);
                     }
                     ProposalSource::None if retired_before[index] => stats.ar_windows += 1,
                     ProposalSource::None => stats.windows += 1,

@@ -148,6 +148,115 @@ pub(crate) struct Metrics {
     pub(crate) completion_tokens: AtomicU64,
     pub(crate) cached_prompt_tokens: AtomicU64,
     pub(crate) spec_retired: AtomicU64,
+    pub(crate) spec_positions: SpecPositions,
+}
+
+/// Draft positions a lane done event resolves; mirrors
+/// `hipfire_arch_qwen4::lane::SPEC_DEPTHS`.
+const SPEC_POSITION_BINS: usize = 8;
+
+/// Per-position speculative acceptance folded from lane `done` events
+/// (`mtp_depth_offered|reached|accepted`, index `d - 1` = depth `d`), the
+/// shape the other engines expose as `draft_positions` on `/stats`:
+/// `accepted[d] / reached[d]` is the conditional per-position acceptance.
+/// `cycles` and `tokens` are summed over the same requests, so
+/// `tokens / cycles` is the committed tokens per window.
+#[derive(Debug, Default)]
+pub(crate) struct SpecPositions {
+    offered: [AtomicU64; SPEC_POSITION_BINS],
+    reached: [AtomicU64; SPEC_POSITION_BINS],
+    accepted: [AtomicU64; SPEC_POSITION_BINS],
+    cycles: AtomicU64,
+    tokens: AtomicU64,
+}
+
+impl SpecPositions {
+    /// Fold one `done` event; an event without the arrays contributes nothing.
+    fn observe_done(&self, done: &serde_json::Value, tokens: Option<u64>) {
+        let arrays = [
+            ("mtp_depth_offered", &self.offered),
+            ("mtp_depth_reached", &self.reached),
+            ("mtp_depth_accepted", &self.accepted),
+        ];
+        let mut any = false;
+        for (key, bins) in arrays {
+            let Some(values) = done.get(key).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for (bin, v) in bins.iter().zip(values) {
+                if let Some(n) = v.as_u64() {
+                    bin.fetch_add(n, Ordering::Relaxed);
+                    any = true;
+                }
+            }
+        }
+        if any {
+            if let Some(c) = done.get("cycles").and_then(serde_json::Value::as_u64) {
+                self.cycles.fetch_add(c, Ordering::Relaxed);
+            }
+            if let Some(t) = tokens {
+                self.tokens.fetch_add(t, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `/stats` body: `draft_positions` (trimmed after the last non-zero
+    /// depth; empty before any lane window) plus the cycle and token sums.
+    pub(crate) fn stats_json(&self) -> serde_json::Value {
+        let load = |bins: &[AtomicU64; SPEC_POSITION_BINS]| -> Vec<u64> {
+            bins.iter().map(|b| b.load(Ordering::Relaxed)).collect()
+        };
+        let (offered, reached, accepted) = (
+            load(&self.offered),
+            load(&self.reached),
+            load(&self.accepted),
+        );
+        let last = offered.iter().rposition(|&n| n != 0).map_or(0, |i| i + 1);
+        let positions: Vec<serde_json::Value> = (0..last)
+            .map(|i| {
+                serde_json::json!({
+                    "depth": i + 1,
+                    "offered": offered[i],
+                    "reached": reached[i],
+                    "accepted": accepted[i],
+                    "rate": (reached[i] != 0).then(|| accepted[i] as f64 / reached[i] as f64),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "draft_positions": positions,
+            "spec_cycles": self.cycles.load(Ordering::Relaxed),
+            "spec_committed_tokens": self.tokens.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Prometheus counters, emitted only once a lane window has been folded.
+    fn render(&self, out: &mut String) {
+        let stats = self.stats_json();
+        let Some(positions) = stats["draft_positions"]
+            .as_array()
+            .filter(|p| !p.is_empty())
+        else {
+            return;
+        };
+        out.push_str(
+            "# HELP hipfire_spec_draft_position_total Draft rows per position: offered, reached (first d-1 accepted), accepted.\n\
+             # TYPE hipfire_spec_draft_position_total counter\n",
+        );
+        for p in positions {
+            for kind in ["offered", "reached", "accepted"] {
+                out.push_str(&format!(
+                    "hipfire_spec_draft_position_total{{depth=\"{}\",kind=\"{kind}\"}} {}\n",
+                    p["depth"], p[kind]
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "# HELP hipfire_spec_cycles_total Speculative verify windows folded into draft positions.\n\
+             # TYPE hipfire_spec_cycles_total counter\nhipfire_spec_cycles_total {}\n",
+            stats["spec_cycles"]
+        ));
+    }
 }
 
 impl Default for Metrics {
@@ -166,6 +275,7 @@ impl Default for Metrics {
             completion_tokens: AtomicU64::new(0),
             cached_prompt_tokens: AtomicU64::new(0),
             spec_retired: AtomicU64::new(0),
+            spec_positions: SpecPositions::default(),
         }
     }
 }
@@ -217,6 +327,8 @@ impl Metrics {
         if let Some(v) = f64_field("tau") {
             self.spec_tau.observe(v);
         }
+        let tokens_for_spec = u64_field("tokens").or_else(|| u64_field("completion_tokens"));
+        self.spec_positions.observe_done(done, tokens_for_spec);
         if done.get("spec_retired") == Some(&serde_json::Value::Bool(true)) {
             self.spec_retired.fetch_add(1, Ordering::Relaxed);
         }
@@ -523,6 +635,7 @@ impl Metrics {
             "hipfire_spec_tau",
             "Speculative decoding mean accepted length (tau), per request that reports one.",
         );
+        self.spec_positions.render(&mut out);
 
         out
     }
@@ -544,6 +657,56 @@ mod tests {
             m.insert((*k).to_string(), value);
         }
         serde_json::Value::Object(m)
+    }
+
+    /// Lane `done` events fold into `draft_positions` (Radiance's `/stats`
+    /// shape): counts add across requests, `rate` is accepted / reached, the
+    /// list is trimmed after the last non-zero depth, and `/metrics` carries
+    /// the same counters. An event without the arrays adds nothing.
+    #[test]
+    fn lane_done_arrays_fold_into_draft_positions() {
+        let m = Metrics::default();
+        let empty = m.spec_positions.stats_json();
+        assert_eq!(empty["draft_positions"], serde_json::json!([]));
+        assert_eq!(empty["spec_cycles"], 0);
+        let mut render = String::new();
+        m.spec_positions.render(&mut render);
+        assert!(
+            render.is_empty(),
+            "no counters before a lane window: {render}"
+        );
+
+        let lane = |off: [u64; 3], rea: [u64; 3], acc: [u64; 3], cycles: u64, tokens: u64| {
+            serde_json::json!({
+                "mtp_depth_offered": off, "mtp_depth_reached": rea,
+                "mtp_depth_accepted": acc, "cycles": cycles, "tokens": tokens,
+            })
+        };
+        m.observe_done(&lane([4, 3, 2], [4, 2, 1], [3, 1, 1], 4, 9), None, 10.0);
+        m.observe_done(&lane([2, 2, 0], [2, 2, 0], [2, 1, 0], 2, 5), None, 10.0);
+        m.observe_done(&done(&[("tokens", 7.0)]), None, 10.0);
+        let stats = m.spec_positions.stats_json();
+        let p = stats["draft_positions"].as_array().unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[0]["offered"], 6);
+        assert_eq!(p[0]["reached"], 6);
+        assert_eq!(p[0]["accepted"], 5);
+        assert_eq!(p[1]["reached"], 4);
+        assert_eq!(p[1]["accepted"], 2);
+        assert_eq!(p[1]["rate"], 0.5);
+        assert_eq!(p[2]["offered"], 2);
+        assert_eq!(stats["spec_cycles"], 6);
+        assert_eq!(
+            stats["spec_committed_tokens"], 14,
+            "the array-less event adds no tokens"
+        );
+        let mut text = String::new();
+        m.spec_positions.render(&mut text);
+        assert!(
+            text.contains("hipfire_spec_draft_position_total{depth=\"2\",kind=\"accepted\"} 2"),
+            "{text}"
+        );
+        assert!(text.contains("hipfire_spec_cycles_total 6"), "{text}");
     }
 
     #[test]
