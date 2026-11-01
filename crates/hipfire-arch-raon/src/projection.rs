@@ -301,7 +301,9 @@ static ROWS_EXACT_MODE: std::sync::LazyLock<RowsExactMode> = std::sync::LazyLock
         Some("1" | "on" | "true") => RowsExactMode::On,
         Some("0" | "off" | "false") => RowsExactMode::Off,
         Some(other) => {
-            eprintln!("raon1_mini: HIPFIRE_RAON_VERIFY_ROWEXACT={other} is not auto|0|1; using auto");
+            eprintln!(
+                "raon1_mini: HIPFIRE_RAON_VERIFY_ROWEXACT={other} is not auto|0|1; using auto"
+            );
             RowsExactMode::Auto
         }
     }

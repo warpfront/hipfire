@@ -1097,9 +1097,7 @@ fn ffn_block(
     rows: usize,
 ) -> Result<(), String> {
     match &layer.ffn {
-        RaonFfn::Dense(d)
-            if crate::projection::rows_exact(&gpu.arch, rows) =>
-        {
+        RaonFfn::Dense(d) if crate::projection::rows_exact(&gpu.arch, rows) => {
             // Row-exact verify: every row equals the decode step's MLP row bit for
             // bit: the decode weight copy (`projections(1)`), Q8 projections through
             // the multi-row row-exact GEMV (weights read once), other dtypes per row.

@@ -415,8 +415,9 @@ impl RaonMlaWork {
     ) -> Result<AttentionRoute<'_>, String> {
         let policy = self.policy;
         let ws = Some(&self.split_ws);
-        let rows_route =
-            (2..=self.rows_exact_max).contains(&rows).then_some(MlaRowsRoute::DecodeExact);
+        let rows_route = (2..=self.rows_exact_max)
+            .contains(&rows)
+            .then_some(MlaRowsRoute::DecodeExact);
         match (route, policy.tiled) {
             (MlaRoute::Decompressed, false) => Ok(AttentionRoute::Reference),
             (MlaRoute::Decompressed, true) => Ok(match rows_route {
