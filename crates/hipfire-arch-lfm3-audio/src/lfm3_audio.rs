@@ -1178,11 +1178,26 @@ pub fn audio_forward(
 /// (the Phase 3 deferred item) — enables `transcribe_live` (live
 /// transcription) and chunked `prefill_audio` (audio tokens appended to the
 /// LM cache as chunks complete).
+///
+/// ASR-STR-1: unlike the first cut (per-chunk mel + per-chunk downsample +
+/// permanent drop of every <8-frame tail), the cache now carries the raw
+/// sample tail and the token count so streaming matches the batch path:
+/// the mel and downsampler run over the FULL accumulated stream each call
+/// (their convs have ±1-frame receptive-field overlap, so per-chunk slicing
+/// shifted the phase at chunk boundaries), tokens are emitted only when
+/// their full 8-frame group exists, and `is_final` flushes the partial
+/// trailing group as one last token (HF: `(num_frames + 7) // 8`).
 pub struct AudioEncoderStreamingCache {
     pub state: AudioEncoderState,
-    /// Config (needed per-chunk for the mel + downsampler shapes).
-    pub mel_n_mels: usize,
-    pub enc_hidden: usize,
+    /// Raw samples accumulated across all chunks (the mel + downsampler are
+    /// recomputed over the full stream per call — CPU, and it keeps chunk
+    /// boundaries bit-identical to the batch path).
+    pub accum_samples: Vec<f32>,
+    /// Tokens already emitted (HF `cache.num_tokens`).
+    pub num_tokens_emitted: usize,
+    /// Set by the `is_final` flush; further chunks are rejected (HF raises
+    /// "This stream is finalized").
+    pub finished: bool,
 }
 
 impl AudioEncoderStreamingCache {
@@ -1191,8 +1206,9 @@ impl AudioEncoderStreamingCache {
         state.reset(gpu)?;
         Ok(Self {
             state,
-            mel_n_mels: cfg.mel.n_mels,
-            enc_hidden: cfg.enc.hidden_size,
+            accum_samples: Vec::new(),
+            num_tokens_emitted: 0,
+            finished: false,
         })
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -1202,46 +1218,74 @@ impl AudioEncoderStreamingCache {
 
 /// Streaming audio forward: process one audio chunk (mono F32 @ 16 kHz),
 /// carrying the encoder state across chunks. Returns the projected audio
-/// tokens `[n_tokens, 2048]` for the COMPLETE tokens in this chunk (the
-/// downsampler groups 8 mel frames per token; an incomplete trailing group is
-/// dropped — pass the next chunk to continue). The mel is computed per chunk
-/// (`center=False`), so the chunk-boundary frames differ slightly from a
-/// global mel — audio chunks should be ≥ ~1 s to keep that error small.
+/// tokens `[n_tokens, 2048]` for the COMPLETE tokens in this chunk (a
+/// partial trailing 8-frame group is held back — pass `is_final = true` on
+/// the last chunk to flush it as one final token, mirroring HF
+/// `num_tokens = (num_frames + (7 if is_final else 0)) // 8`).
 ///
 /// Ground truth: HF `Lfm3OmniForConditionalGeneration.prefill_audio` /
-/// `transcribe_live` (streaming ASR).
+/// `transcribe_live` / `Lfm3AudioEncoder.stream` (streaming ASR).
 pub fn audio_forward_streaming(
     gpu: &mut Gpu,
     weights: &AudioWeights,
     cfg: &AudioConfig,
     cache: &mut AudioEncoderStreamingCache,
     audio_chunk: &[f32],
+    is_final: bool,
 ) -> HipResult<Vec<f32>> {
+    if cache.finished && !audio_chunk.is_empty() {
+        return Err(HipError::new(
+            999,
+            "lfm3-audio: stream is finalized; start a new cache for the next utterance",
+        ));
+    }
     let n_mels = cfg.mel.n_mels;
-    // 1. CPU mel per chunk (center=False; partial trailing frames dropped).
-    let mel = crate::mel::log_mel_spectrogram(audio_chunk, &cfg.mel);
+
+    // 1. Accumulate + full-stream mel (batch-identical; center=False).
+    cache.accum_samples.extend_from_slice(audio_chunk);
+    let mel = crate::mel::log_mel_spectrogram(&cache.accum_samples, &cfg.mel);
     let num_frames = mel.len() / n_mels;
 
-    // 2. CPU downsampler: complete 8-mel-frame groups only.
-    let complete_frames = num_frames - (num_frames % 8);
-    if complete_frames == 0 {
+    // 2. Token accounting (HF `stream()`): a token needs its full 8-frame
+    //    group, except on the final flush where the partial group emits one
+    //    last token.
+    let num_tokens = if is_final { (num_frames + 7) / 8 } else { num_frames / 8 };
+    let start_token = cache.num_tokens_emitted;
+    let new_tokens = num_tokens.saturating_sub(start_token);
+    if new_tokens == 0 {
+        cache.num_tokens_emitted = num_tokens;
+        cache.finished = is_final;
         return Ok(Vec::new());
     }
-    let mel_complete = &mel[..complete_frames * n_mels];
-    let tokens = downsampler_forward(mel_complete, n_mels, complete_frames, &weights.downsampler);
-    let n_tokens = tokens.len() / cfg.enc.hidden_size;
-    if n_tokens == 0 {
-        return Ok(Vec::new());
+
+    // 3. CPU downsampler over the FULL mel, then slice this call's tokens —
+    //    the k3s2p1 conv chain overlaps group boundaries, so per-chunk
+    //    downsampling shifted the phase (ASR-STR-1). Downsampling the whole
+    //    stream keeps every token bit-identical to the batch path.
+    let tokens_all = downsampler_forward(&mel, n_mels, num_frames, &weights.downsampler);
+    let avail = tokens_all.len() / cfg.enc.hidden_size;
+    let end_token = start_token + new_tokens;
+    if end_token > avail {
+        return Err(HipError::new(
+            999,
+            &format!(
+                "lfm3-audio: stream token accounting desync (want tokens {start_token}..{end_token}, downsample produced {avail})"
+            ),
+        ));
     }
+    let slice = &tokens_all[start_token * cfg.enc.hidden_size..end_token * cfg.enc.hidden_size];
 
-    // 3. GPU encoder forward (persistent state — position carries).
-    let enc_out = encoder_forward(gpu, &weights.encoder, &cfg.enc, &mut cache.state, &tokens, n_tokens)
+    // 4. GPU encoder forward (persistent state — position carries).
+    let enc_out =
+        encoder_forward(gpu, &weights.encoder, &cfg.enc, &mut cache.state, slice, new_tokens)
+            .map_err(|e| HipError::new(999, &e))?;
+
+    // 5. GPU projector.
+    let proj = projector_forward(gpu, &weights.projector, &cfg.proj, &enc_out, new_tokens)
         .map_err(|e| HipError::new(999, &e))?;
 
-    // 4. GPU projector.
-    let proj = projector_forward(gpu, &weights.projector, &cfg.proj, &enc_out, n_tokens)
-        .map_err(|e| HipError::new(999, &e))?;
-
+    cache.num_tokens_emitted = num_tokens;
+    cache.finished = is_final;
     Ok(proj)
 }
 

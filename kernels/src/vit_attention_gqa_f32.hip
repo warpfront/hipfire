@@ -20,9 +20,22 @@
 //   v  : [N, n_kv   * head_dim]
 //   out: [N, n_heads * head_dim]
 //
-// Grid = [num_heads, N]; one block computes one (head, query patch). Block
-// size must be a power of two >= max(N reduced, head_dim). Shared memory:
-// scores[N] + workspace[block_size].
+// GRID-1: the grid is FLATTENED to [n_heads * N] (head = blockIdx.x / N,
+// qi = blockIdx.x % N) — the old [n_heads, N] 2-D grid put N on gridDim.y,
+// which caps at 65535 and tripped exactly when the LFM3-VL pixel budget
+// (longest_edge 16.7M px → N ≈ 65536) was honored.
+//
+// The key loop is TILED with an online (running max/sum) softmax so the
+// score scratch is a fixed TILE-sized LDS buffer instead of N floats — the
+// old (N + block) * 4 bytes exceeded the ~64 KB workgroup LDS ceiling at
+// N ≳ 16k. Keys are revisited in pass 2 (scores recomputed from Q·K), which
+// doubles the QK work but keeps the launcher API scratch-free; this is a
+// one-shot prefill path, not the decode hot loop.
+//
+// Numerics: online softmax is mathematically identical to the single-pass
+// max/sum/normalize (floating-point association order differs slightly).
+
+#define VIT_ATTN_TILE 2048
 
 extern "C" __global__ void vit_attention_gqa_f32(
     const float* __restrict__ q,    // [N, n_heads*head_dim]
@@ -32,8 +45,9 @@ extern "C" __global__ void vit_attention_gqa_f32(
     int N, int n_heads, int n_kv, int head_dim, float scale
 ) {
     extern __shared__ float sdata[];
-    int head = blockIdx.x;
-    int qi = blockIdx.y;
+    if (N <= 0) return; // guard the blockIdx.x / N decomposition below
+    int head = blockIdx.x / N;
+    int qi = blockIdx.x % N;
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
     if (head >= n_heads || qi >= N) return;
@@ -46,56 +60,80 @@ extern "C" __global__ void vit_attention_gqa_f32(
     int q_off = head * head_dim;
     int kv_off = kv_head * head_dim;
 
-    float* scores = sdata;
+    float* tile_scores = sdata;                    // [VIT_ATTN_TILE]
+    float* ws = sdata + VIT_ATTN_TILE;             // [nthreads] reduction scratch
 
-    // Phase 1: Q[qi] @ K[j]^T  (bidirectional — all N keys)
     const float* q_ptr = q + qi * q_stride + q_off;
-    float local_max = -1e30f;
-    for (int j = tid; j < N; j += nthreads) {
-        const float* k_ptr = k + j * kv_stride + kv_off;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++)
-            dot += q_ptr[d] * k_ptr[d];
-        float s = dot * scale;
-        scores[j] = s;
-        local_max = fmaxf(local_max, s);
-    }
 
-    float* ws = sdata + N;
-    ws[tid] = local_max;
-    __syncthreads();
-    for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]);
+    // ── Pass 1: online softmax over key tiles → (max_val, sum_val) ──
+    float run_max = -1e30f;
+    float run_sum = 0.0f;
+    for (int tile_start = 0; tile_start < N; tile_start += VIT_ATTN_TILE) {
+        int tile_n = min(VIT_ATTN_TILE, N - tile_start);
+        float tile_max = -1e30f;
+        for (int t = tid; t < tile_n; t += nthreads) {
+            const float* k_ptr = k + (tile_start + t) * kv_stride + kv_off;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q_ptr[d] * k_ptr[d];
+            float s = dot * scale;
+            tile_scores[t] = s;
+            tile_max = fmaxf(tile_max, s);
+        }
+        // Tile max reduce.
+        ws[tid] = tile_max;
         __syncthreads();
-    }
-    float max_val = ws[0];
-    __syncthreads();
-
-    float local_sum = 0.0f;
-    for (int j = tid; j < N; j += nthreads) {
-        float e = expf(scores[j] - max_val);
-        scores[j] = e;
-        local_sum += e;
-    }
-    ws[tid] = local_sum;
-    __syncthreads();
-    for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) ws[tid] += ws[tid + s];
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]);
+            __syncthreads();
+        }
+        tile_max = ws[0];
         __syncthreads();
+
+        // Online rescale: fold this tile into the running (max, sum).
+        float m_new = fmaxf(run_max, tile_max);
+        float correction = (run_max == -1e30f) ? 0.0f : expf(run_max - m_new);
+        float tile_sum = 0.0f;
+        for (int t = tid; t < tile_n; t += nthreads)
+            tile_sum += expf(tile_scores[t] - m_new);
+        ws[tid] = tile_sum;
+        __syncthreads();
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) ws[tid] += ws[tid + s];
+            __syncthreads();
+        }
+        tile_sum = ws[0];
+        __syncthreads();
+
+        run_sum = run_sum * correction + tile_sum;
+        run_max = m_new;
     }
-    float sum_val = ws[0];
-    __syncthreads();
+    float max_val = run_max;
+    float sum_val = run_sum;
 
-    for (int j = tid; j < N; j += nthreads)
-        scores[j] /= sum_val;
-    __syncthreads();
-
-    // Phase 2: weighted V sum
+    // ── Pass 2: recompute scores per tile, accumulate the weighted V sum ──
     float* out_row = out + qi * q_stride + head * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads) {
-        float val = 0.0f;
-        for (int j = 0; j < N; j++)
-            val += scores[j] * v[j * kv_stride + kv_off + d];
-        out_row[d] = val;
+    float inv_sum = 1.0f / sum_val;
+    for (int d = tid; d < head_dim; d += nthreads)
+        out_row[d] = 0.0f;
+    __syncthreads();
+
+    for (int tile_start = 0; tile_start < N; tile_start += VIT_ATTN_TILE) {
+        int tile_n = min(VIT_ATTN_TILE, N - tile_start);
+        for (int t = tid; t < tile_n; t += nthreads) {
+            const float* k_ptr = k + (tile_start + t) * kv_stride + kv_off;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q_ptr[d] * k_ptr[d];
+            tile_scores[t] = expf(dot * scale - max_val) * inv_sum;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_dim; d += nthreads) {
+            float val = 0.0f;
+            for (int t = 0; t < tile_n; t++)
+                val += tile_scores[t] * v[(tile_start + t) * kv_stride + kv_off + d];
+            out_row[d] += val;
+        }
+        __syncthreads();
     }
 }

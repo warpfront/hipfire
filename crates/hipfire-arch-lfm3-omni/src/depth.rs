@@ -713,11 +713,27 @@ impl DepthRng {
     pub fn next_f32(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
     }
+    /// Unbiased bounded draw from [0, bound). The naive `next_u64() % bound`
+    /// carries the (tiny but free to remove) modulo bias of
+    /// 2^64 % bound — NITS-1. Rejection is unreachable in practice for
+    /// the depth decoder's bound (≤ codebook_size ≈ 2017: rejection
+    /// probability < 2^-51) but keeps the distribution exactly uniform.
+    pub fn randbounded(&mut self, bound: u64) -> u64 {
+        debug_assert!(bound > 0);
+        // threshold = 2^64 % bound, computed without overflow.
+        let threshold = u64::MIN.wrapping_sub(bound) % bound;
+        loop {
+            let x = self.next_u64();
+            if x >= threshold {
+                return x % bound;
+            }
+        }
+    }
     /// Random permutation of 0..n (Fisher-Yates).
     pub fn randperm(&mut self, n: usize) -> Vec<usize> {
         let mut p: Vec<usize> = (0..n).collect();
         for i in (1..n).rev() {
-            let j = (self.next_u64() as usize) % (i + 1);
+            let j = self.randbounded((i + 1) as u64) as usize;
             p.swap(i, j);
         }
         p
@@ -739,9 +755,16 @@ fn sample_code(
     // Repetition penalty (HF RepetitionPenaltyLogitsProcessor): for each prior
     // code, score > 0 → /= penalty, else *= penalty.
     if rep_penalty != 1.0 {
+        // REPPEN-1: HF's gather→where→scatter is idempotent per UNIQUE token.
+        // Iterating the raw history window compounded the penalty once per
+        // DUPLICATE occurrence, over-penalizing codes that legitimately recur
+        // across speech frames (and diverging from HF the more a code repeats
+        // inside the 64-frame window). Penalize each code at most once.
+        let mut penalized = vec![false; n];
         for &c in history {
             let ci = c as usize;
-            if ci < n {
+            if ci < n && !penalized[ci] {
+                penalized[ci] = true;
                 if scores[ci] > 0.0 {
                     scores[ci] /= rep_penalty;
                 } else {

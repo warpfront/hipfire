@@ -91,12 +91,14 @@ fn main() {
     while lo < waveform.len() {
         let hi = (lo + chunk_samples).min(waveform.len());
         let chunk = &waveform[lo..hi];
+        let is_final = hi == waveform.len();
         let toks = hipfire_arch_lfm3_audio::lfm3_audio::audio_forward_streaming(
             &mut gpu,
             &audio_weights,
             &audio_cfg,
             &mut cache,
             chunk,
+            is_final,
         )
         .expect("audio_forward_streaming");
         if !toks.is_empty() {
@@ -105,6 +107,12 @@ fn main() {
         n_chunks += 1;
         lo = hi;
     }
+    // ASR-STR-1: the is_final flush on the last chunk above now emits the
+    // partial trailing 8-frame group as one final token (HF
+    // `(num_frames + 7) // 8`); before the fix that tail was dropped and a
+    // clip shorter than one group yielded 0 tokens. Assert the flush actually
+    // closed the stream.
+    assert!(cache.finished, "is_final chunk must finalize the stream cache");
     cache.free_gpu(&mut gpu);
     let stream_n = stream_tokens.len() / audio_cfg.proj.out_features;
     let stream_finite = stream_tokens.iter().all(|v| v.is_finite());
@@ -119,12 +127,14 @@ fn main() {
     );
 
     // ── Verify ──
-    // The batch mel pads the waveform to a full final frame; the streaming
-    // drops partial 8-frame groups + uses per-chunk mel — so the token counts
-    // can differ slightly. Both must be plausible (>0) + finite + same dim.
+    // ASR-STR-1: streaming (with the is_final flush) now matches the batch
+    // token count exactly — both go through the same full-stream mel +
+    // downsampler; the batch path pads the waveform (pad_length) which can
+    // add one trailing frame, so allow ±1 token but require >0 and finite.
     let pass = batch_n > 0 && stream_n > 0 && batch_finite && stream_finite
         && batch_tokens.len() == batch_n * audio_cfg.proj.out_features
-        && stream_tokens.len() == stream_n * audio_cfg.proj.out_features;
+        && stream_tokens.len() == stream_n * audio_cfg.proj.out_features
+        && (batch_n as i64 - stream_n as i64).abs() <= 1;
     println!(
         "batch_tokens={batch_n} stream_tokens={stream_n} chunks={n_chunks} dim={}",
         audio_cfg.proj.out_features

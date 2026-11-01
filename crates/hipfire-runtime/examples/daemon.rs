@@ -18774,50 +18774,16 @@ fn generate_lfm3(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
-    // Contract opener: the CLI serve's StreamContractGate rejects every
-    // pre-gen_start event (PreStartEvent → client abort → drain deadlock), so
-    // this path MUST emit gen_start before any token/error event. Matches the
-    // main generate() opener (line ~15614); arch 13 latches the legacy
-    // contract (gen_start_contract_version_for_arch returns None for 13).
-    // started_in_think mirrors the Jinja enable_thinking flag below: when
-    // thinking is on, the template's assistant prefix ends inside <think>, so
-    // generated tokens ARE reasoning until the model emits </think>.
-    emit_gen_start(
-        stdout,
-        id,
-        max_think_tokens != 1,
-        gen_start_contract_version_for_arch(m.arch_id),
-    );
-    if m.tokenizer.is_none() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "tokenizer not loaded",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-    if m.lfm3().is_none() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "lfm3 bundle missing on arch_id=13 generate",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    // ── Prompt build (same Jinja/Plain two-path branch as lfm2moe) ──
-    let prompt_ids: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        // LFM3 ships its own Jinja chat_template; render through it when present
-        // (default ON; opt out with HIPFIRE_JINJA_CHAT=0). Falls back to Plain.
+    // THINK-1: derive started_in_think from the frame actually rendered, not
+    // from `max_think_tokens != 1`. That flag is correct for the Jinja path
+    // (it keys the template's think opener) but wrong for the Plain fallback
+    // (HIPFIRE_JINJA_CHAT=0 or a render failure): Plain emits no think
+    // opener, so flagging started_in_think=true there mislabels the whole
+    // answer as reasoning_content. Same derivation as the lfm2moe/qwen routes
+    // (render_tail_opens_think on the rendered template; false for Plain).
+    // The prompt build emits no events, so it can run before the contract
+    // opener (which must stay the first event on the stream).
+    let prompt_build: Option<(Vec<u32>, bool)> = m.tokenizer.as_ref().map(|tokenizer| {
         let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
@@ -18862,30 +18828,79 @@ fn generate_lfm3(
                 frame.render()
             };
             match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    let opened = render_tail_opens_think(&rendered);
+                    (tokenizer.encode(&rendered), opened)
+                }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in lfm3 path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
-                        tokenizer,
-                        system: system_prompt,
-                        user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
-                    }
-                    .build()
+                    (
+                        hipfire_runtime::prompt_frame::ChatFrame {
+                            tokenizer,
+                            system: system_prompt,
+                            user: prompt,
+                            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                            raw: false,
+                        }
+                        .build(),
+                        false,
+                    )
                 }
             }
         } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
-                tokenizer,
-                system: system_prompt,
-                user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                raw: false,
-            }
-            .build()
+            (
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                    raw: false,
+                }
+                .build(),
+                false,
+            )
         }
-    };
+    });
+    let (prompt_ids, started_in_think) = prompt_build.unwrap_or((Vec::new(), false));
+    // Contract opener: the CLI serve's StreamContractGate rejects every
+    // pre-gen_start event (PreStartEvent → client abort → drain deadlock), so
+    // this path MUST emit gen_start before any token/error event. Matches the
+    // main generate() opener (line ~15614); arch 13 latches the legacy
+    // contract (gen_start_contract_version_for_arch returns None for 13).
+    emit_gen_start(
+        stdout,
+        id,
+        started_in_think,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    if m.lfm3().is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "lfm3 bundle missing on arch_id=13 generate",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Prompt build (hoisted above the contract opener — see THINK-1) ──
+    // `prompt_ids` and `started_in_think` were computed before gen_start; the
+    // tokenizer / bundle validation below still gates every event path.
 
     if prompt_ids.is_empty() {
         emit_active_attempt_error(
@@ -19115,13 +19130,19 @@ fn generate_lfm3_vl(
     let sms = vision_config.spatial_merge_size;
 
     // ── Image preprocessing (CPU decode + smart resize + patch extract) ──
+    // VL-RESIZE-1: LFM3-VL has its own pixel budget (HF `Lfm3VlImageProcessor`
+    // size {shortest_edge: 65_536, longest_edge: 16_777_216}); the shared
+    // preprocessor's Qwen defaults silently changed the patch grid for
+    // out-of-overlap images.
     let (pixels, img_h, img_w) = match image_source {
         ImageSource::Path(path) => {
             eprintln!("[lfm3-vl] preprocessing image: path: {}", path);
-            match image::load_and_preprocess(
+            match image::load_and_preprocess_with_pixels(
                 Path::new(path),
                 vision_config.patch_size,
                 vision_config.spatial_merge_size,
+                image::LFM3_VL_MIN_PIXELS,
+                image::LFM3_VL_MAX_PIXELS,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -19149,10 +19170,12 @@ fn generate_lfm3_vl(
                     return;
                 }
             };
-            match image::load_and_preprocess_from_bytes(
+            match image::load_and_preprocess_from_bytes_with_pixels(
                 &bytes,
                 vision_config.patch_size,
                 vision_config.spatial_merge_size,
+                image::LFM3_VL_MIN_PIXELS,
+                image::LFM3_VL_MAX_PIXELS,
             ) {
                 Ok(r) => r,
                 Err(e) => {
