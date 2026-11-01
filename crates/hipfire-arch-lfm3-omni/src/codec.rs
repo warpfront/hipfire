@@ -861,30 +861,34 @@ pub fn codec_decode(
 
 // ─── WAV writer (16-bit PCM mono) ────────────────────────────────────────────
 
-/// Write a 16-bit PCM mono WAV file.
-pub fn write_wav(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> std::io::Result<()> {
+/// Encode a 16-bit PCM mono WAV into an in-memory byte vector (for base64
+/// transport over the daemon's JSON-lines protocol).
+pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     let n = samples.len();
     let data_len = n * 2;
-    let mut f = std::fs::File::create(path)?;
+    let mut out = Vec::with_capacity(44 + data_len);
     use std::io::Write;
-    f.write_all(b"RIFF")?;
-    f.write_all(&(36 + data_len as u32).to_le_bytes())?;
-    f.write_all(b"WAVE")?;
-    f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?;
-    f.write_all(&1u16.to_le_bytes())?; // PCM
-    f.write_all(&1u16.to_le_bytes())?; // mono
-    f.write_all(&sample_rate.to_le_bytes())?;
-    f.write_all(&(sample_rate * 2).to_le_bytes())?; // byte rate
-    f.write_all(&2u16.to_le_bytes())?; // block align
-    f.write_all(&16u16.to_le_bytes())?; // bits per sample
-    f.write_all(b"data")?;
-    f.write_all(&(data_len as u32).to_le_bytes())?;
-    let mut buf = Vec::with_capacity(data_len);
+    let _ = (&mut out).write_all(b"RIFF");
+    let _ = (&mut out).write_all(&(36 + data_len as u32).to_le_bytes());
+    let _ = (&mut out).write_all(b"WAVE");
+    let _ = (&mut out).write_all(b"fmt ");
+    let _ = (&mut out).write_all(&16u32.to_le_bytes());
+    let _ = (&mut out).write_all(&1u16.to_le_bytes()); // PCM
+    let _ = (&mut out).write_all(&1u16.to_le_bytes()); // mono
+    let _ = (&mut out).write_all(&sample_rate.to_le_bytes());
+    let _ = (&mut out).write_all(&(sample_rate * 2).to_le_bytes()); // byte rate
+    let _ = (&mut out).write_all(&2u16.to_le_bytes()); // block align
+    let _ = (&mut out).write_all(&16u16.to_le_bytes()); // bits per sample
+    let _ = (&mut out).write_all(b"data");
+    let _ = (&mut out).write_all(&(data_len as u32).to_le_bytes());
     for &s in samples {
         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-        buf.extend_from_slice(&v.to_le_bytes());
+        out.extend_from_slice(&v.to_le_bytes());
     }
-    f.write_all(&buf)?;
-    Ok(())
+    out
+}
+
+/// Write a 16-bit PCM mono WAV file.
+pub fn write_wav(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> std::io::Result<()> {
+    std::fs::write(path, wav_bytes(samples, sample_rate))
 }

@@ -5971,6 +5971,9 @@ fn main() {
                 let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
                 let audio = msg.get("audio").and_then(|v| v.as_str());
                 let audio_base64 = msg.get("audio_base64").and_then(|v| v.as_str());
+                // Omni TTS (audio OUTPUT): `"tts": true` on an LFM3-Omni model
+                // (depth decoder present) routes to generate_lfm3_omni.
+                let tts = msg.get("tts").and_then(|v| v.as_bool()).unwrap_or(false);
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -6297,6 +6300,20 @@ fn main() {
                 let is_lfm3_vl = m.lfm3_vision_config.is_some();
                 let is_lfm3_audio = m.lfm3_audio_config.is_some();
                 let has_vl = m.vision_config.is_some() || is_dots_ocr || is_lfm3_vl;
+
+                // Omni TTS (audio output): `"tts": true` + a depth decoder.
+                // Checked before the audio-INPUT path (has_audio) since TTS is
+                // a distinct route. Phase 4c.
+                if tts && m.lfm3_depth_weights.is_some() {
+                    generate_lfm3_omni(
+                        m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens,
+                    );
+                    continue;
+                }
+                if tts && m.lfm3_depth_weights.is_none() {
+                    write_error(&mut stdout, id, "model has no depth decoder (not an LFM3-Omni model); tts=true needs arch_id 13 + depth decoder");
+                    continue;
+                }
 
                 if has_audio && !is_lfm3_audio {
                     write_error(&mut stdout, id, "model has no audio encoder");
@@ -19631,6 +19648,161 @@ fn generate_lfm3_audio(
         ClientTerminalDecision::Abort => {}
     }
 }
+/// LFM3-Omni TTS (audio output) path — Phase 4c. Generates audio OUTPUT: a
+/// ChatML prompt + `<|audio_start|>` → `omni_generate_audio` (LM decode loop +
+/// depth decoder MaskGIT + codebook_embedding feedback) → `codec_decode` →
+/// 24 kHz WAV → base64 `audio` event.
+///
+/// Triggered by `"tts": true` on an LFM3-Omni model (depth decoder present).
+/// The codec loads from `HIPFIRE_OMNI_CODEC_DIR` (the `audio_tokenizer/` dir).
+/// AUDIO mode only here; TEXT/INTERLEAVED + the eos refinement are open.
+#[allow(clippy::too_many_arguments)]
+fn generate_lfm3_omni(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    _system_prompt: Option<&str>,
+    _temp: f32,
+    _top_p: f32,
+    max_tokens: usize,
+) {
+    use hipfire_arch_lfm3_omni as omni;
+    use hipfire_runtime::safetensors_source::SafetensorsSource;
+
+    if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_depth_weights.is_none() {
+        write_error(stdout, id, "lfm3-omni: tokenizer / lfm3 bundle / depth decoder missing");
+        return;
+    }
+    let codec_dir = match std::env::var("HIPFIRE_OMNI_CODEC_DIR") {
+        Ok(d) => d,
+        Err(_) => {
+            write_error(
+                stdout,
+                id,
+                "lfm3-omni: HIPFIRE_OMNI_CODEC_DIR not set (point at the audio_tokenizer/ dir)",
+            );
+            return;
+        }
+    };
+
+    // Build the prompt: BOS + ChatML user turn + assistant prefix + thinking-end + <|audio_start|>.
+    let tok = m.tokenizer.as_ref().unwrap();
+    let chatml = format!(
+        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>"
+    );
+    let mut prompt_tokens = tok.encode(&chatml);
+    prompt_tokens.insert(0, 124_894); // BOS <|startoftext|>
+    prompt_tokens.push(125_012); // <|audio_start|>
+    eprintln!("[lfm3-omni] tts prompt: {} tokens", prompt_tokens.len());
+
+    // max_tokens bounds the audio frames (1 LM step per frame). Cap at 200 (16s).
+    let max_frames = max_tokens.max(1).min(200);
+    let depth_cfg = m.lfm3_depth_config.as_ref().unwrap().clone();
+
+    // Omni generate loop (AUDIO mode).
+    let t0 = std::time::Instant::now();
+    let (frames, n_emitted, hit_eos) = {
+        let bundle = match m.state.as_mut() {
+            Some(ModelState::Lfm3(b)) => b,
+            _ => {
+                write_error(stdout, id, "lfm3-omni: not an lfm3 model");
+                return;
+            }
+        };
+        let depth_weights = m.lfm3_depth_weights.as_ref().unwrap();
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(42);
+        let mut rng = omni::DepthRng::new(seed);
+        match omni::omni_generate_audio(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            &depth_cfg,
+            depth_weights,
+            gpu,
+            &prompt_tokens,
+            max_frames,
+            &mut rng,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm3-omni: generate failed: {e}"));
+                return;
+            }
+        }
+    };
+    let gen_ms = t0.elapsed().as_millis();
+    eprintln!(
+        "[lfm3-omni] generated {n_emitted} audio frames (eos={hit_eos}) in {gen_ms}ms"
+    );
+    if frames.is_empty() {
+        write_error(stdout, id, "lfm3-omni: no audio frames generated");
+        return;
+    }
+
+    // Load the codec + decode.
+    let source = match SafetensorsSource::open(std::path::Path::new(&codec_dir)) {
+        Ok(s) => s,
+        Err(e) => {
+            write_error(stdout, id, &format!("lfm3-omni: open codec dir: {e}"));
+            return;
+        }
+    };
+    let cfg_val: serde_json::Value =
+        match std::fs::read_to_string(format!("{codec_dir}/config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(v) => v,
+            None => {
+                write_error(stdout, id, "lfm3-omni: read codec config.json failed");
+                return;
+            }
+        };
+    let codec_cfg = omni::CodecConfig::from_config_value(&cfg_val);
+    let codec_weights = match omni::load_codec_weights(&source, &codec_cfg, gpu) {
+        Ok(w) => w,
+        Err(e) => {
+            write_error(stdout, id, &format!("lfm3-omni: load codec: {e}"));
+            return;
+        }
+    };
+    let (waveform, sr) = match omni::codec_decode(&codec_cfg, &codec_weights, gpu, &frames) {
+        Ok(v) => v,
+        Err(e) => {
+            write_error(stdout, id, &format!("lfm3-omni: codec decode: {e}"));
+            return;
+        }
+    };
+    codec_weights.free_gpu(gpu);
+
+    // Emit the audio (base64 WAV) + done.
+    let wav = omni::wav_bytes(&waveform, sr);
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+    let envelope = serde_json::json!({
+        "type": "audio",
+        "id": id,
+        "audio": b64,
+        "sample_rate": sr,
+        "frames": n_emitted,
+        "duration_s": (waveform.len() as f64 / sr as f64 * 100.0).round() / 100.0,
+        "eos": hit_eos,
+        "attempt_id": active_attempt_id(),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = writeln!(
+        stdout,
+        "{}",
+        serde_json::json!({"type":"done","id":id,"tokens":n_emitted,"total_ms":gen_ms,"attempt_id":active_attempt_id()})
+    );
+    let _ = stdout.flush();
+}
+
 ///
 /// Mirrors `generate_lfm2moe`'s shape (prefill loop / chunked batched prefill,
 /// per-token decode loop, JSONL `token` / `done` events) with two differences:

@@ -39,7 +39,7 @@ pub mod omni;
 
 #[cfg(feature = "deltanet")]
 pub use codec::{
-    codec_decode, load_codec_weights, write_wav, CodecConfig, CodecWeights,
+    codec_decode, load_codec_weights, wav_bytes, write_wav, CodecConfig, CodecWeights,
 };
 #[cfg(feature = "deltanet")]
 pub use depth::{
