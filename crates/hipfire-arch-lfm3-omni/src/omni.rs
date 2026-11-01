@@ -267,3 +267,198 @@ fn omni_generate_interleaved(
         finished,
     })
 }
+
+// ─── Streaming generation (Phase 4d) ─────────────────────────────────────────
+// Prefill once, then generate in chunks (carrying the LM state + depth history
+// + position + hidden across chunks). The daemon decodes each chunk via
+// `codec_decode_streaming` + emits audio chunks for low-latency TTS.
+
+/// Omni generation mode.
+#[derive(Clone, Copy, PartialEq)]
+pub enum OmniMode {
+    Audio,
+    Interleaved,
+}
+
+/// Persistent state across streaming `omni_stream_step` calls. The LFM3
+/// `Lfm3State` (KV cache + conv state) lives in the caller's `LoadedModel` and
+/// is passed to each step; this struct carries the omni-loop-level state
+/// (position, hidden, depth history, INTERLEAVED block state).
+pub struct OmniStreamState {
+    pub mode: OmniMode,
+    pub position: u32,
+    pub hidden: Vec<f32>,
+    pub history: Vec<Vec<u32>>,
+    /// INTERLEAVED text-slot logits (from the previous step).
+    pub prev_logits: Option<Vec<f32>>,
+    pub slots_left: usize,
+    pub speaking: bool,
+    pub text_done: bool,
+    pub finished: bool,
+    pub hit_eos: bool,
+}
+
+/// One streaming step's output.
+pub struct OmniStepOutput {
+    pub audio_codes: Vec<u32>,
+    pub n_audio_frames: usize,
+    pub text_tokens: Vec<u32>,
+    pub finished: bool,
+}
+
+/// Prefill the prompt + return the initial stream state. The mode is inferred
+/// from the prompt's last token (`<|audio_start|>` → AUDIO, `<|mixed_start|>`
+/// → INTERLEAVED). The caller's `Lfm3State` is advanced (KV cache + conv state
+/// filled); `state.final_norm_buf` holds the hidden at the last prompt token.
+pub fn omni_stream_prefill(
+    cfg: &Lfm3Config,
+    weights: &Lfm3Weights,
+    state: &mut Lfm3State,
+    gpu: &mut Gpu,
+    prompt_tokens: &[u32],
+) -> Result<OmniStreamState, String> {
+    let last = *prompt_tokens.last().unwrap_or(&0);
+    let mode = if last == MIXED_START_TOKEN {
+        OmniMode::Interleaved
+    } else {
+        OmniMode::Audio
+    };
+    let mut prev_logits: Option<Vec<f32>> = None;
+    for (i, &t) in prompt_tokens.iter().enumerate() {
+        prev_logits = Some(
+            decode_step(cfg, weights, state, gpu, t, i as u32)
+                .map_err(|e| format!("omni stream: prefill @ {i}: {e}"))?,
+        );
+    }
+    let hidden = gpu
+        .download_f32(&state.final_norm_buf)
+        .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
+    Ok(OmniStreamState {
+        mode,
+        position: prompt_tokens.len() as u32 - 1,
+        hidden,
+        history: Vec::new(),
+        prev_logits,
+        slots_left: INTERLEAVED_N_TEXT,
+        speaking: false,
+        text_done: false,
+        finished: false,
+        hit_eos: false,
+    })
+}
+
+/// Generate up to `max_steps` steps (audio frames in AUDIO mode; text/audio
+/// steps in INTERLEAVED), carrying `stream`. Returns the audio codes + text
+/// tokens generated in THIS step. The caller decodes the audio codes via
+/// `codec_decode_streaming` + emits. `stream.finished` is set on eos/im_end.
+pub fn omni_stream_step(
+    cfg: &Lfm3Config,
+    weights: &Lfm3Weights,
+    state: &mut Lfm3State,
+    depth_cfg: &DepthConfig,
+    depth_weights: &DepthWeights,
+    gpu: &mut Gpu,
+    stream: &mut OmniStreamState,
+    max_steps: usize,
+    rng: &mut DepthRng,
+) -> Result<OmniStepOutput, String> {
+    let eos_code = depth_cfg.audio_eos_code;
+    let mut audio_codes: Vec<u32> = Vec::new();
+    let mut text_tokens: Vec<u32> = Vec::new();
+    let mut n_frames = 0usize;
+
+    for _ in 0..max_steps {
+        if stream.finished {
+            break;
+        }
+        match stream.mode {
+            OmniMode::Audio => {
+                let codes = sample_audio_frame(depth_cfg, depth_weights, gpu, &stream.hidden, &stream.history, rng)
+                    .map_err(|e| format!("omni stream: sample: {e}"))?;
+                let is_eos = codes.iter().any(|&c| c == eos_code);
+                if is_eos {
+                    stream.hit_eos = true;
+                    stream.finished = true;
+                    break;
+                }
+                stream.history.push(codes.clone());
+                audio_codes.extend_from_slice(&codes);
+                n_frames += 1;
+                text_tokens.push(AUDIO_OUT_TOKEN);
+                let next_embed = get_audio_out_embeds(depth_cfg, depth_weights, &codes);
+                stream.position += 1;
+                decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
+                    .map_err(|e| format!("omni stream: audio step: {e}"))?;
+                stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                    .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
+            }
+            OmniMode::Interleaved => {
+                if stream.speaking {
+                    let codes = sample_audio_frame(depth_cfg, depth_weights, gpu, &stream.hidden, &stream.history, rng)
+                        .map_err(|e| format!("omni stream: sample: {e}"))?;
+                    let is_eos = codes.iter().any(|&c| c == eos_code);
+                    if is_eos {
+                        stream.hit_eos = true;
+                        stream.finished = true;
+                        break;
+                    }
+                    stream.history.push(codes.clone());
+                    audio_codes.extend_from_slice(&codes);
+                    n_frames += 1;
+                    text_tokens.push(AUDIO_OUT_TOKEN);
+                    let next_embed = get_audio_out_embeds(depth_cfg, depth_weights, &codes);
+                    stream.position += 1;
+                    decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
+                        .map_err(|e| format!("omni stream: audio step: {e}"))?;
+                    stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                        .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
+                    if !stream.text_done {
+                        stream.slots_left -= 1;
+                        if stream.slots_left == 0 {
+                            stream.speaking = false;
+                            stream.slots_left = INTERLEAVED_N_TEXT;
+                        }
+                    }
+                } else {
+                    let logits = stream.prev_logits.as_ref()
+                        .ok_or_else(|| "omni stream: no prev logits".to_string())?;
+                    let token = logits.iter().enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap().0 as u32;
+                    text_tokens.push(token);
+                    if token == TEXT_END_TOKEN {
+                        stream.text_done = true;
+                        stream.speaking = true;
+                        stream.slots_left = INTERLEAVED_N_AUDIO;
+                        stream.position += 1;
+                        stream.prev_logits = Some(decode_step(cfg, weights, state, gpu, token, stream.position)
+                            .map_err(|e| format!("omni stream: text_end step: {e}"))?);
+                        stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                            .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
+                        continue;
+                    }
+                    if token == IM_END_TOKEN {
+                        stream.finished = true;
+                        break;
+                    }
+                    stream.position += 1;
+                    stream.prev_logits = Some(decode_step(cfg, weights, state, gpu, token, stream.position)
+                        .map_err(|e| format!("omni stream: text step: {e}"))?);
+                    stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                        .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
+                    stream.slots_left -= 1;
+                    if stream.slots_left == 0 {
+                        stream.speaking = true;
+                        stream.slots_left = INTERLEAVED_N_AUDIO;
+                    }
+                }
+            }
+        }
+    }
+    Ok(OmniStepOutput {
+        audio_codes,
+        n_audio_frames: n_frames,
+        text_tokens,
+        finished: stream.finished,
+    })
+}

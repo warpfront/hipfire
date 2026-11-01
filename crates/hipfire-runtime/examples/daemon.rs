@@ -5977,6 +5977,8 @@ fn main() {
                 // Omni mode: "audio" (default, pure TTS) or "interleaved"
                 // (text + audio blocks via <|mixed_start|>).
                 let tts_mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("audio");
+                // Streaming TTS: emit audio chunks as frames are generated.
+                let tts_stream = msg.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -6310,7 +6312,7 @@ fn main() {
                 if tts && m.lfm3_depth_weights.is_some() {
                     generate_lfm3_omni(
                         m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens,
-                        tts_mode,
+                        tts_mode, tts_stream,
                     );
                     continue;
                 }
@@ -19672,6 +19674,7 @@ fn generate_lfm3_omni(
     _top_p: f32,
     max_tokens: usize,
     mode: &str,
+    stream: bool,
 ) {
     use hipfire_arch_lfm3_omni as omni;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
@@ -19714,6 +19717,186 @@ fn generate_lfm3_omni(
     // max_tokens bounds the generation steps (1 LM step per text token or audio frame). Cap at 200.
     let max_steps = max_tokens.max(1).min(200);
     let depth_cfg = m.lfm3_depth_config.as_ref().unwrap().clone();
+
+    // ── Streaming TTS path: emit audio chunks as frames are generated ──
+    if stream {
+        let t0 = std::time::Instant::now();
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(42);
+        // Prefill once.
+        let mut stream_state = {
+            let bundle = match m.state.as_mut() {
+                Some(ModelState::Lfm3(b)) => b,
+                _ => {
+                    write_error(stdout, id, "lfm3-omni: not an lfm3 model");
+                    return;
+                }
+            };
+            match omni::omni_stream_prefill(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                &prompt_tokens,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    write_error(stdout, id, &format!("lfm3-omni: stream prefill: {e}"));
+                    return;
+                }
+            }
+        };
+        // Load the codec + create the streaming cache.
+        let source = match SafetensorsSource::open(std::path::Path::new(&codec_dir)) {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm3-omni: open codec dir: {e}"));
+                return;
+            }
+        };
+        let cfg_val: serde_json::Value = match std::fs::read_to_string(format!("{codec_dir}/config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(v) => v,
+            None => {
+                write_error(stdout, id, "lfm3-omni: read codec config.json failed");
+                return;
+            }
+        };
+        let codec_cfg = omni::CodecConfig::from_config_value(&cfg_val);
+        let codec_weights = match omni::load_codec_weights(&source, &codec_cfg, gpu) {
+            Ok(w) => w,
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm3-omni: load codec: {e}"));
+                return;
+            }
+        };
+        let mut codec_cache = match omni::CodecStreamingCache::new(gpu, &codec_cfg, max_steps) {
+            Ok(c) => c,
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm3-omni: codec cache: {e}"));
+                return;
+            }
+        };
+        let depth_weights = m.lfm3_depth_weights.as_ref().unwrap();
+        let mut rng = omni::DepthRng::new(seed);
+        let chunk_steps = 12usize; // generate ~12 frames/steps per chunk
+        let mut total_frames = 0usize;
+        let mut n_chunks = 0usize;
+        while !stream_state.finished {
+            let step_out = {
+                let bundle = match m.state.as_mut() {
+                    Some(ModelState::Lfm3(b)) => b,
+                    _ => {
+                        write_error(stdout, id, "lfm3-omni: not an lfm3 model");
+                        return;
+                    }
+                };
+                match omni::omni_stream_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    &depth_cfg,
+                    depth_weights,
+                    gpu,
+                    &mut stream_state,
+                    chunk_steps,
+                    &mut rng,
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        write_error(stdout, id, &format!("lfm3-omni: stream step: {e}"));
+                        return;
+                    }
+                }
+            };
+            // Emit any text tokens.
+            if !step_out.text_tokens.is_empty() {
+                let tok = m.tokenizer.as_ref().unwrap();
+                let text_ids: Vec<u32> = step_out
+                    .text_tokens
+                    .iter()
+                    .filter(|&&t| t != omni::AUDIO_OUT_TOKEN)
+                    .copied()
+                    .collect();
+                let text = tok.decode(&text_ids);
+                if !text.is_empty() {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({"type":"token","id":id,"text":text,"attempt_id":active_attempt_id()})
+                    );
+                    let _ = stdout.flush();
+                }
+            }
+            // Decode + emit the audio chunk.
+            if !step_out.audio_codes.is_empty() {
+                let finalize = step_out.finished;
+                let audio_chunk = match omni::codec_decode_streaming(
+                    &codec_cfg,
+                    &codec_weights,
+                    gpu,
+                    &step_out.audio_codes,
+                    &mut codec_cache,
+                    finalize,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        write_error(stdout, id, &format!("lfm3-omni: stream decode: {e}"));
+                        return;
+                    }
+                };
+                if !audio_chunk.is_empty() {
+                    let wav = omni::wav_bytes(&audio_chunk, 24_000);
+                    use base64::Engine as _;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({"type":"audio_chunk","id":id,"audio":b64,"sample_rate":24000,"frames":step_out.n_audio_frames,"final":finalize,"attempt_id":active_attempt_id()})
+                    );
+                    let _ = stdout.flush();
+                    n_chunks += 1;
+                }
+                total_frames += step_out.n_audio_frames;
+            }
+        }
+        // Flush the codec's held-back tail if not already finalized.
+        if !codec_cache.finished {
+            if let Ok(tail) =
+                omni::codec_decode_streaming(&codec_cfg, &codec_weights, gpu, &[], &mut codec_cache, true)
+            {
+                if !tail.is_empty() {
+                    let wav = omni::wav_bytes(&tail, 24_000);
+                    use base64::Engine as _;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({"type":"audio_chunk","id":id,"audio":b64,"sample_rate":24000,"frames":0,"final":true,"attempt_id":active_attempt_id()})
+                    );
+                    let _ = stdout.flush();
+                    n_chunks += 1;
+                }
+            }
+        }
+        codec_cache.free_gpu(gpu);
+        codec_weights.free_gpu(gpu);
+        let gen_ms = t0.elapsed().as_millis();
+        eprintln!(
+            "[lfm3-omni] streamed {total_frames} audio frames in {n_chunks} chunks in {gen_ms}ms"
+        );
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type":"done","id":id,"tokens":total_frames,"total_ms":gen_ms,"streamed":true,"attempt_id":active_attempt_id()})
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     // Omni generate loop (AUDIO or INTERLEAVED, inferred from the prompt marker).
     let t0 = std::time::Instant::now();
