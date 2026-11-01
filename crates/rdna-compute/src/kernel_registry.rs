@@ -1762,9 +1762,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     // `Gpu::select_regrid_enabled` routes the row selectors through these on
-    // gfx1201 and gfx1151 (measured: Halo 27B DFlash/MTP request them first
-    // on a host without hipcc).
-    if matches!(arch, "gfx1201" | "gfx1151") {
+    // gfx1201, gfx1151 and gfx1100 (measured: Halo 27B DFlash/MTP request them
+    // first on a host without hipcc).
+    if matches!(arch, "gfx1201" | "gfx1151" | "gfx1100") {
         add!(
             "select_regrid",
             crate::select_regrid::SELECT_REGRID_SRC,
@@ -2777,7 +2777,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "moe_scatter_fused_top10",
             kernels::MOE_SCATTER_FUSED_TOP10_SRC,
-            ["moe_scatter_fused_top10"]
+            ["moe_scatter_fused_top10", "moe_scatter_fused_top10_serial"]
         );
         add!(
             "mq_rotate_x_128_v2",
@@ -5283,6 +5283,17 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_q8_0_mmq_4w_gfx1151",
             kernels::GEMM_Q8_0_MMQ_4W_GFX1151_SRC,
             ["gemm_q8_0_mmq_4w_gfx1151"]
+        );
+        // Tiled bit-identical sibling (`gemm_q8_mmq_gfx11.rs`): gfx1100 routes it, gfx1151 builds it
+        // for the Halo guard and the kernel test only.
+        add!(
+            "gemm_q8_0_mmq_i8_gfx11",
+            kernels::GEMM_Q8_0_MMQ_I8_GFX11_SRC,
+            [
+                "gemm_q8_0_mmq_i8_gfx11_t64x64",
+                "gemm_q8_0_mmq_i8_gfx11_t64x128",
+                "gemm_q8_0_mmq_i8_gfx11_t128x128",
+            ]
         );
     }
     if arch == "gfx1100" {

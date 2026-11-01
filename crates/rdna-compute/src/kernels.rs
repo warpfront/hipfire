@@ -4398,6 +4398,12 @@ pub const GEMM_Q8_0_WMMA_4W_SRC: &str = include_str!("../../../kernels/src/gemm_
 pub const GEMM_Q8_0_MMQ_4W_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_mmq_4w.gfx1151.hip");
 
+/// W8A8 Q8_0 GEMM for gfx11 (gfx1100, gfx1151): the tiled (64x64 / 64x128 / 128x128, pipelined
+/// single-LDS-buffer) sibling of [`GEMM_Q8_0_MMQ_4W_GFX1151_SRC`] on the same Q8_1 activations,
+/// bit-identical to it. Y[N,M] = X[N,K] @ W[M,K]^T with K % 64 == 0 and a 4-byte aligned weight base.
+pub const GEMM_Q8_0_MMQ_I8_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_mmq_i8.gfx11.hip");
+
 /// W8A8 Q8_0 GEMM for gfx12 (gfx1200/gfx1201): int8 weights x int8 per-row
 /// per-32-K activations on `v_wmma_i32_16x16x16_iu8`, F32 output. Ships its
 /// own producer (`quantize_x_q8_blk32`, F32 -> int8 + F32 scales). Y[N,M] =
@@ -4450,9 +4456,16 @@ pub const GEMV_Q8_0_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
 pub const GEMM_Q8_0_MOE_GROUPED_TOP10_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_moe_grouped_top10.hip");
 /// Qwen4 alias of the existing bounds-safe scatter body with an independent
-/// entry point.  The old k=8 symbol and launcher are not widened.
+/// entry point.  The old k=8 symbol and launcher are not widened.  The module
+/// also exports `moe_scatter_fused_top10_serial`: the same launch ABI with the
+/// serial thread-0 prefix walk on every arch (the gfx1201
+/// `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` kill switch and the incumbent arm of
+/// `moe_scatter_scan_oracle`); the default symbol scans block-wide on gfx1151
+/// and gfx1201 and walks serially elsewhere.
 pub const MOE_SCATTER_FUSED_TOP10_SRC: &str = concat!(
+    "#define QWEN4_SCATTER_SERIAL_ENTRY 1\n",
     "#define moe_scatter_fused_k8 moe_scatter_fused_top10\n",
+    "#define moe_scatter_fused_k8_serial moe_scatter_fused_top10_serial\n",
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip")
 );
 /// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 and gfx1201),

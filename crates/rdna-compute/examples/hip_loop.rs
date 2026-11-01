@@ -3174,8 +3174,8 @@ mod lane_tests {
 mod contract_tests {
     use super::*;
 
-    const TILED: &str = "contract:generic_gemm.f32_tiled_rows.mpw16";
-    const BATCHED: &str = "contract:generic_gemm.f32_batched.wave_per_output";
+    const TILED: &str = "contract:generic_gemm.bf16_xf32_tiled_rows.mpw16";
+    const BATCHED: &str = "contract:generic_gemm.bf16_xf32_batched.wave_per_output";
     const Q8: &str = "contract:gemm_q8_0_wmma_gfx12";
     const QT44: &str = "contract:moe_grouped_qt44_a8_sym_gfx1201_nt1r1";
 
@@ -3262,7 +3262,7 @@ mod contract_tests {
         .unwrap();
         assert_eq!(n.arch(), "gfx1201");
         assert!(n.candidate_incumbent().unwrap().is_some());
-        assert_eq!(n.incumbent().unwrap().symbol, "gemm_f32_batched");
+        assert_eq!(n.incumbent().unwrap().symbol, "gemm_bf16_xf32_batched");
     }
 
     #[test]
@@ -3276,9 +3276,12 @@ mod contract_tests {
             "vs",
         );
         assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
-        assert_eq!(rec["symbol"], "gemm_f32_batched");
-        assert_eq!(rec["vs"]["candidate"]["symbol"], "gemm_f32_tiled_rows");
-        assert_eq!(rec["vs"]["baseline"]["module"], "gemm_f32_batched");
+        assert_eq!(rec["symbol"], "gemm_bf16_xf32_batched");
+        assert_eq!(
+            rec["vs"]["candidate"]["symbol"],
+            "gemm_bf16_xf32_tiled_rows"
+        );
+        assert_eq!(rec["vs"]["baseline"]["module"], "gemm_bf16_xf32_batched");
         assert_eq!(rec["arch"], "gfx1201");
         assert_eq!(
             rec["baseline"]["geometry"]["grid_workgroups"],
@@ -3296,16 +3299,19 @@ mod contract_tests {
             "two different kernels"
         );
         assert_eq!(rec["candidate"]["lds_bytes"], 16384, "{}", rec["candidate"]);
-        assert_eq!(rec["contract"]["id"], "generic_gemm.f32_tiled_rows.mpw16");
+        assert_eq!(
+            rec["contract"]["id"],
+            "generic_gemm.bf16_xf32_tiled_rows.mpw16"
+        );
         assert_eq!(
             rec["contract_vs"]["id"],
-            "generic_gemm.f32_batched.wave_per_output"
+            "generic_gemm.bf16_xf32_batched.wave_per_output"
         );
         assert_eq!(rec["rows_param"], "N");
         assert_eq!(rec["regime"], "hot");
         assert_eq!(
             rec["bytes_per_call"],
-            (128 * 2560 + 512 * 2560 + 512 * 128) * 4
+            128 * 2560 * 2 + (512 * 2560 + 512 * 128) * 4
         );
         assert_eq!(rec["work"]["flops"], 2.0 * 128.0 * 512.0 * 2560.0);
         assert_eq!(rec["shape_dims"]["params"]["K"], 2560);
@@ -3402,7 +3408,7 @@ mod contract_tests {
         );
         assert_eq!(
             rc[1]["bytes_per_call"],
-            (128 * 2560 + 512 * 2560 + 512 * 128) * 4
+            128 * 2560 * 2 + (512 * 2560 + 512 * 128) * 4
         );
         assert_eq!(rc[1]["regime"], "hot");
         assert!(rc[0]["timing"].is_null() && rc[0]["identical_to_baseline"].is_null());
@@ -3434,7 +3440,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn emu_gate_judges_the_f32_pair_through_two_symbols() {
+    fn emu_gate_judges_the_bf16_pair_through_two_symbols() {
         if !jit::hipcc_available() {
             eprintln!("SKIP: no hipcc");
             return;
@@ -3450,8 +3456,11 @@ mod contract_tests {
         let g = &rec["emu_gate"];
         assert_eq!(g["pass"], true);
         assert_eq!(g["identical_to_baseline"], true);
-        assert_eq!(g["arms"]["baseline"]["symbol"], "gemm_f32_batched");
-        assert_eq!(g["arms"]["candidate"]["symbol"], "gemm_f32_tiled_rows");
+        assert_eq!(g["arms"]["baseline"]["symbol"], "gemm_bf16_xf32_batched");
+        assert_eq!(
+            g["arms"]["candidate"]["symbol"],
+            "gemm_bf16_xf32_tiled_rows"
+        );
         // one wave per output (40 x 10) against 1 x ceil(10/4) tiled workgroups
         assert_eq!(g["workgroups"], json!({"baseline": 400, "candidate": 3}));
         assert_eq!(g["extent_cases"], json!([]));

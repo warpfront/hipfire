@@ -1255,25 +1255,7 @@ impl RaonState {
     /// the whole reserved context. The choice is made here, once, before any mirror
     /// memory exists.
     pub fn fit_mirror_budget(&mut self, gpu: &Gpu) -> Result<usize, String> {
-        let planned = self.mirror_available_bytes(gpu)?;
-        // Everything non-lazy is allocated by now. The planned figure ignores a
-        // foreign holder, so a mirror that grows lazily into physically absent
-        // memory would fill the card (measured: VRAM 100% full -> pp4096 5.8k ->
-        // 1.0k, decode 73 -> 12 tok/s at 3.3 GiB foreign). Cap the growth by what
-        // the device can really still back, less a fixed floor.
-        let real = hip(gpu.device_mem_info(), "query device memory")?.0;
-        let real_cap = real
-            .saturating_sub(self.pending_latent_bytes(gpu))
-            .saturating_sub(MIRROR_REAL_FLOOR_BYTES);
-        let usable = planned.min(real_cap);
-        if real_cap < planned {
-            eprintln!(
-                "raon1_mini: expanded K/V mirror growth capped by real free memory: planned {:.0} MiB, still allocatable {:.0} MiB after the {:.0} MiB floor",
-                mib(planned),
-                mib(real_cap),
-                mib(MIRROR_REAL_FLOOR_BYTES)
-            );
-        }
+        let usable = self.mirror_available_bytes(gpu)?;
         let (q8, rows) = self.plan_mirror(usable);
         self.dims.mirror_q8 = q8;
         self.mirror_budget_rows = rows;
@@ -1299,13 +1281,35 @@ impl RaonState {
         gpu: &Gpu,
     ) -> Result<(usize, rdna_compute::PlannedCapacity), String> {
         let cap = hip(gpu.planned_capacity(), "query device memory")?;
-        Ok((
-            cap.bytes
-                .saturating_sub(self.pending_latent_bytes(gpu))
-                .saturating_sub(ADMISSION_HEADROOM_BYTES)
-                .saturating_sub(MIRROR_POST_ASSEMBLY_RESERVE_BYTES),
-            cap,
-        ))
+        let pending = self.pending_latent_bytes(gpu);
+        let planned = cap
+            .bytes
+            .saturating_sub(pending)
+            .saturating_sub(ADMISSION_HEADROOM_BYTES)
+            .saturating_sub(MIRROR_POST_ASSEMBLY_RESERVE_BYTES);
+        // The planned figure ignores a foreign holder and any runtime residency
+        // beyond its reserve, so a mirror that grows lazily into physically
+        // absent memory would fill the card (measured: VRAM 100% full -> pp4096
+        // 5.8k -> 1.0k, decode 73 -> 12 tok/s at 3.3 GiB foreign). Cap by what
+        // the device can really still back, less a fixed floor. Applied here, in
+        // the one place both the chunk admission (before scratch exists; the
+        // candidate's bytes are subtracted later) and `fit_mirror_budget` read,
+        // so the chunk rung is picked against the same mirror the fit will give
+        // (otherwise a rung that "preserves" a planned-only mirror wins and the
+        // fit then shrinks it below what a smaller rung would have kept).
+        let real = hip(gpu.device_mem_info(), "query device memory")?.0;
+        let real_cap = real
+            .saturating_sub(pending)
+            .saturating_sub(MIRROR_REAL_FLOOR_BYTES);
+        if real_cap < planned {
+            eprintln!(
+                "raon1_mini: expanded K/V mirror capacity capped by real free memory: planned {:.0} MiB, still allocatable {:.0} MiB after the {:.0} MiB floor",
+                mib(planned),
+                mib(real_cap),
+                mib(MIRROR_REAL_FLOOR_BYTES)
+            );
+        }
+        Ok((planned.min(real_cap), cap))
     }
 
     /// Mirror budget in rows [`Self::fit_mirror_budget`] would settle on if

@@ -92,22 +92,24 @@ fn chunk_span(off: usize, len: usize, keep_from: usize) -> Option<(usize, usize)
 /// line)`. The lines price the production cycle: `raon_dflash_oracle costs`
 /// times the speculator's own greedy windows (draft, selector, verify, commit,
 /// feature append and their host round trips) in decode steps and fits
-/// `base + per_row * rows` over them (block 16, graph decode, the shipped
-/// `raon-1-mini-preview-v2.mq4-xts`, mtp-bench `code_python` and
-/// `explain_concept`, receipts `raon/dflash2/evidence/b14` R9700, `b9x` 7900
-/// XTX). The per-call micro costs alone (draft + verify(rows) + partial
-/// commit) under-price a cycle by about 0.2 decode steps. `per_1k_ctx` is the
-/// growth from the short prompts to an 8K-token prompt. Quantized = the MQ4
-/// draft `raon-1-mini-preview-dflash2.mq4` (5.1 ms R9700 / 4.9 ms XTX per
-/// block-16 draft); unquantized = the F16 draft (11.2 ms / 5.9 ms), priced as
-/// the MQ4 line plus its extra draft time.
+/// `base + per_row * rows` over them (block 16, graph decode, the default
+/// verify route: row-exact up to `projection::ROWS_EXACT_AUTO` rows, batched
+/// above; mtp-bench `explain_concept` (2-row windows) and `code_python` (wide
+/// windows), beta 365862651c, receipts `raon/dflash2/evidence/b37` R9700,
+/// `b34x` / `b38x` 7900 XTX). R9700 prose cycles: 1.72 decode steps at 2
+/// verified rows; 7900 XTX: 1.90. `per_1k_ctx` is the growth from the short
+/// prompts to an 8K-token prompt (measured on the earlier v2 build, b14 /
+/// b9x). Quantized = the MQ4 draft `raon-1-mini-preview-dflash2.mq4` (3.8 ms
+/// R9700 / 4.9 ms XTX per block-16 draft); unquantized = the F16 draft, priced
+/// as the MQ4 line plus its extra draft time measured on the earlier build
+/// (not re-measured).
 const RAON_DFLASH_BREAK_EVEN: &[(&str, bool, BreakEven)] = &[
     (
         "gfx1201",
         true,
         BreakEven {
-            base: 1.85,
-            per_row: 0.05,
+            base: 1.45,
+            per_row: 0.135,
             per_1k_ctx: 0.025,
         },
     ),
@@ -115,8 +117,8 @@ const RAON_DFLASH_BREAK_EVEN: &[(&str, bool, BreakEven)] = &[
         "gfx1201",
         false,
         BreakEven {
-            base: 2.30,
-            per_row: 0.05,
+            base: 1.90,
+            per_row: 0.135,
             per_1k_ctx: 0.025,
         },
     ),
@@ -124,8 +126,8 @@ const RAON_DFLASH_BREAK_EVEN: &[(&str, bool, BreakEven)] = &[
         "gfx1100",
         true,
         BreakEven {
-            base: 2.00,
-            per_row: 0.05,
+            base: 1.53,
+            per_row: 0.175,
             per_1k_ctx: 0.05,
         },
     ),
@@ -133,8 +135,8 @@ const RAON_DFLASH_BREAK_EVEN: &[(&str, bool, BreakEven)] = &[
         "gfx1100",
         false,
         BreakEven {
-            base: 2.07,
-            per_row: 0.05,
+            base: 1.60,
+            per_row: 0.175,
             per_1k_ctx: 0.05,
         },
     ),

@@ -1,0 +1,314 @@
+{
+ "schema": "mtp-parity-fixture/1",
+ "fixture_id": "mtp-parity-v1",
+ "purpose": "Same-bytes MTP acceptance and window-cost comparison (hipfire EP2/PP2 vs Radiance 1.11.0 stock) and the durability ratchet. Owner MgLanes.MtpParity; shared with AvalonDecode so both engines run identical bytes.",
+ "prompts": {
+  "story": {
+   "path": "benchmarks/prompts/fiction_lighthouse.txt",
+   "class": "story",
+   "tier": "core",
+   "md5": "d3768bd6479ce9aae08c9e0152b39e06",
+   "bytes": 134
+  },
+  "code": {
+   "path": "benchmarks/prompts/humaneval_0_has_close_elements.txt",
+   "class": "code",
+   "tier": "core",
+   "md5": "5333a1f70d884060807676347c0edb93",
+   "bytes": 348,
+   "note": "HumanEval/0 signature+docstring as the user message."
+  },
+  "prose_long": {
+   "path": "benchmarks/mtp-parity/prompts/prose_long.txt",
+   "class": "prose_long",
+   "tier": "breadth",
+   "md5": "39fb57f301d387e83a191769a2fef23d",
+   "bytes": 148
+  },
+  "agentic": {
+   "path": "benchmarks/mtp-parity/prompts/agentic_frozen_chain.json",
+   "class": "agentic",
+   "tier": "breadth",
+   "md5": "dedb861a5aa5dcff554b9c3ec608bf20",
+   "bytes": 7715,
+   "note": "OpenAI-format messages + tools; send as-is (chat completions with tools). Eight messages of fixed bytes and a closing user turn; the model generates the final answer. A cell whose median completion is < 128 tokens is invalid (v1 of this file ended after one 28-token tool call)."
+  },
+  "math": {
+   "path": "benchmarks/mtp-parity/prompts/math_reason.txt",
+   "class": "math",
+   "tier": "breadth",
+   "md5": "2adc75296df0877a1c38aa53511a7d3d",
+   "bytes": 239
+  },
+  "multilingual": {
+   "path": "benchmarks/mtp-parity/prompts/multilingual_zh.txt",
+   "class": "multilingual",
+   "tier": "breadth",
+   "md5": "44476c7d649b4ed4626f4fcca6342009",
+   "bytes": 117
+  }
+ },
+ "request": {
+  "endpoint": "/v1/chat/completions",
+  "stream": true,
+  "max_tokens": 256,
+  "thinking": "off",
+  "message": "each prompt (except agentic) is sent as one user message; agentic supplies its own messages+tools",
+  "no_nonce": "prompts are sent byte-exact; no per-request nonce line (prefix/session caches off: HIPFIRE_SESSION_CACHE_BYTES=0)"
+ },
+ "modes": {
+  "t1": {
+   "temperature": 1.0,
+   "top_p": 0.95,
+   "top_k": 20,
+   "seed": "1000*rep + stream_index"
+  },
+  "greedy": {
+   "temperature": 0.0
+  }
+ },
+ "concurrency_semantics": "C streams started together, each sends the prompt once per round; rounds=3 per fresh process; closed loop; stats/trace counters read before and after the cell and differenced (or one fresh process per cell).",
+ "reps": {
+  "per_cell": 3,
+  "process": "fresh daemon per rep (min_reps in ratchet.rule)"
+ },
+ "depths": [
+  1,
+  2,
+  3
+ ],
+ "definitions": {
+  "offered_d": "windows whose draft offered >= d rows",
+  "reached_d": "offered >= d and the first d-1 drafts accepted (= accepted_{d-1} when every window offers d)",
+  "accepted_d": "first d drafts accepted",
+  "a_d": "accepted_d/reached_d",
+  "yield": "committed tokens per lane-window (user step)",
+  "window_ms": "wall ms of one engine step"
+ },
+ "cells": [
+  {
+   "cell": "story-C1-t1",
+   "prompt": "story",
+   "class": "story",
+   "tier": "core",
+   "concurrency": 1,
+   "mode": "t1"
+  },
+  {
+   "cell": "story-C1-greedy",
+   "prompt": "story",
+   "class": "story",
+   "tier": "core",
+   "concurrency": 1,
+   "mode": "greedy"
+  },
+  {
+   "cell": "story-C4-t1",
+   "prompt": "story",
+   "class": "story",
+   "tier": "core",
+   "concurrency": 4,
+   "mode": "t1"
+  },
+  {
+   "cell": "story-C4-greedy",
+   "prompt": "story",
+   "class": "story",
+   "tier": "core",
+   "concurrency": 4,
+   "mode": "greedy"
+  },
+  {
+   "cell": "story-C8-t1",
+   "prompt": "story",
+   "class": "story",
+   "tier": "core",
+   "concurrency": 8,
+   "mode": "t1"
+  },
+  {
+   "cell": "story-C8-greedy",
+   "prompt": "story",
+   "class": "story",
+   "tier": "core",
+   "concurrency": 8,
+   "mode": "greedy"
+  },
+  {
+   "cell": "code-C1-t1",
+   "prompt": "code",
+   "class": "code",
+   "tier": "core",
+   "concurrency": 1,
+   "mode": "t1"
+  },
+  {
+   "cell": "code-C1-greedy",
+   "prompt": "code",
+   "class": "code",
+   "tier": "core",
+   "concurrency": 1,
+   "mode": "greedy"
+  },
+  {
+   "cell": "code-C4-t1",
+   "prompt": "code",
+   "class": "code",
+   "tier": "core",
+   "concurrency": 4,
+   "mode": "t1"
+  },
+  {
+   "cell": "code-C4-greedy",
+   "prompt": "code",
+   "class": "code",
+   "tier": "core",
+   "concurrency": 4,
+   "mode": "greedy"
+  },
+  {
+   "cell": "code-C8-t1",
+   "prompt": "code",
+   "class": "code",
+   "tier": "core",
+   "concurrency": 8,
+   "mode": "t1"
+  },
+  {
+   "cell": "code-C8-greedy",
+   "prompt": "code",
+   "class": "code",
+   "tier": "core",
+   "concurrency": 8,
+   "mode": "greedy"
+  },
+  {
+   "cell": "prose_long-C1-t1",
+   "prompt": "prose_long",
+   "class": "prose_long",
+   "tier": "breadth",
+   "concurrency": 1,
+   "mode": "t1"
+  },
+  {
+   "cell": "prose_long-C1-greedy",
+   "prompt": "prose_long",
+   "class": "prose_long",
+   "tier": "breadth",
+   "concurrency": 1,
+   "mode": "greedy"
+  },
+  {
+   "cell": "prose_long-C8-t1",
+   "prompt": "prose_long",
+   "class": "prose_long",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "t1"
+  },
+  {
+   "cell": "prose_long-C8-greedy",
+   "prompt": "prose_long",
+   "class": "prose_long",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "greedy"
+  },
+  {
+   "cell": "agentic-C1-t1",
+   "prompt": "agentic",
+   "class": "agentic",
+   "tier": "breadth",
+   "concurrency": 1,
+   "mode": "t1"
+  },
+  {
+   "cell": "agentic-C1-greedy",
+   "prompt": "agentic",
+   "class": "agentic",
+   "tier": "breadth",
+   "concurrency": 1,
+   "mode": "greedy"
+  },
+  {
+   "cell": "agentic-C8-t1",
+   "prompt": "agentic",
+   "class": "agentic",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "t1"
+  },
+  {
+   "cell": "agentic-C8-greedy",
+   "prompt": "agentic",
+   "class": "agentic",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "greedy"
+  },
+  {
+   "cell": "math-C1-t1",
+   "prompt": "math",
+   "class": "math",
+   "tier": "breadth",
+   "concurrency": 1,
+   "mode": "t1"
+  },
+  {
+   "cell": "math-C1-greedy",
+   "prompt": "math",
+   "class": "math",
+   "tier": "breadth",
+   "concurrency": 1,
+   "mode": "greedy"
+  },
+  {
+   "cell": "math-C8-t1",
+   "prompt": "math",
+   "class": "math",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "t1"
+  },
+  {
+   "cell": "math-C8-greedy",
+   "prompt": "math",
+   "class": "math",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "greedy"
+  },
+  {
+   "cell": "multilingual-C1-t1",
+   "prompt": "multilingual",
+   "class": "multilingual",
+   "tier": "breadth",
+   "concurrency": 1,
+   "mode": "t1"
+  },
+  {
+   "cell": "multilingual-C1-greedy",
+   "prompt": "multilingual",
+   "class": "multilingual",
+   "tier": "breadth",
+   "concurrency": 1,
+   "mode": "greedy"
+  },
+  {
+   "cell": "multilingual-C8-t1",
+   "prompt": "multilingual",
+   "class": "multilingual",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "t1"
+  },
+  {
+   "cell": "multilingual-C8-greedy",
+   "prompt": "multilingual",
+   "class": "multilingual",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "greedy"
+  }
+ ]
+}

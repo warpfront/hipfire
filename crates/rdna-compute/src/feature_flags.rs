@@ -121,6 +121,10 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
     pub qwen4_router_fast: bool,
+    /// Block-wide prefix scan in the Qwen4 top-10 MoE scatter
+    /// (`HIPFIRE_QWEN4_MOE_SCATTER_SCAN`), default on for gfx1201 (`=0` keeps the serial
+    /// thread-0 walk); gfx1151 always scans, every other arch always walks.
+    pub qwen4_moe_scatter_scan: bool,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
     /// on for gfx1151 and gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_gdn_lanes: bool,
@@ -1034,10 +1038,13 @@ impl FeatureFlags {
                 .unwrap_or(halo_hyper_default || is_gfx1201),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST")
                 .unwrap_or(exact_unit_default),
+            qwen4_moe_scatter_scan: parse_bool("HIPFIRE_QWEN4_MOE_SCATTER_SCAN")
+                .unwrap_or(is_gfx1201),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
             qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(false),
-            qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4").unwrap_or(arch == "gfx1151"),
+            qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
+                .unwrap_or(arch == "gfx1151" || is_gfx1201),
             qwen4_shared_down_fuse: parse_bool("HIPFIRE_QWEN4_SHARED_DOWN_FUSE")
                 .unwrap_or(arch == "gfx1151"),
             qwen4_decode_zba_x3: parse_bool("HIPFIRE_QWEN4_DECODE_ZBA_X3")
@@ -1723,7 +1730,7 @@ impl FeatureFlags {
     }
 
     pub fn qwen4_moe_down_r4_enabled(&self) -> bool {
-        self.qwen4_moe_down_r4 && self.arch == "gfx1151"
+        self.qwen4_moe_down_r4 && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
     pub fn qwen4_shared_down_fuse_enabled(&self) -> bool {
@@ -1732,6 +1739,13 @@ impl FeatureFlags {
 
     pub fn qwen4_router_fast_enabled(&self) -> bool {
         self.qwen4_router_fast && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+    }
+
+    /// Serial thread-0 prefix walk in the Qwen4 top-10 scatter
+    /// (`HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` on exact gfx1201): launches the
+    /// `moe_scatter_fused_top10_serial` module instead of the scanning default.
+    pub fn qwen4_moe_scatter_serial_walk(&self) -> bool {
+        !self.qwen4_moe_scatter_scan && self.arch == "gfx1201"
     }
 
     pub fn qwen4_decode_zba_x3_enabled(&self) -> bool {
@@ -1891,6 +1905,7 @@ impl FeatureFlags {
             qwen4_moe_combine_zinit: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
+            qwen4_moe_scatter_scan: false,
             qwen4_gdn_lanes: false,
             qwen4_qsa_lanes: false,
             qwen4_gdn_lanes_rows: false,
@@ -2917,6 +2932,34 @@ mod tests {
                 }
             });
             assert_eq!(on.qwen4_router_fast_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The scatter scan flag defaults on for exact gfx1201; `=0` selects the serial walk (a
+    /// second symbol of the same module) there only, and no other value or arch ever does.
+    #[test]
+    fn qwen4_moe_scatter_scan_kill_switch_selects_the_serial_walk_on_gfx1201_only() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let with = |value: Option<&'static str>| {
+                FeatureFlags::from_lookup(arch, move |n| match (n, value) {
+                    ("HIPFIRE_QWEN4_MOE_SCATTER_SCAN", Some(v)) => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            assert_eq!(
+                with(None).qwen4_moe_scatter_scan,
+                arch == "gfx1201",
+                "{arch}"
+            );
+            assert!(!with(None).qwen4_moe_scatter_serial_walk(), "{arch}");
+            assert!(!with(Some("1")).qwen4_moe_scatter_serial_walk(), "{arch}");
+            assert_eq!(
+                with(Some("0")).qwen4_moe_scatter_serial_walk(),
+                arch == "gfx1201",
+                "{arch}"
+            );
         }
     }
 

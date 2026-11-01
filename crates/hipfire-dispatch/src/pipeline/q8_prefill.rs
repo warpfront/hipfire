@@ -9,7 +9,7 @@
 //! (never an error). The tier that actually ran is reported back where a call returns one.
 
 use crate::types::DispatchError;
-use rdna_compute::{Gpu, GpuTensor, Q8A8Activations};
+use rdna_compute::{q8_mmq_gfx11_admits, Gpu, GpuTensor, Q8A8Activations, Q8MmqActivations};
 
 /// Activation precision of one prefill GEMM site.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -142,6 +142,13 @@ pub fn q8_0_prefill_gemm(
 ) -> Result<PrefillActTier, DispatchError> {
     if q8_0_prefill_runs(gpu, tier, m, k, rows) {
         match tier {
+            PrefillActTier::A8
+                if gpu.arch == "gfx1100" && gpu.q8_mmq_gfx11_supported(k, w.buf.as_ptr()) =>
+            {
+                // Tiled i8-MMQ (bit-identical to the 64x64 kernel below; HIPFIRE_Q8_MMQ_GFX11_TILES=0
+                // keeps the 64x64 kernel).
+                hip!(gpu.gemm_q8_0_mmq_gfx11_batched(w, x, y, m, k, rows))?
+            }
             PrefillActTier::A8 if gpu.arch != "gfx1201" => {
                 hip!(gpu.gemm_q8_0_mmq_4w_gfx1151(w, x, y, m, k, rows))?
             }
@@ -156,19 +163,30 @@ pub fn q8_0_prefill_gemm(
 }
 
 /// One activation tensor quantized once for every A8 Q8_0 consumer of a node (RDA q/k/v/g, MLA
-/// q_a/kv_a/g). The int8 plane and block scales live in the `Gpu`'s shared W8A8 scratch, so the
-/// value is valid only until the next A8/FP8 quantizer runs or the scratch grows: the lifetime is
-/// one node, and [`q8_0_prefill_gemm_prepared`] re-quantizes (never reads stale bytes) when a
-/// later quantizer overwrote it, or when the consumer's `x`, `k` or `rows` differ.
+/// q_a/kv_a/g). On gfx1201 the int8 plane and block scales live in the `Gpu`'s W8A8 scratch; on
+/// gfx1100 the Q8_1 plane lives in the Q8_1 MMQ scratch. Either way the value is valid only until
+/// the next quantizer of that scratch runs or the scratch grows: the lifetime is one node, and
+/// [`q8_0_prefill_gemm_prepared`] re-quantizes (never reads stale bytes) when a later quantizer
+/// overwrote it, or when the consumer's `x`, `k` or `rows` differ.
 #[derive(Clone, Copy, Debug)]
 pub struct PreparedA8 {
-    acts: Q8A8Activations,
+    acts: PreparedActs,
     x: *const std::ffi::c_void,
 }
 
-/// Quantize `x[rows, k]` once when an A8 Q8_0 projection `[m, k]` runs the gfx1201 W8A8 route
-/// ([`q8_0_prefill_runs`]; the gfx11 int8 MMQ route quantizes inside its own kernel); `None` (nothing launched) otherwise: the consumers then take their
-/// ordinary route. Bit-identical to what each [`q8_0_prefill_gemm`] call quantizes itself.
+#[derive(Clone, Copy, Debug)]
+enum PreparedActs {
+    /// gfx1201 `quantize_x_q8_blk32` sidecar.
+    Gfx12(Q8A8Activations),
+    /// gfx1100 `quantize_q8_1_mmq_ds4` plane (tiled i8-MMQ route).
+    Gfx11(Q8MmqActivations),
+}
+
+/// Quantize `x[rows, k]` once when an A8 Q8_0 projection `[m, k]` runs a W8A8 route whose
+/// quantizer can be shared ([`q8_0_prefill_runs`]): the gfx1201 W8A8 route, or the gfx1100 tiled
+/// i8-MMQ route (`gemm_q8_0_mmq_gfx11_batched`; the 64x64 fallback and gfx1151 quantize inside
+/// their own call). `None` (nothing launched) otherwise: the consumers then take their ordinary
+/// route. Bit-identical to what each [`q8_0_prefill_gemm`] call quantizes itself.
 pub fn q8_0_prefill_prepare(
     gpu: &mut Gpu,
     tier: PrefillActTier,
@@ -177,13 +195,16 @@ pub fn q8_0_prefill_prepare(
     k: usize,
     rows: usize,
 ) -> Result<Option<PreparedA8>, DispatchError> {
-    if tier != PrefillActTier::A8
-        || gpu.arch != "gfx1201"
-        || !q8_0_prefill_runs(gpu, tier, m, k, rows)
-    {
+    if tier != PrefillActTier::A8 || !q8_0_prefill_runs(gpu, tier, m, k, rows) {
         return Ok(None);
     }
-    let acts = hip!(gpu.q8_a8_quantize_x(x, rows, k))?;
+    let acts = match gpu.arch.as_str() {
+        "gfx1201" => PreparedActs::Gfx12(hip!(gpu.q8_a8_quantize_x(x, rows, k))?),
+        "gfx1100" if q8_mmq_gfx11_admits(&gpu.arch, k) => {
+            PreparedActs::Gfx11(hip!(gpu.q8_mmq_quantize_x(x, rows, k))?)
+        }
+        _ => return Ok(None),
+    };
     Ok(Some(PreparedA8 {
         acts,
         x: x.buf.as_ptr() as *const std::ffi::c_void,
@@ -202,9 +223,10 @@ pub struct Q8PrefillRun {
 
 /// [`q8_0_prefill_gemm`] with two optional reuses on the A8 route: it consumes `prepared` when
 /// that still describes this call's `x`, `k` and `rows` (GEMM only, no quantizer launch; else it
-/// quantizes `x` itself), and with `bf16_out` the GEMM epilogue rounds every output to BF16
-/// (bit-identical to a separate in-place `bf16_round_trip_f32_strided` pass, see
-/// `Gpu::gemm_q8_0_a8_gemm_bf16`). Every other case is exactly [`q8_0_prefill_gemm`].
+/// quantizes `x` itself), and on gfx1201 with `bf16_out` the GEMM epilogue rounds every output to
+/// BF16 (bit-identical to a separate in-place `bf16_round_trip_f32_strided` pass, see
+/// `Gpu::gemm_q8_0_a8_gemm_bf16`; the gfx1100 tiled GEMM has no such epilogue and reports
+/// `bf16_fused: false`). Every other case is exactly [`q8_0_prefill_gemm`].
 #[allow(clippy::too_many_arguments)]
 pub fn q8_0_prefill_gemm_prepared(
     gpu: &mut Gpu,
@@ -222,14 +244,19 @@ pub fn q8_0_prefill_gemm_prepared(
         && gpu.arch == "gfx1201"
         && q8_0_prefill_runs(gpu, tier, m, k, rows)
     {
-        let reuse = prepared.filter(|p| {
-            p.acts.rows() == rows
-                && p.acts.k() == k
-                && p.x == x.buf.as_ptr() as *const std::ffi::c_void
-                && gpu.q8_a8_acts_current(&p.acts)
+        let reuse = prepared.and_then(|p| match p.acts {
+            PreparedActs::Gfx12(a)
+                if a.rows() == rows
+                    && a.k() == k
+                    && p.x == x.buf.as_ptr() as *const std::ffi::c_void
+                    && gpu.q8_a8_acts_current(&a) =>
+            {
+                Some(a)
+            }
+            _ => None,
         });
         let acts = match reuse {
-            Some(p) => p.acts,
+            Some(a) => a,
             None => hip!(gpu.q8_a8_quantize_x(x, rows, k))?,
         };
         if bf16_out {
@@ -240,6 +267,33 @@ pub fn q8_0_prefill_gemm_prepared(
         return Ok(Q8PrefillRun {
             tier,
             bf16_fused: bf16_out,
+        });
+    }
+    if tier == PrefillActTier::A8
+        && gpu.arch == "gfx1100"
+        && q8_0_prefill_runs(gpu, tier, m, k, rows)
+        && gpu.q8_mmq_gfx11_supported(k, w.buf.as_ptr())
+    {
+        let reuse = prepared.and_then(|p| match p.acts {
+            PreparedActs::Gfx11(a)
+                if a.rows() == rows
+                    && a.k() == k
+                    && p.x == x.buf.as_ptr() as *const std::ffi::c_void
+                    && gpu.q8_mmq_acts_current(&a) =>
+            {
+                Some(a)
+            }
+            _ => None,
+        });
+        let acts = match reuse {
+            Some(a) => a,
+            None => hip!(gpu.q8_mmq_quantize_x(x, rows, k))?,
+        };
+        hip!(gpu.gemm_q8_0_mmq_gfx11_gemm(w, &acts, y, m))?;
+        // The tiled GEMM has no BF16 epilogue: the caller rounds (`bf16_fused: false`).
+        return Ok(Q8PrefillRun {
+            tier,
+            bf16_fused: false,
         });
     }
     let tier = q8_0_prefill_gemm(gpu, tier, w, x, y, m, k, rows)?;

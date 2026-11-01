@@ -66,13 +66,21 @@ pub fn symbol_a8_gfx11(nt: usize, rf: usize) -> Option<&'static str> {
     })
 }
 
-/// Default gfx11 W4A8 `(nt, rf)` from the node sweeps and the end-to-end A/B. gfx1100 (7900 XTX):
-/// `nt2r2` at >= 12288 grouped rows (4096 tokens: gate/up 4.02 ms, down 2.54 ms vs F16 5.64 / 3.60),
-/// below it `nt2r1` (on the XTX's 512-row prefill chunks `nt2r1` beat `nt1r1` end to end). gfx1151
-/// (Strix Halo, bandwidth bound): `nt4r1` below 12288 grouped rows (512 tokens: gate/up 2.12 ms, down
-/// 1.32 ms), `nt2r2` above (4096 tokens: 8.00 / 5.01 ms). `rf = 2` needs `m % 128 == 0`.
+/// Default gfx11 W4A8 `(nt, rf)`; `m_total` is the launch's grouped-row bound (`grouped_moe_m_total_bound`).
+/// gfx1100 (7900 XTX): `nt2r2` (direct weights, no half-row exchange) from `GFX1100_NT2R2_MIN_ROWS` grouped rows,
+/// which covers the XTX's 512-row prefill chunks (bound 4992 at top-6: real route histograms, gate/up -11% and
+/// down -7% against the former `nt2r1` there; 256 tokens, bound 3456, is 2-3% slower with `nt2r2`, so it stays
+/// `nt2r1`). gfx1151 (Strix Halo, bandwidth bound): `nt2r2` at >= 12288 grouped rows (4096 tokens: 8.00 / 5.01 ms),
+/// below it `nt4r1` (512 tokens: gate/up 2.12 ms, down 1.32 ms). `rf = 2` needs `m % 128 == 0`.
+// selector-receipt: receipts/selectors/gfx1100_a8_nt2r2_min_rows.json
+pub const GFX1100_NT2R2_MIN_ROWS: usize = 4_096;
 pub fn select_entry_a8_gfx11(arch: &str, m_total: usize, m: usize) -> (usize, usize) {
-    if m_total >= 12_288 && m % 128 == 0 {
+    let rf2_from = if arch == "gfx1100" {
+        GFX1100_NT2R2_MIN_ROWS
+    } else {
+        12_288
+    };
+    if m_total >= rf2_from && m % 128 == 0 {
         (2, 2)
     } else if arch == "gfx1151" {
         (4, 1)
@@ -447,7 +455,10 @@ mod tests {
                 assert_eq!(m % (64 * rf), 0);
             }
         }
-        assert_eq!(select_entry_a8_gfx11("gfx1100", 4048, 2176), (2, 1));
+        assert_eq!(select_entry_a8_gfx11("gfx1100", 4992, 2176), (2, 2));
+        assert_eq!(select_entry_a8_gfx11("gfx1100", 3456, 2176), (2, 1));
+        assert_eq!(select_entry_a8_gfx11("gfx1100", 4992, 1088), (2, 1));
+        assert_eq!(select_entry_a8_gfx11("gfx1151", 4992, 2176), (4, 1));
         assert_eq!(select_entry_a8_gfx11("gfx1151", 4048, 2176), (4, 1));
         assert_eq!(select_entry_a8_gfx11("gfx1100", 25552, 2560), (2, 2));
         assert!(!a8_supported("gfx1030") && a8_entries("gfx942").is_empty());

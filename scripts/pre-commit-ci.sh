@@ -49,6 +49,9 @@ run cargo clippy --workspace --all-targets --locked
 run python3 scripts/check-env-docs.py
 run python3 scripts/check-lifecycle.py
 run python3 scripts/check-selector-receipts.py
+run python3 scripts/check-mtp-parity-ratchet.py --self-test
+run python3 scripts/check-mtp-parity-ratchet.py fixture
+run python3 scripts/check-mtp-parity-ratchet.py guard --base "${1:-origin/beta}"
 
 echo
 if [[ ${#failed[@]} -gt 0 ]]; then

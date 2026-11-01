@@ -15,10 +15,11 @@
 //! BF16-rounded random (ties), five levels (ties everywhere), constant, fewer
 //! finite values than K (-inf padding), and NaN / +inf planted.
 //!
-//! Prints a timing table (median of launch batches) of the shipping kernel
-//! against the re-grid + tie path at 15 rows. On an arch without the re-grid
-//! route (`Gpu::select_regrid_enabled`) both calls are the shipping kernel and
-//! the test says so.
+//! The re-grid arm is `Gpu::topk_values_regrid_f32_forced`, which bypasses the
+//! arch admission (`Gpu::select_regrid_enabled`): the comparison is the real
+//! re-grid + tie route against the shipping kernel on every arch, including one
+//! that is not (yet) admitted. Prints a timing table (median of launch batches)
+//! of the shipping kernel against the re-grid + tie path at 15 rows.
 //!
 //! `#[ignore]`d: needs a HIP GPU. Run explicitly (through the GPU fabric):
 //!
@@ -83,7 +84,7 @@ fn run(
         gpu.topk_values_batched_f32_shipping(logits, idx, val, vocab, k, rows)
             .expect("shipping top-k");
     } else {
-        gpu.topk_values_batched_f32(logits, idx, val, vocab, k, rows)
+        gpu.topk_values_regrid_f32_forced(logits, idx, val, vocab, k, rows)
             .expect("regrid top-k");
     }
 }
@@ -99,11 +100,11 @@ fn bits(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<u32> {
 #[ignore = "needs a GPU: run through the GPU fabric"]
 fn regrid_topk_with_tie_recompute_is_byte_identical_to_the_shipping_kernel() {
     let mut gpu = Gpu::init().expect("gpu init");
-    if !gpu.select_regrid_enabled() {
-        eprintln!(
-            "NOTE: re-grid route not enabled on this arch: both arms are the shipping kernel"
-        );
-    }
+    eprintln!(
+        "arch {}: select_regrid_enabled = {} (the re-grid arm is forced either way)",
+        gpu.arch,
+        gpu.select_regrid_enabled()
+    );
     let mut g = Lcg(0x5eed);
     let mut compared = 0usize;
     for vocab in [259_840usize, 100_003, 200] {

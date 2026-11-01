@@ -13,7 +13,7 @@
 //! | [`GEMM_F32_BATCHED`] | `gemm_f32_batched` (gfx1201, gfx1100) | `Gpu::gemm_f32_batched` (`gemm.rs`) |
 //! | [`GEMM_BF16_XF32_BATCHED`] | `gemm_bf16_xf32_batched` (gfx1201, gfx1100) | `Gpu::gemm_bf16_xf32_batched` (`gemm.rs`) |
 //! | [`GEMM_BF16_XF32_TILED_ROWS`] / [`GEMM_BF16_XF32_TILED_ROWS_MP4`] | `gemm_bf16_xf32_tiled_rows`, `gemm_bf16_xf32_tiled_rows_mp4` (gfx1201) | `Gpu::gemm_bf16_xf32_tiled_rows` (`gemm.rs`), selector `rows_gemm` (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`) |
-//! | [`GEMM_BF16_XF32_SMALL_ROWS_R1`] / `_R4` / `_R8`, [`GEMM_BF16_XBF16_SMALL_ROWS_S1`] / `_S4` / `_S8` | `gemm_bf16_xf32_small_rows_{r1,r4,r8}`, `gemm_bf16_xbf16_small_rows_{s1,s4,s8}` (gfx1201) | `Gpu::gemm_bf16_small_rows` (`gemm.rs`), selector `rows_gemm` and `helmert_selector_gemm` (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`) |
+//! | [`GEMM_BF16_XF32_SMALL_ROWS_R1`] / `_R4` / `_R8`, [`GEMM_BF16_XBF16_SMALL_ROWS_S1`] / `_S4` / `_S8` | `gemm_bf16_xf32_small_rows_{r1,r4,r8}`, `gemm_bf16_xbf16_small_rows_{s1,s4,s8}` (gfx1201, gfx1100) | `Gpu::gemm_bf16_small_rows` (`gemm.rs`), selector `rows_gemm` and `helmert_selector_gemm` (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`) |
 //! | [`GEMV_Q8_0`] | `gemv_q8_0` (gfx1201, gfx1100) | `Gpu::gemv_q8_0` (`crates/rdna-compute/src/gemv.rs`) |
 //! | [`EMBEDDING_Q8_BATCHED`] | `embedding_q8_batched` (gfx1201, gfx1100) | `Gpu::embedding_lookup_q8_batched` (`crates/rdna-compute/src/embedding.rs`) |
 //! | [`MOE_GROUPED_QT44_A8_SYM`] | `moe_grouped_qt44_a8_sym_gfx1201_nt{1,2}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` (`crates/rdna-compute/src/moe_grouped_qt44_iu4.rs`) |
@@ -925,7 +925,8 @@ const DOMAIN_SMALL_ROWS_NT8: &[DomainRuleV1] = &[
 /// hidden block and segment 36 / align 8), no LDS, and the lane-strided numerics of `gemm_f32_batched`.
 /// `NT` activation rows and `OS` outputs per wave live in registers; a CTA of `NW` waves owns
 /// `NW * OS` outputs and `NT` rows (grid x = ceil(M / (NW * OS)), grid y = ceil(N / NT)); `UR` is the
-/// k-unroll. hipcc-JIT'd from `kernels/src/gemm_bf16_small_rows.hip` (no hsaco hash is pinned).
+/// k-unroll. hipcc-JIT'd from `kernels/src/gemm_bf16_small_rows.hip` (no hsaco hash is pinned); the same
+/// source, symbol, block, grid and constants on gfx1201 and gfx1100 (one export per arch).
 macro_rules! small_rows_abi {
     (
         $(#[$meta:meta])*
@@ -947,19 +948,34 @@ macro_rules! small_rows_abi {
             segment_bytes: 36,
             segment_align: 8,
             domain: $domain,
-            exports: &[ExportV1 {
-                symbol: $symbol,
-                arch: Arch::Gfx1201,
-                object: ObjectRefV1::HipccSource {
-                    module: "gemm_bf16_small_rows",
-                    source: "kernels/src/gemm_bf16_small_rows.hip",
+            exports: &[
+                ExportV1 {
+                    symbol: $symbol,
+                    arch: Arch::Gfx1201,
+                    object: ObjectRefV1::HipccSource {
+                        module: "gemm_bf16_small_rows",
+                        source: "kernels/src/gemm_bf16_small_rows.hip",
+                    },
+                    block: [$block, 1, 1],
+                    dynamic_lds: 0,
+                    group_segment_fixed: 0,
+                    grid: [Expr::DivCeil(&P_M, $outputs), $grid_y, ONE],
+                    consts: &[("NT", $nt), ("OS", $os), ("NW", $nw), ("UR", $ur)],
                 },
-                block: [$block, 1, 1],
-                dynamic_lds: 0,
-                group_segment_fixed: 0,
-                grid: [Expr::DivCeil(&P_M, $outputs), $grid_y, ONE],
-                consts: &[("NT", $nt), ("OS", $os), ("NW", $nw), ("UR", $ur)],
-            }],
+                ExportV1 {
+                    symbol: $symbol,
+                    arch: Arch::Gfx1100,
+                    object: ObjectRefV1::HipccSource {
+                        module: "gemm_bf16_small_rows",
+                        source: "kernels/src/gemm_bf16_small_rows.hip",
+                    },
+                    block: [$block, 1, 1],
+                    dynamic_lds: 0,
+                    group_segment_fixed: 0,
+                    grid: [Expr::DivCeil(&P_M, $outputs), $grid_y, ONE],
+                    consts: &[("NT", $nt), ("OS", $os), ("NW", $nw), ("UR", $ur)],
+                },
+            ],
         };
     };
 }
@@ -1008,7 +1024,7 @@ small_rows_abi!(
 );
 
 /// Admission of the `gemm_bf16_small_rows` family: the selector `rows_gemm` (and the stream-mix selector
-/// GEMM) send gfx1201 calls here at every row count unless `HIPFIRE_BF16W_SMALL_ROWS=0`. `small_rows_profile`
+/// GEMM) send gfx1201 and gfx1100 calls here at every row count unless `HIPFIRE_BF16W_SMALL_ROWS=0`. `small_rows_profile`
 /// picks the kernel by activation dtype (F32 + M > 32: router `_r*`; BF16 + M <= 32: selector `_s*`) and by
 /// row count, and only for K a multiple of 512 (`small_rows_route`; the kernels have no k tail and the
 /// launcher rejects other K). Every kernel is correct at every row count, so the domain is not row-limited.
@@ -1044,7 +1060,7 @@ const ADMIT_F32_BATCHED: RowDomainV1 = RowDomainV1 {
 
 /// Admission of `gemm_bf16_xf32_batched`: the selector `rows_gemm` sends BF16-resident weights with
 /// `n < BF16_TILED_ROWS_MIN_N` (512) here, and every row count on archs without the tiled kernel
-/// (gfx1100) or with `HIPFIRE_BF16W_TILED_ROWS=0`. On gfx1201 the router-shaped (F32 activation, M > 32)
+/// (gfx1100) or with `HIPFIRE_BF16W_TILED_ROWS=0`. On gfx1201 and gfx1100 the router-shaped (F32 activation, M > 32)
 /// and selector-shaped (BF16 activation, M <= 32) calls take the `gemm_bf16_small_rows` kernels instead
 /// ([`ADMIT_BF16_SMALL_ROWS`]) unless `HIPFIRE_BF16W_SMALL_ROWS=0`; other shapes and direct callers
 /// still run this kernel.
@@ -1089,7 +1105,8 @@ pub static WORK_GEMM_F32_BATCHED: WorkSpecV1 = WorkSpecV1 {
         note: "One wave per output: grid (M, N) gives M and N exactly; K from the weight. Bytes = A + B + Y extents. \
                Every output re-reads its activation row (reads are L2-served), so the true traffic exceeds the \
                operand extents: the memory floor is a lower bound. See the admit note: this is the \
-               selector's n < 512 (or non-gfx1201 / kill-switch) route AND the direct-call route at any rows.",
+               selector's n < 512 (or non-gfx1201 / kill-switch) route AND the direct-call route at any rows. On gfx1201 \
+               and gfx1100 the router and selector shapes take the small-rows kernels instead.",
     },
 };
 
@@ -1108,7 +1125,7 @@ pub static WORK_GEMM_BF16_XF32_BATCHED: WorkSpecV1 = WorkSpecV1 {
         note: "One wave per output: grid (M, N) gives M and N exactly; K from the BF16 weight. Bytes = A + B + Y \
                extents (A is 2 bytes per element). Every output re-reads its activation row (L2-served), so the \
                true traffic exceeds the operand extents. Selector `rows_gemm`'s route for BF16-resident weights \
-               at n < 512 / non-gfx1201 / kill-switch (`HIPFIRE_BF16W_SMALL_ROWS=0` on gfx1201: the small-rows \
+               at n < 512 / non-gfx1201 / kill-switch (`HIPFIRE_BF16W_SMALL_ROWS=0` on gfx1201 / gfx1100: the small-rows \
                kernels take the router and selector shapes otherwise), and direct callers.",
     },
 };
@@ -1206,14 +1223,14 @@ small_rows_work!(
     BINDS_SMALL_ROWS_EXACT,
     "Router shape (F32 activation, M > 32), decode / speculative verify row counts. Grid y = N pins N; grid x = \
      ceil(M/8) leaves M in an interval of 8 that the weight match (by M) binds exactly, with K. Admitted on \
-     gfx1201 only, K % 512 == 0 (no k tail), `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
+     gfx1201 and gfx1100, K % 512 == 0 (no k tail), `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
 );
 small_rows_work!(
     WORK_GEMM_BF16_XF32_SMALL_ROWS_R4,
     GEMM_BF16_XF32_SMALL_ROWS_R4,
     BINDS_SMALL_ROWS_CHUNKED,
     "Router shape (F32 activation, M > 32), 4 rows per CTA. Grid y = ceil(N/4) leaves N in an interval of 4: \
-     ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 only, K % 512 == 0 (no k tail), \
+     ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), \
      `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
 );
 small_rows_work!(
@@ -1221,7 +1238,7 @@ small_rows_work!(
     GEMM_BF16_XF32_SMALL_ROWS_R8,
     BINDS_SMALL_ROWS_CHUNKED,
     "Router shape (F32 activation, M > 32), 8 rows per CTA (prefill row counts). Grid y = ceil(N/8) leaves N in \
-     an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 only, K % 512 == 0 (no k tail), \
+     an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), \
      `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
 );
 small_rows_work!(
@@ -1230,7 +1247,7 @@ small_rows_work!(
     BINDS_SMALL_ROWS_EXACT,
     "mHC selector shape (BF16 activation, M <= 32), decode / speculative verify row counts. Grid y = N pins N; \
      grid x = ceil(M/17) is 1 for M <= 17 and the weight match (by M) binds M exactly (the 17-row fused mHC \
-     phi) and K. Admitted on gfx1201 only, K % 512 == 0 (no k tail), `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled \
+     phi) and K. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled \
      routes. Bytes = A + X + Y extents (X is 2 bytes per element)."
 );
 small_rows_work!(
@@ -1238,7 +1255,7 @@ small_rows_work!(
     GEMM_BF16_XBF16_SMALL_ROWS_S4,
     BINDS_SMALL_ROWS_CHUNKED,
     "mHC selector shape (BF16 activation, M <= 32), 4 rows per CTA. Grid y = ceil(N/4) leaves N in an interval \
-     of 4: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 only, K % 512 == 0 (no k tail), \
+     of 4: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), \
      `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled routes. Bytes = A + X + Y extents."
 );
 small_rows_work!(
@@ -1246,7 +1263,7 @@ small_rows_work!(
     GEMM_BF16_XBF16_SMALL_ROWS_S8,
     BINDS_SMALL_ROWS_CHUNKED,
     "mHC selector shape (BF16 activation, M <= 32), 8 rows per CTA (prefill row counts). Grid y = ceil(N/8) \
-     leaves N in an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 only, K % 512 == 0 (no k tail), \
+     leaves N in an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), \
      `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled routes. Bytes = A + X + Y extents."
 );
 
@@ -2528,59 +2545,67 @@ mod tests {
     #[test]
     fn small_rows_grids_and_layouts_follow_the_launcher() {
         for (abi, _, symbol, nt, outputs, block, x_format) in small_rows_cases() {
-            let ex = export(abi, Arch::Gfx1201, symbol);
-            assert_eq!(abi.exports.len(), 1, "{symbol}: gfx1201 only");
-            assert_eq!(ex.block, [block, 1, 1], "{symbol}");
-            assert_eq!(ex.dynamic_lds, 0);
-            assert_eq!(ex.group_segment_fixed, 0);
-            assert!(
-                abi.hidden.is_empty(),
-                "{symbol}: the kernels read no blockDim"
-            );
-            assert_eq!(abi.operands[1].format, x_format, "{symbol}: B format");
             assert_eq!(
-                abi.operands[0].format, FORMAT_BF16_FLAT,
-                "{symbol}: A format"
+                abi.exports.iter().map(|e| e.arch).collect::<Vec<_>>(),
+                [Arch::Gfx1201, Arch::Gfx1100],
+                "{symbol}: gfx1201 and gfx1100 exports"
             );
-            // Launcher grid: [ceil(M/outputs), ceil(N/NT)] at the Raon router (M=128) and selector (M=17).
-            for (m, n) in [(128u64, 1u64), (128, 9), (128, 512), (17, 33), (17, 513)] {
-                let wg = eval_grid(abi, ex, &[("M", m), ("K", 2560), ("N", n)]);
-                assert_eq!(
-                    wg,
-                    [m.div_ceil(outputs), n.div_ceil(nt), 1],
-                    "{symbol} M={m} N={n}"
+            for arch in [Arch::Gfx1201, Arch::Gfx1100] {
+                let ex = export(abi, arch, symbol);
+                assert_eq!(ex.block, [block, 1, 1], "{symbol}");
+                assert_eq!(ex.dynamic_lds, 0);
+                assert_eq!(ex.group_segment_fixed, 0);
+                assert!(
+                    abi.hidden.is_empty(),
+                    "{symbol}: the kernels read no blockDim"
                 );
+                assert_eq!(abi.operands[1].format, x_format, "{symbol}: B format");
+                assert_eq!(
+                    abi.operands[0].format, FORMAT_BF16_FLAT,
+                    "{symbol}: A format"
+                );
+                // Launcher grid: [ceil(M/outputs), ceil(N/NT)] at the Raon router (M=128) and selector (M=17).
+                for (m, n) in [(128u64, 1u64), (128, 9), (128, 512), (17, 33), (17, 513)] {
+                    let wg = eval_grid(abi, ex, &[("M", m), ("K", 2560), ("N", n)]);
+                    assert_eq!(
+                        wg,
+                        [m.div_ceil(outputs), n.div_ceil(nt), 1],
+                        "{symbol} M={m} N={n}"
+                    );
+                }
+                // The interval each grid axis pins contains the launched value.
+                let (lo, hi) = interval(&ex.grid[0], 128u64.div_ceil(outputs), "M");
+                assert!(
+                    (lo..=hi).contains(&128),
+                    "{symbol}: M interval [{lo}, {hi}]"
+                );
+                let (lo, hi) = interval(&ex.grid[1], 9u64.div_ceil(nt), "N");
+                assert!((lo..=hi).contains(&9), "{symbol}: N interval [{lo}, {hi}]");
+                let consts = |name: &str| ex.consts.iter().find(|(n, _)| *n == name).unwrap().1;
+                assert_eq!(consts("NT"), nt, "{symbol}");
+                assert_eq!(consts("NW") * consts("OS"), outputs, "{symbol}");
+                assert_eq!(consts("NW") * 32, u64::from(block), "{symbol}");
             }
-            // The interval each grid axis pins contains the launched value.
-            let (lo, hi) = interval(&ex.grid[0], 128u64.div_ceil(outputs), "M");
-            assert!(
-                (lo..=hi).contains(&128),
-                "{symbol}: M interval [{lo}, {hi}]"
-            );
-            let (lo, hi) = interval(&ex.grid[1], 9u64.div_ceil(nt), "N");
-            assert!((lo..=hi).contains(&9), "{symbol}: N interval [{lo}, {hi}]");
-            let consts = |name: &str| ex.consts.iter().find(|(n, _)| *n == name).unwrap().1;
-            assert_eq!(consts("NT"), nt, "{symbol}");
-            assert_eq!(consts("NW") * consts("OS"), outputs, "{symbol}");
-            assert_eq!(consts("NW") * 32, u64::from(block), "{symbol}");
         }
         // Router shape (M = 128) and selector shape (M = 17) at N = 512 on the 8-row profiles.
-        check_grid(
-            &GEMM_BF16_XF32_SMALL_ROWS_R8,
-            Arch::Gfx1201,
-            "gemm_bf16_xf32_small_rows_r8",
-            [2 * 256, 64],
-            &[("M", 128), ("K", 2560), ("N", 512)],
-            [Some("M"), Some("N")],
-        );
-        check_grid(
-            &GEMM_BF16_XBF16_SMALL_ROWS_S8,
-            Arch::Gfx1201,
-            "gemm_bf16_xbf16_small_rows_s8",
-            [128, 64],
-            &[("M", 17), ("K", 10240), ("N", 512)],
-            [Some("M"), Some("N")],
-        );
+        for arch in [Arch::Gfx1201, Arch::Gfx1100] {
+            check_grid(
+                &GEMM_BF16_XF32_SMALL_ROWS_R8,
+                arch,
+                "gemm_bf16_xf32_small_rows_r8",
+                [2 * 256, 64],
+                &[("M", 128), ("K", 2560), ("N", 512)],
+                [Some("M"), Some("N")],
+            );
+            check_grid(
+                &GEMM_BF16_XBF16_SMALL_ROWS_S8,
+                arch,
+                "gemm_bf16_xbf16_small_rows_s8",
+                [128, 64],
+                &[("M", 17), ("K", 10240), ("N", 512)],
+                [Some("M"), Some("N")],
+            );
+        }
     }
 
     #[test]
@@ -2589,30 +2614,32 @@ mod tests {
         let text = std::fs::read_to_string(root.join("crates/rdna-compute/src/gemm.rs")).unwrap();
         assert!(text.contains("BF16_SMALL_ROWS_K_MULTIPLE: usize = 512;"));
         for (abi, _, symbol, ..) in small_rows_cases() {
-            let ex = export(abi, Arch::Gfx1201, symbol);
-            let Some(Rule::MultipleOf(expr, m)) = abi
-                .domain
-                .iter()
-                .map(|d| d.rule)
-                .find(|r| matches!(r, Rule::MultipleOf(..)))
-            else {
-                panic!("{symbol}: no K % 512 domain rule");
-            };
-            assert_eq!(m, 512, "{symbol}");
-            // The rule's expression is K: it admits the Raon K and rejects the ragged K the launcher refuses.
-            for (k, admitted) in [
-                (512u64, true),
-                (2560, true),
-                (5120, true),
-                (10240, true),
-                (40, false),
-                (511, false),
-                (513, false),
-                (2600, false),
-            ] {
-                let v = eval(&expr, abi, ex, &[128, k, 64]).unwrap();
-                assert_eq!(v, k, "{symbol}: the rule is over K");
-                assert_eq!(v.is_multiple_of(m), admitted, "{symbol}: K = {k}");
+            for arch in [Arch::Gfx1201, Arch::Gfx1100] {
+                let ex = export(abi, arch, symbol);
+                let Some(Rule::MultipleOf(expr, m)) = abi
+                    .domain
+                    .iter()
+                    .map(|d| d.rule)
+                    .find(|r| matches!(r, Rule::MultipleOf(..)))
+                else {
+                    panic!("{symbol}: no K % 512 domain rule");
+                };
+                assert_eq!(m, 512, "{symbol}");
+                // The rule's expression is K: it admits the Raon K and rejects the ragged K the launcher refuses.
+                for (k, admitted) in [
+                    (512u64, true),
+                    (2560, true),
+                    (5120, true),
+                    (10240, true),
+                    (40, false),
+                    (511, false),
+                    (513, false),
+                    (2600, false),
+                ] {
+                    let v = eval(&expr, abi, ex, &[128, k, 64]).unwrap();
+                    assert_eq!(v, k, "{symbol}: the rule is over K");
+                    assert_eq!(v.is_multiple_of(m), admitted, "{symbol}: K = {k}");
+                }
             }
         }
     }

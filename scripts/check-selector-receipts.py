@@ -29,10 +29,8 @@ from pathlib import Path
 
 SCHEMA = "pm.selector_receipt.v1"
 BASELINE_REL = "scripts/selector-receipts-baseline.txt"
-# (path, NAME) pairs awaiting a receipt from a card job. BF16_TILED_ROWS_MIN_N carries the floor of
-# the removed F32 selector over to the BF16-weight kernels (same tiled shape, bit-identical outputs);
-# its tiled-vs-batched crossover is not re-measured for BF16 yet.
-PENDING: set = {("crates/hipfire-dispatch/src/pipeline/stream_mix.rs", "BF16_TILED_ROWS_MIN_N")}
+# (path, NAME) pairs awaiting a receipt from a card job (none pending).
+PENDING: set = set()
 NAME_RE = re.compile(
     r"(^|_)(MIN|MAX)_(N|M|ROWS|TOKENS|BATCH|T)($|_)"
     r"|ROWS_MIN|MIN_ROWS|MIN_TOKENS|ROWS_MAX|MAX_ROWS"
