@@ -27893,8 +27893,11 @@ impl Gpu {
         if self.gemv_q8_0_staged_rows_supported(k, self.route_rows(n)) {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
         }
-        if self.gemv_q8_0_rows_supported(k, n) {
-            return self.gemv_q8_0_rows(a_raw, x, y, m, k, n);
+        if self.arch_caps.is_gfx1151()
+            && k > crate::gemv::Q8_0_DECODE_WIDE_MAX_K
+            && (1..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&self.route_rows(n))
+        {
+            return self.gemv_q8_0_rows_exact(a_raw, x, y, m, k, n);
         }
         if exact_verify {
             if n > 8 && self.gemv_q8_0_rowtile_supported(k, n) {

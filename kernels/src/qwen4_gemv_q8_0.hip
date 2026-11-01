@@ -414,10 +414,10 @@ static __device__ __forceinline__ void gemv_q8_0_rows_tile(
             for (int w = 0; w < W; ++w) {
                 const unsigned char* block =
                     reinterpret_cast<const unsigned char*>(staged[w]) + sub * 34;
-                float d = (float)*((const _Float16*)block);
-                signed char qval = (signed char)block[2 + lane];
+                // dq is exact (f16 * int8); gemv_q8_0 contracts its update to this fma.
+                const float dq = (float)*((const _Float16*)block) * (float)(signed char)block[2 + lane];
 #pragma unroll
-                for (int r = 0; r < R; ++r) sum[w][r] += d * (float)qval * xv[r];
+                for (int r = 0; r < R; ++r) sum[w][r] = __builtin_fmaf(dq, xv[r], sum[w][r]);
             }
         }
         __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
@@ -429,10 +429,9 @@ static __device__ __forceinline__ void gemv_q8_0_rows_tile(
 #pragma unroll
         for (int w = 0; w < W; ++w) {
             const unsigned char* block = reinterpret_cast<const unsigned char*>(src[w]) + bi * 34;
-            float d = (float)*((const _Float16*)block);
-            signed char qval = (signed char)block[2 + lane];
+            const float dq = (float)*((const _Float16*)block) * (float)(signed char)block[2 + lane];
 #pragma unroll
-            for (int r = 0; r < R; ++r) sum[w][r] += d * (float)qval * xv[r];
+            for (int r = 0; r < R; ++r) sum[w][r] = __builtin_fmaf(dq, xv[r], sum[w][r]);
         }
     }
 #pragma unroll
