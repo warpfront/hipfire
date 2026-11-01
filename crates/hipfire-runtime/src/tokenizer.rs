@@ -52,9 +52,15 @@ const RAON_PRETOK_PATTERN: &str = r" ?[一-龥぀-ゟ゠-ヿ]+| ?(?:(?:(?![一-�
 /// is a maximal `\p{N}+` run that the splitter cuts right-aligned, and the
 /// whitespace tail alternatives are folded into the `hf_ws_tail` group.
 const RAON_PRETOK_RUST_REGEX: &str = r" ?[一-龥぀-ゟ゠-ヿ]+| ?(?:[\p{L}--[一-龥぀-ゟ゠-ヿ]]\p{M}*)+(?: (?:[\p{L}--[一-龥぀-ゟ゠-ヿ]]\p{M}*)+)*|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|(?P<hf_ws_tail>\s+)";
-/// Marker of the Raon CJK class: any pattern containing it that is not the
-/// exact literal above is refused at load (never canonical-GPT-2 fallback).
+/// Marker of the Raon CJK class. A pattern containing it plus a lookahead
+/// needs the Raon emulation: anything but the exact literal above is refused
+/// at load (never canonical-GPT-2 fallback). A plain CJK class without
+/// lookahead (DeepSeek V3/V4 `[一-龥぀-ゟ゠-ヿ]+`) takes the general path.
 const RAON_PRETOK_MARKER: &str = "[一-龥";
+
+fn raon_like(pattern: &str) -> bool {
+    pattern.contains(RAON_PRETOK_MARKER) && (pattern.contains("(?!") || pattern.contains("(?="))
+}
 
 /// Bookkeeping for the emulated `\s+(?!\S)` alternative.
 struct WsTail {
@@ -134,7 +140,7 @@ impl PretokSplitter {
                 drop_gaps,
             });
         }
-        if pattern.contains(RAON_PRETOK_MARKER) {
+        if raon_like(pattern) {
             return Err(
                 "CJK-class pre-tokenizer regex is not the exact supported Raon pattern".into(),
             );
@@ -322,7 +328,7 @@ fn pretokenizer_from_hf_json(
                 };
                 let behavior = p.get("behavior").and_then(|v| v.as_str());
                 let invert = p.get("invert").and_then(|v| v.as_bool()).unwrap_or(false);
-                if re.contains(RAON_PRETOK_MARKER) {
+                if raon_like(re) {
                     if re != RAON_PRETOK_PATTERN || (behavior, invert) != (Some("Isolated"), false)
                     {
                         *fatal = Some(format!(
@@ -377,7 +383,7 @@ fn pretokenizer_from_hf_json(
     for (pattern, drop_gaps) in &patterns {
         match PretokSplitter::compile_with_mode(pattern, *drop_gaps) {
             Ok(s) => splitters.push(s),
-            Err(e) if pattern.contains(RAON_PRETOK_MARKER) => {
+            Err(e) if raon_like(pattern) => {
                 return Err(TokenizerError::UnsupportedPreTokenizer { reason: e });
             }
             Err(e) => {
@@ -4997,6 +5003,21 @@ mod raon_pretok_tests {
             e,
             Err(TokenizerError::UnsupportedPreTokenizer { .. })
         ));
+    }
+
+    /// DeepSeek V3/V4 standalone CJK `Split` (no lookahead) must load on the
+    /// general path, not trip the Raon exact-or-error rule (HIPF-233).
+    #[test]
+    fn plain_cjk_split_is_not_raon() {
+        let pre = pretokenizer_from_hf_json(&json!({"type":"Sequence","pretokenizers":[
+            split_node("\\p{N}{1,3}", "Isolated", false),
+            split_node("[一-龥぀-ゟ゠-ヿ]+", "Isolated", false),
+            {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}
+        ]}))
+        .unwrap()
+        .expect("DS4 pre-tokenizer selected");
+        assert_eq!(pre.splitters.len(), 2);
+        assert!(pre.splitters[1].number_groups.is_none());
     }
 
     fn hf_path() -> Option<std::path::PathBuf> {
