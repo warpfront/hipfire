@@ -48,6 +48,7 @@
 //! | `f32.flat`, `f32.rows_n_k`, `f32.rows_x_s01`, `f32.m`, `f32.n_x_m` | uniform f32 in [-1, 1) |
 //! | `f16.flat` | uniform f16 in [-1, 1) |
 //! | `bf16.flat`, `bf16.token_head_view` | uniform bf16 in [-1, 1) over the whole extent (a strided view's padding included) |
+//! | `i8.mirror_plane_view` | INT8 expanded-mirror plane of the Q8 flash prefill (operand `ka`: width `wa`, `vv`: width `dv`; `n_heads` from the shape): `max_rows` rows of `n_heads*(w+2)` B, each `n_heads*w` seeded i8 codes uniform in [-127, 127] then `n_heads` f16 scales, finite and positive, `(0.5 + 0.5 u)/127`, u in [0, 1) |
 //! | `ggml.q8_0.34` | blocks of 34 B: f16 scale in [0.001, 0.021) + 32 random i8 codes |
 //! | `moe_grouped.expert_ptr_table.u64` | `n_experts` slabs of `M x K/256` MQ4G256V2 groups (136 B, symmetric `zp = f16(-8 sc)`, `moe::synth_rows`), the table holds their device addresses |
 //! | `moe_grouped.expert_tile_ids.i32.per_tile16`, `...sorted_slot_index.i32.minus1_padding`, `...expert_offsets.i32.e_plus_1` | the ONE grouped routing plan: `tokens` tokens routed to `topk` of `n_experts` experts (uniform Gumbel-top-k, shape-seeded), scattered like `moe_scatter_fused_k8` (`moe::scatter`) |
@@ -408,6 +409,9 @@ pub enum Recipe {
     F16,
     Bf16,
     Q8_0,
+    /// INT8 mirror plane (`[n_heads*w codes | n_heads f16 scales]` rows); geometry from `n_heads` and the
+    /// operand's width param, see [`ContractNode::q8_plane_geom`].
+    Q8Plane,
     /// u64 table of expert slab addresses (slabs of MQ4G256V2 groups).
     ExpertPtrTable,
     TileIds,
@@ -451,6 +455,7 @@ pub fn recipe_for(format: FormatId, access: Access) -> Result<Recipe> {
         "f32.flat" | "f32.rows_n_k" | "f32.rows_x_s01" | "f32.m" | "f32.n_x_m" => Recipe::F32,
         "f16.flat" => Recipe::F16,
         "bf16.flat" | "bf16.token_head_view" => Recipe::Bf16,
+        "i8.mirror_plane_view" => Recipe::Q8Plane,
         "ggml.q8_0.34" => Recipe::Q8_0,
         "moe_grouped.expert_ptr_table.u64" => Recipe::ExpertPtrTable,
         "moe_grouped.expert_tile_ids.i32.per_tile16" => Recipe::TileIds,
@@ -545,7 +550,27 @@ fn gen_bytes(r: Recipe, bytes: usize, seed: u64, vocab: u64) -> Vec<u8> {
         | Recipe::TileIds
         | Recipe::SortedSlots
         | Recipe::ExpertOffsets
-        | Recipe::DeviceScalar => {}
+        | Recipe::DeviceScalar
+        | Recipe::Q8Plane => {}
+    }
+    out.resize(bytes, 0);
+    out
+}
+
+/// An INT8 mirror plane of `bytes` bytes: rows of `row_bytes` = `[code_bytes codes | f16 scales]`. Codes are
+/// uniform in [-127, 127] (the quantizer never emits -128); each scale is `(0.5 + 0.5 u) / 127`, u in [0, 1),
+/// as f16, so `code * scale` spans about +-1 like the bf16 recipes.
+fn gen_q8_plane(bytes: usize, row_bytes: usize, code_bytes: usize, seed: u64) -> Vec<u8> {
+    let mut rng = Xs64::new(seed);
+    let mut out = Vec::with_capacity(bytes);
+    for _ in 0..bytes / row_bytes.max(1) {
+        out.extend(
+            (0..code_bytes).map(|_| (((rng.next_u64() >> 33) % 255) as i64 - 127) as i8 as u8),
+        );
+        for _ in 0..(row_bytes - code_bytes) / 2 {
+            let u = (rng.unit() + 1.0) * 0.5;
+            out.extend_from_slice(&f16_bits((0.5 + 0.5 * u) / 127.0).to_le_bytes());
+        }
     }
     out.resize(bytes, 0);
     out
@@ -994,6 +1019,28 @@ impl ContractNode {
                 field_offset: off,
             });
         }
+        for o in operands.iter().filter(|o| o.recipe == Recipe::Q8Plane) {
+            let w = match o.name {
+                "ka" => "wa",
+                "vv" => "dv",
+                n => {
+                    return Err(format!(
+                        "{} operand {n}: the i8.mirror_plane_view recipe knows the planes `ka` (width wa) and `vv` (width dv) only",
+                        base.abi.id
+                    )
+                    .into())
+                }
+            };
+            for k in ["n_heads", w] {
+                if base.abi.param_index(k).is_none() {
+                    return Err(format!(
+                        "{} operand {}: the i8.mirror_plane_view recipe needs the param `{k}`",
+                        base.abi.id, o.name
+                    )
+                    .into());
+                }
+            }
+        }
         if operands.iter().any(|o| o.recipe == Recipe::ExpertPtrTable) {
             for k in ["M", "K", "n_experts"] {
                 if base.abi.param_index(k).is_none() {
@@ -1275,12 +1322,35 @@ impl ContractNode {
         if o.recipe == Recipe::ExpertPtrTable {
             return vec![0u8; o.bytes];
         }
-        gen_bytes(
-            o.recipe,
-            o.bytes,
-            seed ^ fnv(o.name) ^ ((set as u64) << 40),
-            self.vocab(),
-        )
+        let seed = seed ^ fnv(o.name) ^ ((set as u64) << 40);
+        if o.recipe == Recipe::Q8Plane {
+            let (row_bytes, code_bytes) = self
+                .q8_plane_geom(o.name)
+                .expect("Q8Plane geometry is checked at build");
+            return gen_q8_plane(o.bytes, row_bytes, code_bytes, seed);
+        }
+        gen_bytes(o.recipe, o.bytes, seed, self.vocab())
+    }
+
+    /// `(row bytes, code bytes per row)` of the INT8 mirror plane operand `name`: `ka` has width `wa`, `vv`
+    /// width `dv`; a row is `n_heads*(w+2)` bytes, its codes `n_heads*w`.
+    fn q8_plane_geom(&self, name: &str) -> Result<(usize, usize)> {
+        let w = match name {
+            "ka" => "wa",
+            "vv" => "dv",
+            _ => {
+                return Err(format!(
+                    "operand {name}: the i8.mirror_plane_view recipe knows the planes `ka` (width wa) and `vv` (width dv) only"
+                ))
+            }
+        };
+        let get = |k: &str| {
+            param_value(self.base.abi, &self.params, k).ok_or_else(|| {
+                format!("operand {name}: the i8.mirror_plane_view recipe needs the param `{k}`")
+            })
+        };
+        let (h, w) = (get("n_heads")? as usize, get(w)? as usize);
+        Ok((h * (w + 2), h * w))
     }
 
     /// The explicit kernarg image (padded to 16 B) for `arm` with `addrs[i]` the base address of operand
@@ -2518,6 +2588,133 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("i32"), "{e}");
+    }
+
+    const FLASH_Q8: &str = "contract:latent_attention_flash_prefill_q8";
+    /// 8 heads: plane rows of 8 * 130 = 1040 B (a multiple of 16).
+    const FLASH_Q8_SHAPE: &str =
+        "n_heads=8,wa=128,wb=64,dv=128,pos_offset=0,max_rows=200,ka_tok=1040,\
+        ka_head=128,kb_tok=576,kb_head=0,v_tok=1040,v_head=128,scale_bits=1033096506,round_y=1";
+
+    fn flash_q8(extra: &str) -> String {
+        format!("{FLASH_Q8_SHAPE},{extra}")
+    }
+
+    #[test]
+    fn flash_q8_plane_and_view_recipes() {
+        let n = node(FLASH_Q8, &flash_q8("n_rows=48,prefix=100"));
+        let by_name = |s: &str| n.operands.iter().position(|o| o.name == s).unwrap();
+        let extent = (200 - 1) * 1040 + 8 * 130;
+        assert_eq!(extent, 200 * 1040);
+        let mut planes = Vec::new();
+        for name in ["ka", "vv"] {
+            let i = by_name(name);
+            assert_eq!(n.operands[i].recipe, Recipe::Q8Plane, "{name}");
+            assert_eq!(n.operands[i].bytes, extent, "{name} extent");
+            assert!(!n.operands[i].recipe.is_index());
+            let b = n.host_operand(i, 3, 0);
+            assert_eq!(b.len(), extent, "{name} fill covers the whole extent");
+            assert_eq!(b, n.host_operand(i, 3, 0), "{name} deterministic");
+            assert_ne!(b, n.host_operand(i, 3, 1), "{name} pool sets differ");
+            for row in b.chunks_exact(1040) {
+                let (codes, scales) = row.split_at(8 * 128);
+                assert!(
+                    codes.iter().all(|&c| (c as i8) >= -127),
+                    "{name}: -128 code"
+                );
+                assert!(
+                    codes.iter().any(|&c| (c as i8) > 100)
+                        && codes.iter().any(|&c| (c as i8) < -100)
+                );
+                assert_eq!(scales.len(), 8 * 2);
+                for c in scales.chunks_exact(2) {
+                    let v = half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+                    assert!(
+                        v.is_finite()
+                            && v > 0.0
+                            && (0.5 / 127.0 - 1e-5..=1.0 / 127.0 + 1e-5).contains(&v),
+                        "{name}: scale {v}"
+                    );
+                }
+            }
+            planes.push(b);
+        }
+        assert_ne!(
+            planes[0], planes[1],
+            "the planes have different operand seeds"
+        );
+        let kb = by_name("kb");
+        assert_eq!(n.operands[kb].recipe, Recipe::Bf16);
+        assert_eq!(n.operands[kb].bytes, ((200 - 1) * 576 + 64) * 2);
+        let p = by_name("pos_ptr");
+        assert_eq!(n.operands[p].recipe, Recipe::DeviceScalar);
+        assert_eq!(n.host_operand(p, 3, 0), 100i32.to_le_bytes().to_vec());
+        // the emulator case maps the planes at their extent, the scale bytes after the codes of row 0
+        let c = n.emu_case(1).unwrap();
+        for name in ["ka", "vv"] {
+            let r = c.bufs.iter().find(|b| b.name == name).unwrap();
+            assert_eq!(r.bytes.len(), extent, "{name} region");
+            let scale0 =
+                half::f16::from_bits(u16::from_le_bytes([r.bytes[8 * 128], r.bytes[8 * 128 + 1]]))
+                    .to_f32();
+            assert!(
+                scale0 > 0.0 && scale0 <= 1.0 / 127.0 + 1e-5,
+                "{name}: {scale0}"
+            );
+            assert_eq!(r.bytes, n.host_operand(by_name(name), 1, 0));
+        }
+    }
+
+    #[test]
+    fn flash_q8_domain_geometry_and_work() {
+        for shape in [
+            flash_q8("n_rows=48").replace("ka_tok=1040", "ka_tok=1024"),
+            flash_q8("n_rows=48").replace("v_tok=1040", "v_tok=1024"),
+            flash_q8("n_rows=48").replace("ka_head=128", "ka_head=256"),
+            flash_q8("n_rows=48").replace("v_head=128", "v_head=256"),
+            flash_q8("n_rows=48").replace("n_heads=8", "n_heads=2"),
+            flash_q8("n_rows=48").replace("wa=128", "wa=64"),
+            flash_q8("n_rows=48,prefix=153"),
+        ] {
+            assert!(
+                matches!(build(FLASH_Q8, &shape), Err(BuildError::Domain(_))),
+                "{shape}"
+            );
+        }
+        // n_heads = 2 with tok 260 (the whole plane row) fails the 16-byte alignment rule too
+        let s = flash_q8("n_rows=48")
+            .replace("n_heads=8", "n_heads=2")
+            .replace("1040", "260");
+        assert!(
+            matches!(build(FLASH_Q8, &s), Err(BuildError::Domain(_))),
+            "{s}"
+        );
+        assert!(build(FLASH_Q8, &flash_q8("n_rows=48,prefix=152")).is_ok());
+        assert!(matches!(
+            build(FLASH_Q8, &flash_q8("prefix=152,rows=49")),
+            Err(BuildError::Domain(_))
+        ));
+        let n = node(FLASH_Q8, &flash_q8("n_rows=100,prefix=100"));
+        let bf = node(
+            FLASH,
+            &flash("n_rows=100,prefix=100").replace("n_heads=2", "n_heads=8"),
+        );
+        assert_eq!(n.work().flops, bf.work().flops);
+        assert_eq!(n.rows(), Some(("n_rows", 100)));
+        let (prefix, rows, h) = (100u64, 100u64, 8u64);
+        assert_eq!(
+            n.bytes_per_call(),
+            4 * rows * h * 320 + (prefix + rows) * h * (130 + 130) + 2 * (prefix + rows) * h * 64
+        );
+        let g = n.arm_geometry(&n.base).unwrap();
+        assert_eq!((g.grid, g.block, g.lds), ([2, 8, 1], [128, 1, 1], 61440));
+        // both archs resolve
+        let o = node(FLASH_Q8, &flash_q8("n_rows=48,arch=gfx1100"));
+        assert_eq!(o.arch(), "gfx1100");
+        assert_eq!(o.base.export.arch, Arch::Gfx1100);
+        assert_eq!(o.base.export.symbol, "latent_attention_flash_prefill_q8");
+        assert_eq!(o.arm_geometry(&o.base).unwrap().lds, 61440);
+        assert_eq!(node(FLASH_Q8, &flash_q8("n_rows=48")).arch(), "gfx1201");
     }
 
     #[test]

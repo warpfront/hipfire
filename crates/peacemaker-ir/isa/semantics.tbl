@@ -67,6 +67,7 @@ s_cbranch_scc1	control
 s_cbranch_vccnz	control
 s_cbranch_vccz	control
 s_clause	wait
+s_clz_i32_u32	alu
 s_cmp_eq_u32	alu
 s_cmp_eq_u64	alu
 s_cmp_ge_i32	alu
