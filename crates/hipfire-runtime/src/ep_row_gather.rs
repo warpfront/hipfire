@@ -1159,6 +1159,26 @@ pub(crate) mod tests {
         assert!(s.check_call_slots(81).is_err());
     }
 
+    /// A2: the 32-row verify capacity (320 slots of 10-expert top-k rows)
+    /// validates, admits every call of 9..=32 rows, refuses 33, and a crossing
+    /// tag carries the 320-slot count without truncation.
+    #[test]
+    fn wide_verify_capacity_320_slots() {
+        let s = spec(2, 320, 2048 * 4);
+        assert!(s.validate().is_ok());
+        assert_eq!(s.buffer_bytes(), 320 * 8192);
+        for rows in 1..=32 {
+            assert!(s.check_call_slots(rows * 10).is_ok(), "{rows} rows");
+        }
+        assert!(s.check_call_slots(33 * 10).is_err());
+        assert!(s.check_buffer_len(0, 320 * 8192).is_ok());
+        assert!(s.check_buffer_len(0, 80 * 8192).is_err());
+        for rows in [9usize, 16, 24, 32] {
+            let tag = CrossingTag::new(GatherKind::ExpertModulo, 1, 7, rows * 10, 3);
+            assert_eq!(tag.slots(), rows * 10);
+        }
+    }
+
     #[test]
     fn device_waits_require_explicit_opt_in() {
         assert!(!EpRowGather::builder(spec(2, 10, 10240)).device_waits);

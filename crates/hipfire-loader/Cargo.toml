@@ -85,6 +85,10 @@ name = "fn_ep_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "fn_ep_wide_gather_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "fn_mesh_lane_oracle"
 required-features = ["lab"]
 

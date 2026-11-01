@@ -1798,7 +1798,8 @@ fn forward_lanes_scoped(
     // forward over the rank's replicated trunk (the row gather must already be
     // installed; checked before any launch). A PREFILL wave under EP is the
     // exact joint full-table prefill instead (`forward_wave_ep`).
-    let ep_lane_step = ep_lane(fwd.ep.as_ref(), &fwd.scratch)?.is_some();
+    let ep_gather_cap = ep_lane(fwd.ep.as_ref(), &fwd.scratch)?.map(|ep| ep.rows_cap);
+    let ep_lane_step = ep_gather_cap.is_some();
     let ep_wave = ep_lane_step && out.prefill();
     // The route of the wave in flight (set by `ep_wave_run`); `None` outside a wave.
     let wave_route = fwd.wave_route;
@@ -2153,7 +2154,7 @@ fn forward_lanes_scoped(
             } else {
                 seg.rows
             };
-            ep_lane_moe_rows(seg.rows, rr)?;
+            ep_lane_moe_rows(seg.rows, rr, ep_gather_cap.unwrap_or(0))?;
         }
         all_segs.iter().map(|seg| seg.rows).collect()
     } else if prefill {
@@ -2954,7 +2955,7 @@ fn forward_lanes_scoped(
                             // step's alternation as the expanded-row scratch.
                             let seal_scratch = match (&ep_lane, &ep_seg_scratch) {
                                 (Some(ep), Some(per_seg)) => {
-                                    ep_lane_moe_rows(r, rr)?;
+                                    ep_lane_moe_rows(r, rr, ep.rows_cap)?;
                                     bind_ep_lane_gather(&mut moe, r, ep.gather, ep.shared_down);
                                     let buffer = ep_lane_buffer(ep_invocations);
                                     ep_invocations += 1;
@@ -3316,6 +3317,143 @@ fn forward_lanes_scoped(
             }
         }
     }
+}
+
+/// Lab probe (A2, `ep_moe_layer_probe`): run ONE trunk MoE layer of this EP
+/// rank over the F32 normalized input rows `input` (`rows * hidden`), cut into
+/// consecutive `groups` of rows, each group one gathered MoE invocation exactly
+/// as a lane step seals it (`ep_lane_moe_rows`, `bind_ep_lane_gather`, the
+/// alternating gather buffer from `start_ordinal`), with the verify scope
+/// `scope_rows` open (`0` = closed, the lane step's own scope). Returns every
+/// group's `ffn_output` rows, bytes, concatenated in row order, and whether the
+/// layer runs balanced ownership. Every rank of the mesh must run it with the
+/// same arguments (the gather is a collective).
+pub(crate) fn ep_moe_probe_rank(
+    gpu: &mut Gpu,
+    bundle: &mut Qwen4Bundle,
+    layer: usize,
+    input: &[f32],
+    groups: &[usize],
+    start_ordinal: usize,
+    scope_rows: usize,
+) -> Result<(Vec<u8>, bool), Qwen4GpuForwardError> {
+    let mut forward = bundle
+        .execution
+        .take()
+        .ok_or_else(|| invalid("Qwen4 forward resources are not attached"))?;
+    let prior_scope = std::mem::replace(&mut gpu.qwen4_scope, true);
+    let prior_wide = gpu.set_wide_verify_rows(scope_rows);
+    let result = ep_moe_probe_scoped(
+        gpu,
+        &mut forward,
+        bundle,
+        layer,
+        input,
+        groups,
+        start_ordinal,
+    );
+    gpu.set_wide_verify_rows(prior_wide);
+    gpu.qwen4_scope = prior_scope;
+    bundle.execution = Some(forward);
+    result
+}
+
+fn ep_moe_probe_scoped(
+    gpu: &mut Gpu,
+    fwd: &mut Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    layer: usize,
+    input: &[f32],
+    groups: &[usize],
+    start_ordinal: usize,
+) -> Result<(Vec<u8>, bool), Qwen4GpuForwardError> {
+    let config = &bundle.config;
+    let dims = program_dims(config);
+    let hidden = config.hidden_size;
+    let total: usize = groups.iter().sum();
+    if groups.is_empty() || input.len() != total * hidden {
+        return Err(invalid(format!(
+            "EP MoE probe: {} input values for {total} rows of {hidden}",
+            input.len()
+        )));
+    }
+    let ep = ep_lane(fwd.ep.as_ref(), &fwd.scratch)?
+        .ok_or_else(|| invalid("EP MoE probe needs an EP forward"))?;
+    for &rows in groups {
+        ep_lane_moe_rows(rows, rows, ep.rows_cap)?;
+        if rows > fwd.scratch.max_chunk {
+            return Err(invalid(format!(
+                "EP MoE probe group of {rows} rows exceeds the forward scratch ({} rows)",
+                fwd.scratch.max_chunk
+            )));
+        }
+    }
+    let balanced = fwd.ep_layer_is_balanced(layer);
+    gpu.set_router_row_base(0);
+    let staged = gpu.upload_f32(input, &[input.len()])?;
+    let ctx = DispatchCtx::new(gpu);
+    let scratch = &fwd.scratch;
+    let mut out = Vec::with_capacity(input.len() * std::mem::size_of::<f32>());
+    let mut begin = 0usize;
+    for (index, &rows) in groups.iter().enumerate() {
+        let desc = layer_desc(
+            &bundle.weights,
+            bundle
+                .weights
+                .layer(layer)
+                .ok_or_else(|| invalid(format!("EP MoE probe layer {layer} is not owned")))?,
+            lane_layer_moe(fwd.ep.as_ref(), &fwd.moe, layer),
+            config,
+            &fwd.decode_q8,
+            rows,
+            gpu.few_row_limit(),
+            None,
+        )?;
+        let Qwen4FfnBinding::Moe(moe) = desc.ffn else {
+            return Err(invalid(format!(
+                "EP MoE probe layer {layer} is not a MoE layer"
+            )));
+        };
+        let mut moe = moe;
+        if let Some(runtime) = lane_layer_moe(fwd.ep.as_ref(), &fwd.moe, layer) {
+            moe.routed_experts = runtime.routed_view(true, rows, rows, false, 8);
+        }
+        bind_ep_lane_gather(&mut moe, rows, ep.gather, ep.shared_down);
+        let router_logits = matrix_view(&scratch.router_logits, rows, router_columns(dims))?;
+        let base = crate::gpu_forward::layer_scratch(scratch, &router_logits);
+        let buffer = ep_lane_buffer(start_ordinal + index);
+        let seal_scratch = Qwen4LayerScratch {
+            moe_down_expanded: ep.buffers[buffer],
+            ..base
+        };
+        let sealed =
+            seal_moe_for_layer(&ctx, dims, moe, &seal_scratch, rows, rows).map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("seal probe MoE: {error:?}"))
+            })?;
+        let source = view(&staged, begin * hidden, rows * hidden);
+        let destination = view(&scratch.hc_mixed, 0, rows * hidden);
+        gpu.copy_d2d(&source, &destination, destination.byte_size())?;
+        let steps = [
+            Step::Clear(ClearOp {
+                tensor: &scratch.ffn_output,
+                elements: rows * hidden,
+            }),
+            Step::Moe(sealed),
+        ];
+        validate_steps(gpu, &steps).map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("preflight probe MoE: {error:?}"))
+        })?;
+        execute_validated_steps(gpu, &ctx, &steps).map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("execute probe MoE: {error:?}"))
+        })?;
+        gpu.hip.device_synchronize()?;
+        let rows_out = view(&scratch.ffn_output, 0, rows * hidden);
+        out.extend_from_slice(&gpu.download_raw_bytes(&rows_out)?);
+        begin += rows;
+    }
+    drop(ctx);
+    gpu.free_tensor(staged)?;
+    Ok((out, balanced))
 }
 
 /// HC storage of an AR lane step. Both devices of a PP edge must agree.

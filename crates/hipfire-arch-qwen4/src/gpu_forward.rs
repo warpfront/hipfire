@@ -2281,18 +2281,22 @@ pub(crate) const fn ep_lane_shared_down(rows: usize) -> bool {
 }
 
 /// A lane MoE invocation under EP runs the singleton's gathered forward: its
-/// real rows are its routing rows, at most [`QWEN4_EP_GATHER_MAX_ROWS`]. Wider
+/// real rows are its routing rows, at most `cap` ([`qwen4_ep_gather_rows`]). Wider
 /// or re-routed calls would be the full-table chunk route, which a lane step
 /// does not run.
-pub(crate) fn ep_lane_moe_rows(rows: usize, route_rows: usize) -> Result<(), Qwen4GpuForwardError> {
+pub(crate) fn ep_lane_moe_rows(
+    rows: usize,
+    route_rows: usize,
+    cap: usize,
+) -> Result<(), Qwen4GpuForwardError> {
     if rows == 0 {
         return Err(invalid(
             "an EP lane MoE invocation carries at least one row",
         ));
     }
-    if rows > QWEN4_EP_GATHER_MAX_ROWS {
+    if rows > cap {
         return Err(invalid(format!(
-            "an EP lane MoE invocation of {rows} rows exceeds the {QWEN4_EP_GATHER_MAX_ROWS}-row gather cap"
+            "an EP lane MoE invocation of {rows} rows exceeds the {cap}-row gather cap"
         )));
     }
     if route_rows != rows {
@@ -2344,6 +2348,8 @@ pub(crate) struct Qwen4EpLane<'a> {
     pub(crate) gather: &'a dyn MoeRowGather,
     pub(crate) buffers: [&'a GpuTensor; 2],
     pub(crate) shared_down: &'a GpuTensor,
+    /// The gather capacity in rows of this rank's buffers ([`qwen4_ep_gather_rows`]).
+    pub(crate) rows_cap: usize,
 }
 
 /// The runtime a lane MoE invocation of `layer` binds (see
@@ -2478,6 +2484,7 @@ pub(crate) fn ep_lane<'a>(
         gather: gather as &dyn MoeRowGather,
         buffers: [&ep.buffers[0], &ep.buffers[1]],
         shared_down: &scratch.moe_down_expanded,
+        rows_cap: ep.gather_rows,
     }))
 }
 /// Whether a layer's D2 executor is bound for one MoE call: always when no
@@ -2566,6 +2573,48 @@ pub const QWEN4_EP_GATHER_BUFFERS: usize = 4;
 /// Most rows a few-row forward (verify / replay / takeover) may carry through
 /// the EP table + row gather; larger chunks run the full (P2P) table.
 pub const QWEN4_EP_GATHER_MAX_ROWS: usize = 8;
+
+/// Gather capacity (rows) of the verify scope under
+/// [`QWEN4_EP_WIDE_VERIFY_ENV`]: one 32-row lane verify pass (8 lanes x 4 rows).
+/// A row-exactness bound is separate ([`crate::gpu_forward_lanes::LANE_MAX_ROWS`]).
+pub const QWEN4_EP_GATHER_VERIFY_ROWS: usize = 32;
+
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY=1` (developer, default off): size every EP
+/// rank's row-gather buffers, the gather transport's slot capacity and the
+/// balanced-owner slot array for [`QWEN4_EP_GATHER_VERIFY_ROWS`] rows instead of
+/// [`QWEN4_EP_GATHER_MAX_ROWS`]. Capacity only: no route, segmentation or kernel
+/// choice changes with it; off allocates exactly what it always did.
+pub const QWEN4_EP_WIDE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_WIDE_VERIFY";
+
+/// The rows one gathered EP call may carry on this process: 8 by default, 32
+/// with [`QWEN4_EP_WIDE_VERIFY_ENV`]. Every rank reads the same process snapshot.
+pub fn qwen4_ep_gather_rows() -> usize {
+    ep_gather_rows(hipfire_config::developer_bool(
+        QWEN4_EP_WIDE_VERIFY_ENV,
+        false,
+    ))
+}
+
+/// [`qwen4_ep_gather_rows`] for an explicit flag value.
+pub const fn ep_gather_rows(wide_verify: bool) -> usize {
+    if wide_verify {
+        QWEN4_EP_GATHER_VERIFY_ROWS
+    } else {
+        QWEN4_EP_GATHER_MAX_ROWS
+    }
+}
+
+/// Device bytes of one rank's EP gather state that scale with the gather
+/// capacity at `rows` rows: the [`QWEN4_EP_GATHER_BUFFERS`] expanded-row F32
+/// buffers plus the `rows * top_k` slot-owner words.
+pub const fn ep_gather_capacity_bytes(rows: usize, top_k: usize, hidden: usize) -> u64 {
+    (QWEN4_EP_GATHER_BUFFERS * rows * top_k * hidden * 4 + rows * top_k * 4) as u64
+}
+
+/// Slot capacity of the row-gather transport at `rows` rows.
+pub const fn ep_gather_slots(rows: usize, top_k: usize) -> usize {
+    rows * top_k
+}
 
 /// Which EP gather buffer a MoE invocation uses: trunk layer `L` uses
 /// `L % 2`; the MTP head (a layer index at or past the trunk layer count)
@@ -4075,13 +4124,16 @@ pub(crate) struct Qwen4ForwardEp {
     moe_full: Vec<Qwen4MoeLayerRuntime>,
     /// Expanded-row exchange buffers, see [`qwen4_ep_buffer_index`].
     buffers: [GpuTensor; QWEN4_EP_GATHER_BUFFERS],
+    /// Rows each gather buffer and the slot-owner array hold
+    /// ([`qwen4_ep_gather_rows`] at construction).
+    gather_rows: usize,
     /// Row gather the one-row and few-row forwards install, once attached.
     gather: Option<Arc<dyn MoeRowGather + Send + Sync>>,
     /// Balanced-ownership state per MoE ordinal (`Some` for every host-mapped
     /// trunk layer); empty when `HIPFIRE_EP_BALANCED_OWNERS=0` at
     /// [`Qwen4GpuForward::attach_ep`].
     balanced: Vec<Option<Qwen4BalancedLayer>>,
-    /// The rank's `QWEN4_EP_GATHER_MAX_ROWS * k` i32 slot owners, shared by the
+    /// The rank's `gather_rows * k` i32 slot owners, shared by the
     /// balanced layers (stream-ordered: a call's assignment writes it and the
     /// same call's gather reads it before the next layer's assignment).
     slot_owner: Option<GpuTensor>,
@@ -4098,7 +4150,8 @@ impl Qwen4ForwardEp {
         seal: Qwen4EpRankSeal,
     ) -> Result<Self, Qwen4GpuForwardError> {
         validate_ep_placement(placement, config.num_experts)?;
-        let elements = QWEN4_EP_GATHER_MAX_ROWS
+        let gather_rows = qwen4_ep_gather_rows();
+        let elements = gather_rows
             .checked_mul(config.num_experts_per_tok)
             .and_then(|slots| slots.checked_mul(config.hidden_size))
             .ok_or_else(|| invalid("EP gather buffer size overflows"))?;
@@ -4126,6 +4179,7 @@ impl Qwen4ForwardEp {
             dummy,
             moe_full: Vec::new(),
             buffers,
+            gather_rows,
             gather: None,
             balanced: Vec::new(),
             slot_owner: None,
@@ -13179,6 +13233,14 @@ impl Qwen4GpuForward {
         })
     }
 
+    /// Whether trunk layer `layer` runs balanced ownership on this rank.
+    pub(crate) fn ep_layer_is_balanced(&self, layer: usize) -> bool {
+        self.ep
+            .as_ref()
+            .and_then(|ep| ep.balanced.get(layer))
+            .is_some_and(|balanced| balanced.is_some())
+    }
+
     /// What the rank's row-gather hook needs to run balanced ownership: `None`
     /// when `HIPFIRE_EP_BALANCED_OWNERS=0` was set at [`Self::attach_ep`]
     /// (default on under EP) or no trunk MoE layer is host-mapped. The
@@ -13346,6 +13408,10 @@ impl Qwen4GpuForward {
                 )
             })
             .collect();
+        let gather_rows = self
+            .ep
+            .as_ref()
+            .map_or_else(qwen4_ep_gather_rows, |ep| ep.gather_rows);
         let Some(ep) = self.ep.as_mut() else {
             return Err(invalid("attach_ep on a forward without an EP placement"));
         };
@@ -13513,7 +13579,7 @@ impl Qwen4GpuForward {
                         Some(owners) => owners.buf.as_ptr() as usize,
                         None => {
                             let tensor = gpu.zeros(
-                                &[QWEN4_EP_GATHER_MAX_ROWS * config.num_experts_per_tok],
+                                &[ep_gather_slots(gather_rows, config.num_experts_per_tok)],
                                 DType::F32,
                             )?;
                             let address = tensor.buf.as_ptr() as usize;
@@ -22178,16 +22244,61 @@ mod seal_view_identity_tests {
     /// re-routed count refuse.
     #[test]
     fn ep_lane_rows_refuse_over_cap_and_rerouted() {
-        for rows in 1..=QWEN4_EP_GATHER_MAX_ROWS {
-            assert!(ep_lane_moe_rows(rows, rows).is_ok());
+        let cap = QWEN4_EP_GATHER_MAX_ROWS;
+        for rows in 1..=cap {
+            assert!(ep_lane_moe_rows(rows, rows, cap).is_ok());
             assert_eq!(ep_lane_shared_down(rows), rows >= 2);
         }
-        assert!(ep_lane_moe_rows(0, 0).is_err());
-        assert!(
-            ep_lane_moe_rows(QWEN4_EP_GATHER_MAX_ROWS + 1, QWEN4_EP_GATHER_MAX_ROWS + 1).is_err()
-        );
-        assert!(ep_lane_moe_rows(1, 2).is_err());
-        assert!(ep_lane_moe_rows(4, 1).is_err());
+        assert!(ep_lane_moe_rows(0, 0, cap).is_err());
+        assert!(ep_lane_moe_rows(cap + 1, cap + 1, cap).is_err());
+        assert!(ep_lane_moe_rows(1, 2, cap).is_err());
+        assert!(ep_lane_moe_rows(4, 1, cap).is_err());
+    }
+
+    /// A2 slot accounting at 9..=32 rows: the wide cap admits every row count
+    /// to 32 with equal routing rows and still refuses 0, 33, re-routed counts;
+    /// the default cap is untouched (flag off = today's 8 rows / 80 slots).
+    #[test]
+    fn ep_wide_verify_gather_accounting_covers_9_to_32_rows() {
+        const TOP_K: usize = 10;
+        assert_eq!(ep_gather_rows(false), 8);
+        assert_eq!(ep_gather_rows(true), 32);
+        assert_eq!(ep_gather_slots(ep_gather_rows(false), TOP_K), 80);
+        assert_eq!(ep_gather_slots(ep_gather_rows(true), TOP_K), 320);
+        let wide = ep_gather_rows(true);
+        for rows in 1..=wide {
+            assert!(ep_lane_moe_rows(rows, rows, wide).is_ok(), "{rows} rows");
+            // The call's slots never exceed the transport capacity or the
+            // owner-assign kernel's 512-slot contract.
+            let slots = rows * TOP_K;
+            assert!(slots <= ep_gather_slots(wide, TOP_K));
+            assert!(slots <= rdna_compute::moe::QWEN4_EP_OWNER_EXPERTS);
+        }
+        for rows in 9..=wide {
+            assert!(
+                ep_lane_moe_rows(rows, rows, ep_gather_rows(false)).is_err(),
+                "{rows} rows stay refused with the flag off"
+            );
+        }
+        assert!(ep_lane_moe_rows(0, 0, wide).is_err());
+        assert!(ep_lane_moe_rows(wide + 1, wide + 1, wide).is_err());
+        assert!(ep_lane_moe_rows(9, 8, wide).is_err());
+        assert!(ep_lane_moe_rows(32, 33, wide).is_err());
+        // The device bytes of the capacity-scaled state, hidden 2048 (the
+        // Flash-Next width): flag off is today's footprint.
+        let off = ep_gather_capacity_bytes(8, TOP_K, 2048);
+        let on = ep_gather_capacity_bytes(32, TOP_K, 2048);
+        assert_eq!(off, 4 * 80 * 2048 * 4 + 80 * 4);
+        assert_eq!(on - off, 4 * 240 * 2048 * 4 + 240 * 4);
+        // Four 8-row groups tile one 32-row call: slot ranges are disjoint and
+        // cover 0..320 in order.
+        let mut next = 0;
+        for group in 0..4 {
+            let range = group * 8 * TOP_K..(group + 1) * 8 * TOP_K;
+            assert_eq!(range.start, next);
+            next = range.end;
+        }
+        assert_eq!(next, ep_gather_slots(wide, TOP_K));
     }
 
     /// The buffer sequence of the emitted MoE invocations: lane-major (every

@@ -23,7 +23,8 @@ use crate::ep_trunk_split::{
     agree_layouts, split_buffer_bytes, split_census, SplitWeight, TrunkSplitMode, TrunkSplitRank,
 };
 use crate::gpu_forward::{
-    Qwen4BalancedPlan, Qwen4PeerLayerSource, QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
+    ep_gather_slots, qwen4_ep_gather_rows, Qwen4BalancedPlan, Qwen4PeerLayerSource,
+    QWEN4_EP_GATHER_BUFFERS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
@@ -1477,7 +1478,7 @@ impl Qwen4Bundle {
         }
         let spec = EpRowGatherSpec {
             ranks,
-            slots: QWEN4_EP_GATHER_MAX_ROWS * self.config.num_experts_per_tok,
+            slots: ep_gather_slots(qwen4_ep_gather_rows(), self.config.num_experts_per_tok),
             row_bytes,
         };
         let fingerprint = self.ep_replication_fingerprint();
@@ -3287,6 +3288,51 @@ impl Qwen4Bundle {
         if let Err(error) = mapped {
             eprintln!("  qwen4 EP: lane map_ahead_decode: {error}");
         }
+    }
+
+    /// Lab probe (lever A2): one trunk MoE layer over `input` (F32 normalized
+    /// rows, `sum(groups) * hidden` values) as consecutive gathered MoE
+    /// invocations of `groups` rows on every rank, with the verify scope
+    /// `scope_rows` open (`0` closed). Returns rank 0's concatenated `ffn_output`
+    /// bytes and whether the layer runs balanced ownership; every rank's bytes
+    /// must agree (the fan-out refuses a divergence). `start_ordinal` is the
+    /// running invocation count of earlier probe calls (gather-buffer parity);
+    /// `skew_rank0_us` / `skew_peers_us` delay that side's call (peer-skew soak).
+    pub fn ep_moe_layer_probe(
+        &mut self,
+        gpu: &mut Gpu,
+        layer: usize,
+        input: &[f32],
+        groups: &[usize],
+        start_ordinal: usize,
+        scope_rows: usize,
+        skew_rank0_us: u64,
+        skew_peers_us: u64,
+    ) -> Result<(Vec<u8>, bool), BundleError> {
+        let run = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu, skew_us: u64| {
+            if skew_us > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(skew_us));
+            }
+            crate::gpu_forward_lanes::ep_moe_probe_rank(
+                gpu,
+                bundle,
+                layer,
+                input,
+                groups,
+                start_ordinal,
+                scope_rows,
+            )
+        };
+        self.ep_fanout(
+            "ep_moe_layer_probe",
+            |bundle| {
+                run(bundle, gpu, skew_rank0_us)
+                    .map_err(|error| BundleError::Forward(error.to_string()))
+            },
+            &|bundle, peer_gpu, _| {
+                run(bundle, peer_gpu, skew_peers_us).map_err(|error| error.to_string())
+            },
+        )
     }
 
     pub(crate) fn ep_lane_forward_step(
