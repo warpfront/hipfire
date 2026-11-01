@@ -62,6 +62,10 @@ use serde_json::{json, Value};
 
 use super::logits::{check_tokens, load_bundle, parse_prefill};
 
+// Shared sysfs clock sampler (also used by rdna-compute's `hip_loop`).
+#[path = "../../../rdna-compute/examples/support/clk.rs"]
+mod clk;
+
 const PROTOCOL: &str = "raon-bench-v1";
 const DEFAULT_PROMPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -468,13 +472,20 @@ fn bench_pp(
     let mut tok_s = Vec::with_capacity(reps);
     let mut top1 = Vec::with_capacity(reps);
     let mut finite = true;
-    for _ in 0..reps {
+    let mut rep_clocks: Vec<Value> = Vec::with_capacity(reps);
+    let mut rep_samples: Vec<Value> = Vec::with_capacity(2 * reps);
+    for rep in 0..reps {
+        // sysfs reads stay outside the timed region (`timed_prefill` measures its own interval).
+        let rep_before = clk::sample(pci);
         let s = timed_prefill(bundle, gpu, &ids)?;
         secs.push(s);
         tok_s.push(n as f64 / s.max(1e-12));
         let (t, f) = read_top1(bundle, gpu)?;
         top1.push(t);
         finite &= f;
+        let rep_after = clk::sample(pci);
+        rep_samples.extend([rep_before.clone(), rep_after.clone()]);
+        rep_clocks.push(json!({"rep": rep, "before": rep_before, "after": rep_after}));
     }
     let clocks_after = clocks_json(pci);
     Ok(json!({
@@ -489,6 +500,8 @@ fn bench_pp(
         "logits_finite": finite,
         "clocks_before": clocks_before,
         "clocks_after": clocks_after,
+        "rep_clocks": rep_clocks,
+        "clock_summary": clk::summary(&rep_samples),
     }))
 }
 
@@ -518,7 +531,10 @@ fn bench_tg(
     let mut device_reps: Vec<Value> = Vec::new();
     let mut last_token_ms: Vec<f64> = Vec::new();
     let mut greedy_reps: Vec<Value> = Vec::new();
-    for _ in 0..reps {
+    let mut rep_clocks: Vec<Value> = Vec::with_capacity(reps);
+    let mut rep_samples: Vec<Value> = Vec::with_capacity(2 * reps);
+    for rep in 0..reps {
+        let rep_before = clk::sample(pci);
         let (gc0, gr0) = bundle.decode_graph_stats();
         let g = greedy_run(bundle, gpu, &prompt, tg)?;
         let (gc1, gr1) = bundle.decode_graph_stats();
@@ -552,6 +568,9 @@ fn bench_tg(
             "step_ms": {"mean": mean(&d.step_ms), "p50": percentile(&sm, 0.5), "max": sm.last()},
             "slow_steps_over_1p5x_p50": sm.get(sm.len() / 2).map_or(0, |p| d.step_ms.iter().filter(|m| **m > 1.5 * p).count()),
         }));
+        let rep_after = clk::sample(pci);
+        rep_samples.extend([rep_before.clone(), rep_after.clone()]);
+        rep_clocks.push(json!({"rep": rep, "before": rep_before, "after": rep_after}));
     }
     let clocks_after = clocks_json(pci);
     let mut sorted = last_token_ms.clone();
@@ -588,6 +607,8 @@ fn bench_tg(
         },
         "clocks_before": clocks_before,
         "clocks_after": clocks_after,
+        "rep_clocks": rep_clocks,
+        "clock_summary": clk::summary(&rep_samples),
     }))
 }
 
