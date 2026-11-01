@@ -2236,8 +2236,9 @@ fn trace_gemma4_logits(
 /// arch 13 `cache_capable` when a cache is attached.
 ///
 /// EAGLE spec-decode (arch-22 drafter via `params.drafter`, opt-in with
-/// `HIPFIRE_GEMMA4_EAGLE=1`; not faster than AR on gfx1151) runs tool-free
-/// greedy, sampled, penalized and logprobs requests through the generic
+/// `HIPFIRE_GEMMA4_EAGLE=1`; faster than AR on gfx1151 for 12B and 26B-A4B)
+/// runs tool-free greedy, sampled, penalized and logprobs requests through
+/// the generic
 /// `generate_spec` core instead ([`generate_gemma4_spec`]).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
