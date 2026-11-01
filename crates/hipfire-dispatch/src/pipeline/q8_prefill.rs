@@ -223,10 +223,10 @@ pub struct Q8PrefillRun {
 
 /// [`q8_0_prefill_gemm`] with two optional reuses on the A8 route: it consumes `prepared` when
 /// that still describes this call's `x`, `k` and `rows` (GEMM only, no quantizer launch; else it
-/// quantizes `x` itself), and on gfx1201 with `bf16_out` the GEMM epilogue rounds every output to
+/// quantizes `x` itself), and on gfx1201 / gfx1100 with `bf16_out` the GEMM epilogue rounds every output to
 /// BF16 (bit-identical to a separate in-place `bf16_round_trip_f32_strided` pass, see
-/// `Gpu::gemm_q8_0_a8_gemm_bf16`; the gfx1100 tiled GEMM has no such epilogue and reports
-/// `bf16_fused: false`). Every other case is exactly [`q8_0_prefill_gemm`].
+/// `Gpu::gemm_q8_0_a8_gemm_bf16`; the gfx1100 tiled GEMM does the same through its `_bf16` entries,
+/// `Gpu::gemm_q8_0_mmq_gfx11_gemm_bf16`). Every other case is exactly [`q8_0_prefill_gemm`].
 #[allow(clippy::too_many_arguments)]
 pub fn q8_0_prefill_gemm_prepared(
     gpu: &mut Gpu,
@@ -289,11 +289,14 @@ pub fn q8_0_prefill_gemm_prepared(
             Some(a) => a,
             None => hip!(gpu.q8_mmq_quantize_x(x, rows, k))?,
         };
-        hip!(gpu.gemm_q8_0_mmq_gfx11_gemm(w, &acts, y, m))?;
-        // The tiled GEMM has no BF16 epilogue: the caller rounds (`bf16_fused: false`).
+        if bf16_out {
+            hip!(gpu.gemm_q8_0_mmq_gfx11_gemm_bf16(w, &acts, y, m))?;
+        } else {
+            hip!(gpu.gemm_q8_0_mmq_gfx11_gemm(w, &acts, y, m))?;
+        }
         return Ok(Q8PrefillRun {
             tier,
-            bf16_fused: false,
+            bf16_fused: bf16_out,
         });
     }
     let tier = q8_0_prefill_gemm(gpu, tier, w, x, y, m, k, rows)?;

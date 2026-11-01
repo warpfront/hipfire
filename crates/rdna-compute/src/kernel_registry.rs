@@ -5298,6 +5298,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_q8_0_mmq_i8_gfx11_t64x64",
                 "gemm_q8_0_mmq_i8_gfx11_t64x128",
                 "gemm_q8_0_mmq_i8_gfx11_t128x128",
+                "gemm_q8_0_mmq_i8_gfx11_t64x64_bf16",
+                "gemm_q8_0_mmq_i8_gfx11_t64x128_bf16",
+                "gemm_q8_0_mmq_i8_gfx11_t128x128_bf16",
             ]
         );
     }
