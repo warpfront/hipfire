@@ -21,6 +21,7 @@ deltanet = [
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-lfm3 = { path = "../hipfire-arch-lfm3" }
 hipfire-dispatch = { path = "../hipfire-dispatch", optional = true }
 rdna-compute = { path = "../rdna-compute" }
 hip-bridge = { path = "../hip-bridge" }

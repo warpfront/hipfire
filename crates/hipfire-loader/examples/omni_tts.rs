@@ -17,10 +17,8 @@
 //!
 //! Usage: `omni_tts [omni_hfq] [audio_tokenizer_dir] [prompt] [max_frames] [out.wav]`
 
-use hipfire_arch_lfm3::forward::{decode_step, decode_step_with_embed};
 use hipfire_arch_lfm3_omni::{
-    codec_decode, get_audio_out_embeds, load_codec_weights, sample_audio_frame, write_wav,
-    CodecConfig, DepthRng,
+    codec_decode, load_codec_weights, omni_generate_audio, write_wav, CodecConfig, DepthRng,
 };
 use hipfire_loader::{load_model, ModelState};
 use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
@@ -29,8 +27,6 @@ use rdna_compute::Gpu;
 
 /// `<|audio_start|>` (config audio_start_token_id) — switches generation to speech.
 const AUDIO_START_TOKEN: u32 = 125_012;
-/// `<audio_out>` placeholder (config audio_out_token_id) — one per speech frame.
-const AUDIO_OUT_TOKEN: u32 = 125_032;
 
 fn main() {
     let omni_path = std::env::args()
@@ -69,7 +65,6 @@ fn main() {
     )
     .expect("load_model");
     let depth_cfg = model.lfm3_depth_config.as_ref().expect("depth config").clone();
-    let eos_code = depth_cfg.audio_eos_code;
 
     // ── Build the prompt: ChatML user turn + assistant prefix + <|audio_start|> ──
     let tok = model.tokenizer.as_ref().expect("tokenizer");
@@ -80,16 +75,6 @@ fn main() {
     // The chat template prepends bos_token (<|startoftext|> = 124894); the
     // tokenizer's encode doesn't add it, so prepend it manually.
     prompt_tokens.insert(0, 124_894);
-    // Verify the special tokens encoded (else fall back to a bare prompt).
-    let has_im_start = prompt_tokens.iter().any(|&t| {
-        // <|im_start|> typically encodes to a single special token; check the
-        // tokenizer produced a token whose decoded form contains "<|im_start|>".
-        // Heuristic: the token count is reasonable and the last tokens are the
-        // assistant prefix. If the tokenizer split special tokens into BPE
-        // pieces, the model still runs (just less aligned).
-        false
-    });
-    let _ = has_im_start;
     prompt_tokens.push(AUDIO_START_TOKEN);
     eprintln!(
         "  prompt: {chatml:?} + <|audio_start|> → {} tokens: {:?}…",
@@ -97,70 +82,31 @@ fn main() {
         &prompt_tokens[..prompt_tokens.len().min(12)]
     );
 
-    // ── Prefill the text backbone ──
-    eprintln!("omni_tts: prefilling {} tokens...", prompt_tokens.len());
-    let bundle = match model.state.as_mut() {
-        Some(ModelState::Lfm3(b)) => b,
-        _ => panic!("not lfm3"),
-    };
-    let mut last_logits: Option<Vec<f32>> = None;
-    for (i, &t) in prompt_tokens.iter().enumerate() {
-        last_logits = Some(
-            decode_step(&bundle.config, &bundle.weights, &mut bundle.state, &mut gpu, t, i as u32)
-                .unwrap_or_else(|e| panic!("decode_step @ {i}: {e}")),
-        );
-    }
-    let mut position = prompt_tokens.len() as u32 - 1;
-    // hidden = last_hidden_state at the <|audio_start|> position.
-    let mut hidden = gpu
-        .download_f32(&bundle.state.final_norm_buf)
-        .expect("download hidden");
-    eprintln!("  hidden finite={}", hidden.iter().all(|v| v.is_finite()));
-    let _ = last_logits; // AUDIO mode doesn't consume text logits.
-
     // ── Omni generate loop (AUDIO mode) ──
-    eprintln!("omni_tts: generating audio (max {max_frames} frames, eos_code={eos_code})...");
-    let depth_weights = model.lfm3_depth_weights.as_ref().expect("depth weights");
-    let mut rng = DepthRng::new(42);
-    let mut history: Vec<Vec<u32>> = Vec::new();
-    let mut frames: Vec<u32> = Vec::new();
-    let mut n_emitted = 0usize;
-    let mut hit_eos = false;
-
-    for step in 0..max_frames {
-        let codes =
-            sample_audio_frame(&depth_cfg, depth_weights, &mut gpu, &hidden, &history, &mut rng)
-                .unwrap_or_else(|e| panic!("sample_audio_frame @ {step}: {e}"));
-        let is_eos = codes.iter().any(|&c| c == eos_code);
-        if is_eos {
-            hit_eos = true;
-            eprintln!("  step {step}: end-of-audio frame — stopping.");
-            break;
-        }
-        history.push(codes.clone());
-        frames.extend_from_slice(&codes);
-        n_emitted += 1;
-
-        // Feed the codes back to the LM via the shared codebook_embedding.
-        let next_embed = get_audio_out_embeds(&depth_cfg, depth_weights, &codes);
-        position += 1;
-        let _logits = decode_step_with_embed(
+    eprintln!(
+        "omni_tts: generating audio (max {max_frames} frames, eos_code={})...",
+        depth_cfg.audio_eos_code
+    );
+    let (frames, n_emitted, hit_eos) = {
+        let bundle = match model.state.as_mut() {
+            Some(ModelState::Lfm3(b)) => b,
+            _ => panic!("not lfm3"),
+        };
+        let depth_weights = model.lfm3_depth_weights.as_ref().expect("depth weights");
+        let mut rng = DepthRng::new(42);
+        omni_generate_audio(
             &bundle.config,
             &bundle.weights,
             &mut bundle.state,
+            &depth_cfg,
+            depth_weights,
             &mut gpu,
-            &next_embed,
-            position,
+            &prompt_tokens,
+            max_frames,
+            &mut rng,
         )
-        .unwrap_or_else(|e| panic!("decode_step_with_embed @ {step}: {e}"));
-        hidden = gpu
-            .download_f32(&bundle.state.final_norm_buf)
-            .expect("download hidden");
-
-        if step > 0 && step % 10 == 0 {
-            eprintln!("  step {step}: {n_emitted} frames emitted");
-        }
-    }
+        .unwrap_or_else(|e| panic!("omni_generate_audio: {e}"))
+    };
     eprintln!(
         "  generated {n_emitted} audio frames (hit_eos={hit_eos}, {} codebooks each)",
         depth_cfg.num_codebooks

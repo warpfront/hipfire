@@ -34,6 +34,8 @@ pub mod arch;
 pub mod codec;
 #[cfg(feature = "deltanet")]
 pub mod depth;
+#[cfg(feature = "deltanet")]
+pub mod omni;
 
 #[cfg(feature = "deltanet")]
 pub use codec::{
@@ -44,3 +46,5 @@ pub use depth::{
     depth_config_from_hfq, get_audio_out_embeds, load_depth_weights, sample_audio_frame,
     DepthConfig, DepthRng, DepthWeights,
 };
+#[cfg(feature = "deltanet")]
+pub use omni::omni_generate_audio;
