@@ -1,0 +1,101 @@
+{
+ "model_path": "C:/Users/Jan/.hipfire/models/qwen3.8-27b.mq4l",
+ "expect_n_ctx": 152539,
+ "budget": 150000,
+ "needle_at": 140000,
+ "kv": {
+  "kv_mode": "q8",
+  "kv_k": null,
+  "kv_v": null
+ },
+ "trials": [
+  {
+   "name": "control",
+   "needle_token_pos_est": 74992,
+   "passed": true,
+   "answer": "CORAL-BREEZE-07",
+   "reasoning": "The user is asking me to find the secret password mentioned in the text. Let me search through the massive text for any mention of a password.\n\nLooking through the text, I can find this line: \"The secret password is: CORAL-BREEZE-07.\"\n\nSo the password is CORAL-BREEZE-07.",
+   "finish": "stop",
+   "usage": {
+    "prompt_tokens": 149381,
+    "completion_tokens": 82,
+    "total_tokens": 149463,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "ttft_ms": 256779.5,
+    "prefill_ms": 256779.5,
+    "prefill_tok_s": 581.7,
+    "decode_tok_s": 22.2,
+    "latency_ms": null,
+    "tau": null,
+    "cycles": null,
+    "dflash": null,
+    "mtp": null,
+    "mtp_ngram": null,
+    "ngram_mod_windows": null,
+    "ngram_mod_drafts": null,
+    "ngram_mod_accepted": null,
+    "ngram_mod_accept_rate": null,
+    "mtp_windows": null,
+    "ar_windows": null,
+    "mtp_retired": null,
+    "spec_retired": null,
+    "spec_retired_at": null,
+    "ar_tokens": null,
+    "mtp_window_timings": null
+   },
+   "wall_s": 260.8
+  },
+  {
+   "name": "target",
+   "needle_token_pos_est": 139994,
+   "passed": true,
+   "answer": "CORAL-BREEZE-07",
+   "reasoning": "The user is asking me to find the secret password mentioned in the text. Let me search through the massive text for any mention of a password.\n\nLooking through the text, I can find this line: \"The secret password is: CORAL-BREEZE-07.\"\n\nSo the password is CORAL-BREEZE-07.",
+   "finish": "stop",
+   "usage": {
+    "prompt_tokens": 149381,
+    "completion_tokens": 82,
+    "total_tokens": 149463,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "ttft_ms": 257403.8,
+    "prefill_ms": 257403.8,
+    "prefill_tok_s": 580.3,
+    "decode_tok_s": 22.1,
+    "latency_ms": null,
+    "tau": null,
+    "cycles": null,
+    "dflash": null,
+    "mtp": null,
+    "mtp_ngram": null,
+    "ngram_mod_windows": null,
+    "ngram_mod_drafts": null,
+    "ngram_mod_accepted": null,
+    "ngram_mod_accept_rate": null,
+    "mtp_windows": null,
+    "ar_windows": null,
+    "mtp_retired": null,
+    "spec_retired": null,
+    "spec_retired_at": null,
+    "ar_tokens": null,
+    "mtp_window_timings": null
+   },
+   "wall_s": 261.4
+  }
+ ],
+ "resident_n_ctx": 152558,
+ "resident_bound": "legacy-fit",
+ "calibration": {
+  "template_question_tokens": 26,
+  "per_sentence_tokens": 13.63
+ },
+ "vram_peak_mib": 22954,
+ "serve_max_seq_line": "max_seq: 152558 (bound=legacy-fit; model_ctx=unknown, card_cap=unknown, kv=q8)"
+}

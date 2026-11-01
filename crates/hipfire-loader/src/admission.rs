@@ -1072,6 +1072,10 @@ pub struct SourceAdmission {
     pub sequence: Option<SequenceResolution>,
     /// Why an automatic sequence bound retained legacy behavior.
     pub sequence_reason: Option<&'static str>,
+    /// True when the automatic legacy fallback measured from free VRAM
+    /// ([`qwen35_legacy_fit`]) instead of taking the fixed 4096. Backend-gated,
+    /// not OS-gated; the daemon reports bound `legacy-fit` for these loads.
+    pub legacy_measured: bool,
     pub kv_backend_request: KvBackendRequest,
     pub qwen_default_q8: bool,
     /// Effective V axis ([`resolve_kv_v`]); the loader hands exactly this to
@@ -1767,6 +1771,65 @@ pub fn qwen35_card_projection(
         model_ctx,
         kv_mode: kv_mode::qwen_k_display_name(pair.k()),
     })
+}
+
+/// Legacy KV contiguity margin: the legacy backend allocates the full admitted
+/// context contiguously at load while VMM grows on demand, so free-total
+/// overstates what one allocation can take. Start 512 MiB; tune from the
+/// live test.
+const QWEN35_LEGACY_CONTIGUITY_MARGIN_BYTES: usize = 512 << 20;
+
+/// Measured automatic context for one legacy-backend Qwen3.5 dense load.
+struct Qwen35LegacyFit {
+    max_seq: usize,
+    card_cap: usize,
+    model_ctx: usize,
+}
+
+/// Measured automatic context for the legacy KV backend, or `None` where the
+/// shape is outside the admitted set (fixed 4096 survives there).
+///
+/// Backend-gated, not OS-gated: any load that resolves `KvBackend::Legacy`
+/// measures — explicit `--kv-backend legacy` on any OS, or automatic with a
+/// VMM refusal (including Windows, where VMM mapping/graph semantics are
+/// uncertified and automatic therefore lands here). Start: Qwen3.5 dense;
+/// MoE keeps its existing behavior, and Qwen4 keeps its own legacy refusal
+/// (both gated out by the caller).
+fn qwen35_legacy_fit(
+    source: &ModelSource,
+    gpu_arch: &str,
+    hints: KvBackendHints<'_>,
+) -> Result<Option<Qwen35LegacyFit>, String> {
+    let ModelSource::Hfq(hfq) = source else {
+        return Ok(None);
+    };
+    if hints.free_vram_bytes.is_none() {
+        return Ok(None);
+    }
+    let config = hipfire_arch_qwen35::qwen35::config_from_metadata_json(&hfq.metadata_json)
+        .map_err(|e| format!("Qwen legacy context config: {e}"))?;
+    if config.num_experts != 0 {
+        return Ok(None);
+    }
+    let projection = qwen35_card_projection(source, gpu_arch, hints)?;
+    // Same parts as the VMM projection, plus the contiguity margin. No
+    // vision term, matching the VMM projection (the Qwen35 reserve is zero
+    // on this path); the margin covers tower scratch.
+    let room = projection
+        .free
+        .saturating_sub(projection.weights)
+        .saturating_sub(projection.scratch)
+        .saturating_sub(projection.page_rounding)
+        .saturating_sub(QWEN35_LEGACY_CONTIGUITY_MARGIN_BYTES);
+    let card_cap = room / projection.bytes_per_token;
+    if card_cap < QWEN35_MIN_AUTO_CONTEXT {
+        return Err("Qwen legacy load refused: the model weights, the minimum prefill scratch and the KV cache do not fit in free VRAM. Free GPU memory, set a smaller memory.max_seq, or use a smaller quantization of this model".into());
+    }
+    Ok(Some(Qwen35LegacyFit {
+        max_seq: projection.model_ctx.min(card_cap),
+        card_cap,
+        model_ctx: projection.model_ctx,
+    }))
 }
 
 fn resolve_sequence(
@@ -2847,20 +2910,24 @@ pub fn admit_source_with_options(
     } else {
         None
     };
-    let effective_seq = sequence.as_ref().map_or_else(
-        || {
-            if max_seq == 0 {
-                if pinned_moe {
-                    32768
-                } else {
-                    4096
-                }
-            } else {
-                max_seq
+    let (effective_seq, legacy_measured): (usize, bool) = match &sequence {
+        Some(resolved) => (resolved.max_seq, false),
+        None if max_seq != 0 => (max_seq, false),
+        None if pinned_moe => (32768, false),
+        None if matches!(arch_id, 5 | 6)
+            && !is_dir
+            && matches!(topology, EffectiveTopology::Single)
+            && kv_backend == KvBackend::Legacy =>
+        {
+            // Measured legacy fit (backend-gated, not OS-gated): explicit
+            // legacy on any OS, or automatic with a VMM refusal.
+            match qwen35_legacy_fit(&source, gpu_arch, hints)? {
+                Some(fit) => (fit.max_seq, true),
+                None => (4096, false),
             }
-        },
-        |resolved| resolved.max_seq,
-    );
+        }
+        None => (4096, false),
+    };
     let sequence_reason = match (max_seq, pinned_moe, dir_fixed_context) {
         (0, true, _) => {
             Some("max_seq auto-capacity unsupported for MoE on a discrete GPU; using prior default")
@@ -3123,6 +3190,7 @@ pub fn admit_source_with_options(
         max_seq: effective_seq,
         sequence,
         sequence_reason,
+        legacy_measured,
         kv_backend_request: request,
         qwen_default_q8: hints.qwen_default_q8,
         kv_v,
@@ -5010,6 +5078,142 @@ mod tests {
             assert!(omitted.sequence.is_none());
             assert!(omitted.sequence_reason.is_some());
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Measured legacy fit is backend-gated, not OS-gated: the automatic
+        /// legacy fallback measures from free VRAM (bound `legacy-fit`)
+        /// instead of taking the fixed 4096, on any load that resolves the
+        /// legacy backend — explicit `--kv-backend legacy` on any OS, or
+        /// automatic with a VMM refusal (which is every Windows load).
+        mod legacy_fit {
+            use super::*;
+
+            fn hints(free: Option<usize>) -> KvBackendHints<'static> {
+                KvBackendHints {
+                    kv_mode: Some("q8"),
+                    kv_k: None,
+                    kv_v: None,
+                    qwen_default_q8: true,
+                    kv_adaptive: None,
+                    cask: None,
+                    deepseek4_heterogeneous: false,
+                    vmm_runtime_available: true,
+                    free_vram_bytes: free,
+                }
+            }
+
+            fn admit_legacy(
+                path: &std::path::Path,
+                max_seq: usize,
+                free: Option<usize>,
+            ) -> Result<SourceAdmission, String> {
+                crate::admission::admit_source(
+                    path.to_str().unwrap(),
+                    1,
+                    1,
+                    KvBackendRequest::Explicit(KvBackend::Legacy),
+                    None,
+                    "gfx1100",
+                    None,
+                    "auto",
+                    None,
+                    max_seq,
+                    hints(free),
+                )
+            }
+
+            #[test]
+            fn automatic_measures_instead_of_fixed_4096() {
+                let trunk = write_hfq("legacy-fit-dense", 5, false);
+                let admitted =
+                    admit_legacy(&trunk, 0, Some(24 << 30)).expect("legacy automatic must admit");
+                assert_eq!(admitted.kv_backend, KvBackend::Legacy);
+                assert!(admitted.sequence.is_none());
+                assert!(admitted.legacy_measured, "measured, not fixed");
+                // 24 GiB free dwarfs the tiny trunk: the trained window wins.
+                assert_eq!(admitted.max_seq, 131072);
+                cleanup(&trunk);
+            }
+
+            #[test]
+            fn automatic_caps_below_model_ctx_when_tight() {
+                let trunk = write_hfq("legacy-fit-tight", 5, false);
+                // Derive a free budget that leaves room for exactly 10_000
+                // tokens past every projected owner, so the pin is exact and
+                // immune to scratch/stride changes.
+                let target = 10_000usize;
+                let free = {
+                    let hfq = hipfire_runtime::hfq::HfqFile::open(&trunk).unwrap();
+                    let source = hipfire_runtime::loader_api::ModelSource::Hfq(hfq);
+                    let projection = crate::admission::qwen35_card_projection(
+                        &source,
+                        "gfx1100",
+                        hints(Some(1 << 60)),
+                    )
+                    .expect("projection");
+                    projection.weights
+                        + projection.scratch
+                        + projection.page_rounding
+                        + super::super::super::QWEN35_LEGACY_CONTIGUITY_MARGIN_BYTES
+                        + target * projection.bytes_per_token
+                };
+                let admitted =
+                    admit_legacy(&trunk, 0, Some(free)).expect("derived budget must fit");
+                assert!(admitted.legacy_measured);
+                assert_eq!(admitted.max_seq, target);
+                cleanup(&trunk);
+            }
+
+            #[test]
+            fn automatic_refuses_when_nothing_fits() {
+                let trunk = write_hfq("legacy-fit-oom", 5, false);
+                let err = admit_legacy(&trunk, 0, Some(256 << 20))
+                    .map(|_| ())
+                    .expect_err("weights alone exceed 256 MiB");
+                assert!(err.contains("legacy"), "{err}");
+                assert!(err.contains("memory.max_seq"), "{err}");
+                cleanup(&trunk);
+            }
+
+            #[test]
+            fn fixed_4096_pinned_without_free_vram() {
+                let trunk = write_hfq("legacy-fit-nofree", 5, false);
+                let admitted =
+                    admit_legacy(&trunk, 0, None).expect("no measurement must still load");
+                assert_eq!(admitted.max_seq, 4096);
+                assert!(!admitted.legacy_measured);
+                assert!(admitted.sequence.is_none());
+                cleanup(&trunk);
+            }
+
+            #[test]
+            fn explicit_max_seq_unchanged() {
+                let trunk = write_hfq("legacy-fit-explicit", 5, false);
+                let admitted =
+                    admit_legacy(&trunk, 8192, Some(24 << 30)).expect("explicit must admit");
+                assert_eq!(admitted.max_seq, 8192);
+                assert!(!admitted.legacy_measured);
+                cleanup(&trunk);
+            }
+
+            #[test]
+            fn moe_keeps_fixed_4096() {
+                let path = write_hfq("legacy-fit-moe", 6, false);
+                let metadata = r#"{"config":{"text_config":{"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":4,"vocab_size":1000,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":1024,"max_position_embeddings":131072}}}"#;
+                let embedding = HfqMemTensor {
+                    name: "model.embed_tokens.weight".into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    data: vec![0u8; 32],
+                };
+                write_hfqm_package_mem(&path, 6, metadata, &[embedding]).unwrap();
+                let admitted =
+                    admit_legacy(&path, 0, Some(24 << 30)).expect("MoE legacy automatic must load");
+                assert_eq!(admitted.max_seq, 4096);
+                assert!(!admitted.legacy_measured);
+                cleanup(&path);
+            }
         }
     }
     /// The loader gate and the arch resolvers reach the same verdict for the

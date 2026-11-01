@@ -38,9 +38,11 @@
 #![allow(dead_code)]
 use core::ffi::{c_char, c_int, c_uint, c_ulonglong, c_void, CStr};
 use std::ffi::CString;
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
+#[cfg(unix)]
 mod sys {
     use core::ffi::{c_char, c_int, c_void};
     extern "C" {
@@ -50,6 +52,39 @@ mod sys {
         pub fn dlerror() -> *mut c_char;
         pub fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
         pub fn close(fd: c_int) -> c_int;
+    }
+    /// `struct dl_addr` of `dladdr(3)`; only `dli_fname` is read.
+    #[repr(C)]
+    pub struct DlInfo {
+        pub dli_fname: *const c_char,
+        pub dli_fbase: *mut c_void,
+        pub dli_sname: *const c_char,
+        pub dli_saddr: *mut c_void,
+    }
+    pub const RTLD_NOW: c_int = 2;
+    pub const RTLD_NOLOAD: c_int = 4;
+}
+/// Windows has no dlopen/dlsym/dlclose/dlerror/dladdr libc surface: every entry
+/// fails closed (null handle/symbol, error return, message string), which the
+/// existing null/error checks turn into `Err`. No HIP runtime can load through
+/// this backend on Windows; Linux behavior is unchanged.
+#[cfg(windows)]
+mod sys {
+    use core::ffi::{c_char, c_int, c_void};
+    pub unsafe fn dlopen(_filename: *const c_char, _flags: c_int) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+    pub unsafe fn dlsym(_handle: *mut c_void, _symbol: *const c_char) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+    pub unsafe fn dlclose(_handle: *mut c_void) -> c_int {
+        -1
+    }
+    pub unsafe fn dlerror() -> *mut c_char {
+        b"NPU HIP loader unavailable on Windows\0".as_ptr() as *mut c_char
+    }
+    pub unsafe fn dladdr(_addr: *const c_void, _info: *mut DlInfo) -> c_int {
+        0
     }
     /// `struct dl_addr` of `dladdr(3)`; only `dli_fname` is read.
     #[repr(C)]
@@ -606,6 +641,7 @@ impl Drop for Vmm {
 }
 
 /// Packed A in HIP VMM host-backed memory plus its exported dma-buf fd. See the module docs for drop order.
+#[cfg(unix)]
 pub struct HipDmabufA {
     api: Rc<Api>,
     kind: HipMemoryKind,
@@ -617,6 +653,7 @@ pub struct HipDmabufA {
     fd: RawFd,
 }
 
+#[cfg(unix)]
 impl HipDmabufA {
     /// Initialise and export either supported host physical-memory pool. Does not fall back to another mode.
     pub fn create_kind(packed_a: &[u8], kind: HipMemoryKind) -> Result<Self, String> {
@@ -711,6 +748,7 @@ impl HipDmabufA {
     }
 }
 
+#[cfg(unix)]
 impl Drop for HipDmabufA {
     fn drop(&mut self) {
         if self.fd >= 0 {
@@ -1215,6 +1253,7 @@ impl HipRuntime {
     /// dma-buf fd of a host-VMM `buffer` (`hipMemGetHandleForAddressRange(.., DmaBufFd)` over its whole
     /// granularity-rounded allocation), for `railgun::npu::Device::import_dmabuf`. `hipMalloc` buffers are refused.
     /// The buffer must outlive every importer of the fd (see the module docs for drop order).
+    #[cfg(unix)]
     pub fn export_dmabuf(&self, buffer: &HipBuffer) -> Result<DmabufFd, String> {
         self.owns(&buffer.shared, "export buffer")?;
         let Backing::Vmm(vmm) = &buffer.backing else {
@@ -1452,18 +1491,21 @@ impl Drop for HostRegistration {
 }
 
 /// Owned dma-buf fd exported by [`HipRuntime::export_dmabuf`]; closed on drop.
+#[cfg(unix)]
 pub struct DmabufFd {
     fd: RawFd,
     /// Granularity-rounded size of the exported allocation (the dma-buf size).
     pub alloc: usize,
 }
 
+#[cfg(unix)]
 impl DmabufFd {
     pub fn fd(&self) -> RawFd {
         self.fd
     }
 }
 
+#[cfg(unix)]
 impl Drop for DmabufFd {
     fn drop(&mut self) {
         unsafe { sys::close(self.fd) };

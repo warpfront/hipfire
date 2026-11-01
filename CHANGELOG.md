@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- **Fixed: automatic `max_seq` is measured from free VRAM on legacy-KV loads instead of falling back to the fixed 4096.** The no-sequence fallback (`KvBackend::Legacy`, explicit or automatic-with-VMM-refusal) now runs the same free-VRAM projection as the VMM path (weight-file estimate, minimum prefill scratch, page rounding, KV bytes/token stride) plus a 512 MiB contiguity margin for the single upfront allocation, resolving automatic to `min(model ctx, card cap)` with a distinct `legacy-fit` bound (the daemon log, `loaded` ack and load summary report it instead of `legacy`). Below 512 tokens an automatic load is refused, naming `memory.max_seq`. Backend-gated, not OS-gated: explicit `--kv-backend legacy` on any OS measures, and Qwen4/MoE/directory loads keep their existing behavior. `hipfire fit` is unchanged (still advisory for these loads).
+
 ## v0.4.5 — 2026-10-30
 
 Highlights (details in the entries below):
