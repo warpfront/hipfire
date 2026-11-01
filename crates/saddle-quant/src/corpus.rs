@@ -207,9 +207,13 @@ pub fn render_conversations(json: &str, template_src: &str) -> Result<Vec<String
         normalize_arguments_in_messages(&mut conv.messages);
 
         let messages_val = minijinja::Value::from_serialize(&conv.messages);
+        // Missing or empty `tools` binds `none`, as HF and the daemon do: Llama-3.x
+        // renders its tool preamble on `tools is not none`.
         let tools_val = match &conv.tools {
-            Some(v) => minijinja::Value::from_serialize(v),
-            None => minijinja::Value::from_serialize(&serde_json::Value::Array(Vec::new())),
+            Some(v) if v.as_array().is_none_or(|a| !a.is_empty()) => {
+                minijinja::Value::from_serialize(v)
+            }
+            _ => minijinja::Value::from(()),
         };
         let ctx = minijinja::context! {
             messages => messages_val,

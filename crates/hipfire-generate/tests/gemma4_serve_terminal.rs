@@ -363,7 +363,8 @@ fn template_messages_carry_openai_function_calls_and_resolved_tool_names() {
         }])
     );
     assert_eq!(values[3]["name"], "get_temperature");
-    assert_eq!(values[1].get("tool_calls"), Some(&json!([])));
+    // An empty `tool_calls` is omitted (Llama-3.x tests `'tool_calls' in message`).
+    assert!(values[1].get("tool_calls").is_none());
     assert!(values[1].get("name").is_none());
 
     let mut bad = smoke_history();
