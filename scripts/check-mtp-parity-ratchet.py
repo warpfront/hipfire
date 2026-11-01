@@ -210,6 +210,73 @@ def from_radiance(path, cell=None):
                              "offered_note": "Radiance exports reached/accepted only; offered := reached"})
 
 
+def diff_positions(before, after):
+    """`/stats` `draft_positions` (cumulative) -> per-depth deltas between two snapshots."""
+    def by_depth(s):
+        return {p["depth"]: p for p in (s or {}).get("draft_positions") or []}
+    b, a = by_depth(before), by_depth(after)
+    rows = []
+    for depth in sorted(a):
+        p0 = b.get(depth, {})
+        rows.append(depth_row(depth, a[depth]["offered"] - p0.get("offered", 0),
+                              a[depth]["reached"] - p0.get("reached", 0),
+                              a[depth]["accepted"] - p0.get("accepted", 0)))
+    return rows
+
+
+def from_driver_obj(d, trace_reqs=None, max_depth=3, build="", engine=""):
+    """One `mtp-parity-drive.py` cell file -> cell record.
+
+    Lane serves: per-position counts are the `/stats` `draft_positions` delta over
+    the cell, steps = delta `spec_cycles`, committed = delta `spec_committed_tokens`.
+    Singleton serves (no `draft_positions`): the `HIPFIRE_MTP_TRACE` requests
+    `[request_index_start : +requests]` (`trace_reqs` = parse_trace(...)).
+    window_ms = sum(latency - ttft) / sum(cycles) over the requests (decode wall per
+    verify window; lanes step together, so this is the engine step)."""
+    flat = [r for s in d["streams"] for r in s]
+    failed = [r["error"] for r in flat if r["error"]]
+    if failed:
+        raise ValueError(f"{d['cell']}: {len(failed)} failed request(s): {failed[0]}")
+    before, after = d.get("stats_before") or {}, d.get("stats_after") or {}
+    decode_ms = cycles_timed = client_ms = 0.0
+    for r in flat:
+        t = r.get("timings") or {}
+        if t.get("cycles") and t.get("latency_ms") is not None and t.get("ttft_ms") is not None:
+            decode_ms += t["latency_ms"] - t["ttft_ms"]
+            cycles_timed += t["cycles"]
+        if r.get("ttft_ms_client") is not None and r.get("wall_ms") is not None:
+            client_ms += r["wall_ms"] - r["ttft_ms_client"]  # the client's own first-token to end wall
+    extra = {"requests": len(flat), "concurrency": d["concurrency"]}
+    if after.get("draft_positions"):
+        depths = [r for r in diff_positions(before, after) if r["depth"] <= max_depth]
+        steps = after.get("spec_cycles", 0) - before.get("spec_cycles", 0)
+        committed = after.get("spec_committed_tokens", 0) - before.get("spec_committed_tokens", 0)
+        extra["source"] = "/stats draft_positions delta"
+        wms = decode_ms / cycles_timed if cycles_timed else None
+        wsrc = "per-request (latency-ttft)/cycles"
+    elif trace_reqs is not None:
+        s = d["request_index_start"]
+        reqs = trace_reqs[s:s + d["requests"]]
+        if len(reqs) != d["requests"]:
+            raise ValueError(f"{d['cell']}: trace has {len(reqs)} of {d['requests']} requests from index {s}")
+        windows = [w for r in reqs for w in r["windows"]]
+        off, rea, acc, steps, committed = trace_to_counts(windows, max_depth)
+        depths = [depth_row(i + 1, off[i], rea[i], acc[i]) for i in range(max_depth)]
+        extra["source"] = "HIPFIRE_MTP_TRACE"
+        extra["windows_by_source"] = {src: sum(1 for w in windows if w.get("source") == src)
+                                      for src in {w.get("source") for w in windows}}
+        if steps and cycles_timed:
+            wms, wsrc = decode_ms / steps, "server (latency-ttft) / trace windows"
+        elif steps and client_ms:
+            wms, wsrc = client_ms / steps, "client (wall-first token) / trace windows"
+        else:
+            wms, wsrc = None, None
+    else:
+        raise ValueError(f"{d['cell']}: no draft_positions in /stats and no --trace given")
+    return new_record(d["cell"], depths, steps, committed, window_ms=wms, window_src=wsrc if wms else None,
+                      engine=engine, build=build, rep=d.get("rep", 0), extra=extra)
+
+
 # --------------------------------------------------------------------------
 # thresholds (pre-registered rule) and register
 # --------------------------------------------------------------------------
@@ -395,6 +462,9 @@ def cmd_check(args):
         if entry is None:
             print(f"[{cell}] not in fixture")
             worst = max(worst, EXIT_USAGE)
+            continue
+        if entry.get("baseline") is None and not entry.get("gate", True):
+            print(f"[{cell}] not gated, no baseline ({entry.get('pending', 'pending')})")
             continue
         if entry.get("baseline") is None:
             print(f"[{cell}] UNREGISTERED (no baseline; run a registration campaign)")
@@ -626,6 +696,46 @@ def self_test():
         assert not check_fixture(fx, t)
         (t / "p.txt").write_bytes(b"hellO")
         assert check_fixture(fx, t)
+    # from-driver: lane serve (stats delta) and singleton serve (trace slice)
+    req = lambda cyc: {"error": None, "timings": {"cycles": cyc, "latency_ms": 100.0, "ttft_ms": 20.0}}
+    before = {"draft_positions": [{"depth": 1, "offered": 10, "reached": 10, "accepted": 8, "rate": .8}],
+              "spec_cycles": 10, "spec_committed_tokens": 30}
+    after = {"draft_positions": [{"depth": 1, "offered": 30, "reached": 30, "accepted": 20, "rate": .67},
+                                 {"depth": 2, "offered": 14, "reached": 12, "accepted": 6, "rate": .5}],
+             "spec_cycles": 30, "spec_committed_tokens": 80}
+    d = {"cell": "story-C4-t1", "rep": 1, "concurrency": 4, "request_index_start": 0, "requests": 2,
+         "streams": [[req(10)], [req(10)]], "stats_before": before, "stats_after": after}
+    r = from_driver_obj(d)
+    assert not validate_record(r), validate_record(r)
+    assert [(x["offered"], x["reached"], x["accepted"]) for x in r["depths"]] == [(20, 20, 12), (14, 12, 6)]
+    assert (r["steps"], r["committed"]) == (20, 50) and abs(r["window_ms"] - 8.0) < 1e-9
+    wl = lambda rows, c: {"event": "window", "source": "mtp", "rows": [{"match": m} for m in rows], "committed": c}
+    reqs = [{"req": {}, "windows": [wl([True, False], [1, 2])]}, {"req": {}, "windows": [wl([True, True], [1, 2, 3])]},
+            {"req": {}, "windows": []}]
+    d2 = {"cell": "code-C1-t1", "rep": 0, "concurrency": 1, "request_index_start": 1, "requests": 2,
+          "streams": [[req(1), req(0)]], "stats_before": {}, "stats_after": {}}
+    r2 = from_driver_obj(d2, trace_reqs=reqs)
+    assert not validate_record(r2), validate_record(r2)
+    assert (r2["steps"], r2["committed"]) == (1, 3), (r2["steps"], r2["committed"])
+    assert [(x["offered"], x["reached"], x["accepted"]) for x in r2["depths"]] == [(1, 1, 1), (1, 1, 1), (0, 0, 0)]
+    assert abs(r2["window_ms"] - 80.0) < 1e-9
+    creq = {"error": None, "timings": None, "ttft_ms_client": 10.0, "wall_ms": 90.0}
+    d3 = {"cell": "code-C1-t1", "rep": 0, "concurrency": 1, "request_index_start": 1, "requests": 2,
+          "streams": [[creq, creq]], "stats_before": {}, "stats_after": {}}
+    r3 = from_driver_obj(d3, trace_reqs=reqs)
+    assert r3["window_ms"] is not None and abs(r3["window_ms"] - 160.0) < 1e-9 and "client" in r3["window_ms_source"], r3["window_ms"]
+    try:
+        from_driver_obj(d2)
+        raise AssertionError("no trace and no stats accepted")
+    except ValueError:
+        pass
+    bad = copy.deepcopy(d)
+    bad["streams"][0][0]["error"] = "boom"
+    try:
+        from_driver_obj(bad)
+        raise AssertionError("failed request accepted")
+    except ValueError:
+        pass
     print("check-mtp-parity-ratchet: self-test ok")
     return EXIT_OK
 
@@ -645,6 +755,12 @@ def main(argv=None):
     p = sub.add_parser("from-radiance")
     p.add_argument("file")
     p.add_argument("--cell")
+    p = sub.add_parser("from-driver")
+    p.add_argument("file")
+    p.add_argument("--trace", help="HIPFIRE_MTP_TRACE serve log (singleton serves)")
+    p.add_argument("--max-depth", type=int, default=3)
+    p.add_argument("--build", default="")
+    p.add_argument("--engine", default="")
     p = sub.add_parser("register")
     p.add_argument("records", nargs="+")
     p.add_argument("--dry-run", action="store_true")
@@ -675,6 +791,13 @@ def main(argv=None):
             return EXIT_OK
         if args.cmd == "from-radiance":
             print(json.dumps(from_radiance(args.file, args.cell), indent=1))
+            return EXIT_OK
+        if args.cmd == "from-driver":
+            tr = None
+            if args.trace:
+                with open(args.trace, errors="replace") as f:
+                    tr = parse_trace(f)
+            print(json.dumps(from_driver_obj(load_json(args.file), tr, args.max_depth, args.build, args.engine), indent=1))
             return EXIT_OK
         if args.cmd == "register":
             return cmd_register(args)

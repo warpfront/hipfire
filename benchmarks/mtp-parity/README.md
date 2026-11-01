@@ -26,6 +26,9 @@ Definitions match MtpTrain's `a_d` and the `/stats draft_positions` counters:
 python3 scripts/check-mtp-parity-ratchet.py fixture                 # prompt bytes
 python3 scripts/check-mtp-parity-ratchet.py extract-trace LOG --cell story-C1-t1 --build SHA > rec.json
 python3 scripts/check-mtp-parity-ratchet.py from-radiance cell.json > rec.json
+python3 scripts/mtp-parity-drive.py --base http://127.0.0.1:PORT --out cells/ --cells c1 --rep 0   # drive a running serve
+python3 scripts/check-mtp-parity-ratchet.py from-driver cells/story-C1-t1-r0.json --trace serve.log > rec.json   # singleton (HIPFIRE_MTP_TRACE=1)
+python3 scripts/check-mtp-parity-ratchet.py from-driver cells/story-C4-t1-r0.json > rec.json   # lanes: /stats draft_positions delta
 python3 scripts/check-mtp-parity-ratchet.py register recs/          # >= 3 fresh-process reps per cell
 python3 scripts/check-mtp-parity-ratchet.py check recs/             # exit 1 on regression
 python3 scripts/check-mtp-parity-ratchet.py guard --base origin/beta
@@ -38,6 +41,9 @@ so with a `RATCHET-RAISE: <cell|rule> <reason>` line in its message.
 `register` refuses a cell with yield cv > 0.15 across reps or fewer than 50 pooled reached trials at any depth
 (a prompt that ends early cannot carry a baseline). Single-stream cells are the noisy ones: on the other engine's
 fixture run, `prose_long-C1-t1` measured cv 0.16 at 3 reps, so C1 cells may need 5 reps.
+
+Cells at C > 1 are `gate: false` (with a `pending` note) until native-MTP lanes are on beta: only the singleton
+route has a per-position count today. `check` skips un-gated cells without a baseline and enabling a gate is always allowed.
 
 A hipfire baseline on this fixture does not exist yet. The card job that
 produces records is `HIPFIRE_MTP_TRACE=1` serve runs (singleton) or, for EP2/PP2

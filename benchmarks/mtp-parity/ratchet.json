@@ -32,24 +32,28 @@
    "baseline": null
   },
   "story-C4-t1": {
-   "gate": true,
+   "gate": false,
    "tier": "core",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "story-C4-greedy": {
-   "gate": true,
+   "gate": false,
    "tier": "core",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "story-C8-t1": {
-   "gate": true,
+   "gate": false,
    "tier": "core",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "story-C8-greedy": {
-   "gate": true,
+   "gate": false,
    "tier": "core",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "code-C1-t1": {
    "gate": true,
@@ -62,24 +66,28 @@
    "baseline": null
   },
   "code-C4-t1": {
-   "gate": true,
+   "gate": false,
    "tier": "core",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "code-C4-greedy": {
-   "gate": true,
+   "gate": false,
    "tier": "core",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "code-C8-t1": {
-   "gate": true,
+   "gate": false,
    "tier": "core",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "code-C8-greedy": {
-   "gate": true,
+   "gate": false,
    "tier": "core",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "prose_long-C1-t1": {
    "gate": true,
@@ -92,14 +100,16 @@
    "baseline": null
   },
   "prose_long-C8-t1": {
-   "gate": true,
+   "gate": false,
    "tier": "breadth",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "prose_long-C8-greedy": {
-   "gate": true,
+   "gate": false,
    "tier": "breadth",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "agentic-C1-t1": {
    "gate": true,
@@ -112,14 +122,16 @@
    "baseline": null
   },
   "agentic-C8-t1": {
-   "gate": true,
+   "gate": false,
    "tier": "breadth",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "agentic-C8-greedy": {
-   "gate": true,
+   "gate": false,
    "tier": "breadth",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "math-C1-t1": {
    "gate": true,
@@ -132,14 +144,16 @@
    "baseline": null
   },
   "math-C8-t1": {
-   "gate": true,
+   "gate": false,
    "tier": "breadth",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "math-C8-greedy": {
-   "gate": true,
+   "gate": false,
    "tier": "breadth",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "multilingual-C1-t1": {
    "gate": true,
@@ -152,14 +166,16 @@
    "baseline": null
   },
   "multilingual-C8-t1": {
-   "gate": true,
+   "gate": false,
    "tier": "breadth",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   },
   "multilingual-C8-greedy": {
-   "gate": true,
+   "gate": false,
    "tier": "breadth",
-   "baseline": null
+   "baseline": null,
+   "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
   }
  }
 }
