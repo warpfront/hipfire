@@ -247,6 +247,7 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1100", "ffn_round_bf16_f32"),
     ("gfx1100", "ffn_single_expert_tables"),
     ("gfx1100", "ffn_situ_grouped_f32"),
+    ("gfx1100", "ffn_situ_grouped_rotate_i8_gfx1201"),
     ("gfx1100", "ffn_situ_rows_f32"),
     ("gfx1100", "gemm_bf16_xbf16_small_rows_s1"),
     ("gfx1100", "gemm_bf16_xbf16_small_rows_s4"),

@@ -7704,6 +7704,19 @@ pub fn grouped_moe_iu4_shape_admits(g: &GroupedMoeGeometry, rows: usize) -> bool
         && g.hidden % 64 == 0
 }
 
+/// `HIPFIRE_RAON_GFX1100_DOWN_PRODUCER` (developer, default on, exact gfx1100): the routed grouped down site
+/// runs the G5 fused producer (`ffn_situ_grouped_rotate_i8`: activation + rotation + A8 quantizer in one
+/// launch, bytewise the three-launch chain) on the 7900 XTX as it does on gfx1201 (where
+/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` governs it). `=0` restores the three-launch chain. The shared/dense
+/// rows entry is not part of this flag (it stays gfx1201-only).
+pub fn gfx1100_grouped_down_producer_enabled(arch: &str) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    arch == "gfx1100"
+        && *ON.get_or_init(|| {
+            hipfire_config::developer_bool("HIPFIRE_RAON_GFX1100_DOWN_PRODUCER", true)
+        })
+}
+
 /// Whether a down site runs the fused A8 producer (`Gpu::ffn_activation_grouped_rotate_i8_f32` /
 /// `Gpu::ffn_activation_rows_rotate_i8_f32`: activation + rotation + A8 quantizer in one launch,
 /// bytewise the three-launch chain). Pure: `fused_flag` is
@@ -7983,7 +7996,8 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
             // output is byte-identical to the fused launch).
             let down_xq_fused = if !super::moe_capture::act_capture_enabled()
                 && grouped_down_producer_fused_admits(
-                    gpu.flags.gfx12_producer_quant_fused_enabled(),
+                    gpu.flags.gfx12_producer_quant_fused_enabled()
+                        || gfx1100_grouped_down_producer_enabled(&gpu.arch),
                     tiers.down,
                     &g,
                 ) {

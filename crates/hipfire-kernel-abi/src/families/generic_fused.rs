@@ -25,8 +25,9 @@
 //!
 //! Scope and conventions of this file:
 //!
-//! * Only `Arch::Gfx1201` is exported. Each launcher is exact-arch gfx1201 or its trace is gfx1201-only; no
-//!   gfx1100 object of these symbols exists in the kernel cache.
+//! * `Arch::Gfx1201` is exported for every contract here; `ffn_situ_grouped_rotate_i8_gfx1201` is also exported on
+//!   `Arch::Gfx1100` (layout from a local `hipcc --offload-arch=gfx1100` build: kernarg 104, 0 LDS). Every other
+//!   launcher is exact-arch gfx1201 or its trace is gfx1201-only; no gfx1100 object of those symbols exists.
 //! * f32 kernel scalars (`post_factor`, `eps`, `p0`, ...) are `U32` params named `*_bits` carrying the IEEE-754
 //!   bit pattern, because `ScalarTy` has no float.
 //! * The `ffn_swiglu_*` / `ffn_swiglu_clamp_*` siblings of the rotate-i8 module have the same kernarg layout
@@ -807,16 +808,30 @@ mod ffn_grouped {
         rule(Rule::OneOf(p!("round_output"), BOOL), "flag is 0 or 1"),
     ];
 
-    const EXPORTS: &[ExportV1] = &[ExportV1 {
-        symbol: "ffn_situ_grouped_rotate_i8_gfx1201",
-        arch: Arch::Gfx1201,
-        object: MODULE_FFN_ROTATE_I8,
-        block: [32, 1, 1],
-        dynamic_lds: 0,
-        group_segment_fixed: 0,
-        grid: [GRID_X, c!(1), c!(1)],
-        consts: &[],
-    }];
+    const EXPORTS: &[ExportV1] = &[
+        ExportV1 {
+            symbol: "ffn_situ_grouped_rotate_i8_gfx1201",
+            arch: Arch::Gfx1201,
+            object: MODULE_FFN_ROTATE_I8,
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+            group_segment_fixed: 0,
+            grid: [GRID_X, c!(1), c!(1)],
+            consts: &[],
+        },
+        // gfx1100 (7900 XTX) runs the same module text (symbol keeps its gfx1201 name); local hipcc build
+        // `--offload-arch=gfx1100`: kernarg 104, 0 LDS, max flat workgroup 32.
+        ExportV1 {
+            symbol: "ffn_situ_grouped_rotate_i8_gfx1201",
+            arch: Arch::Gfx1100,
+            object: MODULE_FFN_ROTATE_I8,
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+            group_segment_fixed: 0,
+            grid: [GRID_X, c!(1), c!(1)],
+            consts: &[],
+        },
+    ];
 
     /// `ffn_situ_grouped_rotate_i8_gfx1201`: grouped gate/up SiTU-GLU activation + per-expert AWQ divide +
     /// un-scatter + FWHT256 rotation + `block_i8_128` quantization in one launch, one wave per (grouped row,
@@ -1350,7 +1365,12 @@ mod tests {
     fn every_export_symbol_resolves_through_the_registry() {
         for abi in ABIS {
             for e in abi.exports {
-                assert_eq!(e.arch, Arch::Gfx1201);
+                // gfx1201 everywhere; the grouped G5 down producer is also exported on gfx1100.
+                assert!(
+                    e.arch == Arch::Gfx1201
+                        || (e.arch == Arch::Gfx1100
+                            && e.symbol == "ffn_situ_grouped_rotate_i8_gfx1201")
+                );
                 let (found, _) = crate::families::find_export(e.arch, e.symbol).unwrap();
                 assert_eq!(found.id, abi.id);
             }

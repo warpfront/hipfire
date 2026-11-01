@@ -658,7 +658,8 @@ impl Gpu {
     }
 
     /// Grouped gate/up activation + FWHT rotation + A8 `block_i8_128` quantization in one launch
-    /// (`ffn_grouped_activation_rotate_i8.gfx1201.hip`), exact gfx1201 only.
+    /// (`ffn_grouped_activation_rotate_i8.gfx1201.hip`), exact gfx1201 and exact gfx1100 (byte oracle vs the
+    /// three-launch chain on both; the dense-rows entry below stays gfx1201-only).
     ///
     /// The blocks written into `reservation` are byte-identical to
     /// [`Self::ffn_activation_grouped_f32`] into an F32 `[total_slots, phys_n]` tensor, then
@@ -676,9 +677,9 @@ impl Gpu {
     ) -> HipResult<crate::scratch::Int8MmqPrepared> {
         self.bind_thread()?;
         const WHAT: &str = "ffn_activation_grouped_rotate_i8_f32";
-        if self.arch != "gfx1201" {
+        if self.arch != "gfx1201" && self.arch != "gfx1100" {
             return Err(refuse(
-                "ffn_activation_grouped_rotate_i8_f32: exact gfx1201 only",
+                "ffn_activation_grouped_rotate_i8_f32: exact gfx1201 / gfx1100 only",
             ));
         }
         let (p0, p1) = activation_params(a.activation)?;
