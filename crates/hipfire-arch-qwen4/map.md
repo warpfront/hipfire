@@ -16,6 +16,7 @@ Native Qwen4 / Qwen3.8-Flash-Next (arch 16): strict config and admission, typed 
 - The RC3 prefix cache (end-of-prompt checkpoint, radix store, anchors, periodic captures) is gone; `HIPFIRE_QWEN_PROMPT_CACHE` / `HIPFIRE_QWEN_RADIX_CACHE` do not affect this crate — do not reintroduce them.
 - [`src/cache_quality.rs`](src/cache_quality.rs) (`reference-parity` feature) is the hit-vs-cold logits oracle of the session cache (`qwen4_parity --mode cache-quality`, env `HIPFIRE_CQ_SESSION_BUDGET_BYTES`, `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`) plus the opt-in capture sink `HIPFIRE_QWEN4_CACHE_QUALITY_OUT`; it is a reference-parity tool, not a production path. `state_parity.rs` no longer holds prefix/radix session parity.
 - Exact AR lanes (`lane.rs`, `lane_exec.rs`, `gpu_forward_lanes.rs`; served as the `fn-lanes` route) never touch `bundle.state`/`bundle.mtp` in a lane step; a lane's prefill tile swaps its state into the bundle for one singleton chunk call with `Qwen4GpuForward::lane_scope` set, which keeps the retained tape (recorded against the resident state's pointers) out. A row-local stage may only become `OnceAllRows` in `STAGE_SHARE` when EVERY owned weight-instance route of that stage (`LaneStageRoutes`, derived from the actually bound weights) matches a `RowTwinProof` {arch, stage, route: `StageRoute`, domain: `&[LaneTopology]`, receipt} row of `LANE_ROW_TWIN_PROOFS`; an unmatched instance leaves only that stage per lane (the reason is recorded in the `LanePolicyResolution`), the evidence is the deduplicated set of receipts of the proofs used and is carried in the resolved policy, not inferred from the production shape (`examples/fn_lane_oracle --g0` produces G0 receipts). gfx1151 keeps its historical topologies and expert classes through wildcard-route rows over every topology under `GFX1151_LANE_RECEIPT`. The gfx1201 rows are route-bound and carry one receipt per proved topology. PP rows (PP domain) cover PP2 mq2 under `GFX1201_PP2_MQ2_RECEIPT` (hold j1574: lane ids and every logits row byte-identical to the serialized PP singleton at K=1..8, 8 prompts x 64 tokens): the actual all-MQ6 projection route of the PP2 artifact, Q8 embedding, BF16 HC/router/shared routes, resident MQ4/E8P MoE with per-expert `DecodeGemv` capability admission. EP rows (`[Ep]` domain; twelve: eleven non-MoE rows for embed, PLE rows, HC read, HC write, GDN in/out projections, QSA in/out projections, final HC read, head and argmax, plus one MoE row) carry `GFX1201_EP2_MQ4_RECEIPT` (hold j1570, `mcb-notes/runs/ep-diag-8e148906a-1`: production ids and logits byte-identical to the serialized EP singleton at K=1, 2, 4 and 8, 64 tokens, on one gfx1201 EP2 mq4-xts load). The bound routes a non-MoE row requires are exactly the ones that artifact binds: MQ6 for every GDN qkv/z/a/b/out and QSA indexer/q/k/v/out projection and for the head, Q8 embed, BF16 HC, BF16 PLE rows, F32 argmax. The EP MoE row requires `LaneExpertRoute::EpPackedStaticOrBalanced` plus BF16 router/shared routes and per-expert `DecodeGemv` capability admission: every owned MoE layer must be either the actual static gathered runtime over fully resident packed QT44/QT53 experts or the actual balanced-live gathered runtime over fully host-mapped packed QT44/QT53 experts, with the gather installed, no CPU (D1/D2), tier, slab, pruned or FP8 route, and dtype buffers and selected runtime in agreement; any mix of the two across layers is admitted (27 + 21, 28 + 20, ...) with no resident-count restriction. A different bound route, arch or topology, or one MoE layer outside that class, matches no row, and the fallback is stage-specific: only the affected stage (for the MoE class, the MoE stage) runs per lane. The `Ep` domain does not encode the rank count and the measured EP cells are EP2 mq4-xts at K=1, 2, 4 and 8 only; it evidences no other width, topology count or latency, and both receipts are exactness evidence, not performance. A future arch qualifies by adding a proof row alone. The store logs one `qwen4 lanes: stage policy <describe()> (proofs <receipts>; per-lane: <stage>=<reason>,...)` line. Stateful stages are always per lane.
+- The gfx1201 PP MoE stage carries two route-bound rows: `LaneExpertRoute::ResidentMq2Slab` (resident slab layers of MQ4-XTS plus at least one E8P-I4 expert, `GFX1201_PP2_MQ2_RECEIPT`) and `LaneExpertRoute::ResidentMq3Slab` (resident slab layers of MQ4-XTS plus at least one MQ3-I4 expert, `GFX1201_PP2_MQ3_RECEIPT`: PP2 mq3-xts 25/23 `fn_mesh_lane_oracle` byte-identical lane ids and logits rows vs the serialized PP singleton at K=1..8 under per-lane, MoE-only-shared and production policies, adaptive / 4 micro-batches / overlap off). `lane::slab_layer_cold_experts` classifies a layer as complete MQ4-XTS plus one cold format only (never E8P with MQ3-I4 in one layer, no W2, no absent expert); a band mixing the two cold formats stays `Unclassified`, so its MoE stage runs per lane.
 - `memory.offload_exec=cpu|passback` may arm whole host-mapped trunk expert aggregates for eager CPU routed FFNs (decode and at most four verify rows); wide prefill keeps the GPU path. The splice's CPU work runs on a pinned physical-core pool (`hipfire_cpu::splice_pool`; `HIPFIRE_CPU_EXPERT_THREADS` / `HIPFIRE_CPU_EXPERT_PIN`). `gpu_forward/cpu_splice.rs` caches checked host spans from the owning aggregate tensors, never borrowed expert device aliases. EP, slab and tier/hot-set leases do not arm this D1 whole-layer splice. Hot-set (tier) layers arm the separate D2 tier split under `memory.offload_exec=cpu` with no CPU-side arch gate: it follows the tier plan the loader admitted (`expert_hotset::hotset_arch_admits`: the default sibling sidecar on gfx1201 only, an explicit absolute `HIPFIRE_QWEN4_EXPERT_HOTSET` path on any arch) when uniform QT44/QT53 and not EP/slab/AWQ/FP8; a route it has no masked ids or cold-slot installation for is refused with one `[moe-cpu-split]` log line per reason and stays on PCIe.
 
 ## Crate map
@@ -54,10 +55,13 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `qwen4_pp_auto_fit`
   - `qwen4_pp_band_budget`
   - `qwen4_pp_budget_refusal`
+  - `QWEN4_PP_CHUNK_LADDER`
+  - `qwen4_pp_chunk_ladder`
   - `qwen4_pp_edge_max_bytes`
   - `QWEN4_PP_FIRST_BAND_MIN_LAYERS`
   - `QWEN4_PP_FIT_CHUNK_RUNGS`
   - `qwen4_pp_fit_chunk_rungs`
+  - `qwen4_pp_negotiate_chunk`
   - `qwen4_pp_rank_lines`
   - `QWEN4_PP_RESERVE_BYTES`
   - `Qwen4Admission`
@@ -68,7 +72,9 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `Qwen4Capabilities`
   - `Qwen4Capability`
   - `Qwen4PpAutoFit`
+  - `Qwen4PpBandChunk`
   - `Qwen4PpBudgetInputs`
+  - `Qwen4PpChunkNegotiation`
   - `Qwen4PpDefaultShortfall`
   - `Qwen4PpRankFit`
   - `Qwen4QuantGeometry`
@@ -109,7 +115,10 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `assemble_band_with_ple_rows`
   - `assemble_with_metadata`
   - `assemble_with_ple_rows`
+  - `attach_chunk_rows`
   - `attach_forward`
+  - `attach_forward_canonical`
+  - `attach_forward_ep_reserve`
   - `attach_mtp`
   - `attach_npu_trunk_identity`
   - `attach_ple_hot_store`
@@ -404,10 +413,48 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `Qwen4EpMesh`
   - `Qwen4EpPeer`
   - `ranks`
+  - `reserve_receipt`
   - `TensorSpec`
   - `top1`
   - `used_bytes`
   - `with_rank_mut`
+- [`src/ep_reserve.rs`](src/ep_reserve.rs)
+  - `admit_ep_reserve`
+  - `agree`
+  - `attempts`
+  - `charged_forward_bytes`
+  - `dedicated_bytes`
+  - `describe`
+  - `EP2_DOWN_EXPERT_BYTES`
+  - `EP2_GATE_UP_EXPERT_BYTES`
+  - `EP_RESERVE_DECOUPLE_ENV`
+  - `EP_RESERVE_MIN_RESIDENT_LAYERS`
+  - `EP_RESERVE_PROMPT_ROWS`
+  - `EP_RESERVE_RANKS`
+  - `ep_reserve_request`
+  - `ep_reserve_request_from_env`
+  - `EP_RESERVE_RESIDENT_ROWS`
+  - `EP_RESERVE_ROOT_ALIGN`
+  - `EP_RESERVE_S2_DONORS`
+  - `EpDonorSlot`
+  - `EpRankGeometry`
+  - `EpReserveCapacity`
+  - `EpReserveFacts`
+  - `EpReserveForwardPlan`
+  - `EpReserveMeshReceipt`
+  - `EpReservePlan`
+  - `EpReserveRequest`
+  - `EpReserveSegment`
+  - `EpReserveTouchedExtent`
+  - `flash_next`
+  - `from_config`
+  - `layer_bytes`
+  - `mesh_receipt`
+  - `persistent_prompt_bytes`
+  - `persistent_resident_bytes`
+  - `plan_ep_reserve`
+  - `Refusal`
+  - `remaining_bytes`
 - [`src/ep_seal.rs`](src/ep_seal.rs)
   - `bind_ep_seal`
   - `check_source`
@@ -556,6 +603,11 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `dedicated_slab_stage`
   - `describe`
   - `describe_with`
+  - `ep_chunk_fit_line`
+  - `EP_CHUNK_FIT_MIN_GAIN_LAYERS`
+  - `ep_chunk_fit_pick`
+  - `EP_CHUNK_FIT_RUNGS`
+  - `ep_chunk_fit_rungs`
   - `ep_fit_rank_line`
   - `ep_fit_report`
   - `ep_lane_reservation_line`
@@ -614,11 +666,13 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `NativeMtpCensus`
   - `NativeMtpCensusInputs`
   - `new`
+  - `place_embedding_host`
   - `place_routed_experts`
   - `place_routed_experts_set`
   - `placement_bytes`
   - `placement_digest`
   - `placement_inputs`
+  - `placement_inputs_with_ep_reserve`
   - `placement_inputs_with_forward`
   - `PlacementCharges`
   - `PlacementInputs`
@@ -666,6 +720,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `winner`
   - `with_decode_share`
   - `with_decode_share_shadows`
+  - `with_ep_reserve`
   - `with_slowlink`
   - `WORKSPACE_TERM_COUNT`
 - [`src/expert_slab_aggregate.rs`](src/expert_slab_aggregate.rs)
@@ -783,6 +838,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `with_host_window`
 - [`src/gpu_forward.rs`](src/gpu_forward.rs)
   - `band_scope`
+  - `ep_reserve_forward`
   - `forward_chunk`
   - `forward_mesh_chunk`
   - `forward_token`
@@ -803,6 +859,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `qwen4_decode_share_classes`
   - `qwen4_decode_share_dedicated_bytes`
   - `QWEN4_DECODE_SHARE_RESIDENT_ROWS`
+  - `qwen4_ep_auto_prefill_chunk`
   - `QWEN4_EP_BALANCED_OWNERS_ENV`
   - `QWEN4_EP_GATHER_BUFFERS`
   - `QWEN4_EP_GATHER_MAX_ROWS`
@@ -819,6 +876,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `qwen4_prefill_chunk_default`
   - `qwen4_prefill_chunk_requested`
   - `qwen4_prefill_chunk_rows_pinned`
+  - `qwen4_set_ep_auto_prefill_chunk`
   - `Qwen4ForwardScratchMode`
   - `Qwen4GpuForward`
   - `Qwen4GpuForwardError`
@@ -831,6 +889,10 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ROUTE_TRACE_ENV`
 - [`src/gpu_forward/cpu_slab_owner.rs`](src/gpu_forward/cpu_slab_owner.rs)
 - [`src/gpu_forward/cpu_splice.rs`](src/gpu_forward/cpu_splice.rs)
+- [`src/gpu_forward/ep_reserve_forward.rs`](src/gpu_forward/ep_reserve_forward.rs)
+  - `ep_reserve_receipt_scope`
+- [`src/gpu_forward/ep_reserve_loan.rs`](src/gpu_forward/ep_reserve_loan.rs)
+- [`src/gpu_forward/ep_reserve_scratch.rs`](src/gpu_forward/ep_reserve_scratch.rs)
 - [`src/gpu_forward/panel_stage.rs`](src/gpu_forward/panel_stage.rs)
 - [`src/gpu_forward/slab_stage.rs`](src/gpu_forward/slab_stage.rs)
 - [`src/gpu_forward_lanes.rs`](src/gpu_forward_lanes.rs)
@@ -841,6 +903,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `GFX1151_LANE_RECEIPT`
   - `GFX1201_EP2_MQ4_RECEIPT`
   - `GFX1201_PP2_MQ2_RECEIPT`
+  - `GFX1201_PP2_MQ3_RECEIPT`
   - `key`
   - `LANE_MAX_ROWS`
   - `LANE_ROW_TWIN_PROOFS`
@@ -999,6 +1062,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `decode_share`
   - `decode_share_shadows`
   - `ep`
+  - `ep_reserve`
   - `ep_seal`
   - `ep_trunk_split`
   - `expert_arena`
@@ -1687,10 +1751,13 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
 - [`src/state_parity.rs`](src/state_parity.rs)
   - `crate`
   - `into_json`
+  - `MtpHeadPinCase`
+  - `MtpHeadPinGpu`
   - `ProfileReport`
   - `run_compact`
   - `run_mtp_fill_digest`
   - `run_mtp_head_d2_probe`
+  - `run_mtp_head_reference_pin_gpu`
   - `run_mtp_takeover_fill_oracle`
   - `run_profile`
   - `run_slowlink_prefill_state`
@@ -1774,6 +1841,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ple_valid_rows_for_shard`
   - `PleWeights`
   - `QsaWeights`
+  - `QWEN4_EMBED`
   - `Qwen4BandScope`
   - `Qwen4EpPlacement`
   - `Qwen4FfnWeights`
@@ -1874,6 +1942,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
 #### dev
 
 - `half`
+- `hipfire-cpu`
 - `hipfire-dispatch`
 - `hipfire-loader`
 - `memmap2`

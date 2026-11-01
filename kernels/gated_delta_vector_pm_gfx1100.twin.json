@@ -1,0 +1,461 @@
+{
+  "module": "gated_delta_vector_pm_gfx1100",
+  "arch": "gfx1100",
+  "reports": [
+    {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 40,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 48,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 56,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 64,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 72,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 76,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 80,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 84,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 88,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 92,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 96,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 100,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 104,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 108,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 112,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 116,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 120,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 124,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 128,
+            "pointer": false,
+            "size": 8,
+            "value_kind": "by_value"
+          }
+        ],
+        "compared_to_incumbent": true,
+        "incumbent_sha256": "da8a958422c2fe5c1849829e791deadee55eae3049e68363681102807b679a9c",
+        "incumbent_symbol": "gated_delta_net_vector_serial_f32",
+        "kernarg_segment_size": 136
+      },
+      "arch": "gfx1100",
+      "elf_bytes": 16800,
+      "elf_sha256": "065a4695f9dcaa44b7a74e5814e731e626a44f2660f3c3d3e2da7a91bd6db757",
+      "hazards": {
+        "advisory": 16,
+        "blocking": 0,
+        "checked": true,
+        "findings": 16,
+        "pm_ir_obligations": 0
+      },
+      "hxaco_bytes": 20896,
+      "hxaco_sha256": "14cef5693183e86678275a4a72627da987eece8b20ea9728aa94a27eca1407ff",
+      "kernel": "gated_delta_net_vector_serial_f32_pm_gfx1100",
+      "lds": 0,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 412,
+      "scratch": 0,
+      "sgprs": 62,
+      "text_bytes": 4824,
+      "text_sha256": "6d0b57fb7bb4d8f5f8ab1bbd3ceffeb31ffdb08bd1a761dbfebc8b8b60e8113f",
+      "user_sgprs": 14,
+      "vgprs": 96,
+      "wavefront_size": 32
+    },
+    {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 40,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 44,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 48,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 52,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 56,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 60,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 64,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 68,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 72,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 76,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 80,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 88,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "hidden_block_count_x"
+          },
+          {
+            "name": "",
+            "offset": 92,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "hidden_block_count_y"
+          },
+          {
+            "name": "",
+            "offset": 96,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "hidden_block_count_z"
+          },
+          {
+            "name": "",
+            "offset": 100,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_group_size_x"
+          },
+          {
+            "name": "",
+            "offset": 102,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_group_size_y"
+          },
+          {
+            "name": "",
+            "offset": 104,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_group_size_z"
+          },
+          {
+            "name": "",
+            "offset": 106,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_remainder_x"
+          },
+          {
+            "name": "",
+            "offset": 108,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_remainder_y"
+          },
+          {
+            "name": "",
+            "offset": 110,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_remainder_z"
+          },
+          {
+            "name": "",
+            "offset": 128,
+            "pointer": false,
+            "size": 8,
+            "value_kind": "hidden_global_offset_x"
+          },
+          {
+            "name": "",
+            "offset": 136,
+            "pointer": false,
+            "size": 8,
+            "value_kind": "hidden_global_offset_y"
+          },
+          {
+            "name": "",
+            "offset": 144,
+            "pointer": false,
+            "size": 8,
+            "value_kind": "hidden_global_offset_z"
+          },
+          {
+            "name": "",
+            "offset": 152,
+            "pointer": false,
+            "size": 2,
+            "value_kind": "hidden_grid_dims"
+          }
+        ],
+        "compared_to_incumbent": true,
+        "incumbent_sha256": "68652be91486474bee166c84e027b3780be40f65e3f2a0cf034f48d55c6fc05a",
+        "incumbent_symbol": "causal_conv_depthwise_silu_rows_f32",
+        "kernarg_segment_size": 344
+      },
+      "arch": "gfx1100",
+      "elf_bytes": 16800,
+      "elf_sha256": "065a4695f9dcaa44b7a74e5814e731e626a44f2660f3c3d3e2da7a91bd6db757",
+      "hazards": {
+        "advisory": 0,
+        "blocking": 0,
+        "checked": true,
+        "findings": 0,
+        "pm_ir_obligations": 0
+      },
+      "hxaco_bytes": 20896,
+      "hxaco_sha256": "14cef5693183e86678275a4a72627da987eece8b20ea9728aa94a27eca1407ff",
+      "kernel": "causal_conv_depthwise_silu_rows_f32_pm_gfx1100",
+      "lds": 0,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 412,
+      "scratch": 0,
+      "sgprs": 48,
+      "text_bytes": 4452,
+      "text_sha256": "95629e55cb81c016bbca77dd366aebce2830c2612e7c8e9d4d927570b20e1a0a",
+      "user_sgprs": 14,
+      "vgprs": 40,
+      "wavefront_size": 32
+    }
+  ],
+  "judged_text_check": [
+    {
+      "symbol": "gated_delta_net_vector_serial_f32_pm_gfx1100",
+      "judged_object": "rda_serial-pp512-R2Rda-05-rs-tv8-prio",
+      "judged_symbol": "gated_delta_net_vector_serial_f32",
+      "judged_code_sha256": "6d0b57fb7bb4d8f5f8ab1bbd3ceffeb31ffdb08bd1a761dbfebc8b8b60e8113f",
+      "twin_text_sha256": "6d0b57fb7bb4d8f5f8ab1bbd3ceffeb31ffdb08bd1a761dbfebc8b8b60e8113f",
+      "equal": true
+    },
+    {
+      "symbol": "causal_conv_depthwise_silu_rows_f32_pm_gfx1100",
+      "judged_object": "conv_rows-pp512-R1Conv-04-rpw32-k4",
+      "judged_symbol": "causal_conv_depthwise_silu_rows_f32",
+      "judged_code_sha256": "95629e55cb81c016bbca77dd366aebce2830c2612e7c8e9d4d927570b20e1a0a",
+      "twin_text_sha256": "95629e55cb81c016bbca77dd366aebce2830c2612e7c8e9d4d927570b20e1a0a",
+      "equal": true
+    }
+  ]
+}

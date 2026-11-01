@@ -71,7 +71,9 @@
 //!   MTP lanes check it when a batched window is drafted, before an
 //!   `ArSynced` head append, before each prefill tile, and at the end of
 //!   every verify (`mtp_lanes`).
-//! - I2 (one snapshot ticket, only in a verify): AR lanes snapshot nothing.
+//! - I2 (one snapshot ticket, only in a verify): AR lanes snapshot nothing,
+//!   and an AR store's lane states are built without the snapshot arena
+//!   (`StateMirror::Absent`; a snapshot of one is `StateError::MirrorAbsent`).
 //!   An MTP lane holds one head ticket (taken at `draft_step`) and one target
 //!   ticket (taken at `forward_step`) only inside a `Batched` window; both
 //!   are committed by the window's finish, or dropped with the lane by
@@ -1206,46 +1208,66 @@ fn forward_inner(
     // completing tiles.
     let mut final_tiles: Vec<(usize, usize, usize)> = Vec::new();
     let mut ordinal = 0usize;
-    for (entry, e) in entries.iter_mut().enumerate() {
-        if e.r.kind != RequestStepKind::Prefill {
-            continue;
-        }
-        let i = ordinal;
-        ordinal += 1;
-        let tokens = &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()];
-        let completes = wants_pick(&e.lane.host, e.r);
-        if e.lane.spec.is_some() {
-            let scratch = append.as_deref_mut().and_then(Option::as_mut);
-            let pick = prefill_tile(bundle, gpu, &mut *e.lane, tokens, scratch, sample_host)?;
-            if completes {
-                picks[e.r.rows.end() - 1] =
-                    pick.ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
+    // A step's prefill tiles are one whole-prompt entry: on an EP
+    // reserve-sharing load the donors are borrowed by every tile of more than
+    // the resident rows and restored ONCE when the entry ends (the decode rows
+    // of this step already ran, and the next step's decode rows need them
+    // restored), not once per tile. A no-op on every other load.
+    if n_prefill > 0 {
+        bundle.share_prompt_begin();
+    }
+    let tiles: Result<(), String> = (|| {
+        for (entry, e) in entries.iter_mut().enumerate() {
+            if e.r.kind != RequestStepKind::Prefill {
+                continue;
             }
-        } else if completes {
-            let row = logits.sub_offset((rows_cap + i) * vocab, vocab);
-            bundle
-                .lane_prefill_tile(gpu, &mut e.lane.state, tokens, Some(&row))
+            let i = ordinal;
+            ordinal += 1;
+            let tokens = &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()];
+            let completes = wants_pick(&e.lane.host, e.r);
+            if e.lane.spec.is_some() {
+                let scratch = append.as_deref_mut().and_then(Option::as_mut);
+                let pick = prefill_tile(bundle, gpu, &mut *e.lane, tokens, scratch, sample_host)?;
+                if completes {
+                    picks[e.r.rows.end() - 1] = pick
+                        .ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
+                }
+            } else if completes {
+                let row = logits.sub_offset((rows_cap + i) * vocab, vocab);
+                bundle
+                    .lane_prefill_tile(gpu, &mut e.lane.state, tokens, Some(&row))
+                    .map_err(|e| e.to_string())?;
+                let slot = top1.sub_offset(
+                    (rows_cap + i) * std::mem::size_of::<i32>(),
+                    std::mem::size_of::<i32>(),
+                );
+                argmax_f32(
+                    gpu,
+                    &ArgmaxF32 {
+                        logits: &row,
+                        indices: &slot,
+                        rows: 1,
+                        vocab,
+                    },
+                )
                 .map_err(|e| e.to_string())?;
-            let slot = top1.sub_offset(
-                (rows_cap + i) * std::mem::size_of::<i32>(),
-                std::mem::size_of::<i32>(),
-            );
-            argmax_f32(
-                gpu,
-                &ArgmaxF32 {
-                    logits: &row,
-                    indices: &slot,
-                    rows: 1,
-                    vocab,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            final_tiles.push((i, e.r.rows.end() - 1, entry));
-        } else {
-            bundle
-                .lane_prefill_tile(gpu, &mut e.lane.state, tokens, None)
-                .map_err(|e| e.to_string())?;
+                final_tiles.push((i, e.r.rows.end() - 1, entry));
+            } else {
+                bundle
+                    .lane_prefill_tile(gpu, &mut e.lane.state, tokens, None)
+                    .map_err(|e| e.to_string())?;
+            }
         }
+        Ok(())
+    })();
+    if n_prefill > 0 {
+        let ended = bundle
+            .share_prompt_end(gpu, tiles.is_ok())
+            .map_err(|error| error.to_string());
+        tiles?;
+        ended?;
+    } else {
+        tiles?;
     }
     let prefill_ran = ordinal > 0;
     if !final_tiles.is_empty() {

@@ -1,0 +1,119 @@
+{
+  "module": "gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100",
+  "arch": "gfx1100",
+  "reports": [
+    {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 40,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 44,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 48,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 52,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 56,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          }
+        ],
+        "compared_to_incumbent": true,
+        "incumbent_sha256": "02c7472cf555f4be388aadec111ab7255eb80d4ed1fad16ab7097c077d29d4c8",
+        "incumbent_symbol": "gemm_mq4g256v2_moe_grouped_wmma_k2",
+        "kernarg_segment_size": 60
+      },
+      "arch": "gfx1100",
+      "elf_bytes": 14232,
+      "elf_sha256": "1f63cb943d2f356d28cfee46d7436322aa37b20d4b35995e7b6edaf406f25e06",
+      "hazards": {
+        "advisory": 5,
+        "blocking": 0,
+        "checked": true,
+        "findings": 5,
+        "pm_ir_obligations": 0
+      },
+      "hxaco_bytes": 18328,
+      "hxaco_sha256": "9e0321b8f74d33b83dce1aef01a3182392db3d1b3e90d50788fa3c1f97bc4d91",
+      "kernel": "gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100",
+      "lds": 9216,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 412,
+      "scratch": 0,
+      "sgprs": 32,
+      "text_bytes": 9612,
+      "text_sha256": "33675b778bc94940ad4fa6600111953b32eaeb2eb503ed530cd4b1b78ef4228d",
+      "user_sgprs": 14,
+      "vgprs": 136,
+      "wavefront_size": 32
+    }
+  ],
+  "judged_text_check": [
+    {
+      "symbol": "gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100",
+      "judged_object": "moe_k2-gu512-R1Moe-04-xlds-w4-t2",
+      "judged_symbol": "gemm_mq4g256v2_moe_grouped_wmma_k2",
+      "judged_code_sha256": "33675b778bc94940ad4fa6600111953b32eaeb2eb503ed530cd4b1b78ef4228d",
+      "twin_text_sha256": "33675b778bc94940ad4fa6600111953b32eaeb2eb503ed530cd4b1b78ef4228d",
+      "equal": true
+    }
+  ]
+}

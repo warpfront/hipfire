@@ -1,0 +1,15 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "SMALL_ROWS_BF16_ROWS4_MIN_ROWS",
+  "value": 80,
+  "covers": true,
+  "arch": "gfx1201",
+  "card": "R9700 (fabric j5919 + j5921, confounded=false)",
+  "summary": "Node bench (standalone hipcc harness, bit-identical to gemm_bf16_xf32_batched at every row count, odd M/K/N included): Selector shape (M17 K10240, BF16 x). 1 row/CTA vs 4 rows/CTA, us per call at N=32/33/64/80/96/112/128/256: p1 7.3/10.8/11.3/16.1/16.0/19.9/20.1/37.5, p4 14.6/14.6/14.9/15.1/15.3/15.4/15.1/17.6: p1 wins up to N=64 (p4 at N=80), crossover between 64 and 80; 80 is the first measured row count where p4 wins. Previous route 28.0-29.0 us at N<=64.",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/small_rows_node_gfx1201.txt",
+      "sha256": "4dc17c49efab18cc97e1a327892f54948347c368500819378cbf59c849fd26cc"
+    }
+  ]
+}

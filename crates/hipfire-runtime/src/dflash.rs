@@ -34,17 +34,28 @@ use std::collections::{HashMap, HashSet};
 
 /// Max rows per call into `gemm_dispatch` for the MQ (FWHT-rotated)
 /// path. The activation rotation scratch (`DflashScratch.mq_x_rot`) is
-/// sized to this many rows × `max(inter, q_dim, num_extract * hidden)`,
+/// sized to this many rows × `max(inter, q_dim, feature_width)`,
 /// regardless of context length. Calls with `batch > MQ_X_ROT_CHUNK_ROWS`
 /// are chunked transparently inside `gemm_dispatch`.
 ///
-/// Sizing rationale: at chunk=1024 and 27B (ne*h = 25600 floats per row),
+/// Sizing rationale: at chunk=1024 and 27B (feature width 25600 floats per row),
 /// the scratch is `1024 × 25600 × 4 ≈ 100 MB`. The pre-2026-05-15
-/// allocator sized this buffer to `max_seq × ne × h`, which at ctx=17K
+/// allocator sized this buffer to `max_seq × feature_width`, which at ctx=17K
 /// reached 1.74 GB on 27B — a multi-GB waste that scaled with `max_seq`.
 /// Chunking adds `ceil(batch / 1024)` extra kernel launches on the
 /// first-call `fc` rotation (one-shot per prompt, negligible vs prefill).
 const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
+
+/// Elements of the MQ rotation scratch (`mq_x_rot` and its F16 twin): a
+/// [`MQ_X_ROT_CHUNK_ROWS`] chunk of the widest rotated input. With staged
+/// features (`stage = Some(n)`) `fc` rotates at most `n` feature rows per
+/// call, so the feature width no longer sets the chunk.
+fn mq_x_rot_elems(inter: usize, qd: usize, fw: usize, stage: Option<usize>) -> usize {
+    match stage {
+        None => MQ_X_ROT_CHUNK_ROWS * inter.max(qd).max(fw),
+        Some(n) => (MQ_X_ROT_CHUNK_ROWS * inter.max(qd)).max(n * fw),
+    }
+}
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -148,12 +159,22 @@ pub struct DflashConfig {
     pub conv_kernel_size: Option<usize>,
     pub selector_rank: Option<usize>,
     pub selector_top_k: Option<usize>,
+    /// Hidden rows the target appends per extract layer per position
+    /// (`dflash_config.target_streams_per_layer`, default 1). A multi-stream
+    /// residual target (e.g. Raon's 4 mHC streams) contributes every stream.
+    pub target_streams_per_layer: usize,
 }
 
 impl DflashConfig {
     /// Returns the number of target hidden layers concatenated into fc input.
     pub fn num_extract(&self) -> usize {
         self.target_layer_ids.len()
+    }
+
+    /// Width of one feature row (= fc input K):
+    /// `num_extract × target_streams_per_layer × hidden`.
+    pub fn feature_width(&self) -> usize {
+        self.num_extract() * self.target_streams_per_layer * self.hidden
     }
 
     pub fn kv_dim(&self) -> usize {
@@ -182,6 +203,11 @@ impl DflashConfig {
     /// `dflash` object written by `dflash_convert`.
     pub fn from_hfq(hfq: &HfqFile) -> Option<Self> {
         let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
+        Self::from_metadata(&meta)
+    }
+
+    /// Parse from the full HFQ metadata JSON value (see [`Self::from_hfq`]).
+    pub fn from_metadata(meta: &serde_json::Value) -> Option<Self> {
         let df = meta.get("dflash")?;
 
         let n_layers = df.get("num_hidden_layers").and_then(|v| v.as_u64())? as usize;
@@ -292,6 +318,9 @@ impl DflashConfig {
         let conv_kernel_size = dflash_u64("conv_kernel_size");
         let selector_rank = dflash_u64("selector_rank");
         let selector_top_k = dflash_u64("selector_top_k");
+        let target_streams_per_layer = dflash_u64("target_streams_per_layer")
+            .filter(|&s| s >= 1)
+            .unwrap_or(1);
 
         Some(DflashConfig {
             n_layers,
@@ -313,6 +342,7 @@ impl DflashConfig {
             conv_kernel_size,
             selector_rank,
             selector_top_k,
+            target_streams_per_layer,
         })
     }
 }
@@ -363,7 +393,7 @@ impl SelectorCodebook {
 }
 
 pub struct DflashWeights {
-    /// `fc`: Linear(num_extract × hidden → hidden). Shape: [hidden, num_extract × hidden].
+    /// `fc`: Linear(feature_width → hidden). Shape: [hidden, feature_width].
     pub fc: WeightTensor,
     pub hidden_norm: GpuTensor, // [hidden] — F32
     pub norm: GpuTensor,        // [hidden] — F32, final output norm
@@ -960,7 +990,7 @@ impl DflashWeights {
             gpu,
             "fc.weight",
             cfg.hidden,
-            cfg.num_extract() * cfg.hidden,
+            cfg.feature_width(),
         ));
         let i_hidden_norm = gt!(hfq_tensor_f32(
             hfq,
@@ -1595,7 +1625,7 @@ pub const DRAFT_LANE_WS_ROWS: usize = 72;
 pub struct DraftLaneWorkspace {
     /// Packed rows these tensors hold ([`DRAFT_LANE_WS_ROWS`]).
     pub rows: usize,
-    /// Row stride of `input`: `max(num_extract × hidden, hidden)`.
+    /// Row stride of `input`: `max(feature_width, hidden)`.
     pub input_width: usize,
     /// `[rows, input_width]` gathered `target_hidden` (fc) / projected-hidden
     /// (ctx) rows; shape subviews use the actual width of the stage.
@@ -1617,7 +1647,7 @@ impl DraftLaneWorkspace {
         let rows = DRAFT_LANE_WS_ROWS;
         let h = cfg.hidden;
         let kvd = cfg.kv_dim();
-        let input_width = std::cmp::max(cfg.num_extract() * h, h);
+        let input_width = std::cmp::max(cfg.feature_width(), h);
         let mut live: Vec<GpuTensor> = Vec::with_capacity(5);
         for len in [rows * input_width, rows * h, rows * kvd, rows * kvd, rows] {
             match gpu.alloc_tensor(&[len], DType::F32) {
@@ -1679,7 +1709,7 @@ pub struct DflashScratch {
     pub residual: GpuTensor, // [B, hidden]
 
     // Context activations (L rows), where L ≤ max_ctx_len.
-    pub target_hidden: GpuTensor,      // [L, num_extract × hidden]
+    pub target_hidden: GpuTensor,      // [L, feature_width]
     pub target_hidden_proj: GpuTensor, // [L, hidden]
 
     // Concatenated K/V (L + B rows).
@@ -1696,7 +1726,7 @@ pub struct DflashScratch {
     pub lane_positions_q: Vec<i32>,
 
     // FWHT rotation scratch for MQ4 weight paths. Sized to the largest
-    // single-call requirement: max(max_ctx × num_extract*hidden,
+    // single-call requirement: max(max_ctx × feature_width,
     // max_block × max_layer_K). Allocated only when DflashWeights.has_mq.
     pub mq_x_rot: Option<GpuTensor>,
     // Launch-fusion prescaffold (S7): F16 twin of `mq_x_rot` (same element
@@ -1772,6 +1802,16 @@ pub struct DflashScratch {
     /// Developer-only online draft tuner (`HIPFIRE_DFLASH_ONLINE_TUNE`);
     /// `None` keeps the shipping argmax proposal path.
     pub online: Option<crate::dflash_online::OnlineDraftTuner>,
+    /// Staged feature rows ([`Self::new_windowed_staged`]): `target_hidden`
+    /// holds this many rows and is NOT a resident context ring. Every
+    /// `draft_forward_based` streams the rows it projects (`fc` +
+    /// `hidden_norm`) from the caller's host feature rows through it, at most
+    /// this many per GEMM; only the projected rows stay resident. `None`: the
+    /// resident ring every other path reads.
+    pub feature_stage_rows: Option<usize>,
+    /// Graph-captured fixed-shape layer segments of the draft window
+    /// ([`DraftGraphState`], `HIPFIRE_DFLASH_DRAFT_GRAPH`).
+    pub draft_graph: DraftGraphState,
 }
 
 impl DflashScratch {
@@ -1811,6 +1851,46 @@ impl DflashScratch {
             with_mq,
             &mut || Ok(()),
         )
+    }
+
+    /// [`Self::new_windowed`] for an all-sliding DFlash2 draft fed from host
+    /// feature rows (`draft_forward_based` with `target_hidden = Some`), with
+    /// a `stage_rows`-row feature staging buffer instead of the `w`-row raw
+    /// feature ring ([`Self::feature_stage_rows`]). The raw ring only ever
+    /// served the projection of rows not yet projected, so staging leaves the
+    /// draft's inputs unchanged while saving `(w - stage_rows) x
+    /// feature_width x 4` bytes (Raon-1-mini: 51200-wide rows, 0.42 GB at
+    /// `w = 2048`). A draft with a full-attention layer (backfill from the
+    /// raw ring) is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_windowed_staged(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        w: usize,
+        max_ctx: usize,
+        with_mq: bool,
+        stage_rows: usize,
+    ) -> HipResult<Self> {
+        if !cfg.all_layers_sliding || stage_rows == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "staged draft features need an all-sliding draft and a non-empty stage",
+            ));
+        }
+        let stage_rows = stage_rows.min(w);
+        let mut s = Self::new_with_mq_inner(
+            gpu,
+            cfg,
+            max_block_size,
+            w,
+            with_mq,
+            Some(stage_rows),
+            &mut || Ok(()),
+        )?;
+        s.max_ctx_len = max_ctx;
+        s.ctx_mode = DraftCtxMode::Windowed { w, w_full: w };
+        Ok(s)
     }
 
     #[allow(clippy::too_many_arguments)] // Mirrors the public constructor plus a test-only boundary.
@@ -1928,10 +2008,33 @@ impl DflashScratch {
         with_mq: bool,
         after_owner: &mut impl FnMut() -> HipResult<()>,
     ) -> HipResult<Self> {
+        Self::new_with_mq_inner(
+            gpu,
+            cfg,
+            max_block_size,
+            max_ctx_len,
+            with_mq,
+            None,
+            after_owner,
+        )
+    }
+
+    /// `feature_stage_rows`: `Some(n)` sizes `target_hidden` as an `n`-row
+    /// staging buffer ([`Self::feature_stage_rows`]) instead of the
+    /// `max_ctx_len`-row ring.
+    fn new_with_mq_inner(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        max_ctx_len: usize,
+        with_mq: bool,
+        feature_stage_rows: Option<usize>,
+        after_owner: &mut impl FnMut() -> HipResult<()>,
+    ) -> HipResult<Self> {
         let b = max_block_size;
         let l = max_ctx_len;
         let tot = l + b;
-        let ne = cfg.num_extract();
+        let fw = cfg.feature_width();
         let h = cfg.hidden;
         let inter = cfg.intermediate;
         let qd = cfg.q_dim();
@@ -1984,23 +2087,26 @@ impl DflashScratch {
             // Sized for a CHUNK of the worst-case MQ rotation, not the whole
             // first-call prefix. The rotations called through `gemm_dispatch`
             // are:
-            //   - first-call `fc` (target_hidden):  batch up to `l`, w.k = ne*h
+            //   - first-call `fc` (target_hidden):  batch up to `l`, w.k = feature_width
             //   - per-cycle wq/wk/wv/gate/up:       batch = b,         w.k = h
             //   - per-cycle wo:                     batch = b,         w.k = q_dim
             //   - per-cycle w_down:                 batch = b,         w.k = intermediate
             //   - first-call wk/wv on prefix:       batch up to `l`,   w.k = h
             //
-            // Steady-state cycles only need `b × max(inter, qd, ne*h)`. The
+            // Steady-state cycles only need `b × max(inter, qd, feature_width)`. The
             // first-call rotations against the full prefix used to pin the
-            // buffer to `l × ne × h` (1.7 GB at ctx=17K on 27B). That sizing
+            // buffer to `l × feature_width` (1.7 GB at ctx=17K on 27B). That sizing
             // forced VRAM bloat that scales with max_seq.
             //
-            // Fix: cap the scratch at `MQ_X_ROT_CHUNK_ROWS × max(inter, qd, ne*h)`
+            // Fix: cap the scratch at `MQ_X_ROT_CHUNK_ROWS × max(inter, qd, feature_width)`
             // floats and chunk any call where `batch × w.k > scratch.size()`
             // inside `gemm_dispatch`. The first-call rotations are split into
             // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
             // 1K prefix tokens (negligible vs seconds-scale prefill).
-            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
+            //
+            // Staged features: `fc` sees at most `stage` rows per call, so its
+            // rotation needs `stage × feature_width`, not a chunk of them.
+            let widest = mq_x_rot_elems(inter, qd, fw, feature_stage_rows);
             Some(at!(&[widest]))
         } else {
             None
@@ -2009,7 +2115,7 @@ impl DflashScratch {
         // Joins the `at!` transaction (dtype arm): a bare `?` here would
         // leak every earlier allocation (`GpuTensor` has no `Drop`).
         let i_mq_x_rot_f16 = if with_mq {
-            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
+            let widest = mq_x_rot_elems(inter, qd, fw, feature_stage_rows);
             Some(at!(&[widest], DType::F16))
         } else {
             None
@@ -2067,7 +2173,7 @@ impl DflashScratch {
         let i_attn_out = at!(&[b * qd]);
         let i_residual = at!(&[b * h]);
 
-        let i_target_hidden = at!(&[l * ne * h]);
+        let i_target_hidden = at!(&[feature_stage_rows.unwrap_or(l) * fw]);
         let i_target_hidden_proj = at!(&[l * h]);
 
         let i_k_cat = at!(&[tot * kvd]);
@@ -2133,6 +2239,8 @@ impl DflashScratch {
             draft_ffn_warmed_up,
             lane_ws: None,
             online: crate::dflash_online::OnlineDraftTuner::from_env(),
+            feature_stage_rows,
+            draft_graph: DraftGraphState::from_env(),
         };
         debug_assert!(live.iter().all(|s| s.is_none()));
         Ok(scratch)
@@ -2187,7 +2295,20 @@ impl DflashScratch {
         self.thlog.invalidate_proj_cache();
     }
 
-    pub fn free_gpu(self, gpu: &mut Gpu) {
+    /// Turn the graph-captured draft window on or off for this scratch (the
+    /// default is `HIPFIRE_DFLASH_DRAFT_GRAPH`). Turning it off keeps the
+    /// recorded graphs for a later re-enable.
+    pub fn set_draft_graph(&mut self, on: bool) {
+        self.draft_graph.enabled = on;
+    }
+
+    /// Counters of the graph-captured draft window since this scratch was built.
+    pub fn draft_graph_stats(&self) -> DraftGraphStats {
+        self.draft_graph.stats()
+    }
+
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        std::mem::take(&mut self.draft_graph).free(gpu);
         for per_layer in self.draft_ffn_graphs {
             for (_, (graph, exec, _blobs)) in per_layer {
                 let _ = gpu.hip.graph_exec_destroy(exec);
@@ -2445,6 +2566,61 @@ fn gemm_dispatch_shared<const N: usize>(
         }
     }
     Ok(())
+}
+
+/// `HIPFIRE_DFLASH_FC_SKINNY=0` (developer kill switch, default on): the staged
+/// `fc` projection of a window's few new feature rows goes back to the batched
+/// WMMA GEMM instead of [`Gpu::gemm_f16_skinny_xf32`].
+static FC_SKINNY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_FC_SKINNY").map_or(true, |v| v.trim() != "0")
+});
+
+/// 0 = follow `HIPFIRE_DFLASH_FC_SKINNY`, 1 = force off, 2 = force on.
+static FC_SKINNY_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Developer oracle hook: force the skinny staged `fc` projection on / off for
+/// every later draft forward in this process (`None`: back to the env switch).
+pub fn set_fc_skinny_override(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    FC_SKINNY_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fc_skinny_on() -> bool {
+    match FC_SKINNY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => *FC_SKINNY,
+    }
+}
+
+/// [`gemm_dispatch`] for the draft's staged `fc` projection (`n` new feature
+/// rows, `K = num_extract x streams x hidden`). An F16 `fc` (what the converter
+/// keeps for a multi-stream draft) over at most 16 rows reads its weights once
+/// through [`Gpu::gemm_f16_skinny_xf32`] instead of the one-wave-per-16-rows
+/// WMMA GEMM, which streamed the 260 MB weight at ~100 GB/s. The draft only
+/// proposes, so the different (deterministic, F32-activation) summation order
+/// can change a draft token, never the verified output.
+fn gemm_dispatch_fc_rows(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    w: &WeightTensor,
+    y: &GpuTensor,
+    n: usize,
+    mq_x_rot: Option<&GpuTensor>,
+    mq_x_rot_f16: Option<&GpuTensor>,
+) -> HipResult<()> {
+    if fc_skinny_on()
+        && w.gpu_dtype == DType::F16
+        && w.row_stride == 0
+        && gpu.gemm_f16_skinny_admitted(&w.buf, x, w.m, w.k, n)
+    {
+        return gpu.gemm_f16_skinny_xf32(&w.buf, x, y, w.m, w.k, n);
+    }
+    gemm_dispatch(gpu, x, w, y, n, mq_x_rot, mq_x_rot_f16)
 }
 
 /// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
@@ -2860,6 +3036,260 @@ fn gemm_dispatch(
     result
 }
 
+/// `HIPFIRE_DFLASH_DRAFT_GRAPH=1` (developer, default off): record the
+/// fixed-shape part of every draft layer once per block size and replay it as
+/// `hipGraphLaunch`es. Resolved once per process; a scratch's own switch
+/// ([`DflashScratch::set_draft_graph`]) overrides it.
+static DRAFT_GRAPH_ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT_GRAPH").is_ok_and(|v| v.trim() == "1")
+});
+
+/// Counters of a scratch's graph-captured draft window.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DraftGraphStats {
+    pub enabled: bool,
+    /// Segment graphs recorded since the scratch was built.
+    pub captures: u64,
+    /// Segment graph launches.
+    pub replays: u64,
+    /// Segment graphs currently held.
+    pub segments: usize,
+    /// Host seconds spent inside `hipGraphLaunch` of segment graphs.
+    pub launch_secs: f64,
+    /// Why the graph route stopped for this scratch (it then runs eagerly).
+    pub refused: Option<String>,
+}
+
+/// Graph-captured segments of one DFlash2 draft window.
+///
+/// Per block size `b` a window is `n_layers + 1` graph segments around the
+/// work whose launch arguments follow the committed context and so differ per
+/// window. Segment 0 is layer 0's fixed head (residual save + norm, DFlash2
+/// prepare convolution, Q / noise-K / noise-V projections); segment `i + 1` is
+/// layer `i`'s fixed tail (`wo`, finish convolution, residual, FFN with its
+/// convolutions) followed by layer `i + 1`'s head, and the last one ends with
+/// the final norm. Between segments the window runs eagerly: the context K/V
+/// fill of the new feature rows (row count and ring slots vary), the noise-K
+/// rope, the ring-ordered K/V concat (segment splits vary) and the attention
+/// (span varies until the window is full). The kernels, their arguments and
+/// their order are those of the eager window, so a replayed window is
+/// bit-identical to an eager one.
+///
+/// Lifecycle per `(b, segment)`: the first window runs eagerly (kernel modules
+/// and shared scratch sizes settle, neither of which may happen under capture);
+/// the next records and launches; later windows launch. Every graph bakes
+/// device addresses, so all of them are dropped and re-warmed when the binding
+/// (weights, scratch tensors, shared scratch growth epoch) changes. A refused
+/// capture or an unsupported configuration runs eagerly from then on and says
+/// why in [`DraftGraphStats::refused`].
+#[derive(Default)]
+pub struct DraftGraphState {
+    pub(crate) enabled: bool,
+    segments: HashMap<(usize, usize), (Graph, GraphExec, Vec<Vec<u8>>)>,
+    warmed: HashSet<(usize, usize)>,
+    /// Binding each block size's graphs were recorded with.
+    bound: HashMap<usize, u64>,
+    refused: Option<String>,
+    captures: u64,
+    replays: u64,
+    launch_secs: f64,
+}
+
+impl DraftGraphState {
+    fn from_env() -> Self {
+        Self {
+            enabled: *DRAFT_GRAPH_ENV,
+            ..Self::default()
+        }
+    }
+
+    fn stats(&self) -> DraftGraphStats {
+        DraftGraphStats {
+            enabled: self.enabled,
+            captures: self.captures,
+            replays: self.replays,
+            segments: self.segments.len(),
+            launch_secs: self.launch_secs,
+            refused: self.refused.clone(),
+        }
+    }
+
+    fn refuse(&mut self, why: String) {
+        eprintln!("[dflash] draft graph disabled for this draft: {why}");
+        self.refused = Some(why);
+    }
+
+    /// Destroy every recorded segment of block size `b`.
+    fn drop_block(&mut self, gpu: &mut Gpu, b: usize) {
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            let _ = gpu.hip.stream_synchronize(stream);
+        }
+        let keys: Vec<(usize, usize)> =
+            self.segments.keys().copied().filter(|k| k.0 == b).collect();
+        for key in keys {
+            if let Some((graph, exec, _blobs)) = self.segments.remove(&key) {
+                let _ = gpu.hip.graph_exec_destroy(exec);
+                let _ = gpu.hip.graph_destroy(graph);
+            }
+        }
+        self.warmed.retain(|k| k.0 != b);
+    }
+
+    pub(crate) fn free(mut self, gpu: &mut Gpu) {
+        let blocks: Vec<usize> = self.segments.keys().map(|k| k.0).collect();
+        for b in blocks {
+            self.drop_block(gpu, b);
+        }
+    }
+
+    /// Whether this window runs through segment graphs. `ineligible`: a caller
+    /// condition the graph route cannot serve (per-phase timing, a staged plan).
+    #[allow(clippy::too_many_arguments)]
+    fn admit(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &DflashWeights,
+        cfg: &DflashConfig,
+        scratch: &DflashScratch,
+        b: usize,
+        ordered: bool,
+        ineligible: bool,
+    ) -> HipResult<bool> {
+        if !self.enabled || ineligible || self.refused.is_some() {
+            return Ok(false);
+        }
+        if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+            // Already inside someone else's recording: run the window plainly.
+            return Ok(false);
+        }
+        if !ordered {
+            self.refuse(
+                "HIPFIRE_DFLASH_ORDERED_DRAFT=0 (synchronous D2D copies are not capturable)".into(),
+            );
+            return Ok(false);
+        }
+        if crate::config::get().draft_gemm_dump {
+            return Ok(false);
+        }
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create()?);
+        }
+        let binding = Self::binding(gpu, weights, cfg, scratch, b);
+        if self.bound.get(&b) != Some(&binding) {
+            self.drop_block(gpu, b);
+            self.bound.insert(b, binding);
+        }
+        Ok(true)
+    }
+
+    /// Identity of every device address a segment graph bakes: the layer
+    /// weights' first tensors, the block-sized activation planes, the rotation
+    /// scratch and the shared-scratch growth epoch (a grown shared scratch
+    /// moves the buffers the GEMMs stage through).
+    fn binding(
+        gpu: &Gpu,
+        weights: &DflashWeights,
+        cfg: &DflashConfig,
+        scratch: &DflashScratch,
+        b: usize,
+    ) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x100_0000_01b3);
+        mix(b as u64);
+        mix(cfg.n_layers as u64);
+        mix(rdna_compute::scratch::scratch_growth_epoch());
+        mix(std::sync::Arc::as_ptr(&gpu.flags) as usize as u64);
+        mix(weights.norm.buf.as_ptr() as u64);
+        for layer in &weights.layers {
+            mix(layer.wq.buf.buf.as_ptr() as u64);
+            mix(layer.w_down.buf.buf.as_ptr() as u64);
+        }
+        for t in [
+            &scratch.x,
+            &scratch.x_norm,
+            &scratch.q,
+            &scratch.k_noise,
+            &scratch.v_noise,
+            &scratch.gate,
+            &scratch.up,
+            &scratch.gate_up,
+            &scratch.attn_out,
+            &scratch.residual,
+        ]
+        .into_iter()
+        .chain(scratch.mq_x_rot.iter())
+        .chain(scratch.mq_x_rot_f16.iter())
+        .chain(scratch.conv_temp.iter())
+        .chain(scratch.conv_dynamic.iter())
+        {
+            mix(t.buf.as_ptr() as u64);
+        }
+        h
+    }
+
+    /// Run segment `idx` of block size `b`: launch its graph, record it (the
+    /// window after its warm-up), or run `f` eagerly. `f` may run twice: a
+    /// capture that fails executes nothing, so the segment then runs eagerly and
+    /// the graph route stops for this draft.
+    pub(crate) fn run_segment<F>(
+        &mut self,
+        gpu: &mut Gpu,
+        b: usize,
+        idx: usize,
+        mut f: F,
+    ) -> HipResult<()>
+    where
+        F: FnMut(&mut Gpu) -> HipResult<()>,
+    {
+        let key = (b, idx);
+        if self.refused.is_some() {
+            return f(gpu);
+        }
+        if self.segments.contains_key(&key) {
+            return self.launch(gpu, key);
+        }
+        if self.warmed.insert(key) {
+            return f(gpu);
+        }
+        begin_draft_ffn_graph_capture(gpu)?;
+        match f(gpu) {
+            Ok(()) => match end_draft_ffn_graph_capture(gpu) {
+                Ok(entry) => {
+                    self.segments.insert(key, entry);
+                    self.captures += 1;
+                    self.launch(gpu, key)
+                }
+                Err(e) => {
+                    abort_draft_ffn_graph_capture(gpu);
+                    self.refuse(format!("segment {idx} (B={b}) end capture: {e}"));
+                    f(gpu)
+                }
+            },
+            Err(e) => {
+                abort_draft_ffn_graph_capture(gpu);
+                self.refuse(format!("segment {idx} (B={b}) capture: {e}"));
+                f(gpu)
+            }
+        }
+    }
+
+    fn launch(&mut self, gpu: &mut Gpu, key: (usize, usize)) -> HipResult<()> {
+        let stream = gpu
+            .active_stream
+            .as_ref()
+            .expect("draft graph stream ensured by admit");
+        let entry = self
+            .segments
+            .get(&key)
+            .expect("draft graph segment present");
+        let t = std::time::Instant::now();
+        gpu.hip.graph_launch(&entry.1, stream)?;
+        self.launch_secs += t.elapsed().as_secs_f64();
+        self.replays += 1;
+        Ok(())
+    }
+}
+
 fn begin_draft_ffn_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
     gpu.graphs.capture_blobs.clear();
     gpu.graphs.capture_mode = true;
@@ -3097,11 +3527,11 @@ pub fn draft_seed_backfill(
         _ => return Ok(()),
     };
     let h = cfg.hidden;
-    let ne = cfg.num_extract();
+    let fw = cfg.feature_width();
     let kvd = cfg.kv_dim();
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
-    let row_f32 = ne * h;
+    let row_f32 = fw;
     assert_eq!(
         host_hidden.len(),
         prompt_len * row_f32,
@@ -3206,7 +3636,7 @@ pub fn draft_seed_backfill(
 /// Run one draft forward. Inputs:
 /// - `noise_embedding`: `[block_size × hidden]` f32, row-major. Comes from
 ///   `target.embed_tokens(block_output_ids)` on the caller side.
-/// - `target_hidden`:   `[ctx_len × num_extract × hidden]` f32, row-major
+/// - `target_hidden`:   `[ctx_len × feature_width]` f32, row-major
 ///   (5-way concat of target's chosen-layer hidden states at `ctx_len`
 ///   accepted positions).
 /// - `positions_q`:     `[block_size]` i32 — absolute position index of
@@ -3231,7 +3661,7 @@ pub fn draft_seed_backfill(
 ///     D2D copies into `scratch.x` suffice).
 /// `target_hidden`: if `Some`, uploaded into `scratch.target_hidden`.
 ///     If `None`, the caller must have already filled `scratch.target_hidden`
-///     with `ctx_len × num_extract × hidden` F32 rows.
+///     with `ctx_len × feature_width` F32 rows.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_forward(
     gpu: &mut Gpu,
@@ -3389,12 +3819,54 @@ fn draft_forward_based_impl(
     staged: Option<&DraftStagedInputs<'_>>,
     publish: bool,
 ) -> HipResult<()> {
+    // The graph state is taken out of the scratch for the call so the segment
+    // closures can borrow the scratch while the state records into itself.
+    let mut graphs = std::mem::take(&mut scratch.draft_graph);
+    let result = draft_forward_based_inner(
+        gpu,
+        weights,
+        cfg,
+        noise_embedding,
+        target_hidden,
+        target_hidden_base,
+        positions_q,
+        positions_k,
+        block_size,
+        ctx_len,
+        scratch,
+        graph_ffn,
+        staged,
+        publish,
+        &mut graphs,
+    );
+    scratch.draft_graph = graphs;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draft_forward_based_inner(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    noise_embedding: Option<&[f32]>,
+    target_hidden: Option<&[f32]>,
+    target_hidden_base: usize,
+    positions_q: &[i32],
+    positions_k: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+    scratch: &mut DflashScratch,
+    graph_ffn: bool,
+    staged: Option<&DraftStagedInputs<'_>>,
+    publish: bool,
+    graphs: &mut DraftGraphState,
+) -> HipResult<()> {
     let base = target_hidden_base;
     let b = block_size;
     let l = ctx_len;
     let tot = l + b;
     let h = cfg.hidden;
-    let ne = cfg.num_extract();
+    let fw = cfg.feature_width();
     let kvd = cfg.kv_dim();
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
@@ -3406,7 +3878,7 @@ fn draft_forward_based_impl(
         assert_eq!(ne_slice.len(), b * h, "noise_embedding size");
     }
     if let Some(th_slice) = target_hidden {
-        assert_eq!(th_slice.len(), (l - base) * ne * h, "target_hidden size");
+        assert_eq!(th_slice.len(), (l - base) * fw, "target_hidden size");
     }
     match scratch.ctx_mode {
         DraftCtxMode::Legacy => {
@@ -3476,16 +3948,25 @@ fn draft_forward_based_impl(
     if let Some(ne_slice) = noise_embedding {
         upload_slice_f32(gpu, &scratch.x, ne_slice)?;
     }
-    if let Some(th_slice) = target_hidden {
+    // Staged features ([`DflashScratch::feature_stage_rows`]) are never
+    // uploaded as a ring: step 1 streams the rows it projects from the host.
+    let stage_rows = scratch.feature_stage_rows;
+    if stage_rows.is_some() && target_hidden.is_none() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "staged draft features need the host feature rows (target_hidden = Some)",
+        ));
+    }
+    if let Some(th_slice) = target_hidden.filter(|_| stage_rows.is_none()) {
         // Incremental-upload fast path: the caller passes a rolling prefix
         // (rows 0..l) of target_hidden. In DFlash's common steady-state
         // (ctx_slice == None), the prefix grows by accept+1 rows per cycle
         // and rows [0..prev_l) are unchanged since the previous call.
         // Upload only the new tail when detected. This cuts the H2D from
-        // `l × ne × hidden × 4` (e.g. ~90 MB at l=1100 on 9B) to
-        // `(l - uploaded) × ne × hidden × 4` (~700 KB at accept=8).
+        // `l × feature_width × 4` (e.g. ~90 MB at l=1100 on 9B) to
+        // `(l - uploaded) × feature_width × 4` (~700 KB at accept=8).
         //
-        // The optimization only fires when `th_slice.len() == l × ne × h`
+        // The optimization only fires when `th_slice.len() == l × feature_width`
         // and it matches what the caller told us (matches a non-sliced
         // cumulative buffer). ctx_slice callers pass a DIFFERENT slice
         // every cycle (last N rows shift) — for them, force full upload.
@@ -3494,7 +3975,7 @@ fn draft_forward_based_impl(
         // swa_w); only rows [max(prev, l−swa_w)..l) are uploaded, wrap-split
         // at the ring boundary. Out-of-window rows are never read (fc is the
         // only consumer and its fill is span-limited too).
-        let row_f32 = ne * h;
+        let row_f32 = fw;
         let expected_full_len = (l - base) * row_f32;
         let prev = scratch.thlog.uploaded_rows();
         // Full-upload conditions: first call, reset flagged, caller shrank
@@ -3610,22 +4091,55 @@ fn draft_forward_based_impl(
     let fc_start = cached_rows.max(l.saturating_sub(swa_w));
     let delta = l.saturating_sub(fc_start);
     if delta > 0 {
-        for (_row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
-            let th_slice = scratch
-                .target_hidden
-                .sub_offset(slot0 * ne * h, len * ne * h);
-            let thp_slice = scratch.target_hidden_proj.sub_offset(slot0 * h, len * h);
-            gemm_dispatch(
-                gpu,
-                &th_slice,
-                &weights.fc,
-                &thp_slice,
-                len,
-                scratch.mq_x_rot.as_ref(),
-                scratch.mq_x_rot_f16.as_ref(),
-            )?;
-            gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
+        for (row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
+            let (Some(stage), Some(host)) = (stage_rows, target_hidden) else {
+                let th_slice = scratch.target_hidden.sub_offset(slot0 * fw, len * fw);
+                let thp_slice = scratch.target_hidden_proj.sub_offset(slot0 * h, len * h);
+                gemm_dispatch(
+                    gpu,
+                    &th_slice,
+                    &weights.fc,
+                    &thp_slice,
+                    len,
+                    scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
+                )?;
+                gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
+                continue;
+            };
+            // Staged: host rows → stage buffer → fc + hidden_norm into the
+            // projection ring, at most `stage` rows per GEMM.
+            let mut done = 0usize;
+            while done < len {
+                let n = stage.min(len - done);
+                let first = row0 + done - base;
+                let seg = &host[first * fw..(first + n) * fw];
+                // SAFETY: `seg` is `n * fw` initialized f32s viewed as bytes.
+                let src_bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4) };
+                gpu.hip
+                    .memcpy_htod_offset(&scratch.target_hidden.buf, 0, src_bytes)?;
+                let th_slice = scratch.target_hidden.sub_offset(0, n * fw);
+                let thp_slice = scratch
+                    .target_hidden_proj
+                    .sub_offset((slot0 + done) * h, n * h);
+                gemm_dispatch_fc_rows(
+                    gpu,
+                    &th_slice,
+                    &weights.fc,
+                    &thp_slice,
+                    n,
+                    scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
+                )?;
+                gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, n, h, eps)?;
+                done += n;
+            }
         }
+    }
+    if stage_rows.is_some() {
+        // Every row through `l` was either projected above or already cached.
+        scratch.thlog.mark_uploaded(l);
     }
 
     // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
@@ -3657,78 +4171,25 @@ fn draft_forward_based_impl(
     // DFlash2 all-sliding detection for windowed mode branching.
     let is_all_sliding_windowed = windowed && cfg.all_layers_sliding;
     let ordered = ordered_draft();
+    let graph_seg = graphs.admit(
+        gpu,
+        weights,
+        cfg,
+        scratch,
+        b,
+        ordered,
+        dbg || staged.is_some(),
+    )?;
+    if graph_seg {
+        // Segment 0: layer 0's fixed head. Segment `i + 1`: layer `i`'s fixed tail + layer
+        // `i + 1`'s fixed head (the last one ends with the final norm). The variable
+        // work (context K/V fill, noise-K rope, K/V concat, attention) runs between them.
+        graphs.run_segment(gpu, b, 0, |gpu| {
+            draft_layer_pre(gpu, &weights.layers[0], scratch, cfg, b, h, eps, ordered)
+        })?;
+    }
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
-
-        // S7: dual-output RMSNorm replaces the residual memcpy + attn_norm
-        // pair (bitwise residual capture, identical norm order).
-        if gpu.draft_collapse_fused_enabled() {
-            gpu.rmsnorm_residual_dual_dflash(
-                &scratch.x,
-                &layer.attn_norm,
-                &scratch.residual,
-                &scratch.x_norm,
-                b,
-                h,
-                eps,
-            )?;
-        } else {
-            // Residual.
-            draft_dtod_at(
-                gpu,
-                ordered,
-                &scratch.residual.buf,
-                0,
-                &scratch.x.buf,
-                0,
-                (b * h) * 4,
-            )?;
-            // attn_norm.
-            gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
-        }
-
-        // ── DFlash2 prepare conv before QKV (no cross-cycle history) ─────
-        // After RMSNorm, project normalized hidden to dynamic kernel coeffs
-        // [B,2*K*G] then left-zero-padded grouped conv over the B rows.
-        let attn_prepare_src =
-            if let (Some(base), Some(proj)) = (&layer.attn_conv_base, &layer.attn_conv_proj) {
-                if let (Some(dyn_buf), Some(tmp)) = (&scratch.conv_dynamic, &scratch.conv_temp) {
-                    let k = cfg.conv_kernel_size.unwrap_or(2);
-                    let g = cfg.conv_group_size.unwrap_or(16);
-                    let groups = h / g;
-                    let stride = 2 * k * groups;
-                    // projection: x_norm [B,H] @ proj [2KG, H]^T -> dynamic [B,2KG]
-                    let dyn_slice = dyn_buf.sub_offset(0, b * stride);
-                    gemm_dispatch(
-                        gpu,
-                        &scratch.x_norm,
-                        proj,
-                        &dyn_slice,
-                        b,
-                        scratch.mq_x_rot.as_ref(),
-                        scratch.mq_x_rot_f16.as_ref(),
-                    )?;
-                    // prepare phase offset 0, window K*G
-                    gpu.dynamic_causal_conv_f32(
-                        &scratch.x_norm,
-                        base,
-                        &dyn_slice,
-                        tmp,
-                        b,
-                        h,
-                        k,
-                        g,
-                        stride,
-                        0,
-                    )?;
-                    Some(tmp as &GpuTensor)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-        let qkv_src = attn_prepare_src.unwrap_or(&scratch.x_norm);
 
         let t0 = if dbg {
             gpu.hip.device_synchronize()?;
@@ -3736,24 +4197,9 @@ fn draft_forward_based_impl(
         } else {
             None
         };
-
-        // Q/K/V projections — dispatched on each weight's dtype.
-        // Q and K/V noise (over the B block positions) must be computed
-        // every cycle. K_ctx and V_ctx (over the L context positions)
-        // are *incrementally* cached — see the per-layer block below.
-        gemm_dispatch_shared(
-            gpu,
-            qkv_src,
-            [
-                (&layer.wq, &scratch.q),
-                (&layer.wk, &scratch.k_noise),
-                (&layer.wv, &scratch.v_noise),
-            ],
-            b,
-            scratch.mq_x_rot.as_ref(),
-            scratch.mq_x_rot_f16.as_ref(),
-            SharedProjection::Qkv,
-        )?;
+        if !graph_seg {
+            draft_layer_pre(gpu, layer, scratch, cfg, b, h, eps, ordered)?;
+        }
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
         // accepted-context rows of target_hidden_proj. INCREMENTAL PATH:
@@ -4019,215 +4465,31 @@ fn draft_forward_based_impl(
             None
         };
 
-        // S7: on the DFlash2 finish path the wo projection lands in dead
-        // conv_temp instead of x, and one fused conv+residual kernel replaces
-        // the finish convolution plus the attention residual add
-        // (x = residual + conv(wo_out), identical add order). conv_temp is
-        // dead here: the prepare output it held was consumed by the QKV
-        // GEMMs above. Off-switch and legacy drafts keep today's dataflow.
-        let attn_finish_conv = matches!(
-            (&layer.attn_conv_base, &layer.attn_conv_proj),
-            (Some(_), Some(_))
-        ) && scratch.conv_dynamic.is_some()
-            && scratch.conv_temp.is_some()
-            && gpu.draft_collapse_fused_enabled();
-        if attn_finish_conv {
-            let tmp = scratch.conv_temp.as_ref().unwrap();
-            gemm_dispatch(
-                gpu,
-                &scratch.attn_out,
-                &layer.wo,
-                tmp,
-                b,
-                scratch.mq_x_rot.as_ref(),
-                scratch.mq_x_rot_f16.as_ref(),
-            )?;
+        if graph_seg {
+            let last = li + 1 == cfg.n_layers;
+            graphs.run_segment(gpu, b, li + 1, |gpu| {
+                draft_layer_post(
+                    gpu, layer, scratch, cfg, li, b, h, eps, ordered, false, false, true,
+                )?;
+                if last {
+                    gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, b, h, eps)
+                } else {
+                    draft_layer_pre(
+                        gpu,
+                        &weights.layers[li + 1],
+                        scratch,
+                        cfg,
+                        b,
+                        h,
+                        eps,
+                        ordered,
+                    )
+                }
+            })?;
         } else {
-            // Write the projection directly into x. The pre-attention x is already
-            // preserved in the shared residual plane, so a dedicated attn_proj
-            // allocation has no lifetime that must overlap this output.
-            gemm_dispatch(
-                gpu,
-                &scratch.attn_out,
-                &layer.wo,
-                &scratch.x,
-                b,
-                scratch.mq_x_rot.as_ref(),
-                scratch.mq_x_rot_f16.as_ref(),
+            draft_layer_post(
+                gpu, layer, scratch, cfg, li, b, h, eps, ordered, graph_ffn, dbg, false,
             )?;
-        }
-        // DFlash2 finish convolution before the attention residual add.
-        if let (Some(base), Some(_proj), Some(dyn_buf), Some(tmp)) = (
-            &layer.attn_conv_base,
-            &layer.attn_conv_proj,
-            &scratch.conv_dynamic,
-            &scratch.conv_temp,
-        ) {
-            let k = cfg.conv_kernel_size.unwrap_or(2);
-            let g = cfg.conv_group_size.unwrap_or(16);
-            let groups = h / g;
-            let stride = 2 * k * groups;
-            let dyn_slice = dyn_buf.sub_offset(0, b * stride);
-            let base_phase1 = base.sub_offset(k * h, k * h);
-            if attn_finish_conv {
-                gpu.dynamic_conv_residual_dflash(
-                    tmp,
-                    &base_phase1,
-                    &dyn_slice,
-                    &scratch.residual,
-                    &scratch.x,
-                    b,
-                    h,
-                    k,
-                    g,
-                    stride,
-                    k * groups,
-                )?;
-            } else {
-                gpu.dynamic_causal_conv_f32(
-                    &scratch.x,
-                    &base_phase1,
-                    &dyn_slice,
-                    tmp,
-                    b,
-                    h,
-                    k,
-                    g,
-                    stride,
-                    k * groups,
-                )?;
-                gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
-            }
-        } else {
-            gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)?;
-        }
-
-        // Fixed-shape FFN tail with DFlash2 prepare/finish convolution.
-        if let (Some(base), Some(proj), Some(dyn_buf), Some(tmp)) = (
-            &layer.mlp_conv_base,
-            &layer.mlp_conv_proj,
-            &scratch.conv_dynamic,
-            &scratch.conv_temp,
-        ) {
-            // S7: dual-output RMSNorm replaces the FFN residual memcpy +
-            // ffn_norm pair (bitwise residual capture, identical norm order).
-            let ffn_collapse = gpu.draft_collapse_fused_enabled();
-            if ffn_collapse {
-                gpu.rmsnorm_residual_dual_dflash(
-                    &scratch.x,
-                    &layer.ffn_norm,
-                    &scratch.residual,
-                    &scratch.x_norm,
-                    b,
-                    h,
-                    eps,
-                )?;
-            } else {
-                draft_dtod_at(
-                    gpu,
-                    ordered,
-                    &scratch.residual.buf,
-                    0,
-                    &scratch.x.buf,
-                    0,
-                    (b * h) * 4,
-                )?;
-                gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
-            }
-            let k = cfg.conv_kernel_size.unwrap_or(2);
-            let g = cfg.conv_group_size.unwrap_or(16);
-            let groups = h / g;
-            let stride = 2 * k * groups;
-            let dyn_slice = dyn_buf.sub_offset(0, b * stride);
-            gemm_dispatch(
-                gpu,
-                &scratch.x_norm,
-                proj,
-                &dyn_slice,
-                b,
-                scratch.mq_x_rot.as_ref(),
-                scratch.mq_x_rot_f16.as_ref(),
-            )?;
-            gpu.dynamic_causal_conv_f32(
-                &scratch.x_norm,
-                base,
-                &dyn_slice,
-                tmp,
-                b,
-                h,
-                k,
-                g,
-                stride,
-                0,
-            )?;
-            gemm_dispatch_shared(
-                gpu,
-                tmp,
-                [(&layer.w_gate, &scratch.gate), (&layer.w_up, &scratch.up)],
-                b,
-                scratch.mq_x_rot.as_ref(),
-                scratch.mq_x_rot_f16.as_ref(),
-                SharedProjection::Ffn,
-            )?;
-            gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
-            // S7: w_down lands in dead conv_temp (last read by the gate/up
-            // GEMMs above) and one fused conv+residual kernel replaces the
-            // finish convolution plus the FFN residual add
-            // (x = residual + conv(down_out), identical add order).
-            if ffn_collapse {
-                gemm_dispatch(
-                    gpu,
-                    &scratch.gate_up,
-                    &layer.w_down,
-                    tmp,
-                    b,
-                    scratch.mq_x_rot.as_ref(),
-                    scratch.mq_x_rot_f16.as_ref(),
-                )?;
-            } else {
-                gemm_dispatch(
-                    gpu,
-                    &scratch.gate_up,
-                    &layer.w_down,
-                    &scratch.x,
-                    b,
-                    scratch.mq_x_rot.as_ref(),
-                    scratch.mq_x_rot_f16.as_ref(),
-                )?;
-            }
-            let base_phase1 = base.sub_offset(k * h, k * h);
-            if ffn_collapse {
-                gpu.dynamic_conv_residual_dflash(
-                    tmp,
-                    &base_phase1,
-                    &dyn_slice,
-                    &scratch.residual,
-                    &scratch.x,
-                    b,
-                    h,
-                    k,
-                    g,
-                    stride,
-                    k * groups,
-                )?;
-            } else {
-                gpu.dynamic_causal_conv_f32(
-                    &scratch.x,
-                    &base_phase1,
-                    &dyn_slice,
-                    tmp,
-                    b,
-                    h,
-                    k,
-                    g,
-                    stride,
-                    k * groups,
-                )?;
-                gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
-            }
-        } else {
-            let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
-            draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
         }
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
@@ -4251,7 +4513,9 @@ fn draft_forward_based_impl(
     }
 
     // ── 3. Final norm ────────────────────────────────────────────────────
-    gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, b, h, eps)?;
+    if !graph_seg {
+        gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, b, h, eps)?;
+    }
 
     // ── 4. Advance the draft-ctx projection cache pointer ────────────────
     // All rows [0..l) of target_hidden_proj and every layer's
@@ -4261,6 +4525,349 @@ fn draft_forward_based_impl(
         scratch.thlog.mark_proj_cached(l);
     }
 
+    Ok(())
+}
+
+/// The fixed-shape head of one draft layer: residual save + attention norm, the
+/// DFlash2 prepare convolution, and the Q / noise-K / noise-V projections of the
+/// B block rows. Reads only block-sized buffers and the layer weights, so a
+/// graph segment can record it.
+#[allow(clippy::too_many_arguments)]
+fn draft_layer_pre(
+    gpu: &mut Gpu,
+    layer: &DflashLayerWeights,
+    scratch: &mut DflashScratch,
+    cfg: &DflashConfig,
+    b: usize,
+    h: usize,
+    eps: f32,
+    ordered: bool,
+) -> HipResult<()> {
+    // S7: dual-output RMSNorm replaces the residual memcpy + attn_norm
+    // pair (bitwise residual capture, identical norm order).
+    if gpu.draft_collapse_fused_enabled() {
+        gpu.rmsnorm_residual_dual_dflash(
+            &scratch.x,
+            &layer.attn_norm,
+            &scratch.residual,
+            &scratch.x_norm,
+            b,
+            h,
+            eps,
+        )?;
+    } else {
+        // Residual.
+        draft_dtod_at(
+            gpu,
+            ordered,
+            &scratch.residual.buf,
+            0,
+            &scratch.x.buf,
+            0,
+            (b * h) * 4,
+        )?;
+        // attn_norm.
+        gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
+    }
+
+    // ── DFlash2 prepare conv before QKV (no cross-cycle history) ─────
+    // After RMSNorm, project normalized hidden to dynamic kernel coeffs
+    // [B,2*K*G] then left-zero-padded grouped conv over the B rows.
+    let attn_prepare_src =
+        if let (Some(base), Some(proj)) = (&layer.attn_conv_base, &layer.attn_conv_proj) {
+            if let (Some(dyn_buf), Some(tmp)) = (&scratch.conv_dynamic, &scratch.conv_temp) {
+                let k = cfg.conv_kernel_size.unwrap_or(2);
+                let g = cfg.conv_group_size.unwrap_or(16);
+                let groups = h / g;
+                let stride = 2 * k * groups;
+                // projection: x_norm [B,H] @ proj [2KG, H]^T -> dynamic [B,2KG]
+                let dyn_slice = dyn_buf.sub_offset(0, b * stride);
+                gemm_dispatch(
+                    gpu,
+                    &scratch.x_norm,
+                    proj,
+                    &dyn_slice,
+                    b,
+                    scratch.mq_x_rot.as_ref(),
+                    scratch.mq_x_rot_f16.as_ref(),
+                )?;
+                // prepare phase offset 0, window K*G
+                gpu.dynamic_causal_conv_f32(
+                    &scratch.x_norm,
+                    base,
+                    &dyn_slice,
+                    tmp,
+                    b,
+                    h,
+                    k,
+                    g,
+                    stride,
+                    0,
+                )?;
+                Some(tmp as &GpuTensor)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let qkv_src = attn_prepare_src.unwrap_or(&scratch.x_norm);
+
+    // Q and K/V noise (over the B block positions) must be computed
+    // every cycle. K_ctx and V_ctx (over the L context positions)
+    // are *incrementally* cached — see the per-layer block below.
+    gemm_dispatch_shared(
+        gpu,
+        qkv_src,
+        [
+            (&layer.wq, &scratch.q),
+            (&layer.wk, &scratch.k_noise),
+            (&layer.wv, &scratch.v_noise),
+        ],
+        b,
+        scratch.mq_x_rot.as_ref(),
+        scratch.mq_x_rot_f16.as_ref(),
+        SharedProjection::Qkv,
+    )?;
+    Ok(())
+}
+
+/// The fixed-shape tail of one draft layer: the `wo` projection, the finish
+/// convolution and attention residual, and the whole FFN (with its DFlash2
+/// prepare / finish convolutions). Reads only block-sized buffers and the layer
+/// weights, so a graph segment can record it.
+#[allow(clippy::too_many_arguments)]
+fn draft_layer_post(
+    gpu: &mut Gpu,
+    layer: &DflashLayerWeights,
+    scratch: &mut DflashScratch,
+    cfg: &DflashConfig,
+    li: usize,
+    b: usize,
+    h: usize,
+    eps: f32,
+    ordered: bool,
+    graph_ffn: bool,
+    dbg: bool,
+    in_segment: bool,
+) -> HipResult<()> {
+    // S7: on the DFlash2 finish path the wo projection lands in dead
+    // conv_temp instead of x, and one fused conv+residual kernel replaces
+    // the finish convolution plus the attention residual add
+    // (x = residual + conv(wo_out), identical add order). conv_temp is
+    // dead here: the prepare output it held was consumed by the QKV
+    // GEMMs above. Off-switch and legacy drafts keep today's dataflow.
+    let attn_finish_conv = matches!(
+        (&layer.attn_conv_base, &layer.attn_conv_proj),
+        (Some(_), Some(_))
+    ) && scratch.conv_dynamic.is_some()
+        && scratch.conv_temp.is_some()
+        && gpu.draft_collapse_fused_enabled();
+    if attn_finish_conv {
+        let tmp = scratch.conv_temp.as_ref().unwrap();
+        gemm_dispatch(
+            gpu,
+            &scratch.attn_out,
+            &layer.wo,
+            tmp,
+            b,
+            scratch.mq_x_rot.as_ref(),
+            scratch.mq_x_rot_f16.as_ref(),
+        )?;
+    } else {
+        // Write the projection directly into x. The pre-attention x is already
+        // preserved in the shared residual plane, so a dedicated attn_proj
+        // allocation has no lifetime that must overlap this output.
+        gemm_dispatch(
+            gpu,
+            &scratch.attn_out,
+            &layer.wo,
+            &scratch.x,
+            b,
+            scratch.mq_x_rot.as_ref(),
+            scratch.mq_x_rot_f16.as_ref(),
+        )?;
+    }
+    // DFlash2 finish convolution before the attention residual add.
+    if let (Some(base), Some(_proj), Some(dyn_buf), Some(tmp)) = (
+        &layer.attn_conv_base,
+        &layer.attn_conv_proj,
+        &scratch.conv_dynamic,
+        &scratch.conv_temp,
+    ) {
+        let k = cfg.conv_kernel_size.unwrap_or(2);
+        let g = cfg.conv_group_size.unwrap_or(16);
+        let groups = h / g;
+        let stride = 2 * k * groups;
+        let dyn_slice = dyn_buf.sub_offset(0, b * stride);
+        let base_phase1 = base.sub_offset(k * h, k * h);
+        if attn_finish_conv {
+            gpu.dynamic_conv_residual_dflash(
+                tmp,
+                &base_phase1,
+                &dyn_slice,
+                &scratch.residual,
+                &scratch.x,
+                b,
+                h,
+                k,
+                g,
+                stride,
+                k * groups,
+            )?;
+        } else {
+            gpu.dynamic_causal_conv_f32(
+                &scratch.x,
+                &base_phase1,
+                &dyn_slice,
+                tmp,
+                b,
+                h,
+                k,
+                g,
+                stride,
+                k * groups,
+            )?;
+            gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
+        }
+    } else {
+        gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)?;
+    }
+
+    // Fixed-shape FFN tail with DFlash2 prepare/finish convolution.
+    if let (Some(base), Some(proj), Some(dyn_buf), Some(tmp)) = (
+        &layer.mlp_conv_base,
+        &layer.mlp_conv_proj,
+        &scratch.conv_dynamic,
+        &scratch.conv_temp,
+    ) {
+        // S7: dual-output RMSNorm replaces the FFN residual memcpy +
+        // ffn_norm pair (bitwise residual capture, identical norm order).
+        let ffn_collapse = gpu.draft_collapse_fused_enabled();
+        if ffn_collapse {
+            gpu.rmsnorm_residual_dual_dflash(
+                &scratch.x,
+                &layer.ffn_norm,
+                &scratch.residual,
+                &scratch.x_norm,
+                b,
+                h,
+                eps,
+            )?;
+        } else {
+            draft_dtod_at(
+                gpu,
+                ordered,
+                &scratch.residual.buf,
+                0,
+                &scratch.x.buf,
+                0,
+                (b * h) * 4,
+            )?;
+            gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
+        }
+        let k = cfg.conv_kernel_size.unwrap_or(2);
+        let g = cfg.conv_group_size.unwrap_or(16);
+        let groups = h / g;
+        let stride = 2 * k * groups;
+        let dyn_slice = dyn_buf.sub_offset(0, b * stride);
+        gemm_dispatch(
+            gpu,
+            &scratch.x_norm,
+            proj,
+            &dyn_slice,
+            b,
+            scratch.mq_x_rot.as_ref(),
+            scratch.mq_x_rot_f16.as_ref(),
+        )?;
+        gpu.dynamic_causal_conv_f32(
+            &scratch.x_norm,
+            base,
+            &dyn_slice,
+            tmp,
+            b,
+            h,
+            k,
+            g,
+            stride,
+            0,
+        )?;
+        gemm_dispatch_shared(
+            gpu,
+            tmp,
+            [(&layer.w_gate, &scratch.gate), (&layer.w_up, &scratch.up)],
+            b,
+            scratch.mq_x_rot.as_ref(),
+            scratch.mq_x_rot_f16.as_ref(),
+            SharedProjection::Ffn,
+        )?;
+        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
+        // S7: w_down lands in dead conv_temp (last read by the gate/up
+        // GEMMs above) and one fused conv+residual kernel replaces the
+        // finish convolution plus the FFN residual add
+        // (x = residual + conv(down_out), identical add order).
+        if ffn_collapse {
+            gemm_dispatch(
+                gpu,
+                &scratch.gate_up,
+                &layer.w_down,
+                tmp,
+                b,
+                scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
+            )?;
+        } else {
+            gemm_dispatch(
+                gpu,
+                &scratch.gate_up,
+                &layer.w_down,
+                &scratch.x,
+                b,
+                scratch.mq_x_rot.as_ref(),
+                scratch.mq_x_rot_f16.as_ref(),
+            )?;
+        }
+        let base_phase1 = base.sub_offset(k * h, k * h);
+        if ffn_collapse {
+            gpu.dynamic_conv_residual_dflash(
+                tmp,
+                &base_phase1,
+                &dyn_slice,
+                &scratch.residual,
+                &scratch.x,
+                b,
+                h,
+                k,
+                g,
+                stride,
+                k * groups,
+            )?;
+        } else {
+            gpu.dynamic_causal_conv_f32(
+                &scratch.x,
+                &base_phase1,
+                &dyn_slice,
+                tmp,
+                b,
+                h,
+                k,
+                g,
+                stride,
+                k * groups,
+            )?;
+            gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
+        }
+    } else {
+        // Outside a graph segment the per-layer FFN graph route may apply; inside one the
+        // segment is the graph and the tail runs as plain launches (capture-safe copies
+        // while capturing).
+        if in_segment {
+            draft_ffn_layer(gpu, layer, scratch, b, h, eps, gpu.graphs.capture_mode)?;
+        } else {
+            let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
+            draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
+        }
+    }
     Ok(())
 }
 
@@ -4385,11 +4992,54 @@ mod block_policy_tests {
             conv_kernel_size: Some(2),
             selector_rank: Some(256),
             selector_top_k: Some(16),
+            target_streams_per_layer: 1,
         };
         assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 16);
         assert_eq!(cfg.runtime_block_size(8), 8);
         cfg.selector_rank = None;
         assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 8);
+    }
+
+    fn meta_with(dflash: serde_json::Value) -> serde_json::Value {
+        let mut df = json!({
+            "num_hidden_layers": 5,
+            "hidden_size": 2560,
+            "intermediate_size": 8192,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 5,
+            "head_dim": 128,
+            "vocab_size": 259840,
+            "block_size": 8,
+            "mask_token_id": 259839,
+            "target_layer_ids": [1, 6, 11, 16, 21],
+            "num_target_layers": 24,
+        });
+        for (k, v) in dflash.as_object().unwrap() {
+            df[k] = v.clone();
+        }
+        json!({ "dflash": df })
+    }
+
+    #[test]
+    fn streams_parse_nested_flat_and_default() {
+        let nested = meta_with(json!({"dflash_config": {"target_streams_per_layer": 4}}));
+        let cfg = DflashConfig::from_metadata(&nested).unwrap();
+        assert_eq!(cfg.target_streams_per_layer, 4);
+        assert_eq!(cfg.feature_width(), 5 * 4 * 2560);
+        assert_eq!(cfg.feature_width(), 51200);
+
+        let flat = meta_with(json!({"target_streams_per_layer": 4}));
+        assert_eq!(
+            DflashConfig::from_metadata(&flat)
+                .unwrap()
+                .target_streams_per_layer,
+            4
+        );
+
+        let legacy = meta_with(json!({}));
+        let cfg = DflashConfig::from_metadata(&legacy).unwrap();
+        assert_eq!(cfg.target_streams_per_layer, 1);
+        assert_eq!(cfg.feature_width(), cfg.num_extract() * cfg.hidden);
     }
 }
 
@@ -4419,6 +5069,7 @@ mod construction_tests {
             conv_kernel_size: Some(2),
             selector_rank: Some(8),
             selector_top_k: Some(2),
+            target_streams_per_layer: 1,
         }
     }
 
@@ -4833,11 +5484,36 @@ pub struct DflashCandidateProposal {
     /// Per-row probability of the selected token (entry of `probabilities` at
     /// the chosen index when temperature>0). `None` for greedy.
     pub selected_probabilities: Option<Vec<f32>>,
-    /// Per-row softmax (temperature 1) mass of the selected candidate over
-    /// the row's top-K selector scores, at every temperature (the draft's own
-    /// confidence; picks the DFlash2 verify depth).
+    /// Per-row softmax (temperature 1) mass of the row's TOP candidate over
+    /// its top-K selector scores ([`selector_row_confidence`]), at every
+    /// temperature: the draft's own confidence in this row, fixed before the
+    /// row's draw (picks the DFlash2 verify depth).
     pub confidence: Vec<f32>,
     pub top_k: usize,
+}
+
+/// The request's penalties for the selector walk ([`propose_candidates_device_penalized`]):
+/// the policy [`crate::sampler::apply_logit_policy_cpu`] applies, and the window's
+/// [`crate::spec_sampling::PenaltyHistory`] opened at its base
+/// ([`crate::spec_sampling::PenaltyHistory::begin_window`]: the loop's `emitted`,
+/// pending seed last). Row `r` of the walk scores its candidates after the
+/// penalties over `base ‖ tokens selected for rows 0..r`, the history of the
+/// target row that will verify the draft `r` selects, so the selector's `q`
+/// tracks the penalized target `p` instead of the raw head. Only the
+/// candidates the raw top-K kept are rescored (penalties never promote a
+/// token). The walk leaves the history at its base.
+pub struct SelectorPenalty<'a> {
+    pub cfg: &'a crate::sampler::SamplerConfig,
+    pub history: &'a mut crate::spec_sampling::PenaltyHistory,
+}
+
+/// The selector's confidence in one row: the temperature-1 softmax mass of
+/// its top candidate over the row's `scores` (`1 / Σ exp(s - max)`). A
+/// function of the row's scores only, so it is fixed before the row's draw.
+pub fn selector_row_confidence(scores: &[f32]) -> f32 {
+    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let z: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+    1.0 / z
 }
 
 /// Softmax scores/temp → normalized q; sample index via inverse-CDF on `uniform`.
@@ -4914,6 +5590,35 @@ pub fn propose_candidates_from_rows_capture(
     uniforms: Option<&[f32]>,
     capture: Option<&mut Vec<f32>>,
 ) -> HipResult<DflashCandidateProposal> {
+    propose_candidates_from_rows_penalized(
+        weights,
+        projection,
+        ids,
+        unaries,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+        capture,
+        None,
+    )
+}
+
+/// [`propose_candidates_from_rows_capture`] with the request's penalties
+/// applied to each row's raw unaries before scoring ([`SelectorPenalty`]);
+/// `None` is the unpenalized walk, bit for bit.
+pub fn propose_candidates_from_rows_penalized(
+    weights: &DflashWeights,
+    projection: &[f32],
+    ids: &[u32],
+    unaries: &[f32],
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+    capture: Option<&mut Vec<f32>>,
+    penalty: Option<&mut SelectorPenalty<'_>>,
+) -> HipResult<DflashCandidateProposal> {
     if rows == 0 {
         return Err(hip_bridge::HipError::new(0, "rows must be >0"));
     }
@@ -4940,7 +5645,8 @@ pub fn propose_candidates_from_rows_capture(
     let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
     propose_inner_capture(
         vocab,
-        weights,
+        weights.predecessor_codebook.as_ref().unwrap(),
+        weights.successor_codebook.as_ref().unwrap(),
         projection,
         ids,
         unaries,
@@ -4951,12 +5657,17 @@ pub fn propose_candidates_from_rows_capture(
         temperature,
         uniforms,
         capture,
+        penalty,
     )
 }
 
-fn propose_inner_capture(
+/// The sequential selector walk over host readbacks (see
+/// [`propose_candidates_from_rows`]); takes the two codebooks only, so a CPU
+/// test can drive it without a device.
+pub(crate) fn propose_inner_capture(
     vocab_size: usize,
-    weights: &DflashWeights,
+    pred_cb: &SelectorCodebook,
+    succ_cb: &SelectorCodebook,
     hidden_proj_host: &[f32], // [rows*rank] already projected, row-major
     top_ids: &[u32],          // [rows*K]
     top_vals: &[f32],         // [rows*K] raw unaries
@@ -4967,6 +5678,7 @@ fn propose_inner_capture(
     temperature: f32,
     uniforms: Option<&[f32]>,
     mut capture: Option<&mut Vec<f32>>,
+    mut penalty: Option<&mut SelectorPenalty<'_>>,
 ) -> HipResult<DflashCandidateProposal> {
     if temperature > 0.0 && uniforms.is_none() {
         return Err(hip_bridge::HipError::new(
@@ -4979,8 +5691,6 @@ fn propose_inner_capture(
             return Err(hip_bridge::HipError::new(0, "uniforms length < rows"));
         }
     }
-    let pred_cb = weights.predecessor_codebook.as_ref().unwrap();
-    let succ_cb = weights.successor_codebook.as_ref().unwrap();
     let mut tokens = Vec::with_capacity(rows);
     // Sparse q over every top-K candidate (temp>0 only); selected q matches chosen entry.
     let mut all_probs: Option<Vec<f32>> = if temperature > 0.0 {
@@ -4994,12 +5704,28 @@ fn propose_inner_capture(
         None
     };
     let mut confidence = Vec::with_capacity(rows);
+    let mut penalized_vals: Vec<f32> = Vec::new();
     let mut pred = anchor;
     for r in 0..rows {
         let proj_off = r * rank;
         let proj = &hidden_proj_host[proj_off..proj_off + rank];
         // Build scores for this row's K candidates
         let id_off = r * k;
+        // The row's raw unaries, penalized over this row's history when asked.
+        let row_vals: &[f32] = match penalty.as_deref_mut() {
+            Some(p) => {
+                penalized_vals.clear();
+                penalized_vals.extend_from_slice(&top_vals[id_off..id_off + k]);
+                crate::sampler::apply_logit_policy_candidates_cpu(
+                    &top_ids[id_off..id_off + k],
+                    &mut penalized_vals,
+                    p.history.row(r),
+                    p.cfg,
+                );
+                &penalized_vals
+            }
+            None => &top_vals[id_off..id_off + k],
+        };
         let mut scores = Vec::with_capacity(k);
         for j in 0..k {
             let cand = top_ids[id_off + j] as usize;
@@ -5009,7 +5735,7 @@ fn propose_inner_capture(
                     "candidate id out of vocab range",
                 ));
             }
-            let unary = top_vals[id_off + j];
+            let unary = row_vals[j];
             // dot( pred_cb[pred] * proj , succ_cb[cand] )
             let mut dot = 0.0f32;
             for d in 0..rank {
@@ -5022,10 +5748,15 @@ fn propose_inner_capture(
         if let Some(c) = capture.as_deref_mut() {
             c.extend_from_slice(&scores);
         }
-        // Softmax (temperature 1) mass of the selected candidate, at every
-        // request temperature: the draft's own confidence in this row.
-        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let z: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+        // The draft's confidence in this row: its top candidate's
+        // temperature-1 mass, computed before the draw. It depends on the
+        // drafts of earlier rows only (through `pred`), never on this row's
+        // own draw: a verify depth cut on the drawn token's mass would admit
+        // a sampled draft into the verify more often when it is a likely one,
+        // and the verified row would no longer be distributed as `q`
+        // (DFlash2 `verify_depth`; the target law test lives there).
+        // Greedy picks the top candidate, so its value is unchanged.
+        confidence.push(selector_row_confidence(&scores));
         let sel_idx = if temperature == 0.0 {
             let mut best = 0usize;
             let mut best_s = scores[0];
@@ -5050,10 +5781,16 @@ fn propose_inner_capture(
             }
             idx
         };
-        confidence.push((scores[sel_idx] - max_s).exp() / z);
         let cand_id = top_ids[id_off + sel_idx];
         tokens.push(cand_id);
         pred = cand_id;
+        if let Some(p) = penalty.as_deref_mut() {
+            // Row r + 1 sees the token this row selected.
+            p.history.push_draft(cand_id);
+        }
+    }
+    if let Some(p) = penalty {
+        p.history.rewind_drafts();
     }
     Ok(DflashCandidateProposal {
         tokens,
@@ -5175,6 +5912,35 @@ pub fn propose_candidates_device(
     temperature: f32,
     uniforms: Option<&[f32]>,
 ) -> HipResult<DflashCandidateProposal> {
+    propose_candidates_device_penalized(
+        gpu,
+        weights,
+        scratch,
+        hidden,
+        logits,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+        None,
+    )
+}
+
+/// [`propose_candidates_device`] with the request's penalties applied to each
+/// row's candidate scores ([`SelectorPenalty`]); `None` is the unpenalized
+/// proposal, bit for bit.
+pub fn propose_candidates_device_penalized(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+    penalty: Option<&mut SelectorPenalty<'_>>,
+) -> HipResult<DflashCandidateProposal> {
     if rows == 0 {
         return Err(hip_bridge::HipError::new(0, "rows must be >0"));
     }
@@ -5217,7 +5983,7 @@ pub fn propose_candidates_device(
     }
     gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
     let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows * k)?;
-    propose_candidates_from_rows(
+    propose_candidates_from_rows_penalized(
         weights,
         &host_proj,
         &top_ids,
@@ -5226,6 +5992,8 @@ pub fn propose_candidates_device(
         anchor,
         temperature,
         uniforms,
+        None,
+        penalty,
     )
 }
 

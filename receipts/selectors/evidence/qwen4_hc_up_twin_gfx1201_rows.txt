@@ -1,0 +1,16 @@
+# gfx1201 HC read-up sx twin admission (rows <= 8): evidence
+# hipfire kern branch, EP2 Flash-Next mq4-xts (sha256 eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45), 2x R9700, HIPFIRE_PREFILL_CHUNK_ROWS=512, fabric jobs j6015/j6027 (kE1, kF1), receipts mgmtp/kern/runs/{kE1,kF1,kFC1}-*
+
+## raw f32 bit gate (crates/rdna-compute/tests/hyper_read_up_twin_hw.rs, fabric j6027 kF1-hwtest)
+hyper_read_up_twin: 156 cases (6 seeds x 13 row counts x F32/BF16 normalized), 3870720 output words, 0 mismatches, first None
+
+## EP2 mq4 c512 C8 AR [fn-lane-step] median ms (text md5 bb845335c3f98192dbce58e472ff88e1 in every arm), alternating fresh processes
+kF1-a8-1 step    n=1 runs=[62.3] mean 62.30 median 62.30
+kF1-f8-2 step    n=1 runs=[63.66] mean 63.66 median 63.66
+kF1-a8-3 step    n=1 runs=[62.67] mean 62.67 median 62.67
+kF1-f8-4 step    n=1 runs=[63.97] mean 63.97 median 63.97
+kF1-a8-5 step    n=1 runs=[62.2] mean 62.20 median 62.20
+arm a = twin admitted (R4 down twin + HC sx twin), arm f = both off (HIPFIRE_QWEN4_MOE_DOWN_R4=0 HIPFIRE_QWEN4_HC_UP_TWIN=0)
+
+## EP2 C1 singleton TPOT p50 ms (kFC1): a1 18.88 18.87 18.88 vs f1 18.95 19.12 19.06
+## rows 9..16: the twin is not admitted on gfx1201 (the bit gate covers rows 9,15,16,17,33 as well, 0 mismatches); the cap 8 is the largest decode/verify/fn-lane row count (LANE_MAX_ROWS = 8, MTP K=7 verify = 8 rows)

@@ -177,6 +177,9 @@ struct Args {
     model: String,
     prompt_files: Vec<String>,
     max_seq: usize,
+    /// `--seed` (default `0x1357_9BDF`): the MTP request seed, and the seed the
+    /// reserve receipt names in AR mode too.
+    seed: u64,
     tokens: usize,
     out: PathBuf,
     arm: String,
@@ -361,6 +364,7 @@ fn parse_args() -> R<Args> {
         prompt_files,
         max_seq: max_seq.ok_or("--max-seq is required")?,
         tokens,
+        seed,
         out: out.ok_or("--out is required")?,
         arm: arm.ok_or("--arm is required")?,
         state_steps,
@@ -736,7 +740,7 @@ fn pp_drafter(
 /// Writes one `window` record per window to the logits sink, the state digest
 /// (as `state` records whose `step` is the window index) after the prefill,
 /// every `state_every` windows and after the last window, and a final `tokens`
-/// record. Returns the emitted token count.
+/// record. Returns the emitted token ids (prefill seed included).
 fn mtp_prompt(
     gpu: &mut Gpu,
     mut pp: Option<&mut Gpus>,
@@ -745,7 +749,7 @@ fn mtp_prompt(
     request: SpecRequestConfig,
     run: &MtpRun<'_>,
     sinks: &mut Sinks,
-) -> R<usize> {
+) -> R<Vec<u32>> {
     let ids = &run.prompt.ids;
     match pp.as_deref_mut() {
         Some(gpus) => {
@@ -855,7 +859,16 @@ fn mtp_prompt(
             "ids": emitted,
         }),
     )?;
-    Ok(emitted.len())
+    Ok(emitted)
+}
+
+/// Developer env: print the `EP_RESERVE_RECEIPT <json>` lines the EP2 reserve
+/// gate harvests (`scripts/fn_ep_compare.py reserve harvest`); the forward
+/// prints the per-rank `header`/`rank`/`prompt_rank` records the same way.
+const RESERVE_RECEIPT_ENV: &str = "HIPFIRE_EP_RESERVE_RECEIPT";
+
+fn reserve_receipt(record: &Value) {
+    eprintln!("EP_RESERVE_RECEIPT {record}");
 }
 
 fn run() -> R<()> {
@@ -1082,6 +1095,7 @@ fn run() -> R<()> {
         "devices": devices,
         "max_seq": args.max_seq,
         "tokens": args.tokens,
+        "seed": args.seed,
         "vocab": vocab,
         "state_steps": args.state_steps,
         "moe_dump_positions": args.moe_dump_positions,
@@ -1159,6 +1173,21 @@ fn run() -> R<()> {
         .map_err(e)
     };
     write_meta(&meta)?;
+    // Reserve receipts (`HIPFIRE_EP_RESERVE_RECEIPT=1`): the oracle's half. The header repeats
+    // the values meta.json carries (binary md5, model sha256, seed, mode, max_seq); the PLE
+    // hash is not known to the oracle and is omitted in every arm. The forward prints the
+    // per-rank records, keyed by the prompt scope set around each prompt below.
+    let receipts = hipfire_config::developer_bool(RESERVE_RECEIPT_ENV, false);
+    if receipts {
+        reserve_receipt(&json!({
+            "kind": "header",
+            "binary_id": meta["binary_md5"].clone(),
+            "model_sha256": meta["model_sha256"].clone(),
+            "seed": meta["seed"].clone(),
+            "mode": if args.mtp.is_some() { "mtp" } else { "ar" },
+            "max_seq": meta["max_seq"].clone(),
+        }));
+    }
 
     let mut sinks = Sinks {
         logits: std::fs::File::create(args.out.join("logits.jsonl")).map_err(e)?,
@@ -1174,6 +1203,7 @@ fn run() -> R<()> {
             prompt.path,
             prompt.ids.len()
         );
+        hipfire_arch_qwen4::ep_reserve_receipt_scope(Some(prompt_index as u64));
         if let (Some(mtp), Some(speculator)) = (&args.mtp, speculator.as_mut()) {
             let request = SpecRequestConfig {
                 temp: mtp.temp,
@@ -1191,7 +1221,7 @@ fn run() -> R<()> {
                 ranks,
                 canonical_state: args.canonical_state,
             };
-            steps_run.push(mtp_prompt(
+            let emitted = mtp_prompt(
                 &mut gpu,
                 pp_gpus.as_deref_mut(),
                 bundle,
@@ -1199,7 +1229,12 @@ fn run() -> R<()> {
                 request,
                 &run,
                 &mut sinks,
-            )?);
+            )?;
+            hipfire_arch_qwen4::ep_reserve_receipt_scope(None);
+            if receipts {
+                reserve_receipt(&json!({"kind": "ids", "prompt": prompt_index, "ids": emitted}));
+            }
+            steps_run.push(emitted.len());
             continue;
         }
         if let Some(gpus) = pp_gpus.as_deref_mut() {
@@ -1214,6 +1249,7 @@ fn run() -> R<()> {
                 .map_err(e)?;
         }
         let mut completed = 0usize;
+        let mut generated = Vec::new();
         for step in 0..=args.tokens {
             let token = if step == 0 {
                 None
@@ -1245,6 +1281,9 @@ fn run() -> R<()> {
                 })
             };
             completed = step;
+            if let (true, Some(token)) = (step >= 1, token) {
+                generated.push(token);
+            }
 
             gpu.bind_thread().map_err(e)?;
             let rank0 = tensor_bytes(&gpu, &logits)?;
@@ -1357,6 +1396,10 @@ fn run() -> R<()> {
                 );
             }
         }
+        hipfire_arch_qwen4::ep_reserve_receipt_scope(None);
+        if receipts {
+            reserve_receipt(&json!({"kind": "ids", "prompt": prompt_index, "ids": generated}));
+        }
         steps_run.push(completed);
     }
 
@@ -1364,6 +1407,9 @@ fn run() -> R<()> {
     meta["steps_run"] = json!(steps_run);
     meta["perturb_applied"] = perturb_note;
     write_meta(&meta)?;
+    if receipts {
+        reserve_receipt(&json!({"kind": "end", "complete": true}));
+    }
     eprintln!("[fn_ep_oracle] done: {}", args.out.display());
     Ok(())
 }

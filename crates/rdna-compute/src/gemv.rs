@@ -201,6 +201,205 @@ static BF16_ROWS_WIDE_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(
     Ok(())
 });
 
+/// Most activation rows one `gemv_q8_0_*_rows_exact_r<R>` launch serves;
+/// [`Gpu::gemv_q8_0_rows_exact`] splits larger row counts into groups of this
+/// many (every group exact: rows never interact).
+pub const Q8_0_ROWS_EXACT_KERNELS: usize = 16;
+
+/// The rows == 1 decode GEMV for a Q8_0 weight reads the wide kernel up to
+/// this K and the narrow kernel above it (`Gpu::gemv_q8_0`: `if k <= 1536`).
+pub const Q8_0_DECODE_WIDE_MAX_K: usize = 1536;
+
+/// How [`Gpu::gemv_q8_0_rows_exact`] serves an (architecture, K): which kernel
+/// owns the rows == 1 decode singleton's arithmetic.
+///
+/// # The singleton (what a rows == 1 Q8_0/Q8F16 decode GEMV launches)
+///
+/// Path: `weight_gemv` (hipfire-runtime `llama.rs`) -> `GemvFamily::run_auto`
+/// -> `KernelKey::GemvQ8_0` -> [`Gpu::gemv_q8_0`] (hipfire-dispatch
+/// `families/gemv.rs` `launch`, `types.rs` `(Q8_0, Plain)`). The in-graph Q8
+/// projection (`pipeline/layer_ops.rs` `project_rotated`, `(Q8_0, rows == 1)`)
+/// calls the same launcher. `Gpu::gemv_q8_0` has no environment knob and
+/// `kernel.pm_decode` does not touch it: the exact-gfx1201 `.hxaco` twins in
+/// `pm_decode_twins::GFX1201_TWINS` cover only the five MQ4v2 modules
+/// (`fused_qkvza/fused_qkv/fused_gate_up/gemv_multirow_default/gemv_residual`),
+/// so Q8_0 decode is the hipcc object of the `.hip` source on both arches.
+///
+/// | arch | K (in-dim) | singleton | grid x block |
+/// |---|---|---|---|
+/// | gfx1201, gfx1100 | 128, 512, 576 (K <= 1536) | `gemv_q8_0_wide` (`gemv_q8_0_wide.hip`) | ceil(M/2) x 64 |
+/// | gfx1201, gfx1100 | 2560, 5120 (K > 1536)     | `gemv_q8_0` (`gemv_q8_0.hip`)           | M x 32 |
+///
+/// (gfx1151 alone adds staged K = 320/640/2560 kernels; it is not served by
+/// the multi-row kernels, see [`Q8RowsExactRoute::PerRowSingleton`].)
+///
+/// Both archs compile these two sources to the same arithmetic. Instruction
+/// level (hipcc `-S -O3`): `gemv_q8_0_wide` = per 4-block quad `v_fma_mix_f32`
+/// (f16 scale * (float)int8, exact) then `v_fmac_f32` into chain `block & 3`;
+/// K % 4 tail blocks `v_mul_f32` then `v_add_f32` (NOT fused) into chain 0/1/2;
+/// fold `(a0 + a1) + (a2 + a3)`; wave tree `ds_swizzle`/`ds_bpermute` 16,8,4,2,1.
+/// `gemv_q8_0` = one `v_fmac_f32` chain per lane in ascending block order
+/// (unrolled body and remainder alike), then the same wave tree.
+///
+/// # What the existing multi-row paths are exact to
+///
+/// * `gemm_q8_0_batched_f32_chunked` (the Q8 `rows > 1` trunk arm) is the
+///   singleton only inside an admitted eager verify scope (`wide_verify_rows`
+///   set, not recording/capture), where it runs `gemv_q8_0` per row (exact by
+///   construction) or, for `rows > 8` with the lab switch on, the row-tile twin
+///   below. Outside that scope it runs the scalar `gemm_q8_0_batched`, whose
+///   source is the single-chain `gemv_q8_0` recipe: it is the singleton only
+///   for K > 1536 and NOT the four-chain `gemv_q8_0_wide` at K <= 1536.
+/// * the gfx1100 `gemv_q8_0_*_rows_t8_pm_gfx1100` twins are builder (peacemaker)
+///   transcriptions of acquired gfx1100 singleton objects (`q8-scalar.co` =
+///   `gemv_q8_0`, `gemv_q8_0_wide.gfx1100.co` = `gemv_q8_0_wide`; see
+///   `peacemaker-isa/src/kernels/qwen4_lane_rows_q8_gfx1100.rs`). They are
+///   lab-gated (`WideTwinFamily::Q8` switch, `rows > 8`, `wide_verify_rows`
+///   scope) and their own docs state the object-vs-tile GPU byte gate is still an
+///   integration responsibility; the only GPU Q8 byte gate in tree
+///   (`examples/q8_wide_rows_oracle.rs`) refuses every arch but gfx1151. So they
+///   are NOT treated as hardware-proven singleton-exact here: gfx1100 is served
+///   by the same hipcc rows kernels as gfx1201, whose instruction sequences were
+///   checked against the singleton above, and
+///   `tests/gemv_q8_0_rows_exact.rs` additionally reports (information only)
+///   the twin against the singleton on gfx1100.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Q8RowsExactRoute {
+    /// `gemv_q8_0_wide_rows_exact_r<R>`: `gemv_q8_0_wide`'s code with a per-row
+    /// inner loop (gfx1100/gfx1201, K <= [`Q8_0_DECODE_WIDE_MAX_K`]).
+    Wide,
+    /// `gemv_q8_0_rows_exact_r<R>`: `gemv_q8_0`'s code with a per-row inner
+    /// loop (gfx1100/gfx1201, K > [`Q8_0_DECODE_WIDE_MAX_K`]).
+    Narrow,
+    /// One [`Gpu::gemv_q8_0`] launch per row: exact by construction, weights
+    /// re-read per row. Every other architecture, including gfx1151 whose
+    /// decode singleton also has staged K = 320/640/2560 kernels.
+    PerRowSingleton,
+}
+
+/// [`Q8RowsExactRoute`] for `arch` and a Q8_0 weight of in-dim `k`.
+pub fn q8_0_rows_exact_route(arch: &str, k: usize) -> Q8RowsExactRoute {
+    match arch {
+        "gfx1100" | "gfx1201" if k <= Q8_0_DECODE_WIDE_MAX_K => Q8RowsExactRoute::Wide,
+        "gfx1100" | "gfx1201" => Q8RowsExactRoute::Narrow,
+        _ => Q8RowsExactRoute::PerRowSingleton,
+    }
+}
+
+/// `[weight, x, y]` byte extents of a `rows`-row Q8_0 call, or `None` for a
+/// shape the kernels refuse (`m == 0`, `k` not a positive multiple of 32,
+/// `rows` outside `1..`, or an extent past `u32`).
+fn q8_0_rows_exact_extents(m: usize, k: usize, rows: usize) -> Option<[usize; 3]> {
+    if m == 0
+        || m > i32::MAX as usize
+        || k == 0
+        || k > i32::MAX as usize
+        || k % 32 != 0
+        || rows == 0
+    {
+        return None;
+    }
+    let bytes = [
+        m.checked_mul(k / 32)?.checked_mul(34)?,
+        rows.checked_mul(k)?.checked_mul(4)?,
+        rows.checked_mul(m)?.checked_mul(4)?,
+    ];
+    bytes
+        .iter()
+        .all(|&n| n <= u32::MAX as usize)
+        .then_some(bytes)
+}
+
+/// Weight rows one block of `gemv_q8_0_fast_r*` serves (one wave32 each).
+pub const Q8_0_FAST_ROWS_PER_BLOCK: usize = 8;
+/// Threads per block of `gemv_q8_0_fast_r*`.
+pub const Q8_0_FAST_THREADS: usize = Q8_0_FAST_ROWS_PER_BLOCK * 32;
+
+/// `HIPFIRE_Q8_GEMV_FAST` (developer, read once, default on): `0` keeps the one-wave-per-row
+/// narrow kernel for the row-exact multi-row route too. The two are bit-identical; the switch
+/// is a kill switch / A-B handle only (the decode `gemv_q8_0` never takes the fast kernel).
+static Q8_0_GEMV_FAST: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_Q8_GEMV_FAST", true));
+
+/// Whether `gemv_q8_0_fast_r*` serves a Q8_0 weight of in-dim `k` on `arch`: exact
+/// gfx1100 / gfx1201 (wave32), the narrow arm (`k` above the wide cutoff), an even
+/// block count per row (`k % 64 == 0`: every row start and every staged chunk 4-byte
+/// aligned) and the 4-byte / 16-byte alignment of the weight / activation base the
+/// kernel's dword / float4 loads need. Pure; the caller adds the kill switch.
+pub fn q8_0_fast_admits(arch: &str, k: usize, a_addr: usize, x_addr: usize) -> bool {
+    matches!(arch, "gfx1100" | "gfx1201")
+        && k > Q8_0_DECODE_WIDE_MAX_K
+        && k.is_multiple_of(64)
+        && a_addr.is_multiple_of(4)
+        && x_addr.is_multiple_of(16)
+}
+
+/// `gemv_q8_0_fast_r2` ..= `_r16` (index `rows - 2`). One row is the decode kernel
+/// (`launch_q8_0_narrow`): the fast kernel measured slower than it at n == 1.
+const Q8_0_FAST_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS - 1] = [
+    "gemv_q8_0_fast_r2",
+    "gemv_q8_0_fast_r3",
+    "gemv_q8_0_fast_r4",
+    "gemv_q8_0_fast_r5",
+    "gemv_q8_0_fast_r6",
+    "gemv_q8_0_fast_r7",
+    "gemv_q8_0_fast_r8",
+    "gemv_q8_0_fast_r9",
+    "gemv_q8_0_fast_r10",
+    "gemv_q8_0_fast_r11",
+    "gemv_q8_0_fast_r12",
+    "gemv_q8_0_fast_r13",
+    "gemv_q8_0_fast_r14",
+    "gemv_q8_0_fast_r15",
+    "gemv_q8_0_fast_r16",
+];
+
+fn q8_0_fast_symbol(rows: usize) -> Option<&'static str> {
+    rows.checked_sub(2)
+        .and_then(|i| Q8_0_FAST_SYMBOLS.get(i))
+        .copied()
+}
+
+/// `gemv_q8_0_wide_rows_exact_r1` ..= `_r16` (index `rows - 1`).
+const Q8_0_WIDE_ROWS_EXACT_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS] = [
+    "gemv_q8_0_wide_rows_exact_r1",
+    "gemv_q8_0_wide_rows_exact_r2",
+    "gemv_q8_0_wide_rows_exact_r3",
+    "gemv_q8_0_wide_rows_exact_r4",
+    "gemv_q8_0_wide_rows_exact_r5",
+    "gemv_q8_0_wide_rows_exact_r6",
+    "gemv_q8_0_wide_rows_exact_r7",
+    "gemv_q8_0_wide_rows_exact_r8",
+    "gemv_q8_0_wide_rows_exact_r9",
+    "gemv_q8_0_wide_rows_exact_r10",
+    "gemv_q8_0_wide_rows_exact_r11",
+    "gemv_q8_0_wide_rows_exact_r12",
+    "gemv_q8_0_wide_rows_exact_r13",
+    "gemv_q8_0_wide_rows_exact_r14",
+    "gemv_q8_0_wide_rows_exact_r15",
+    "gemv_q8_0_wide_rows_exact_r16",
+];
+
+/// `gemv_q8_0_rows_exact_r1` ..= `_r16` (index `rows - 1`).
+const Q8_0_NARROW_ROWS_EXACT_SYMBOLS: [&str; Q8_0_ROWS_EXACT_KERNELS] = [
+    "gemv_q8_0_rows_exact_r1",
+    "gemv_q8_0_rows_exact_r2",
+    "gemv_q8_0_rows_exact_r3",
+    "gemv_q8_0_rows_exact_r4",
+    "gemv_q8_0_rows_exact_r5",
+    "gemv_q8_0_rows_exact_r6",
+    "gemv_q8_0_rows_exact_r7",
+    "gemv_q8_0_rows_exact_r8",
+    "gemv_q8_0_rows_exact_r9",
+    "gemv_q8_0_rows_exact_r10",
+    "gemv_q8_0_rows_exact_r11",
+    "gemv_q8_0_rows_exact_r12",
+    "gemv_q8_0_rows_exact_r13",
+    "gemv_q8_0_rows_exact_r14",
+    "gemv_q8_0_rows_exact_r15",
+    "gemv_q8_0_rows_exact_r16",
+];
+
 /// Independent gfx1100 Q8 recipes; never aliases of the Halo staged image.
 const Q8_ROWTILE_GFX1100_SYMBOLS: [&str; 5] = [
     "gemv_q8_0_k8_rows_t8_pm_gfx1100",
@@ -20680,6 +20879,44 @@ impl Gpu {
                 },
             );
         }
+        // Narrow arm (K > 1536). The multi-row `gemv_q8_0_fast_r*` kernels are bit-identical
+        // to this one but measured slower at n == 1 (R9700, 0.61-0.79x), so decode stays here.
+        self.launch_q8_0_narrow(a_raw, x, y, m, k)
+    }
+
+    /// The narrow-arm launch of [`Gpu::gemv_q8_0`] (K > 1536): one 32-thread block per
+    /// output row, single ascending chain per lane + shuffle tree. Also the `rows == 1`
+    /// group of [`Gpu::gemv_q8_0_rows_exact`].
+    fn launch_q8_0_narrow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        };
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
         let block_size = 32u32;
         let bytes = m * (k / 32) * 34 + k * 4 + m * 4;
@@ -20706,6 +20943,246 @@ impl Gpu {
             0,
             &mut params,
             blob_builder,
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Row-exact multi-row Q8_0 GEMV: `y[r, :] = A_q8 * x[r, :]` for `rows`
+    /// activation rows, where every output row is BIT-IDENTICAL to what the
+    /// rows == 1 decode singleton [`Gpu::gemv_q8_0`] (the launcher `weight_gemv`
+    /// reaches for a Q8F16 weight) writes for that `x` row. `x` is F32
+    /// `[rows, k]`, `y` is F32 `[rows, m]`, `a_raw` is the raw `m * k/32 * 34`
+    /// byte Q8_0 weight; `k % 32 == 0`; `rows == 0` is a no-op.
+    ///
+    /// Routing ([`q8_0_rows_exact_route`], singleton table in
+    /// [`Q8RowsExactRoute`]): on gfx1100/gfx1201 `gemv_q8_0_wide_rows_exact_r<R>`
+    /// (K <= 1536) or `gemv_q8_0_rows_exact_r<R>` (K > 1536) — the singleton's
+    /// code with an inner per-row loop (same thread-to-output map, per-lane
+    /// accumulation order, accumulator chains, dequant and reduction tree; the
+    /// weights are loaded once per block and shared by up to
+    /// [`Q8_0_ROWS_EXACT_KERNELS`] rows, more rows run in groups of that many).
+    /// Any other architecture runs [`Gpu::gemv_q8_0`] once per row (exact by
+    /// construction, weights re-read per row).
+    ///
+    /// Independent of `wide_verify_rows`, graph capture and every PM family
+    /// switch: the arithmetic is the singleton's in all of them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_rows_exact(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let bytes = q8_0_rows_exact_extents(m, k, rows).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                1,
+                "gemv_q8_0_rows_exact: need m > 0, K a positive multiple of 32 and \
+                 dimensions/byte extents within u32",
+            )
+        })?;
+        if x.dtype != DType::F32
+            || y.dtype != DType::F32
+            || a_raw.buf.size() < bytes[0]
+            || x.buf.size() < bytes[1]
+            || y.buf.size() < bytes[2]
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_q8_0_rows_exact needs F32 [rows,k] x / [rows,m] y and a full Q8_0 weight",
+            ));
+        }
+        let route = q8_0_rows_exact_route(&self.arch, k);
+        if route == Q8RowsExactRoute::PerRowSingleton {
+            for row in 0..rows {
+                let x_row = x.sub_offset(row * k, k);
+                let y_row = y.sub_offset(row * m, m);
+                self.gemv_q8_0(a_raw, &x_row, &y_row, m, k)?;
+            }
+            return Ok(());
+        }
+        let mut first = 0;
+        while first < rows {
+            let n = (rows - first).min(Q8_0_ROWS_EXACT_KERNELS);
+            let x_group = x.sub_offset(first * k, n * k);
+            let y_group = y.sub_offset(first * m, n * m);
+            if route == Q8RowsExactRoute::Narrow && n == 1 {
+                // One row is the decode launch itself.
+                self.launch_q8_0_narrow(a_raw, &x_group, &y_group, m, k)?;
+            } else if route == Q8RowsExactRoute::Narrow
+                && self.q8_0_fast_narrow_ok(
+                    k,
+                    a_raw.buf.as_ptr() as usize,
+                    x_group.buf.as_ptr() as usize,
+                )
+            {
+                // `gemv_q8_0_fast_r<n>`: row r is the decode kernel's single-row chain on x row
+                // r (same per-lane order, same tree), hence the decode launch's bits.
+                self.launch_q8_0_fast(n, a_raw, &x_group, &y_group, m, k)?;
+            } else {
+                self.launch_q8_0_rows_exact_group(route, a_raw, &x_group, &y_group, m, k, n)?;
+            }
+            first += n;
+        }
+        Ok(())
+    }
+
+    /// One kernel launch of [`Gpu::gemv_q8_0_rows_exact`]: `n` in
+    /// `1..=`[`Q8_0_ROWS_EXACT_KERNELS`] rows on a hipcc route.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_q8_0_rows_exact_group(
+        &mut self,
+        route: Q8RowsExactRoute,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert!((1..=Q8_0_ROWS_EXACT_KERNELS).contains(&n));
+        self.bind_thread()?;
+        let (func, grid, block) = match route {
+            Q8RowsExactRoute::Wide => {
+                let func = Q8_0_WIDE_ROWS_EXACT_SYMBOLS[n - 1];
+                self.ensure_kernel(
+                    "gemv_q8_0_wide_rows_exact",
+                    kernels::GEMV_Q8_0_WIDE_ROWS_EXACT_SRC,
+                    func,
+                )?;
+                (func, m.div_ceil(2) as u32, 64u32)
+            }
+            Q8RowsExactRoute::Narrow => {
+                let func = Q8_0_NARROW_ROWS_EXACT_SYMBOLS[n - 1];
+                self.ensure_kernel(
+                    "gemv_q8_0_rows_exact",
+                    kernels::GEMV_Q8_0_ROWS_EXACT_SRC,
+                    func,
+                )?;
+                (func, m as u32, 32u32)
+            }
+            Q8RowsExactRoute::PerRowSingleton => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemv_q8_0_rows_exact: no multi-row kernel on this route",
+                ))
+            }
+        };
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * (k / 32) * 34 + n * k * 4 + n * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            match route {
+                Q8RowsExactRoute::Wide => "gemv_q8_0_wide_rows_exact",
+                _ => "gemv_q8_0_rows_exact",
+            },
+            bytes,
+        );
+        let result =
+            self.launch_maybe_blob(func, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Whether the narrow-arm row-exact multi-row group (K > 1536, `rows >= 2`) runs
+    /// `gemv_q8_0_fast_r*` here: exact gfx1100 / gfx1201 (wave32), `HIPFIRE_Q8_GEMV_FAST`
+    /// not `0`, and [`q8_0_fast_admits`] for the shape and operand alignment.
+    pub(crate) fn q8_0_fast_narrow_ok(&self, k: usize, a_addr: usize, x_addr: usize) -> bool {
+        *Q8_0_GEMV_FAST && q8_0_fast_admits(&self.arch, k, a_addr, x_addr)
+    }
+
+    /// One `gemv_q8_0_fast_r<rows>` launch (`rows` in `2..=Q8_0_ROWS_EXACT_KERNELS`):
+    /// y `[rows, m]` = A x `[rows, k]`, 8 weight rows
+    /// per 256-thread block. The caller checked [`Gpu::q8_0_fast_narrow_ok`].
+    fn launch_q8_0_fast(
+        &mut self,
+        rows: usize,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let func = q8_0_fast_symbol(rows).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "gemv_q8_0_fast: row count outside the kernel set")
+        })?;
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_q8_0_fast", kernels::GEMV_Q8_0_FAST_SRC, func)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let grid = m.div_ceil(Q8_0_FAST_ROWS_PER_BLOCK) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * (k / 32) * 34 + rows * k * 4 + rows * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_q8_0_fast", bytes);
+        #[cfg(feature = "lab")]
+        self.lab_observe_projection(crate::dispatch::LabProjectionLaunch {
+            symbol: func,
+            family: WideTwinFamily::Q8,
+            form: "single",
+            weights: [Some((a_raw, m)), None, None, None],
+            x,
+            rows,
+            k,
+            scale: None,
+            hc_act: false,
+            grid: [grid, 1, 1],
+            block: [Q8_0_FAST_THREADS as u32, 1, 1],
+            shared_mem: 0,
+        })?;
+        let result = self.launch_maybe_blob(
+            func,
+            [grid, 1, 1],
+            [Q8_0_FAST_THREADS as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -26384,6 +26861,129 @@ mod rowtile_launch_tests {
         assert!(Q8_ROWTILE_GFX1100_SYMBOLS
             .iter()
             .all(|s| s.ends_with("_gfx1100")));
+    }
+
+    /// The rows-exact routing table is pinned to the singleton selection in
+    /// `Gpu::gemv_q8_0`, and its kernels/symbols exist in the shipped sources.
+    #[test]
+    fn q8_rows_exact_route_follows_the_decode_singleton() {
+        use Q8RowsExactRoute::{Narrow, PerRowSingleton, Wide};
+        for arch in ["gfx1201", "gfx1100"] {
+            for k in [32, 128, 512, 576, 1536] {
+                assert_eq!(q8_0_rows_exact_route(arch, k), Wide, "{arch} K={k}");
+            }
+            for k in [1568, 2560, 5120] {
+                assert_eq!(q8_0_rows_exact_route(arch, k), Narrow, "{arch} K={k}");
+            }
+        }
+        // gfx1151's singleton has staged K=320/640/2560 kernels, other arches
+        // have no verified recipe: per-row singleton launches.
+        for arch in ["gfx1151", "gfx1150", "gfx942", "gfx906", "gfx1030"] {
+            for k in [128, 320, 640, 2560, 5120] {
+                assert_eq!(
+                    q8_0_rows_exact_route(arch, k),
+                    PerRowSingleton,
+                    "{arch} K={k}"
+                );
+            }
+        }
+        // Drift guard: the singleton launcher still cuts wide/narrow at
+        // `k <= Q8_0_DECODE_WIDE_MAX_K`, wide first, narrow last.
+        assert_eq!(Q8_0_DECODE_WIDE_MAX_K, 1536);
+        let source = include_str!("gemv.rs");
+        let singleton = source
+            .split("    pub fn gemv_q8_0(")
+            .nth(1)
+            .unwrap()
+            .split("\n    pub fn ")
+            .next()
+            .unwrap();
+        assert!(singleton.contains("if k <= 1536 {"));
+        let wide = singleton.find("\"gemv_q8_0_wide\"").unwrap();
+        // The narrow arm is the one-wave-per-row kernel, after the wide arm; the fast
+        // multi-row kernels are not on the decode path (measured slower at n == 1).
+        let narrow = singleton.find("self.launch_q8_0_narrow(").unwrap();
+        assert!(wide < narrow);
+        assert!(
+            !singleton.contains("q8_0_fast_narrow_ok(") && !singleton.contains("launch_q8_0_fast(")
+        );
+        assert!(singleton.contains("kernels::GEMV_Q8_0_WIDE_SRC"));
+        let narrow_fn = source
+            .split("    fn launch_q8_0_narrow(")
+            .nth(1)
+            .unwrap()
+            .split("\n    pub fn ")
+            .next()
+            .unwrap();
+        assert!(narrow_fn.contains("kernels::GEMV_Q8_0_SRC"));
+        assert!(narrow_fn.contains("\"gemv_q8_0\""));
+    }
+
+    #[test]
+    fn q8_rows_exact_symbols_exist_in_their_kernel_sources() {
+        for rows in 1..=Q8_0_ROWS_EXACT_KERNELS {
+            assert_eq!(
+                Q8_0_WIDE_ROWS_EXACT_SYMBOLS[rows - 1],
+                format!("gemv_q8_0_wide_rows_exact_r{rows}")
+            );
+            assert_eq!(
+                Q8_0_NARROW_ROWS_EXACT_SYMBOLS[rows - 1],
+                format!("gemv_q8_0_rows_exact_r{rows}")
+            );
+            assert!(kernels::GEMV_Q8_0_WIDE_ROWS_EXACT_SRC
+                .contains(&format!("GEMV_Q8_0_WIDE_ROWS_EXACT({rows})\n")));
+            assert!(kernels::GEMV_Q8_0_ROWS_EXACT_SRC
+                .contains(&format!("GEMV_Q8_0_ROWS_EXACT({rows})\n")));
+        }
+        assert!(kernels::GEMV_Q8_0_WIDE_ROWS_EXACT_SRC.contains("gemv_q8_0_wide_rows_exact_r##R"));
+        assert!(kernels::GEMV_Q8_0_ROWS_EXACT_SRC.contains("gemv_q8_0_rows_exact_r##R"));
+    }
+
+    /// The fast narrow kernel admits exactly what its loads need and never the wide arm.
+    #[test]
+    fn q8_fast_narrow_admission_follows_the_kernel_contract() {
+        for arch in ["gfx1201", "gfx1100"] {
+            for k in [2560, 5120, 10240, 1600, 2624, 2688] {
+                assert!(q8_0_fast_admits(arch, k, 256, 256), "{arch} K={k}");
+            }
+            // Wide arm (K <= 1536): other kernel.
+            for k in [128, 512, 576, 1536] {
+                assert!(!q8_0_fast_admits(arch, k, 256, 256), "{arch} K={k}");
+            }
+            // Odd block count (K % 64 != 0): row starts are 2 mod 4.
+            for k in [1568, 2592, 2656] {
+                assert!(!q8_0_fast_admits(arch, k, 256, 256), "{arch} K={k}");
+            }
+            // dword weight / float4 activation loads.
+            assert!(!q8_0_fast_admits(arch, 2560, 258, 256));
+            assert!(q8_0_fast_admits(arch, 2560, 260, 256));
+            assert!(!q8_0_fast_admits(arch, 2560, 256, 260));
+        }
+        // Wave32 gfx11/gfx12 only; gfx1151 keeps its own staged kernels.
+        for arch in ["gfx1151", "gfx1150", "gfx942", "gfx906", "gfx1030"] {
+            assert!(!q8_0_fast_admits(arch, 2560, 256, 256), "{arch}");
+        }
+        // One row is the decode kernel, not a fast kernel.
+        assert_eq!(q8_0_fast_symbol(1), None);
+        assert_eq!(q8_0_fast_symbol(0), None);
+        assert_eq!(q8_0_fast_symbol(17), None);
+        for rows in 2..=Q8_0_ROWS_EXACT_KERNELS {
+            let want = format!("gemv_q8_0_fast_r{rows}");
+            assert_eq!(q8_0_fast_symbol(rows), Some(want.as_str()));
+            assert!(kernels::GEMV_Q8_0_FAST_SRC.contains(&format!("GEMV_Q8_0_FAST({rows})\n")));
+        }
+    }
+
+    #[test]
+    fn q8_rows_exact_extents_refuse_bad_shapes() {
+        assert_eq!(
+            q8_0_rows_exact_extents(5, 128, 3),
+            Some([5 * 4 * 34, 3 * 128 * 4, 3 * 5 * 4])
+        );
+        for (m, k, rows) in [(0, 128, 1), (5, 0, 1), (5, 100, 1), (5, 128, 0)] {
+            assert_eq!(q8_0_rows_exact_extents(m, k, rows), None, "{m} {k} {rows}");
+        }
+        assert_eq!(q8_0_rows_exact_extents(1 << 31, 128, 1), None);
     }
 
     #[test]

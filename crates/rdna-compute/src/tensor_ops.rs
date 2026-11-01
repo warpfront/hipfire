@@ -17,6 +17,17 @@ use crate::{DType, Gpu, GpuTensor};
 pub(crate) mod npu_arena;
 pub use npu_arena::*;
 
+// Multi-lane QSA decode core (fn-lanes, exact gfx1201): a child module so it
+// shares the singleton launchers' private validators and route predicates.
+#[path = "qsa_core_lanes.rs"]
+mod qsa_core_lanes;
+pub(crate) use qsa_core_lanes::QSA_LANES_SRC;
+pub use qsa_core_lanes::{
+    qsa_core_lanes, qsa_core_lanes_min, QsaCoreLane, QsaCoreLanesPlan, QSA_CORE_LANES_MAX,
+    QSA_CORE_LANE_ROWS, QSA_LANES_ATTENTION_SYMBOL, QSA_LANES_MODULE, QSA_LANES_POOL_SYMBOL,
+    QSA_LANES_PROLOGUE_SYMBOL, QSA_LANES_SELECT_SYMBOL,
+};
+
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/rope_yarn.h"),
@@ -2555,11 +2566,36 @@ fn qwen4_hc_up_twin_applies(enabled: bool, exact_gfx1151: bool, rows: usize) -> 
     enabled && exact_gfx1151 && rows >= QWEN4_HC_UP_TWIN_MIN_ROWS
 }
 
+/// Largest row count (inclusive) that takes the `hyper_read_up_fused` twin on exact gfx1201:
+/// decode, verify (K <= 7 drafts) and fn-lane steps (at most `LANE_MAX_ROWS` = 8 rows per
+/// forward). The 8-row decode HC read-up leaves 6 of 8 waves idle in the incumbent; the twin
+/// is bitwise the incumbent, gated by `tests/hyper_read_up_twin_hw.rs` (raw f32 bits).
+// selector-receipt: receipts/selectors/qwen4_hc_up_twin_gfx1201_max_rows.json
+const QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS: usize = 8;
+
+/// The gfx1201 admission of the same twin (`HIPFIRE_QWEN4_HC_UP_TWIN` kill switch applies).
+fn qwen4_hc_up_twin_gfx1201_applies(enabled: bool, exact_gfx1201: bool, rows: usize) -> bool {
+    enabled && exact_gfx1201 && rows <= QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS
+}
+
 /// Same arguments, grid, block, dynamic LDS and kernarg blob for either entry:
-/// on exact gfx1151 with at least 16 rows (and `HIPFIRE_QWEN4_HC_UP_TWIN`
-/// not `0`) the launch is the bitwise twin `hyper_read_up_fused_f32_sx`
-/// (module `hyper_read_up_fused_twin`); otherwise it is `hyper_read_up_fused_f32`.
+/// on exact gfx1151 with at least 16 rows, or exact gfx1201 with at most 8 rows (and
+/// `HIPFIRE_QWEN4_HC_UP_TWIN` not `0`) the launch is the bitwise twin
+/// `hyper_read_up_fused_f32_sx` (module `hyper_read_up_fused_twin`); otherwise it is
+/// `hyper_read_up_fused_f32`.
 pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+    let twin = qwen4_hc_up_twin_applies(*QWEN4_HC_UP_TWIN, gpu.arch_caps.is_gfx1151(), p.rows)
+        || qwen4_hc_up_twin_gfx1201_applies(*QWEN4_HC_UP_TWIN, gpu.arch_caps.is_gfx1201(), p.rows);
+    hyper_read_up_fused_entry(gpu, p, twin)
+}
+
+/// [`hyper_read_up_fused`] with the entry chosen by the caller (`twin` = the `_sx` twin): the
+/// byte-identity gates run both entries on one device through this.
+pub fn hyper_read_up_fused_entry(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    twin: bool,
+) -> HipResult<()> {
     ensure_f32(p.low)?;
     ensure_f32(p.normalized)?;
     ensure_f32(p.mixed)?;
@@ -2583,16 +2619,15 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
     let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
     let row_grid = checked_u32(p.rows.div_ceil(128), "HC read row grid")?;
     let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
-    let (module, source, kernel) =
-        if qwen4_hc_up_twin_applies(*QWEN4_HC_UP_TWIN, gpu.arch_caps.is_gfx1151(), p.rows) {
-            (
-                "hyper_read_up_fused_twin",
-                HYPER_READ_UP_FUSED_TWIN_SRC,
-                "hyper_read_up_fused_f32_sx",
-            )
-        } else {
-            ("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")
-        };
+    let (module, source, kernel) = if twin {
+        (
+            "hyper_read_up_fused_twin",
+            HYPER_READ_UP_FUSED_TWIN_SRC,
+            "hyper_read_up_fused_f32_sx",
+        )
+    } else {
+        ("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")
+    };
     gpu.ensure_kernel_public(module, source, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.up_weight.buf.as_ptr());
@@ -3024,6 +3059,11 @@ pub struct GdnCoreLanesPlan<'a, 'l> {
     step: [i32; 4],
 }
 
+/// Whether no two entries of `keys` are equal.
+fn pairwise_distinct(keys: &[usize]) -> bool {
+    (1..keys.len()).all(|i| !keys[..i].contains(&keys[i]))
+}
+
 /// Admission of the per-lane [`gated_delta_conv_params`] + unrotated
 /// [`gated_delta_step_gated`] calls of 2..=[`GDN_CORE_LANES_MAX`] lanes as two
 /// launches (see [`GdnCoreLanesPlan::launch`]). Lanes share the weights and
@@ -3047,6 +3087,9 @@ pub fn gated_delta_core_lanes<'a, 'l>(
         || lanes.len() > GDN_CORE_LANES_MAX
         || gpu.replay.is_recording()
         || !gpu.flags.qwen4_gdn_lanes_enabled()
+        // The singleton's fused step + gated norm (the body the lane kernel
+        // inlines) is the gfx11+ SIMT 128x128 route.
+        || !gpu.arch_caps.has_gfx11_plus_simt()
     {
         return Ok(None);
     }
@@ -3080,6 +3123,26 @@ pub fn gated_delta_core_lanes<'a, 'l>(
             && g.norm.buf.as_ptr() == g0.norm.buf.as_ptr();
         let lane_shape = ([channels, history_rows, kernel_size], step_args);
         if !fits || *shape.get_or_insert(lane_shape) != lane_shape {
+            return Ok(None);
+        }
+    }
+    // Lanes run concurrently: two lanes naming one state, ring or output
+    // buffer would race, so every written buffer must be pairwise distinct.
+    type LaneKey = fn(&GdnCoreLane<'_>) -> usize;
+    let written: [LaneKey; 6] = [
+        |l| l.step.state.buf.as_ptr() as usize,
+        |l| l.conv.history.buf.as_ptr() as usize,
+        |l| l.conv.output.buf.as_ptr() as usize,
+        |l| l.params.gate.buf.as_ptr() as usize,
+        |l| l.params.beta.buf.as_ptr() as usize,
+        |l| l.gate.output.buf.as_ptr() as usize,
+    ];
+    for key in written {
+        let mut keys = [0usize; GDN_CORE_LANES_MAX];
+        for (slot, lane) in keys.iter_mut().zip(lanes) {
+            *slot = key(lane);
+        }
+        if !pairwise_distinct(&keys[..lanes.len()]) {
             return Ok(None);
         }
     }
@@ -11295,6 +11358,17 @@ pub fn argmax_f32(gpu: &mut Gpu, p: &ArgmaxF32<'_>) -> HipResult<()> {
 /// [`argmax_f32`] of one logits row, read back: `llama::argmax(logits)`
 /// without downloading the row. Uses a lazily allocated 4-byte scratch.
 pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
+    argmax_f32_host_impl(gpu, logits, false)
+}
+
+/// [`argmax_f32_host`] for a decode loop that replays a graph on
+/// `Gpu::active_stream`: the 4-byte result is read back ordered on that stream
+/// ([`Gpu::download_f32_stream_ordered`]) instead of a blocking null-stream copy.
+pub fn argmax_f32_host_stream_ordered(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
+    argmax_f32_host_impl(gpu, logits, true)
+}
+
+fn argmax_f32_host_impl(gpu: &mut Gpu, logits: &GpuTensor, ordered: bool) -> HipResult<u32> {
     if gpu.scratch.argmax_host.is_none() {
         gpu.scratch.argmax_host = Some(gpu.alloc_tensor(&[1], DType::F32)?);
     }
@@ -11311,7 +11385,12 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
             vocab: logits.numel(),
         },
     )?;
-    Ok(gpu.download_f32(&result)?[0].to_bits())
+    let row = if ordered {
+        gpu.download_f32_stream_ordered(&result)?
+    } else {
+        gpu.download_f32(&result)?
+    };
+    Ok(row[0].to_bits())
 }
 
 #[cfg(test)]
@@ -20753,6 +20832,29 @@ mod hc_up_twin_route_tests {
             );
         }
     }
+
+    #[test]
+    fn qwen4_hc_up_twin_gfx1201_route_table() {
+        // (enabled, exact_gfx1201, rows, expected)
+        let cases: [(bool, bool, usize, bool); 9] = [
+            (false, true, 1, false),
+            (false, true, 8, false),
+            (true, false, 1, false),
+            (true, true, 1, true),
+            (true, true, 7, true),
+            (true, true, 8, true),
+            (true, true, 9, false),
+            (true, true, 16, false),
+            (true, true, 529, false),
+        ];
+        for (enabled, exact, rows, want) in cases {
+            assert_eq!(
+                qwen4_hc_up_twin_gfx1201_applies(enabled, exact, rows),
+                want,
+                "enabled={enabled} exact_gfx1201={exact} rows={rows}"
+            );
+        }
+    }
 }
 
 /// CPU-only tests of the Q8Ef live-layout ABI: format metadata, strict state
@@ -21548,5 +21650,98 @@ mod gdn_q8ef_tests {
         for (count, grid) in [(1usize, 1u32), (256, 1), (257, 2), (48 * 128 * 128, 3072)] {
             assert_eq!(blocks(count).unwrap(), grid, "count {count}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gdn_core_lanes_tests {
+    use super::*;
+
+    #[test]
+    fn lane_buffers_must_be_pairwise_distinct() {
+        assert!(pairwise_distinct(&[]));
+        assert!(pairwise_distinct(&[0x10]));
+        assert!(pairwise_distinct(&[0x10, 0x20, 0x30, 0x40]));
+        assert!(!pairwise_distinct(&[0x10, 0x10]));
+        assert!(!pairwise_distinct(&[0x10, 0x20, 0x30, 0x20]));
+        assert!(!pairwise_distinct(&[
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x10
+        ]));
+    }
+
+    /// A lane whose every argument is the one tensor `t`: enough for the
+    /// refusals that precede any shape or pointer validation.
+    fn lane(t: &GpuTensor) -> GdnCoreLane<'_> {
+        GdnCoreLane {
+            conv: GatedDeltaConv {
+                input: t,
+                kernel: t,
+                history: t,
+                output: t,
+                next_history: t,
+                channels: 1,
+                history_rows: 3,
+                kernel_size: 4,
+                cursor: 0,
+                row_index: 0,
+            },
+            params: GatedDeltaParams {
+                a: t,
+                b: t,
+                a_log: t,
+                dt_bias: t,
+                gate: t,
+                beta: t,
+            },
+            step: GatedDeltaStep {
+                q: t,
+                k: t,
+                v: t,
+                gate: t,
+                beta: t,
+                state: t,
+                format: GdnStateFormat::Q8,
+                residual: None,
+                output: t,
+                key_heads: 16,
+                value_heads: 48,
+                key_dim: 128,
+                value_dim: 128,
+                position: 0,
+            },
+            gate: GatedDeltaGate {
+                recurrent_output: t,
+                z: t,
+                norm: t,
+                output: t,
+                value_heads: 48,
+                value_dim: 128,
+            },
+        }
+    }
+
+    /// The count and flag refusals return `Ok(None)` (run the lanes one by one)
+    /// before anything is validated or launched. Needs a GPU for the tensor
+    /// handles only; skipped without one.
+    #[test]
+    fn admission_refuses_bad_counts_and_a_killed_flag() {
+        let Some(mut gpu) = crate::gpu_test::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let t = gpu.zeros(&[16], DType::F32).expect("tensor");
+        let lanes: Vec<GdnCoreLane<'_>> = (0..GDN_CORE_LANES_MAX + 1).map(|_| lane(&t)).collect();
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes = true;
+        assert!(gated_delta_core_lanes(&gpu, &[], 48).unwrap().is_none());
+        assert!(gated_delta_core_lanes(&gpu, &lanes[..1], 48)
+            .unwrap()
+            .is_none());
+        assert!(gated_delta_core_lanes(&gpu, &lanes, 48).unwrap().is_none());
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes = false;
+        assert!(gated_delta_core_lanes(&gpu, &lanes[..2], 48)
+            .unwrap()
+            .is_none());
+        drop(lanes);
+        gpu.free_tensor(t).expect("free");
     }
 }

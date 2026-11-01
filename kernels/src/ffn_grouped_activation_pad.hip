@@ -94,6 +94,9 @@ static __device__ __forceinline__ void ffn_grouped_body(
     out[(long long)flat * phys_n + col] = r;
 }
 
+// Producers that concatenate this file for `ffn_act`/`ffn_grouped_body` define
+// HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE so its entries are not redefined in their module.
+#ifndef HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE
 #define FFN_GROUPED_ENTRY(NAME, ACT)                                                     \
 extern "C" __global__ __launch_bounds__(256) void NAME(                                  \
     const float* y_grouped, const int* sorted_slot_index, const int* expert_tile_ids,    \
@@ -139,3 +142,4 @@ extern "C" __global__ __launch_bounds__(256) void ffn_single_expert_tables(
     }
     if (i < rows_pad / 16) tiles[i] = 0;
 }
+#endif // HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE

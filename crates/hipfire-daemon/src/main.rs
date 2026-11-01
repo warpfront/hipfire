@@ -2816,15 +2816,19 @@ fn main() {
                         batch_scheduler = staged_batch_scheduler;
                         vmm_batch = if staging.vmm { parsed_vmm_batch } else { None };
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // Gemma 4 (13) and Qwen4 (16) only with their attached
-                        // session cache (`ArchModel::session_cache_attached`).
+                        // Beyond the Qwen-family / legacy LCP routes listed here, any
+                        // architecture is cache-capable exactly when its bundle has the
+                        // engine session cache attached
+                        // (`ArchModel::session_cache_attached`: Gemma 4, Qwen4,
+                        // Raon-1-mini). The serve layer cold-resets the daemon before
+                        // every request of a model that is not, which would drop the
+                        // cache's resident follow-up snapshot.
                         let cache_capable = match m.arch_id {
                             5 | 6 | 9 | 10 | 12 | 14 => true,
-                            13 | 16 => m
+                            _ => m
                                 .state
                                 .as_deref()
                                 .is_some_and(|state| state.session_cache_attached()),
-                            _ => false,
                         };
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;

@@ -9355,7 +9355,7 @@ mod tests {
             unreachable!("lowering does not run stages")
         }
 
-        fn host_barrier(&self) -> Result<(), String> {
+        fn host_barrier(&self, _what: u8, _epoch: u32) -> Result<(), String> {
             unreachable!("lowering does not run stages")
         }
 

@@ -26,5 +26,34 @@ deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet"]
 name = "raon_oracle"
 required-features = ["lab"]
 
+# Raon DFlash2 oracle: device feature capture vs the tapped reference, draft emit
+# dump for the torch reference, verify row-exactness, AR vs DFlash greedy.
+# Built with --features lab.
+[[example]]
+name = "raon_dflash_oracle"
+required-features = ["lab"]
+
+# Prepared-A8 activation reuse node-chain bench (PLAN §6 G1); gfx1201, run through fabric.
+# Built with --features lab.
+[[example]]
+name = "bench_a8_reuse_chain"
+required-features = ["lab"]
+
+# Raon band oracles: one layer cut on one device (`raon_band_oracle`) and the
+# generic mesh executor over per-rank bands (`raon_mesh_oracle`), each against the
+# whole-model run. Built with --features lab.
+[[example]]
+name = "raon_band_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "raon_mesh_oracle"
+required-features = ["lab"]
 [dev-dependencies]
 md5 = "0.8"
+
+# One Raon RDA layer (`rda_forward_rows`) on synthetic raw projections: bit digest across
+# HIPFIRE_RAON_RDA_* flags and per-layer timing (needs a gfx1201 GPU). Built with --features lab.
+[[example]]
+name = "rda_layer_node"
+required-features = ["lab"]

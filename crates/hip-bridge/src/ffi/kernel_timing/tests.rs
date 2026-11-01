@@ -15,7 +15,7 @@ use crate::ffi::{Event, Function, HipEvent, HipRuntime, HipStream, Stream, HIP_E
 use libloading::Library;
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 // ── Mock native-call plan ─────────────────────────────────────────────────
@@ -575,6 +575,8 @@ fn mock_runtime() -> HipRuntime {
         fn_get_device_attribute: mock_device_attr,
         fn_mem_get_info: mock_mem_info,
         launch_grid_yz_limit: AtomicU32::new(u32::MAX),
+        own_device_bytes: AtomicUsize::new(0),
+        own_vmm_handles: Default::default(),
         stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(0)),
         kernel_timing_control: std::sync::OnceLock::new(),
     }

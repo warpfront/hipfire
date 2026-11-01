@@ -52,7 +52,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use hipfire_arch_raon::bundle::{PrefillMode, PrefillPrecision, RaonBundle};
+use hipfire_arch_raon::bundle::{PrefillMode, RaonBundle};
 use hipfire_arch_raon::forward::readout_logits;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::loader_api::ModelSource;
@@ -61,6 +61,10 @@ use rdna_compute::{DType, Gpu};
 use serde_json::{json, Value};
 
 use super::logits::{check_tokens, load_bundle, parse_prefill};
+
+// Shared sysfs clock sampler (also used by rdna-compute's `hip_loop`).
+#[path = "../../../rdna-compute/examples/support/clk.rs"]
+mod clk;
 
 const PROTOCOL: &str = "raon-bench-v1";
 const DEFAULT_PROMPT: &str = concat!(
@@ -321,7 +325,7 @@ fn cold(bundle: &mut RaonBundle, gpu: &mut Gpu) -> Result<(), String> {
 
 /// Download the logits and return `(argmax, finite)`.
 fn read_top1(bundle: &RaonBundle, gpu: &Gpu) -> Result<(usize, bool), String> {
-    let l = hip(gpu.download_f32(bundle.logits()), "download logits")?;
+    let l = bundle.download_logits(gpu)?;
     Ok((argmax(&l), l.iter().all(|x| x.is_finite())))
 }
 
@@ -468,13 +472,20 @@ fn bench_pp(
     let mut tok_s = Vec::with_capacity(reps);
     let mut top1 = Vec::with_capacity(reps);
     let mut finite = true;
-    for _ in 0..reps {
+    let mut rep_clocks: Vec<Value> = Vec::with_capacity(reps);
+    let mut rep_samples: Vec<Value> = Vec::with_capacity(2 * reps);
+    for rep in 0..reps {
+        // sysfs reads stay outside the timed region (`timed_prefill` measures its own interval).
+        let rep_before = clk::sample(pci);
         let s = timed_prefill(bundle, gpu, &ids)?;
         secs.push(s);
         tok_s.push(n as f64 / s.max(1e-12));
         let (t, f) = read_top1(bundle, gpu)?;
         top1.push(t);
         finite &= f;
+        let rep_after = clk::sample(pci);
+        rep_samples.extend([rep_before.clone(), rep_after.clone()]);
+        rep_clocks.push(json!({"rep": rep, "before": rep_before, "after": rep_after}));
     }
     let clocks_after = clocks_json(pci);
     Ok(json!({
@@ -489,6 +500,8 @@ fn bench_pp(
         "logits_finite": finite,
         "clocks_before": clocks_before,
         "clocks_after": clocks_after,
+        "rep_clocks": rep_clocks,
+        "clock_summary": clk::summary(&rep_samples),
     }))
 }
 
@@ -518,7 +531,10 @@ fn bench_tg(
     let mut device_reps: Vec<Value> = Vec::new();
     let mut last_token_ms: Vec<f64> = Vec::new();
     let mut greedy_reps: Vec<Value> = Vec::new();
-    for _ in 0..reps {
+    let mut rep_clocks: Vec<Value> = Vec::with_capacity(reps);
+    let mut rep_samples: Vec<Value> = Vec::with_capacity(2 * reps);
+    for rep in 0..reps {
+        let rep_before = clk::sample(pci);
         let (gc0, gr0) = bundle.decode_graph_stats();
         let g = greedy_run(bundle, gpu, &prompt, tg)?;
         let (gc1, gr1) = bundle.decode_graph_stats();
@@ -552,6 +568,9 @@ fn bench_tg(
             "step_ms": {"mean": mean(&d.step_ms), "p50": percentile(&sm, 0.5), "max": sm.last()},
             "slow_steps_over_1p5x_p50": sm.get(sm.len() / 2).map_or(0, |p| d.step_ms.iter().filter(|m| **m > 1.5 * p).count()),
         }));
+        let rep_after = clk::sample(pci);
+        rep_samples.extend([rep_before.clone(), rep_after.clone()]);
+        rep_clocks.push(json!({"rep": rep, "before": rep_before, "after": rep_after}));
     }
     let clocks_after = clocks_json(pci);
     let mut sorted = last_token_ms.clone();
@@ -588,6 +607,8 @@ fn bench_tg(
         },
         "clocks_before": clocks_before,
         "clocks_after": clocks_after,
+        "rep_clocks": rep_clocks,
+        "clock_summary": clk::summary(&rep_samples),
     }))
 }
 
@@ -1083,11 +1104,9 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         ));
     }
 
-    let precision = match PrefillPrecision::from_env()? {
-        PrefillPrecision::F16 => "f16",
-        PrefillPrecision::A8 => "a8",
-        PrefillPrecision::A4 => "a4",
-    };
+    // Raw request; the resolved per-site effective tiers are reported from the loaded bundle.
+    let precision = hipfire_config::developer_var(hipfire_arch_raon::precision::PRECISION_ENV)
+        .unwrap_or_else(|_| "default".to_string());
     let mut gpu = Gpu::init().map_err(|e| format!("bench: gpu init: {e:?}"))?;
     let pci = gpu.hip.device_pci_bus_id(gpu.device_id).unwrap_or_default();
     let gpu_json = json!({
@@ -1206,6 +1225,12 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
             "controls": {
                 "prefill_mode": mode_name(bundle.prefill_mode()),
                 "prefill_precision": precision,
+                "prefill_precision_effective": bundle
+                    .precision_plan()
+                    .sites
+                    .iter()
+                    .map(|(site, r)| (site.name().to_string(), r.effective.name()))
+                    .collect::<BTreeMap<_, _>>(),
                 "decode_route": bundle.decode_mode(),
                 "max_seq": max_seq,
                 "mirror_budget_rows": bundle.state.mirror_budget_rows(),

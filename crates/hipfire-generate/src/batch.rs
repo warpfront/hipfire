@@ -335,6 +335,10 @@ pub fn is_batch_request_eligible(
         has_speculator: has_spec,
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
+        speculator_supports_penalties: m
+            .speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_penalties()),
         deepseek4_spec_requested: false,
         ngram_can_sample,
         temp: sampling.temp,
@@ -1855,6 +1859,7 @@ fn vmm_singleton_route(
         has_speculator: spec.is_some(),
         speculator_is_mtp: spec.is_some_and(|s| s.name() == "mtp"),
         speculator_is_dflash2: spec.is_some_and(|s| s.name() == "dflash2"),
+        speculator_supports_penalties: spec.is_some_and(|s| s.supports_penalties()),
         deepseek4_spec_requested: false,
         ngram_can_sample: spec.map(|s| !s.requires_greedy()).unwrap_or(false),
         temp: sampling.temp,
@@ -2182,6 +2187,7 @@ fn spec_request_config(
         // them); only the singleton drafter retains a window for a terminal repair.
         stop_sequences: false,
         logprobs: false,
+        penalty_generated_only: false,
     }
 }
 
@@ -6836,6 +6842,10 @@ pub fn is_qwen_ep_batch_request_eligible(
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
+        speculator_supports_penalties: m
+            .speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_penalties()),
         deepseek4_spec_requested: false,
         ngram_can_sample: m
             .speculator

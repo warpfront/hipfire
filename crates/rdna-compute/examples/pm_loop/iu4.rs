@@ -37,6 +37,12 @@
 //! expected to be true. The record gains `sparse: {mma, base_mma,
 //! groups_per_block, kept_per_group, seed}`.
 //!
+//! # `--inputs capture:<act_capture.json>[@site]`
+//! The activation records (`N` columns of `K/128` blocks) are quantized from the F32 rows of one site of a pinned
+//! `act_capture.v1` instead of the synthetic generator: column `c` is capture row `c % rows`. The bin's sha256 is
+//! verified, `K` must equal the capture's `k` (else an error), and the record gets
+//! `inputs: {kind:"capture", path, id, site}`. Weights stay synthetic.
+//!
 //! # Generator knobs (`iu4_gemm::Tune`)
 //! `ring` (`2`|`3`), `wait` (`after`|`mid`|`before`: where a K-loop block
 //! publishes its next slab relative to the slab's WMMAs, see
@@ -238,6 +244,162 @@ impl Host {
         let y0 = (0..n * m).map(|_| 0.25 + rng.unit()).collect();
         Self { w, w_up, recs, y0 }
     }
+}
+
+/// The opaque `id` of a pinned `route_hist.v1` / `act_capture.v1` document (its producer's
+/// sha256 of the canonical JSON; never recomputed here). Integrity is checked against the bin.
+pub fn artefact_id(doc: &Value) -> Result<String> {
+    doc["id"]
+        .as_str()
+        .filter(|s| s.len() == 64)
+        .map(str::to_owned)
+        .ok_or_else(|| "missing 64-hex top-level `id`".to_owned())
+}
+
+/// Resolve `p` (a path stored inside an artefact) against the artefact's directory.
+pub fn sibling_path(json_path: &Path, p: &str) -> std::path::PathBuf {
+    let p = Path::new(p);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        json_path.parent().unwrap_or(Path::new(".")).join(p)
+    }
+}
+
+/// `--inputs capture:<act_capture.json>[@site]`: F32 activation rows of one site of a pinned
+/// `act_capture.v1` (rows-only bin grouped per site at `offset_bytes`), sha-verified. Row `i` of a workload is
+/// capture row `i % rows` (cycled).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Capture {
+    pub path: String,
+    pub id: String,
+    pub site: String,
+    pub k: usize,
+    pub nrows: usize,
+    rows: Vec<f32>,
+}
+
+impl Capture {
+    pub fn parse(arg: &str) -> Result<Capture> {
+        let spec = arg
+            .strip_prefix("capture:")
+            .ok_or_else(|| format!("--inputs {arg}: expected capture:<act_capture.json>[@site]"))?;
+        let (path, site) = match spec.rsplit_once('@') {
+            Some((p, s)) if !s.is_empty() => (p, Some(s)),
+            _ => (spec, None),
+        };
+        Self::load(Path::new(path), site)
+    }
+
+    pub fn load(path: &Path, site: Option<&str>) -> Result<Capture> {
+        let err = |m: String| format!("--inputs capture:{}: {m}", path.display());
+        let text = std::fs::read(path).map_err(|e| err(e.to_string()))?;
+        let doc: Value = serde_json::from_slice(&text).map_err(|e| err(e.to_string()))?;
+        if doc["schema"] != "act_capture.v1" {
+            return Err(err(format!(
+                "schema {}: expected act_capture.v1",
+                doc["schema"]
+            )));
+        }
+        let id = artefact_id(&doc).map_err(err)?;
+        let bin_rel = doc["bin"]["path"]
+            .as_str()
+            .ok_or_else(|| err("missing bin.path".into()))?;
+        let bin_path = sibling_path(path, bin_rel);
+        let bin =
+            std::fs::read(&bin_path).map_err(|e| err(format!("{}: {e}", bin_path.display())))?;
+        let want = doc["bin"]["sha256"].as_str().unwrap_or("");
+        let got = sha256_hex(&bin);
+        if want != got {
+            return Err(err(format!(
+                "bin sha256 mismatch ({}): manifest {want}, file {got}",
+                bin_path.display()
+            )));
+        }
+        let sites: Vec<&str> = doc["sites"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s["site"].as_str()).collect())
+            .unwrap_or_default();
+        let site = match (site, sites.as_slice()) {
+            (Some(s), _) if sites.contains(&s) => s,
+            (Some(s), _) => return Err(err(format!("site `{s}` not in {sites:?}"))),
+            (None, [only]) => only,
+            (None, _) => return Err(err(format!("several sites {sites:?}: pick one with @site"))),
+        };
+        let ent = doc["sites"]
+            .as_array()
+            .and_then(|a| a.iter().find(|s| s["site"] == site))
+            .ok_or_else(|| err(format!("site `{site}` missing")))?;
+        let field = |n: &str| {
+            ent[n]
+                .as_u64()
+                .map(|v| v as usize)
+                .ok_or_else(|| err(format!("site `{site}`: missing {n}")))
+        };
+        let (k, nrows, off) = (field("k")?, field("rows_total")?, field("offset_bytes")?);
+        let end = nrows
+            .checked_mul(k)
+            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_add(off))
+            .filter(|&e| e <= bin.len())
+            .ok_or_else(|| {
+                err(format!(
+                    "site `{site}`: rows exceed the bin ({} bytes)",
+                    bin.len()
+                ))
+            })?;
+        if nrows == 0 || k == 0 {
+            return Err(err(format!("site `{site}`: no rows")));
+        }
+        let rows = bin[off..end]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        Ok(Capture {
+            path: path.display().to_string(),
+            id,
+            site: site.to_owned(),
+            k,
+            nrows,
+            rows,
+        })
+    }
+
+    /// Capture row `i` (cycled), `k` f32.
+    pub fn row(&self, i: usize) -> &[f32] {
+        let r = i % self.nrows;
+        &self.rows[r * self.k..(r + 1) * self.k]
+    }
+
+    /// A workload whose activation width is `k` takes the capture only when the widths agree.
+    pub fn require_k(&self, k: usize) -> Result<()> {
+        if self.k != k {
+            return Err(format!(
+                "--inputs capture:{}@{}: capture rows have K={}, the workload needs K={k}",
+                self.path, self.site, self.k
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn json(&self) -> Value {
+        json!({"kind": "capture", "path": self.path, "id": self.id, "site": self.site})
+    }
+}
+
+/// Token-layout MQ4 activation records (`Host::recs`) from capture rows: column `col` is row
+/// `col` of the capture (cycled), K128 block `kb` its elements `kb*128..`.
+fn recs_from_capture(c: &Capture, n: usize, k: usize) -> Vec<u8> {
+    let mut recs = vec![0u8; k / 128 * n * REC];
+    for kb in 0..k / 128 {
+        for col in 0..n {
+            let mut x = [0f32; 128];
+            x.copy_from_slice(&c.row(col)[kb * 128..(kb + 1) * 128]);
+            let o = (kb * n + col) * REC;
+            recs[o..o + REC].copy_from_slice(&quantize_block(&x));
+        }
+    }
+    recs
 }
 
 /// The kept pair (indices into a group's 4 dense K, ascending) of `pick` in `0..6`.
@@ -573,6 +735,8 @@ pub struct Iu4 {
     rip: Option<RipSource>,
     /// `--pool` / `--flush-l2` / `--flush`: cold-cache timing with the rotating weight pool (`Workload::set_cold`).
     cold: crate::cold::ColdMode,
+    /// `--inputs capture:<file>[@site]`: the activation rows come from a pinned capture.
+    capture: Option<Capture>,
 }
 
 struct RipSource {
@@ -793,6 +957,14 @@ pub fn new_with_rip(
         }
         Some(o) => return Err(format!("--base-shipped {o}: expected b1s|v64")),
     }
+    let capture = match knobs.take("inputs") {
+        Some(spec) => {
+            let c = Capture::parse(&spec)?;
+            c.require_k(k)?;
+            Some(c)
+        }
+        None => None,
+    };
     let sparse_seed = match knobs.take("sparse-seed") {
         Some(v) => v
             .parse::<u64>()
@@ -840,6 +1012,7 @@ pub fn new_with_rip(
         sparse_seed,
         rip,
         cold: crate::cold::ColdMode::Hot,
+        capture,
     }))
 }
 
@@ -1147,10 +1320,14 @@ impl Workload for Iu4 {
         v
     }
     fn record_extra(&self) -> Vec<(String, Value)> {
-        if !self.sparse_active() {
-            return Vec::new();
+        let mut extra = Vec::new();
+        if let Some(c) = &self.capture {
+            extra.push(("inputs".to_owned(), c.json()));
         }
-        vec![(
+        if !self.sparse_active() {
+            return extra;
+        }
+        extra.push((
             "sparse".into(),
             json!({
                 "mma": self.cand.mma.name(), "base_mma": self.base.mma.name(),
@@ -1159,7 +1336,8 @@ impl Workload for Iu4 {
                 "weights": "generated MQ4V2 codes pruned 2-of-4 per sparse group, pruned code = 8; \
                     dense arms and the CPU reference read the pruned dense weights, sparse arms the pack_block image",
             }),
-        )]
+        ));
+        extra
     }
     fn candidate_knobs(&self) -> Value {
         let mut v = self.cand_strs.json();
@@ -1185,6 +1363,9 @@ impl Workload for Iu4 {
     fn setup(&mut self, gpu: &Gpu) -> Result<()> {
         let silu = self.cand.epi.is_silu();
         let mut host = Host::synth(self.m, self.n, self.k, silu);
+        if let Some(c) = &self.capture {
+            host.recs = recs_from_capture(c, self.n, self.k);
+        }
         // Any sparse arm: prune the generated weights to 2:4 (in `host.w`, which
         // the dense baseline and the CPU reference read) and pack one image per
         // sparse arm.
@@ -1417,6 +1598,76 @@ impl Workload for Iu4 {
             Ok(v) => v,
             Err(e) => Value::String(format!("refused ({e})")),
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Write a synthetic `act_capture.v1` (rows-only bin, site `a` rows 3xK, site `b` 2xK).
+    fn fixture(tag: &str, k: usize, tamper: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pm_loop_cap_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bin = Vec::new();
+        for i in 0..5 * k {
+            bin.extend((((i % 97) as f32 - 48.0) * 0.05).to_le_bytes());
+        }
+        let sha = sha256_hex(&bin);
+        if tamper {
+            bin[0] ^= 1;
+        }
+        std::fs::write(dir.join("c.bin"), &bin).unwrap();
+        let doc = json!({
+            "schema": "act_capture.v1",
+            "sites": [
+                {"site": "a", "k": k, "rows_total": 3, "records": 1, "offset_bytes": 0},
+                {"site": "b", "k": k, "rows_total": 2, "records": 1, "offset_bytes": 3 * k * 4},
+            ],
+            "bin": {"path": "c.bin", "sha256": sha},
+            "id": "ab".repeat(32),
+        });
+        let p = dir.join("c.json");
+        std::fs::write(&p, serde_json::to_vec(&doc).unwrap()).unwrap();
+        p
+    }
+
+    #[test]
+    fn capture_replay_is_deterministic_and_cycles() {
+        let p = fixture("det", 256, false);
+        let a = Capture::load(&p, Some("a")).unwrap();
+        let b = Capture::load(&p, Some("a")).unwrap();
+        assert_eq!(a, b);
+        assert_eq!((a.nrows, a.k), (3, 256));
+        assert_eq!(a.row(3), a.row(0));
+        assert_ne!(a.row(0), Capture::load(&p, Some("b")).unwrap().row(0));
+        let spec = format!("capture:{}@b", p.display());
+        assert_eq!(Capture::parse(&spec).unwrap().site, "b");
+        assert_eq!(a.json()["kind"], "capture");
+        assert_eq!(a.json()["id"], "ab".repeat(32));
+        assert_eq!(recs_from_capture(&a, 4, 256), recs_from_capture(&b, 4, 256));
+        assert!(Capture::load(&p, None).is_err(), "two sites need @site");
+    }
+
+    #[test]
+    fn capture_sha_mismatch_is_refused() {
+        let p = fixture("sha", 256, true);
+        let e = Capture::load(&p, Some("a")).unwrap_err();
+        assert!(e.contains("sha256 mismatch"), "{e}");
+    }
+
+    #[test]
+    fn capture_k_mismatch_is_refused() {
+        let p = fixture("k", 256, false);
+        let spec = format!("capture:{}@a", p.display());
+        let e = new(
+            "M=128,N=8,K=512",
+            &mut Knobs([("inputs".to_owned(), spec)].into()),
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("K=256") && e.contains("K=512"), "{e}");
     }
 }
 

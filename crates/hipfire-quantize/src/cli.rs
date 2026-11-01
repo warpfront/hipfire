@@ -287,6 +287,46 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "DIR", conflicts_with_all = ["mq4v2_final_codes", "mq3v2_final_codes", "flux_pipe", "reap_overlay", "reap_bake"])]
     pub mq2v2_final_codes: Option<PathBuf>,
 
+    /// Raon-1-mini always-active FFN swap: build a variant of the shipped qt44 artifact
+    /// `--input` whose shared-expert and dense layer-0 gate/up/down weights are stored as
+    /// `q8f16` (qt3, group 32) or `bf16` (qt16, source-exact) instead of qt44 + AWQ sidecar,
+    /// re-quantized from the checkpoint directory `--raon-source` without re-running
+    /// calibration. Every other tensor is copied byte-for-byte. Writes `--output`.
+    #[arg(
+        long,
+        value_name = "STORAGE",
+        value_parser = ["q8f16", "bf16"],
+        requires = "raon_source",
+        conflicts_with_all = ["flux_pipe", "qwen4_flash_next", "recipe", "mq4v2_final_codes",
+                              "mq3v2_final_codes", "mq2v2_final_codes", "reap_overlay",
+                              "reap_bake", "raon_shared_ffn_verify"]
+    )]
+    pub raon_shared_ffn: Option<String>,
+
+    /// Source checkpoint directory (the BF16/MXFP8 safetensors) for `--raon-shared-ffn`.
+    #[arg(long, value_name = "DIR", requires = "raon_shared_ffn")]
+    pub raon_source: Option<PathBuf>,
+
+    /// Read-only proof that `--output` (an existing variant) is `--input` (the shipped
+    /// artifact) with the always-active FFN swapped to STORAGE and nothing else changed.
+    /// Prints a per-class table and exits non-zero on any violation; writes nothing.
+    #[arg(
+        long,
+        value_name = "STORAGE",
+        value_parser = ["q8f16", "bf16"],
+        conflicts_with_all = ["flux_pipe", "qwen4_flash_next", "recipe", "mq4v2_final_codes",
+                              "mq3v2_final_codes", "mq2v2_final_codes", "reap_overlay",
+                              "reap_bake", "raon_shared_ffn"]
+    )]
+    pub raon_shared_ffn_verify: Option<String>,
+
+    /// Scope of `--raon-shared-ffn` / `--raon-shared-ffn-verify`: `all` (default) swaps the
+    /// shared experts and the dense layer-0 MLP, `shared` only the MoE layers' shared
+    /// experts, `shared-gateup` only their gate/up weights, `dense` only the dense layer-0 MLP; the rest stay qt44. The artifact
+    /// records `<storage>:<scope>` in `hipfire_raon.shared_ffn` for a partial scope.
+    #[arg(long, value_name = "SCOPE", value_parser = ["all", "shared", "shared-gateup", "dense"])]
+    pub raon_shared_ffn_scope: Option<String>,
+
     /// Enable K-map promotion for dense models.
     #[arg(long)]
     pub kmap_dense: bool,
@@ -374,6 +414,8 @@ pub(crate) enum Route {
     Qwen4DevTiny,
     /// `--mq{4,3,2}v2-final-codes` import into an existing HFQ.
     FinalCodes,
+    /// `--raon-shared-ffn` swap / `--raon-shared-ffn-verify` proof on a Raon artifact.
+    RaonSharedFfn,
     /// `--format maple|ds4-dense-e8soa-overlay|ds4-dspark-e8soa|qwen3-dspark-q8`.
     EarlySpecial,
     /// Deprecated GGUF weight input.
@@ -397,6 +439,7 @@ const EVERY: &[Route] = &[
     EarlySpecial,
     Gguf,
     Raon,
+    RaonSharedFfn,
     ReapOverlay,
     Main,
 ];
@@ -410,6 +453,7 @@ const EVERY: &[Route] = &[
     EarlySpecial,
     Gguf,
     Raon,
+    RaonSharedFfn,
     ReapOverlay,
     Main,
 ];
@@ -427,6 +471,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
             EarlySpecial,
             Gguf,
             Raon,
+            RaonSharedFfn,
             ReapOverlay,
             Main,
         ],
@@ -442,6 +487,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
             EarlySpecial,
             Gguf,
             Raon,
+            RaonSharedFfn,
             ReapOverlay,
             Main,
         ],
@@ -491,6 +537,10 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("mq4v2_final_codes", &[FinalCodes]),
     ("mq3v2_final_codes", &[FinalCodes]),
     ("mq2v2_final_codes", &[FinalCodes]),
+    ("raon_shared_ffn", &[RaonSharedFfn]),
+    ("raon_source", &[RaonSharedFfn]),
+    ("raon_shared_ffn_verify", &[RaonSharedFfn]),
+    ("raon_shared_ffn_scope", &[RaonSharedFfn]),
     ("kmap_dense", &[Gguf, Main]),
     ("kmap_mode", &[Gguf, Main]),
     ("allow_mq2", &[Gguf, Main]),
@@ -516,6 +566,7 @@ fn route_label(route: Route) -> &'static str {
         EarlySpecial => "this --format",
         Gguf => "GGUF weight input",
         Raon => "the Raon-1-mini converter",
+        RaonSharedFfn => "--raon-shared-ffn / --raon-shared-ffn-verify",
         ReapOverlay => "--reap-overlay",
         Main => "the safetensors quantize path",
     }
@@ -623,6 +674,22 @@ mod route_tests {
                 Gguf,
                 &["--input", "m.gguf", "--output", "o", "--imatrix", "x"],
                 "--imatrix",
+            ),
+            (
+                RaonSharedFfn,
+                &[
+                    "--raon-shared-ffn",
+                    "q8f16",
+                    "--raon-source",
+                    "d",
+                    "--input",
+                    "i",
+                    "--output",
+                    "o",
+                    "--format",
+                    "mq4",
+                ],
+                "--format",
             ),
             (
                 ReapOverlay,

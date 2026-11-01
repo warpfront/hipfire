@@ -7576,6 +7576,10 @@ fn open_bench_engine(
     apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
+        // Final effective selector wins, as on `run`: re-project the inherited
+        // `developer.dflash_draft` when `--spec` turned DFlash on over a
+        // config-off load.
+        project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
     }
     // Registry sidecar for a final auto/on selector the config-time
     // load_params could not see (config-off + `bench --spec dflash`).
@@ -11057,11 +11061,30 @@ mod tests {
             out.display().to_string(),
         ];
         argv.extend(extra.iter().map(|s| s.to_string()));
-        let cli = Cli::try_parse_from(argv)?;
-        let Some(Commands::Quantize(args)) = cli.command else {
-            panic!("expected quantize subcommand");
-        };
-        quantize_command(&paths, args)?;
+        // The script was just written: a sibling test's fork may still hold its
+        // write fd, so exec can fail ETXTBSY. Bounded retry like the fake-daemon
+        // spawns.
+        let mut attempt = 0u64;
+        loop {
+            let cli = Cli::try_parse_from(&argv)?;
+            let Some(Commands::Quantize(args)) = cli.command else {
+                panic!("expected quantize subcommand");
+            };
+            match quantize_command(&paths, args) {
+                Err(error)
+                    if attempt < 8
+                        && error
+                            .root_cause()
+                            .downcast_ref::<io::Error>()
+                            .and_then(io::Error::raw_os_error)
+                            == Some(libc::ETXTBSY) =>
+                {
+                    attempt += 1;
+                    thread::sleep(Duration::from_millis(5 * attempt));
+                }
+                other => break other?,
+            }
+        }
         let lines = fs::read_to_string(&record)?
             .lines()
             .map(str::to_owned)

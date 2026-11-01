@@ -1516,6 +1516,13 @@ impl Rig {
             .device_mem_info()
             .map_err(|e| format!("vram info: {e}"))?;
 
+        // Placement is decided from planned capacity, never the instantaneous
+        // free figure; the preflight below still refuses on real free bytes.
+        let planned = gpu
+            .planned_capacity()
+            .map_err(|e| format!("vram info: {e}"))?;
+        eprintln!("slots: admission decision: weight placement capacity from {planned}");
+
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
         // An auto-sized paged pool has no page count until the post-weight
         // free-VRAM query; charge zero here (like VMM) so placement does not
@@ -1561,7 +1568,7 @@ impl Rig {
             &config,
             cfg,
             &gpu,
-            vram_free as u64,
+            planned.bytes as u64,
             kv_plan_reserve,
             hfq.arch_id,
         )?;
@@ -4292,6 +4299,10 @@ fn spec_request_config(req: &SubmitRequest) -> SpecRequestConfig {
         // neither needs target logit rows or terminal-prefix repair.
         stop_sequences: false,
         logprobs: false,
+        // Beta's `SpecRequestConfig::penalty_generated_only` is Raon's AR
+        // producer only (arch 19); the multi-slot engine serves the Qwen
+        // family, whose speculators penalize `prompt ‖ generated` like AR.
+        penalty_generated_only: false,
     }
 }
 

@@ -73,7 +73,7 @@ Both `master` and `beta` are mutable. For a reproducible install, pin and
 inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
-PIN=v0.4.4
+PIN=v0.4.5
 curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
@@ -81,7 +81,7 @@ less /tmp/hipfire-install.sh
 bash /tmp/hipfire-install.sh --ref "$PIN"
 ```
 
-Use `--tag v0.4.4` when the kind is known, or `--commit <full-sha>` for an
+Use `--tag v0.4.5` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
@@ -140,7 +140,7 @@ directory or URL holding the assets (`https://…`, `file:///…`, or a plain
 path), for mirrors and offline installs:
 
 ```bash
-bash install.sh --tag v0.4.4 --kernel-pack-url file:///srv/hipfire-packs/v0.4.4
+bash install.sh --tag v0.4.5 --kernel-pack-url file:///srv/hipfire-packs/v0.4.5
 ```
 
 `hipfire kernel-pack install --tag <tag> --arch <arch> --source ~/.hipfire/src`
@@ -196,9 +196,9 @@ Repository variables choose another image
 publish from a local toolchain instead:
 
 ```bash
-scripts/build-kernel-pack.sh --tag v0.4.4 --out dist            # every admitted arch
-scripts/build-kernel-pack.sh --tag v0.4.4 --out dist gfx1201    # or a subset
-gh release upload v0.4.4 dist/hipfire-kernels-v0.4.4-*
+scripts/build-kernel-pack.sh --tag v0.4.5 --out dist            # every admitted arch
+scripts/build-kernel-pack.sh --tag v0.4.5 --out dist gfx1201    # or a subset
+gh release upload v0.4.5 dist/hipfire-kernels-v0.4.5-*
 ```
 
 The script compiles `git archive` of the tag's commit with a fresh `HOME` and
@@ -517,7 +517,7 @@ one build, then prints one `fix:` line per problem
 hipfire update                  # advance the currently selected branch
 hipfire update @beta            # auto-detect branch/tag/commit
 hipfire update --branch master
-hipfire update --tag v0.4.4
+hipfire update --tag v0.4.5
 hipfire update --commit <sha>
 ```
 

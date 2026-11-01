@@ -2748,6 +2748,35 @@ impl Qwen4MtpGpu {
         &self.state
     }
 
+    /// The last head step's collapsed hidden (the final HC read feeding the
+    /// draft) and wide 4H streams, downloaded as F32: the observables the CPU
+    /// reference (`reference_mtp::mtp_forward_step`) is pinned against.
+    pub(crate) fn download_head_outputs(
+        &self,
+        gpu: &Gpu,
+    ) -> Result<(Vec<f32>, Vec<f32>), MtpGpuError> {
+        if self.scratch.hc_mixed.dtype != DType::F32 || self.scratch.wide.dtype != DType::F32 {
+            return Err(invalid("MTP head outputs are not F32"));
+        }
+        Ok((
+            gpu.download_f32(&self.scratch.hc_mixed)?,
+            gpu.download_f32(&self.scratch.wide)?,
+        ))
+    }
+
+    /// The draft token the production draft head ranks from an arbitrary
+    /// collapsed hidden row (F32, hidden-wide): the GPU lm_head applied to a
+    /// caller-supplied row, e.g. the CPU reference's.
+    pub(crate) fn draft_from_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        hidden: &GpuTensor,
+    ) -> Result<u32, MtpGpuError> {
+        let head = weights.resident(&weights.root.lm_head)?;
+        Ok(self.draft.draft(gpu, head, hidden)?)
+    }
+
     pub(crate) fn forward_token_with_logits(
         &mut self,
         gpu: &mut Gpu,

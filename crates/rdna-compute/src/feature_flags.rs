@@ -121,9 +121,16 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
     pub qwen4_router_fast: bool,
+    /// Block-wide prefix scan in the Qwen4 top-10 MoE scatter
+    /// (`HIPFIRE_QWEN4_MOE_SCATTER_SCAN`), default on for gfx1201 (`=0` keeps the serial
+    /// thread-0 walk); gfx1151 always scans, every other arch always walks.
+    pub qwen4_moe_scatter_scan: bool,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
-    /// on for gfx1151, off elsewhere.
+    /// on for gfx1151 and gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_gdn_lanes: bool,
+    /// Multi-lane fn-lanes QSA decode core (`HIPFIRE_QWEN4_QSA_LANES`), default
+    /// on for exact gfx1201 (`=0` kills it), off elsewhere.
+    pub qwen4_qsa_lanes: bool,
     /// Qwen4 MQ4G128V2 K=640 indexed MoE down with four weight rows per wave
     /// (`HIPFIRE_QWEN4_MOE_DOWN_R4`), default on for gfx1151.
     pub qwen4_moe_down_r4: bool,
@@ -1027,8 +1034,12 @@ impl FeatureFlags {
                 .unwrap_or(halo_hyper_default || is_gfx1201),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST")
                 .unwrap_or(exact_unit_default),
-            qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(arch == "gfx1151"),
-            qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4").unwrap_or(arch == "gfx1151"),
+            qwen4_moe_scatter_scan: parse_bool("HIPFIRE_QWEN4_MOE_SCATTER_SCAN")
+                .unwrap_or(is_gfx1201),
+            qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
+            qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
+            qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
+                .unwrap_or(arch == "gfx1151" || is_gfx1201),
             qwen4_shared_down_fuse: parse_bool("HIPFIRE_QWEN4_SHARED_DOWN_FUSE")
                 .unwrap_or(arch == "gfx1151"),
             qwen4_decode_zba_x3: parse_bool("HIPFIRE_QWEN4_DECODE_ZBA_X3")
@@ -1695,13 +1706,19 @@ impl FeatureFlags {
     /// Wave-per-token E512/top-10 router for batched prefill
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`). Exact gfx1151 / gfx1201.
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`). Exact
-    /// gfx1151 only.
+    /// gfx1151 and exact gfx1201 (both default on, `=0` kills it).
     pub fn qwen4_gdn_lanes_enabled(&self) -> bool {
-        self.qwen4_gdn_lanes && self.arch == "gfx1151"
+        self.qwen4_gdn_lanes && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+    }
+
+    /// Multi-lane fn-lanes QSA decode core (`HIPFIRE_QWEN4_QSA_LANES`). Exact
+    /// gfx1201 only, default on (`=0` kills it).
+    pub fn qwen4_qsa_lanes_enabled(&self) -> bool {
+        self.qwen4_qsa_lanes && self.arch == "gfx1201"
     }
 
     pub fn qwen4_moe_down_r4_enabled(&self) -> bool {
-        self.qwen4_moe_down_r4 && self.arch == "gfx1151"
+        self.qwen4_moe_down_r4 && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
     pub fn qwen4_shared_down_fuse_enabled(&self) -> bool {
@@ -1710,6 +1727,13 @@ impl FeatureFlags {
 
     pub fn qwen4_router_fast_enabled(&self) -> bool {
         self.qwen4_router_fast && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+    }
+
+    /// Serial thread-0 prefix walk in the Qwen4 top-10 scatter
+    /// (`HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` on exact gfx1201): launches the
+    /// `moe_scatter_fused_top10_serial` module instead of the scanning default.
+    pub fn qwen4_moe_scatter_serial_walk(&self) -> bool {
+        !self.qwen4_moe_scatter_scan && self.arch == "gfx1201"
     }
 
     pub fn qwen4_decode_zba_x3_enabled(&self) -> bool {
@@ -1869,7 +1893,9 @@ impl FeatureFlags {
             qwen4_moe_combine_zinit: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
+            qwen4_moe_scatter_scan: false,
             qwen4_gdn_lanes: false,
+            qwen4_qsa_lanes: false,
             qwen4_moe_down_r4: false,
             qwen4_shared_down_fuse: false,
             qwen4_decode_zba_x3: false,
@@ -2893,6 +2919,34 @@ mod tests {
                 }
             });
             assert_eq!(on.qwen4_router_fast_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The scatter scan flag defaults on for exact gfx1201; `=0` selects the serial walk (a
+    /// second symbol of the same module) there only, and no other value or arch ever does.
+    #[test]
+    fn qwen4_moe_scatter_scan_kill_switch_selects_the_serial_walk_on_gfx1201_only() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let with = |value: Option<&'static str>| {
+                FeatureFlags::from_lookup(arch, move |n| match (n, value) {
+                    ("HIPFIRE_QWEN4_MOE_SCATTER_SCAN", Some(v)) => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            assert_eq!(
+                with(None).qwen4_moe_scatter_scan,
+                arch == "gfx1201",
+                "{arch}"
+            );
+            assert!(!with(None).qwen4_moe_scatter_serial_walk(), "{arch}");
+            assert!(!with(Some("1")).qwen4_moe_scatter_serial_walk(), "{arch}");
+            assert_eq!(
+                with(Some("0")).qwen4_moe_scatter_serial_walk(),
+                arch == "gfx1201",
+                "{arch}"
+            );
         }
     }
 
@@ -4403,6 +4457,83 @@ mod tests {
                     "arch={arch} value={value}"
                 );
             }
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_QSA_LANES`: exact gfx1201 defaults on, `=0` kills it, no
+    /// other arch ever enables it.
+    #[test]
+    fn qsa_lanes_default_and_override_by_arch() {
+        let flags = |arch: &str, value: Option<&str>| {
+            FeatureFlags::from_lookup(arch, |name| match value {
+                Some(v) if name == "HIPFIRE_QWEN4_QSA_LANES" => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        for (arch, unset, forced_on, forced_off) in [
+            ("gfx1201", true, true, false),
+            ("gfx1151", false, false, false),
+            ("gfx1100", false, false, false),
+            ("gfx1201:xnack-", false, false, false),
+        ] {
+            assert_eq!(flags(arch, None).qwen4_qsa_lanes_enabled(), unset, "{arch}");
+            assert_eq!(
+                flags(arch, Some("1")).qwen4_qsa_lanes_enabled(),
+                forced_on,
+                "{arch}"
+            );
+            assert_eq!(
+                flags(arch, Some("0")).qwen4_qsa_lanes_enabled(),
+                forced_off,
+                "{arch}"
+            );
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_GDN_LANES`: exact gfx1151 and exact gfx1201 default on,
+    /// `=0` kills it everywhere, and no other arch ever enables
+    /// it, whatever the value.
+    #[test]
+    fn gdn_lanes_default_and_override_by_arch() {
+        let flags = |arch: &str, value: Option<&str>| {
+            FeatureFlags::from_lookup(arch, |name| match value {
+                Some(v) if name == "HIPFIRE_QWEN4_GDN_LANES" => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        for (arch, unset, forced_on, forced_off) in [
+            ("gfx1151", true, true, false),
+            ("gfx1201", true, true, false),
+            ("gfx1100", false, false, false),
+            ("gfx942", false, false, false),
+            ("gfx1200", false, false, false),
+            ("gfx1201:xnack-", false, false, false),
+        ] {
+            assert_eq!(
+                flags(arch, None).qwen4_gdn_lanes_enabled(),
+                unset,
+                "{arch}: unset"
+            );
+            for on in ["1", "true", "on"] {
+                assert_eq!(
+                    flags(arch, Some(on)).qwen4_gdn_lanes_enabled(),
+                    forced_on,
+                    "{arch}: {on}"
+                );
+            }
+            for off in ["0", "false", "off"] {
+                assert_eq!(
+                    flags(arch, Some(off)).qwen4_gdn_lanes_enabled(),
+                    forced_off,
+                    "{arch}: {off}"
+                );
+            }
+            // An unparsable value is "unset", not "on".
+            assert_eq!(
+                flags(arch, Some("2")).qwen4_gdn_lanes_enabled(),
+                unset,
+                "{arch}: 2"
+            );
         }
     }
 }

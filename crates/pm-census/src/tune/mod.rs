@@ -20,6 +20,9 @@
 //!   `pm-census tune kld|promote|trial-table` CLI.
 //! * [`ktok`] (R9): HFKTOK reader, the token-bootstrap statistic over per-token
 //!   paired differences and the `kld-power` sample-size calculation.
+//! * [`rowclass`] (PM/rip-loop S2): per-row-class verdicts of `hip_loop
+//!   --rowclasses` records, the row-class veto/regime/material promotion gate,
+//!   the derived row domain and the `tune selector-receipt` CLI.
 //!
 //! The types below are the frozen contract between those modules.
 
@@ -27,6 +30,7 @@ pub mod domain;
 pub mod kld;
 pub mod ktok;
 pub mod promote;
+pub mod rowclass;
 pub mod run;
 pub mod store;
 
@@ -171,6 +175,14 @@ pub struct ClaimPolicyV1 {
     /// Max allowed `ci95_hi` of the mean per-chunk KLD increase (candidate - incumbent).
     #[serde(default = "default_kld_margin")]
     pub kld_margin: f64,
+    /// Refuse single-shape evidence for a `contract:` node whose `WorkV1.admit`
+    /// spans more than one row class ("no row-class sweep"); see [`rowclass`].
+    #[serde(default = "default_require_rowclasses")]
+    pub require_rowclasses: bool,
+    /// Optional per-class traffic shares (`rows -> share`) for row-class
+    /// records: when non-empty, `sum(share * (1 - ratio)) >= min_effect`.
+    #[serde(default)]
+    pub shares: BTreeMap<u64, f64>,
 }
 
 impl Default for ClaimPolicyV1 {
@@ -183,6 +195,8 @@ impl Default for ClaimPolicyV1 {
             admit_numeric: true,
             kld_promotion_min_chunks: 24,
             kld_margin: 0.0005,
+            require_rowclasses: true,
+            shares: BTreeMap::new(),
         }
     }
 }
@@ -273,6 +287,9 @@ fn default_kld_min_chunks() -> usize {
 }
 fn default_kld_margin() -> f64 {
     0.0005
+}
+fn default_require_rowclasses() -> bool {
+    true
 }
 
 /// One `eval_hipfire` run (JSON written by the driver script).

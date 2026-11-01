@@ -2421,7 +2421,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_TOPOLOGY_EP"),
-        "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1100 or gfx1201: 1 (default, single device) or 2..=8. Experts shard e % N across N visible homogeneous gfx1100 or gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
+        "Expert-parallel degree (1..=8) for models whose carrier declares expert parallelism (today: Qwen4 / Flash-Next on gfx1100 or gfx1201): 1 (default, single device) or 2..=8. Experts shard e % N across N visible homogeneous cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; the declaring carrier's kill switch (HIPFIRE_QWEN4_EP=0 for Qwen4) forces 1. A model whose carrier does not declare it is refused."
     ),
     field!(
         "topology.pp",
@@ -2433,7 +2433,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_TOPOLOGY_PP"),
-        "Pipeline-parallel degree: 1 (default, single device) or 2..=8. Layers split into N contiguous stages across the first N visible devices (hardware.devices / HIPFIRE_DEVICES). An explicit load request with pp > 1 overrides this value; a request of 1 or no request uses it. Cannot combine with tensor parallelism (tp) or Qwen4 expert parallelism."
+        "Pipeline-parallel degree: 1 (default, single device) or 2..=8, for models whose carrier declares pipeline parallelism (today: Qwen3.5 and Qwen4 / Flash-Next, HFQ files only). Layers split into N contiguous stages across the first N visible devices (hardware.devices / HIPFIRE_DEVICES). An explicit load request with pp > 1 overrides this value; a request of 1 or no request uses it. Cannot combine with tensor parallelism (tp) or expert parallelism (topology.ep)."
     ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
@@ -2970,7 +2970,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         "HIPFIRE_GFX12_PRODUCER_QUANT_FUSED",
-        "Fuse the int4 activation quantiser into the gfx1201 RMSNorm/rotate/gated-norm producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
+        "Fuse the activation quantiser into the gfx1201 producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out). IU4: emits block_i4_128 from the RMSNorm/rotate/gated-norm _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site. A8 (grouped MoE / gated-FFN down, W4A8 tier): one launch forms the SwiGLU/SiTU activation, casts, pads, divides by the AWQ scale, rotates and emits block_i8_128, replacing the activation + mq_rotate_x + quantize_int8_mmq_ds128 chain (the F32 activation/rotation planes are never written). Bit-identical."
     ),
     process_bool_field!(
         "kernel.g12_norm",
@@ -9825,18 +9825,19 @@ pub mod topology {
         }
     }
 
-    /// True when the raw `HIPFIRE_QWEN4_EP` value is the kill switch (`0`).
-    pub fn qwen4_ep_killed(raw: Option<&str>) -> bool {
+    /// True when the raw kill-switch value (a carrier's declared
+    /// `kill_switch_env`, e.g. `HIPFIRE_QWEN4_EP`) is the kill switch (`0`).
+    pub fn ep_killed(raw: Option<&str>) -> bool {
         raw.map(str::trim) == Some("0")
     }
 
-    /// Qwen4 degree from raw inputs: the kill switch wins over any (even
-    /// invalid) configured value.
-    pub fn resolve_qwen4_ep(
+    /// Expert-parallel degree from raw inputs: the kill switch wins over any
+    /// (even invalid) configured value.
+    pub fn resolve_ep(
         configured: Option<&str>,
         kill_switch: Option<&str>,
     ) -> Result<usize, String> {
-        if qwen4_ep_killed(kill_switch) {
+        if ep_killed(kill_switch) {
             return Ok(1);
         }
         parse_ep(configured)
@@ -9847,13 +9848,20 @@ pub mod topology {
         parse_ep(process_value(EP_ENV).as_deref())
     }
 
+    /// The one generic `topology.ep` resolver: the configured degree unless the
+    /// carrier's declared kill switch (`Some(env name)`, `=0`) forces 1. A
+    /// carrier with no kill switch passes `None` and gets [`ep`].
+    pub fn ep_with_kill_switch(kill_switch_env: Option<&str>) -> Result<usize, String> {
+        resolve_ep(
+            process_value(EP_ENV).as_deref(),
+            kill_switch_env.and_then(process_value).as_deref(),
+        )
+    }
+
     /// Effective Qwen4 expert-parallel degree: `topology.ep` unless
     /// `HIPFIRE_QWEN4_EP=0` forces 1.
     pub fn qwen4_ep() -> Result<usize, String> {
-        resolve_qwen4_ep(
-            process_value(EP_ENV).as_deref(),
-            process_value(QWEN4_EP_KILL_SWITCH_ENV).as_deref(),
-        )
+        ep_with_kill_switch(Some(QWEN4_EP_KILL_SWITCH_ENV))
     }
 
     /// Pure parser behind [`pp`]: unset or empty is 1 (the default); an
@@ -9955,17 +9963,17 @@ pub mod topology {
 
         #[test]
         fn kill_switch_forces_one_regardless_of_config() {
-            assert_eq!(resolve_qwen4_ep(Some("4"), Some("0")), Ok(1));
-            assert_eq!(resolve_qwen4_ep(Some("2"), Some("0")), Ok(1));
+            assert_eq!(resolve_ep(Some("4"), Some("0")), Ok(1));
+            assert_eq!(resolve_ep(Some("2"), Some("0")), Ok(1));
             // Even an invalid configured value is moot under the kill switch.
-            assert_eq!(resolve_qwen4_ep(Some("9"), Some("0")), Ok(1));
+            assert_eq!(resolve_ep(Some("9"), Some("0")), Ok(1));
             // Any other kill-switch spelling leaves the config in charge.
-            assert_eq!(resolve_qwen4_ep(Some("4"), Some("1")), Ok(4));
-            assert_eq!(resolve_qwen4_ep(Some("4"), Some("")), Ok(4));
-            assert_eq!(resolve_qwen4_ep(Some("4"), None), Ok(4));
-            assert_eq!(resolve_qwen4_ep(None, None), Ok(1));
-            assert_eq!(resolve_qwen4_ep(Some("6"), None), Ok(6));
-            assert!(resolve_qwen4_ep(Some("9"), None).is_err());
+            assert_eq!(resolve_ep(Some("4"), Some("1")), Ok(4));
+            assert_eq!(resolve_ep(Some("4"), Some("")), Ok(4));
+            assert_eq!(resolve_ep(Some("4"), None), Ok(4));
+            assert_eq!(resolve_ep(None, None), Ok(1));
+            assert_eq!(resolve_ep(Some("6"), None), Ok(6));
+            assert!(resolve_ep(Some("9"), None).is_err());
         }
 
         #[test]

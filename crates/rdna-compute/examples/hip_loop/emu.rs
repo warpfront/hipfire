@@ -108,6 +108,7 @@ fn kernarg_bytes(
             EmuArg::Null => 0u64.to_le_bytes().to_vec(),
             EmuArg::I32(x) => x.to_le_bytes().to_vec(),
             EmuArg::U32(x) => x.to_le_bytes().to_vec(),
+            EmuArg::U64(x) => x.to_le_bytes().to_vec(),
             EmuArg::F32(x) => x.to_le_bytes().to_vec(),
         };
         if bytes.len() != size {
@@ -573,6 +574,20 @@ pub fn gate(
     shape: Value,
     seed: u64,
 ) -> (bool, Value) {
+    gate_syms(symbol, symbol, case, base, cand, shape, seed)
+}
+
+/// [`gate`] for arms that launch different kernel symbols (`--vs`: two shipped kernels of one contract
+/// signature).
+pub fn gate_syms(
+    base_symbol: &str,
+    cand_symbol: &str,
+    case: &mut EmuCase,
+    base: (&[u8], &Geometry),
+    cand: (&[u8], &Geometry),
+    shape: Value,
+    seed: u64,
+) -> (bool, Value) {
     // The two arms are independent runs on the same inputs: the baseline on its own copy of the case, side by side.
     let mut base_case = case.clone();
     let (b, c) = std::thread::scope(|s| {
@@ -580,13 +595,13 @@ pub fn gate(
             run_arm(
                 "baseline",
                 base.0,
-                symbol,
+                base_symbol,
                 base.1,
                 &mut base_case,
                 &WgSel::All,
             )
         });
-        let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::All);
+        let c = run_arm("candidate", cand.0, cand_symbol, cand.1, case, &WgSel::All);
         (
             hb.join().unwrap_or_else(|_| {
                 Err(fail(
@@ -635,18 +650,57 @@ pub fn gate(
             json!("the baseline left the output buffer unchanged: the launch is not exercised");
         return (false, rec);
     }
-    match diff(&b.out, &c.out) {
-        None => {
-            rec["identical_to_baseline"] = json!(true);
+    if let Some((first, n)) = diff(&b.out, &c.out) {
+        rec["identical_to_baseline"] = json!(false);
+        rec["reason"] = json!(format!(
+            "output differs from the emulated incumbent: first differing byte {first}, {n} differing byte(s) of {}",
+            b.out.len()
+        ));
+        return (false, rec);
+    }
+    rec["identical_to_baseline"] = json!(true);
+    // Cross-workgroup order independence: the workgroups of one launch have no defined order, but the emulator
+    // runs them sequentially, so a dependence between workgroups (one reads what another writes, e.g. an in-place
+    // buffer) is invisible to a single pass. Re-run the candidate with the workgroup order reversed: both orders
+    // must store the same bytes.
+    let mut order: Vec<[u32; 3]> = Vec::new();
+    for z in 0..cand.1.grid[2] {
+        for y in 0..cand.1.grid[1] {
+            for x in 0..cand.1.grid[0] {
+                order.push([x, y, z]);
+            }
+        }
+    }
+    order.reverse();
+    let r = run_arm(
+        "candidate-reversed",
+        cand.0,
+        cand_symbol,
+        cand.1,
+        case,
+        &WgSel::List(&order),
+    );
+    let verdict = match &r {
+        Err(f) => Err(format!("candidate with reversed workgroup order: {}", f.reason)),
+        Ok(a) => match diff(&c.out, &a.out) {
+            None => Ok(()),
+            Some((first, n)) => Err(format!(
+                "candidate output depends on workgroup order (reversed order: first differing byte {first}, {n} \
+                 differing byte(s)): workgroups communicate through memory"
+            )),
+        },
+    };
+    rec["wg_order_reversed"] = json!({
+        "pass": verdict.is_ok(),
+        "output_sha256": r.as_ref().ok().map(|a| sha256_hex(&a.out)),
+    });
+    match verdict {
+        Ok(()) => {
             rec["pass"] = json!(true);
             (true, rec)
         }
-        Some((first, n)) => {
-            rec["identical_to_baseline"] = json!(false);
-            rec["reason"] = json!(format!(
-                "output differs from the emulated incumbent: first differing byte {first}, {n} differing byte(s) of {}",
-                b.out.len()
-            ));
+        Err(why) => {
+            rec["reason"] = json!(why);
             (false, rec)
         }
     }
@@ -741,6 +795,21 @@ pub fn extent_gate(
     shape: Value,
     seed: u64,
 ) -> (bool, Value) {
+    extent_gate_syms(label, symbol, symbol, case, base, cand, shape, seed)
+}
+
+/// [`extent_gate`] for arms that launch different kernel symbols (`--vs`).
+#[allow(clippy::too_many_arguments)]
+pub fn extent_gate_syms(
+    label: &str,
+    base_symbol: &str,
+    cand_symbol: &str,
+    case: &mut EmuCase,
+    base: (&[u8], &Geometry, Owner),
+    cand: (&[u8], &Geometry, Owner),
+    shape: Value,
+    seed: u64,
+) -> (bool, Value) {
     let (gb, gc) = (base.1.grid, cand.1.grid);
     let nelem = case.bufs[case.out].bytes.len() / 4;
     let mut rec = json!({
@@ -808,8 +877,22 @@ pub fn extent_gate(
     }
     rec["first_wgs"] = json!({"baseline": wb.iter().take(6).collect::<Vec<_>>(), "candidate": wc.iter().take(6).collect::<Vec<_>>()});
     // 3. run both arms on their lists.
-    let b = run_arm("baseline", base.0, symbol, base.1, case, &WgSel::List(&wb));
-    let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::List(&wc));
+    let b = run_arm(
+        "baseline",
+        base.0,
+        base_symbol,
+        base.1,
+        case,
+        &WgSel::List(&wb),
+    );
+    let c = run_arm(
+        "candidate",
+        cand.0,
+        cand_symbol,
+        cand.1,
+        case,
+        &WgSel::List(&wc),
+    );
     let (bn, cn) = (counts(&b), counts(&c));
     rec["instructions"] = json!({"baseline": bn.0, "candidate": cn.0});
     rec["workgroups"] = json!({"baseline": bn.1, "candidate": cn.1});

@@ -7,7 +7,7 @@
 //! object (schema 1) on stdout.
 //!
 //! ```text
-//! hip_loop --node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo [--shape k=v,...] --cand FILE.hip
+//! hip_loop --node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo|rda_serial|conv_rows|moe_k2 [--shape k=v,...] --cand FILE.hip
 //!          [--offline] [--null-control aa] [--time N] [--rounds R] [--seed S] [--out DIR]
 //! ```
 //!
@@ -116,6 +116,48 @@
 //!   `peacemaker_ir::passes::hazards::analyze`) are part of the gate: any Required/Unchecked finding, any
 //!   PM-IR obligation or an analysis error fails it (`emu_gate.hazards`).
 //!
+//! * `rda_serial` (`gated_delta_net_vector_serial_f32`, the generic gated delta rule kernel of the Raon RDA
+//!   layers; `hip_loop/rda.rs` has the production launch, shape grammar `pp512|pp2048|tg|emu` +
+//!   `t h qk_group per_key round slot slots dev arch=gfx1100|gfx1201`, header keys `rows_per_wg block
+//!   lds_dynamic`). Judged on gfx1100 (7900 XTX) by default, `arch=gfx1201` (R9700) in the shape. The mutable
+//!   outputs are the output AND the in-place state: identity compares both. `--emu` packs output, all state
+//!   slots and poison pads into one region (a store into a pad or an untouched slot fails), runs the small
+//!   `emu` shape over the full grid, then `pp512`, `pp512,dev=1` and a short slot-1/per-head-decay/no-round
+//!   case (`t=64,slot=1,slots=2,per_key=0,round=0`) at sampled workgroups (`t=2048` costs ~9 min of emulation and
+//!   `t=16384` hours, and neither reaches a 32-bit overflow: they are not in the default gate), plus
+//!   the static hazard checks. E.g. `hip_loop --node rda_serial --shape pp512,arch=gfx1201 --emu --cand X.hip`.
+//!
+//! * `conv_rows` (`causal_conv_depthwise_silu_rows_f32`, the Raon depthwise causal short conv; `hip_loop/conv.rs`
+//!   has the production launch, shape grammar `pp512|pp2048|tg|emu` + `n c k inplace silu round arch=gfx1100|gfx1201`,
+//!   header keys `block ch_per_wg rows_per_wg lds_dynamic`). Outputs: `out` AND the (in-place) history; `--emu` packs
+//!   both with poison pads into one region, `emu` shape over the full grid, then `pp512`, `n=4096,c=200` and
+//!   `pp512,inplace=0` sampled, plus the static hazard checks.
+//!
+//! * `moe_k2` (`gemm_mq4g256v2_moe_grouped_wmma_k2`, Raon's hottest gfx1100 prefill kernel; `hip_loop/moe.rs` has the
+//!   production call table, shape grammar `gu512|dn512|gu2048|dn2048|sg512|sd512|dg512|dd512|emu` + `tokens experts top_k
+//!   M K route=uniform|skew skew route_seed`, header keys `rows_per_block slots_per_tile block lds_dynamic`). Seeded qt44
+//!   experts behind a device pointer table, a seed-independent skewed top-k routing scattered like the product; one
+//!   weight set per timing pool above the cold threshold. `--emu`: `emu` over the full grid, then the eight production
+//!   shapes sampled (dead tiles are `PAD_OWNER`), plus the static hazard checks.
+//!
+//! * `contract:<abi id | export symbol>` (gfx1201 default, `--arch gfx1100`): a node GENERATED from a
+//!   `hipfire-kernel-abi` contract (`hip_loop/generic.rs` has the full grammar): the incumbent (source, module,
+//!   symbol), launch geometry, buffers (input recipes keyed by operand format), kernarg image
+//!   (`validate_invocation`), `--emu` case and work counts all come from the contract, no per-node module.
+//!   `--shape` assigns the contract params (+ `tokens topk` of a routed contract); `--cand FILE.hip` (header
+//!   keys `grid block lds_dynamic`), `--null-control aa` and `--vs contract:<id>` (the BASELINE arm is that
+//!   contract's export with its own source/module/symbol/geometry, the CANDIDATE arm the `--node` contract;
+//!   the pair must be signature compatible, identity must be bit-exact) pick the candidate.
+//!   `--rowclasses [r1,r2,..]` (default `1,2,4,8,16,32,64,128,256,512,1024,2048,4096,16384`) sweeps the
+//!   contract's activation-row param in ONE process (arms compiled once; per class: node rebuilt, identity,
+//!   ABBA timing or A/A): the record gets `rows_param`, `regime`, `clipped_classes` (classes outside the
+//!   contract domain) and `rowclasses: [{rows, shape, geometry_base, geometry_cand, identical_to_baseline,
+//!   timing, admitted: {baseline, candidate}, bytes_per_call, regime, work}]`. `--pool`: classes whose
+//!   `bytes_per_call` exceeds the arch's last-level cache (gfx1201 64 MiB, gfx1100 96 MiB) time against a
+//!   pool of distinct weight sets (`regime: pool`), else `regime: hot`.
+//!   `hip_loop --node contract:generic_gemm.f32_tiled_rows.mpw16 --vs contract:generic_gemm.f32_batched.wave_per_output
+//!   --shape M=128,K=2560 --rowclasses`.
+//!
 //! Exit status: 0 ok; 1 identity failure (record still printed); 2 usage; 3 the
 //! candidate (or the device) could not compile/launch (record printed with `error`).
 //!
@@ -130,12 +172,18 @@
 
 #[path = "support/abba.rs"]
 mod abba;
+#[path = "support/clk.rs"]
+mod clk;
 #[path = "support/cold.rs"]
 mod cold;
+#[path = "hip_loop/conv.rs"]
+mod conv;
 #[path = "hip_loop/elf.rs"]
 mod elf;
 #[path = "hip_loop/emu.rs"]
 mod emu;
+#[path = "hip_loop/generic.rs"]
+mod generic;
 #[path = "hip_loop/hc.rs"]
 mod hc;
 #[path = "hip_loop/jit.rs"]
@@ -148,12 +196,16 @@ mod lane_proj;
 mod lane_ref;
 #[path = "hip_loop/lane_wo.rs"]
 mod lane_wo;
+#[path = "hip_loop/moe.rs"]
+mod moe;
 #[path = "hip_loop/mq6.rs"]
 mod mq6;
 #[path = "hip_loop/node.rs"]
 mod node;
 #[path = "hip_loop/qsa.rs"]
 mod qsa;
+#[path = "hip_loop/rda.rs"]
+mod rda;
 
 use node::{err, Geometry, Header, Incumbent, Node, Result, ShapeSpec, ARCH};
 use serde_json::{json, Value};
@@ -162,10 +214,20 @@ use std::path::{Path, PathBuf};
 const SCHEMA: u32 = 1;
 const DEFAULT_TIME: usize = 50;
 const DEFAULT_ROUNDS: usize = 12;
-const NODES: [&str; 5] = ["mq6_res", "hc_mix", "qsa_hg4", "lane_proj", "lane_wo"];
-const USAGE: &str = "--node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo [--shape k=v,...] \
-(--cand FILE.hip | --cand-object FILE.co [--cand-geometry \"tile_m=.. tile_n=.. block=.. lds_dynamic=..\"] | --null-control aa) \
+const NODES: [&str; 8] = [
+    "mq6_res",
+    "hc_mix",
+    "qsa_hg4",
+    "lane_proj",
+    "lane_wo",
+    "rda_serial",
+    "conv_rows",
+    "moe_k2",
+];
+const USAGE: &str = "--node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo|rda_serial|conv_rows|moe_k2|contract:<abi id|export symbol> [--shape k=v,...] \
+(--cand FILE.hip | --cand-object FILE.co [--cand-geometry \"tile_m=.. tile_n=.. block=.. lds_dynamic=..\"] | --null-control aa | --vs contract:<id>) \
 [--base-object FILE.co] [--offline] [--emu [--no-extent] [--emu-extent full|sampled]] [--flush] \
+[--arch gfx1201|gfx1100] [--rowclasses [r1,r2,..]] [--pool] \
 [--identity full|smoke|skip | --identity-only] [--time N] [--rounds R] [--seed S] [--out DIR]";
 
 // ---------------------------------------------------------------------------
@@ -195,6 +257,26 @@ struct Opts {
     rounds: usize,
     seed: u64,
     out: Option<PathBuf>,
+    /// Options of `contract:` nodes (`--vs`, `--arch`, `--rowclasses`, `--pool`).
+    contract: ContractOpts,
+}
+
+/// `contract:` node options: `--vs contract:<id>` (the baseline arm), `--arch` (default gfx1201),
+/// `--rowclasses [r1,r2,...]` (the row-class sweep), `--pool` (distinct weight sets when
+/// `bytes_per_call` exceeds the last-level cache).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ContractOpts {
+    vs: Option<String>,
+    arch: Option<String>,
+    rowclasses: bool,
+    rowclass_list: Option<Vec<u64>>,
+    pool: bool,
+}
+
+impl ContractOpts {
+    fn any(&self) -> bool {
+        *self != Self::default()
+    }
 }
 
 fn parse_args(args: &[String]) -> Result<Opts> {
@@ -217,6 +299,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         rounds: DEFAULT_ROUNDS,
         seed: 1,
         out: None,
+        contract: Default::default(),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -267,20 +350,55 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--rounds" => o.rounds = abba::positive_count(&value("rounds")?)?,
             "--seed" => o.seed = value("seed")?.parse::<u64>().map_err(err)?,
             "--out" => o.out = Some(PathBuf::from(value("out")?)),
+            "--vs" => o.contract.vs = Some(value("vs")?),
+            "--arch" => o.contract.arch = Some(value("arch")?),
+            "--pool" => o.contract.pool = true,
+            "--rowclasses" => {
+                o.contract.rowclasses = true;
+                // An optional class list follows (`--rowclasses 1,2,4`); a following flag is not one.
+                if let Some(next) = it.clone().next().filter(|n| !n.starts_with("--")) {
+                    o.contract.rowclass_list = Some(generic::parse_rowclasses(next)?);
+                    it.next();
+                }
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    if !NODES.contains(&o.node.as_str()) {
-        return Err(format!("--node must be one of {}", NODES.join(", ")));
+    let is_contract = o.node.starts_with("contract:") && o.node.len() > "contract:".len();
+    if !is_contract && !NODES.contains(&o.node.as_str()) {
+        return Err(format!(
+            "--node must be one of {} or contract:<abi id|export symbol>",
+            NODES.join(", ")
+        ));
+    }
+    if !is_contract && o.contract.any() {
+        return Err("--vs/--arch/--rowclasses/--pool are options of contract: nodes".into());
     }
     let sources = usize::from(o.cand.is_some())
         + usize::from(o.cand_object.is_some())
-        + usize::from(o.null_control);
+        + usize::from(o.null_control)
+        + usize::from(o.contract.vs.is_some());
     if sources != 1 {
         return Err(
-            "exactly one of --cand FILE.hip, --cand-object FILE.co, --null-control aa is required"
+            "exactly one of --cand FILE.hip, --cand-object FILE.co, --null-control aa, --vs contract:<id> is required"
                 .into(),
         );
+    }
+    if let Some(vs) = &o.contract.vs {
+        if vs.strip_prefix("contract:").is_none_or(str::is_empty) {
+            return Err(format!(
+                "--vs {vs}: expected contract:<abi id|export symbol>"
+            ));
+        }
+        if o.base_object.is_some() {
+            return Err(
+                "--vs compiles both shipped sources: it cannot be combined with --base-object"
+                    .into(),
+            );
+        }
+    }
+    if o.contract.rowclasses && (o.emu || o.identity_only) {
+        return Err("--rowclasses sweeps the device timing (or --offline records): not with --emu/--identity-only".into());
     }
     if o.identity_only && (o.offline || o.emu) {
         return Err("--identity-only runs on the device (not with --offline/--emu)".into());
@@ -303,6 +421,12 @@ fn build_node(name: &str, shape: Option<&str>) -> Result<Box<dyn Node>> {
         "qsa_hg4" => Ok(Box::new(qsa::QsaHg4::new(&spec)?)),
         "lane_proj" => Ok(Box::new(lane_proj::LaneProj::new(&spec)?)),
         "lane_wo" => Ok(Box::new(lane_wo::LaneWo::new(&spec)?)),
+        "rda_serial" => Ok(Box::new(rda::Rda::new(&spec)?)),
+        "conv_rows" => Ok(Box::new(conv::ConvRows::new(&spec)?)),
+        "moe_k2" => Ok(Box::new(moe::MoeK2::new(&spec)?)),
+        n if n.starts_with("contract:") => Ok(Box::new(
+            generic::ContractNode::build(n, &spec).map_err(|e| e.to_string())?,
+        )),
         other => Err(format!("unknown node `{other}`")),
     }
 }
@@ -362,6 +486,9 @@ fn out_dir_of(o: &Opts) -> PathBuf {
 /// Everything the offline stage produces.
 struct Prep {
     inc: Incumbent,
+    /// The candidate arm's own incumbent-style source/module/symbol: `--vs` (a contract node judging
+    /// one shipped kernel against another), else the baseline's.
+    cand_inc: Incumbent,
     base: jit::Built,
     cand: jit::Built,
     base_geo: Geometry,
@@ -387,6 +514,15 @@ fn prepare(
     rec["symbol"] = json!(inc.symbol);
     rec["module"] = json!(inc.module);
     rec["selection"] = json!(inc.selection);
+    // `--vs`: the candidate arm is another shipped kernel with its own source, module and symbol.
+    let vs_cand = node.candidate_incumbent().map_err(stage("incumbent"))?;
+    let cand_inc = vs_cand.clone().unwrap_or_else(|| inc.clone());
+    if vs_cand.is_some() {
+        rec["vs"] = json!({
+            "baseline": {"symbol": inc.symbol, "module": inc.module, "contract": inc.selection},
+            "candidate": {"symbol": cand_inc.symbol, "module": cand_inc.module, "contract": cand_inc.selection},
+        });
+    }
     // A source candidate (`--cand`), the incumbent's own source (`--null-control aa`) or
     // a prebuilt object (`--cand-object`, no source).
     let cand_source = match (&o.cand, &o.cand_object) {
@@ -395,7 +531,7 @@ fn prepare(
                 .map_err(|e| ("args".to_owned(), format!("--cand {}: {e}", p.display())))?,
         ),
         (None, Some(_)) => None,
-        (None, None) => Some(inc.source.clone()),
+        (None, None) => Some(cand_inc.source.clone()),
     };
     let mut header = match &cand_source {
         Some(s) => Header::parse(s),
@@ -422,7 +558,7 @@ fn prepare(
     let (compiled_base, compiled_cand) = std::thread::scope(|s| {
         let b = want_base.then(|| s.spawn(|| jit::compile_for(arch, workdir, "baseline", &inc, &inc.source)));
         let c = want_cand.then(|| {
-            s.spawn(|| jit::compile_for(arch, workdir, "candidate", &inc, cand_source.as_deref().unwrap_or_default()))
+            s.spawn(|| jit::compile_for(arch, workdir, "candidate", &cand_inc, cand_source.as_deref().unwrap_or_default()))
         });
         let join = |h: Option<std::thread::ScopedJoinHandle<'_, Result<jit::Built>>>| -> Result<Option<jit::Built>> {
             match h {
@@ -481,22 +617,23 @@ fn prepare(
     // DIR/baseline.co`, `--cand-object DIR/candidate.co --cand-geometry <candidate_geometry_arg>`.
     let publish = |name: &str,
                    b: &jit::Built,
+                   arm_inc: &Incumbent,
                    source: &str,
                    kv: &std::collections::BTreeMap<String, String>| {
         let co = workdir.join(name);
-        let side = jit::sidecar_json_for(arch, &o.node, &inc, b, source, kv);
+        let side = jit::sidecar_json_for(arch, &o.node, arm_inc, b, source, kv);
         jit::publish(&co, b, &side).map(|()| {
             json!({"path": co.display().to_string(), "sha256": b.image_sha256,
                 "sidecar": jit::sidecar_path(&co).display().to_string()})
         })
     };
     if o.base_object.is_none() {
-        rec["baseline_co"] = publish("baseline.co", &base, &inc.source, &Default::default())
+        rec["baseline_co"] = publish("baseline.co", &base, &inc, &inc.source, &Default::default())
             .map_err(stage("write"))?;
     }
     if let (true, Some(src)) = (want_cand && o.cand_object.is_none(), &cand_source) {
         rec["candidate_co"] =
-            publish("candidate.co", &cand, src, &header_kv).map_err(stage("write"))?;
+            publish("candidate.co", &cand, &cand_inc, src, &header_kv).map_err(stage("write"))?;
         let arg: Vec<String> = header_kv.iter().map(|(k, v)| format!("{k}={v}")).collect();
         rec["candidate_geometry_arg"] = json!(arg.join(" "));
     }
@@ -509,7 +646,7 @@ fn prepare(
     } else {
         "compile"
     };
-    let ck = arm_json(&cand, &inc.symbol, &cand_geo).map_err(stage(cand_stage))?;
+    let ck = arm_json(&cand, &cand_inc.symbol, &cand_geo).map_err(stage(cand_stage))?;
     rec["candidate"] = ck;
     if o.cand_object.is_some() {
         rec["candidate"]["kind"] = json!("object");
@@ -533,6 +670,7 @@ fn prepare(
     }
     Ok(Prep {
         inc,
+        cand_inc,
         base,
         cand,
         base_geo,
@@ -659,6 +797,12 @@ fn run(o: &Opts) -> (Value, Outcome) {
             None => "flush=1".to_owned(),
         });
     }
+    if o.node.starts_with("contract:") {
+        shape = contract_shape(shape, &o.contract);
+        if o.contract.rowclasses {
+            return run_rowclasses(o, rec, shape);
+        }
+    }
     let mut node = match build_node(&o.node, shape.as_deref()) {
         Ok(n) => n,
         Err(e) => return fail(rec, "args", e),
@@ -706,8 +850,9 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
         Ok(c) => c,
         Err(e) => return fail(rec, "emu_case", e),
     };
-    let (small_pass, mut receipt) = emu::gate(
+    let (small_pass, mut receipt) = emu::gate_syms(
         &prep.inc.symbol,
+        &prep.cand_inc.symbol,
         &mut case,
         (&prep.base.image, &prep.base_geo),
         (&prep.cand.image, &prep.cand_geo),
@@ -835,6 +980,12 @@ fn extent_case(o: &Opts, name: &str, prep: &Prep, shape: &str) -> (bool, Value) 
         Ok(i) => i.symbol,
         Err(e) => return bad(format!("incumbent: {e}")),
     };
+    // `--vs`: the candidate arm launches its own shipped kernel.
+    let cand_symbol = match n.candidate_incumbent() {
+        Ok(Some(c)) => c.symbol,
+        Ok(None) => symbol.clone(),
+        Err(e) => return bad(format!("candidate incumbent: {e}")),
+    };
     let base_geo = n.geometry();
     let cand_geo = match n.geometry_with(&mut prep.cand_header.clone()) {
         Ok(g) => g,
@@ -853,8 +1004,9 @@ fn extent_case(o: &Opts, name: &str, prep: &Prep, shape: &str) -> (bool, Value) 
             Err(e) => return bad(format!("inputs: {e}")),
         };
         let built = t.elapsed().as_millis() as u64;
-        let (ok, mut r) = emu::gate(
+        let (ok, mut r) = emu::gate_syms(
             &symbol,
+            &cand_symbol,
             &mut case,
             (&prep.base.image, &base_geo),
             (&prep.cand.image, &cand_geo),
@@ -880,9 +1032,10 @@ fn extent_case(o: &Opts, name: &str, prep: &Prep, shape: &str) -> (bool, Value) 
         Err(e) => return bad(format!("inputs: {e}")),
     };
     let built = t.elapsed().as_millis() as u64;
-    let (ok, mut r) = emu::extent_gate(
+    let (ok, mut r) = emu::extent_gate_syms(
         shape,
         &symbol,
+        &cand_symbol,
         &mut case,
         (&prep.base.image, &base_geo, &*ob),
         (&prep.cand.image, &cand_geo, &*oc),
@@ -990,7 +1143,13 @@ fn stats_json(s: &abba::TimingStats) -> Value {
 }
 
 /// The timing record from the arms' samples (ns, schedule order, whole rounds).
-fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, work: node::Work) -> Result<Value> {
+fn timing_record(
+    base_ns: &[f64],
+    cand_ns: &[f64],
+    n: usize,
+    work: node::Work,
+    clocks: &[Value],
+) -> Result<Value> {
     let bs = abba::timing_stats(base_ns)?;
     let cs = abba::timing_stats(cand_ns)?;
     let bm = abba::block_medians(base_ns, n)?;
@@ -1002,7 +1161,12 @@ fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, work: node::Work) -
         .map(|(i, r)| {
             let b = (bm[2 * i] + bm[2 * i + 1]) / 2.0;
             let c = (cm[2 * i] + cm[2 * i + 1]) / 2.0;
-            json!({"round": i, "base_us": b / 1e3, "cand_us": c / 1e3, "ratio": r})
+            let mut e = json!({"round": i, "base_us": b / 1e3, "cand_us": c / 1e3, "ratio": r});
+            if clocks.len() == ratios.len() + 1 {
+                e["clock_start"] = clocks[i].clone();
+                e["clock_end"] = clocks[i + 1].clone();
+            }
+            e
         })
         .collect();
     let mut sorted = ratios.clone();
@@ -1017,7 +1181,7 @@ fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, work: node::Work) -
     let slower = ratios.iter().filter(|x| **x > 1.0).count();
     let tflops = |ns: f64| work.flops / ns / 1e3;
     let gbps = |ns: f64| work.bytes / ns;
-    Ok(json!({
+    let mut rec = json!({
         "rounds": rounds,
         "ratio_median": median,
         "ratio_min": sorted[0],
@@ -1036,7 +1200,11 @@ fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, work: node::Work) -
                      device idle at the start (output reset + sync outside the interval), \
                      so launch latency is inside the interval for both arms",
         },
-    }))
+    });
+    if !clocks.is_empty() {
+        rec["clock_summary"] = clk::summary(clocks);
+    }
+    Ok(rec)
 }
 
 fn sample(
@@ -1046,10 +1214,12 @@ fn sample(
     cand: &mut Arm,
     n: usize,
     rounds: usize,
+    pci: Option<&str>,
     flush: Option<&cold::Flush>,
-) -> Result<(Vec<f64>, Vec<f64>)> {
+) -> Result<(Vec<f64>, Vec<f64>, Vec<Value>)> {
     let (per_arm, _) = abba::timing_counts(n, rounds)?;
     let (mut b, mut c) = (Vec::with_capacity(per_arm), Vec::with_capacity(per_arm));
+    let mut clocks: Vec<Value> = Vec::with_capacity(rounds + 1);
     let start = gpu.hip.event_create().map_err(err)?;
     let stop = match gpu.hip.event_create() {
         Ok(e) => e,
@@ -1063,7 +1233,13 @@ fn sample(
     let evict = |gpu: &rdna_compute::Gpu| -> Result<()> { cold::evict(&gpu.hip, flush) };
     let measured = (|| -> Result<()> {
         evict(gpu)?;
+        let round_len = 4 * n;
         for (i, which) in abba::timing_schedule(n, rounds)?.into_iter().enumerate() {
+            // Clock sample at every round start (outside any hipEvent interval; the previous
+            // launch is synchronized and evicted), plus one after the last launch.
+            if i % round_len == 0 {
+                clocks.extend(pci.map(clk::sample));
+            }
             let (arm, sink) = match which {
                 abba::TimingArm::Incumbent => (&mut *base, &mut b),
                 abba::TimingArm::Candidate => (&mut *cand, &mut c),
@@ -1079,6 +1255,7 @@ fn sample(
             sink.push(f64::from(gpu.hip.event_elapsed_ms(&start, &stop).map_err(err)?) * 1e6);
             evict(gpu)?;
         }
+        clocks.extend(pci.map(clk::sample));
         Ok(())
     })();
     let d1 = gpu.hip.event_destroy(start).map_err(err);
@@ -1086,27 +1263,29 @@ fn sample(
     measured?;
     d1?;
     d2?;
-    Ok((b, c))
+    Ok((b, c, clocks))
 }
 
-fn gpu_stage(o: &Opts, node: &mut dyn Node, prep: &Prep, mut rec: Value) -> (Value, Outcome) {
-    let gpu = match rdna_compute::Gpu::init() {
-        Ok(g) => g,
-        Err(e) => return fail(rec, "device", e),
-    };
+/// Open the device, record it and check its arch against the node's.
+fn open_gpu(rec: &mut Value, node_arch: &str) -> std::result::Result<rdna_compute::Gpu, String> {
+    let gpu = rdna_compute::Gpu::init().map_err(|e| e.to_string())?;
     let arch = gpu.arch.split(':').next().unwrap_or("").to_owned();
     rec["device"] = json!({
         "arch": gpu.arch, "device_id": gpu.device_id,
         "uuid": std::env::var("ROCR_VISIBLE_DEVICES").ok().or_else(|| std::env::var("HIPFIRE_DEVICES").ok()),
         "fabric_job": std::env::var("FABRIC_JOB").ok(),
     });
-    if arch != node.arch() {
-        return fail(
-            rec,
-            "device",
-            format!("device is {arch}, hip_loop requires {}", node.arch()),
-        );
+    if arch != node_arch {
+        return Err(format!("device is {arch}, hip_loop requires {node_arch}"));
     }
+    Ok(gpu)
+}
+
+fn gpu_stage(o: &Opts, node: &mut dyn Node, prep: &Prep, mut rec: Value) -> (Value, Outcome) {
+    let gpu = match open_gpu(&mut rec, node.arch()) {
+        Ok(g) => g,
+        Err(e) => return fail(rec, "device", e),
+    };
     if o.identity_only {
         // No timing and no pool: the node's adversarial matrix over every shape it names.
         return identity_only(o, node, prep, &gpu, rec);
@@ -1120,6 +1299,257 @@ fn gpu_stage(o: &Opts, node: &mut dyn Node, prep: &Prep, mut rec: Value) -> (Val
         Ok(outcome) => (rec, outcome),
         Err((stage, e)) => fail(rec, &stage, e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Row-class sweep (`--rowclasses`, contract nodes)
+
+/// The `--shape` of a contract node with the CLI's reserved keys (`arch`, `vs`, `pool`) appended.
+fn contract_shape(shape: Option<String>, c: &ContractOpts) -> Option<String> {
+    let mut parts: Vec<String> = shape.into_iter().filter(|s| !s.is_empty()).collect();
+    if let Some(a) = &c.arch {
+        parts.push(format!("arch={a}"));
+    }
+    if let Some(v) = &c.vs {
+        parts.push(format!("vs={v}"));
+    }
+    if c.pool {
+        parts.push("pool=1".to_owned());
+    }
+    (!parts.is_empty()).then(|| parts.join(","))
+}
+
+/// The timing fields of a class entry: the driver's timing record (`rounds`, `ratio_median`, `p_faster`,
+/// `p_slower`, `timing{..}`, ...) of one class, exactly the single-shape record's keys.
+fn class_timing(crec: &Value) -> Value {
+    let mut t = serde_json::Map::new();
+    for k in [
+        "rounds",
+        "ratio_median",
+        "ratio_min",
+        "ratio_max",
+        "rounds_faster",
+        "rounds_slower",
+        "rounds_tied",
+        "p_faster",
+        "p_slower",
+        "timing",
+        "clock_note",
+        "clock_summary",
+    ] {
+        if let Some(v) = crec.get(k) {
+            t.insert(k.to_owned(), v.clone());
+        }
+    }
+    Value::Object(t)
+}
+
+/// `--rowclasses`: ONE process, the classes in ascending order. The two arms are compiled once; per class the
+/// node is rebuilt with `rows_param = r` (a class outside a contract's domain is clipped and recorded in
+/// `clipped_classes`; a class outside an arm's `WorkV1.admit` is still MEASURED, `admitted` says which arm
+/// the product selector admits there: the decode-regression signature lives below the tiled kernel's
+/// admitted rows), identity, then the normal ABBA timing (`--null-control aa`: A/A). The record is the
+/// single-shape record minus the per-shape fields, plus `rows_param`, `regime`, `clipped_classes` and
+/// `rowclasses: [{rows, shape, geometry_base, geometry_cand, identical_to_baseline, timing, admitted,
+/// bytes_per_call, regime, work, ...}]` (`timing` is the single-shape timing record of that class; `ratio_median`,
+/// `p_faster`, `p_slower` are also copied flat). A class that fails records `error` and the exit code is 3; a
+/// class that is not bit-identical records `identical_to_baseline: false` without timing and the exit
+/// code is 1 (the sweep continues). `--offline`: geometry, bytes and admission per class, no timing.
+fn run_rowclasses(o: &Opts, mut rec: Value, shape: Option<String>) -> (Value, Outcome) {
+    let plan = match generic::row_plan(
+        &o.node,
+        o.contract.vs.as_deref(),
+        o.contract.arch.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return fail(rec, "args", e),
+    };
+    match ShapeSpec::parse(shape.as_deref()) {
+        Ok(s) => {
+            for k in [plan.rows_param.as_str(), "rows"] {
+                if s.kv.contains_key(k) {
+                    return fail(
+                        rec,
+                        "args",
+                        format!("--rowclasses sets `{k}` per class: drop it from --shape"),
+                    );
+                }
+            }
+        }
+        Err(e) => return fail(rec, "args", e),
+    }
+    let classes: Vec<u64> = o
+        .contract
+        .rowclass_list
+        .clone()
+        .unwrap_or_else(|| generic::DEFAULT_ROWCLASSES.to_vec());
+    let shape_for = |r: u64| match shape.as_deref() {
+        Some(s) if !s.is_empty() => format!("{s},{}={r}", plan.rows_param),
+        _ => format!("{}={r}", plan.rows_param),
+    };
+    let mut kept: Vec<(u64, generic::ContractNode)> = Vec::new();
+    let mut clipped: Vec<Value> = Vec::new();
+    for &r in &classes {
+        let sp = match ShapeSpec::parse(Some(&shape_for(r))) {
+            Ok(s) => s,
+            Err(e) => return fail(rec, "args", e),
+        };
+        match generic::ContractNode::build(&o.node, &sp) {
+            Ok(n) => kept.push((r, n)),
+            Err(generic::BuildError::Domain(why)) => {
+                clipped.push(json!({"rows": r, "reason": why}));
+            }
+            Err(generic::BuildError::Other(e)) => return fail(rec, "args", e),
+        }
+    }
+    rec["rows_param"] = json!(plan.rows_param);
+    rec["rowclasses_requested"] = json!(classes);
+    rec["clipped_classes"] = json!(clipped);
+    rec["shape"] = json!(shape);
+    rec["llc_bytes"] = json!(plan.llc_bytes);
+    if kept.is_empty() {
+        return fail(
+            rec,
+            "args",
+            "no row class lies inside the contract's domain (see clipped_classes)",
+        );
+    }
+    rec["arch"] = json!(kept[0].1.arch());
+    if let Value::Object(extra) = kept[0].1.record_extra() {
+        for (k, v) in extra {
+            if !matches!(
+                k.as_str(),
+                "bytes_per_call" | "footprint_bytes" | "regime" | "rows_param"
+            ) {
+                rec[k] = v;
+            }
+        }
+    }
+    let workdir = out_dir_of(o);
+    if let Err(e) = std::fs::create_dir_all(&workdir) {
+        return fail(rec, "args", format!("--out {}: {e}", workdir.display()));
+    }
+    rec["out_dir"] = json!(workdir.display().to_string());
+    let mut prep = match prepare(o, &kept[0].1, &workdir, &mut rec) {
+        Ok(p) => p,
+        Err((stage, e)) => return fail(rec, &stage, e),
+    };
+    // The per-class geometry is in `rowclasses`; the first class's would mislead here.
+    for arm in ["baseline", "candidate"] {
+        if let Some(m) = rec[arm].as_object_mut() {
+            m.remove("geometry");
+        }
+    }
+    let gpu = if o.offline {
+        None
+    } else {
+        match open_gpu(&mut rec, kept[0].1.arch()) {
+            Ok(g) => Some(g),
+            Err(e) => return fail(rec, "device", e),
+        }
+    };
+    let mut entries: Vec<Value> = Vec::new();
+    let mut worst = 0i32;
+    let mut failed: Vec<String> = Vec::new();
+    let mut any_pool = false;
+    let (mut any_false, mut any_true) = (false, false);
+    for (r, node) in kept.iter_mut() {
+        let r = *r;
+        let extra = node.record_extra();
+        let w = node.work();
+        let mut entry = json!({
+            "rows": r,
+            "shape": node.shape_label(),
+            "shape_dims": node.shape_json(),
+            "bytes_per_call": extra["bytes_per_call"],
+            "footprint_bytes": extra["footprint_bytes"],
+            "regime": extra["regime"],
+            "work": {"flops": w.flops, "bytes": w.bytes},
+            "admitted": {
+                "baseline": generic::admits(&plan.admit_base, r),
+                "candidate": generic::admits(&plan.admit_cand, r),
+            },
+            "identical_to_baseline": Value::Null,
+            "timing": Value::Null,
+        });
+        any_pool |= extra["regime"] == "pool";
+        prep.base_geo = node.geometry();
+        let mut hdr = Header {
+            kv: prep.cand_header.kv.clone(),
+        };
+        match node.geometry_with(&mut hdr) {
+            Ok(g) => prep.cand_geo = g,
+            Err(e) => {
+                entry["error"] = json!({"stage": "geometry", "message": e});
+                failed.push(format!("rows {r}: geometry: {e}"));
+                worst = worst.max(Outcome::Unusable.code());
+                entries.push(entry);
+                continue;
+            }
+        }
+        entry["geometry_base"] = geo_json(&prep.base_geo);
+        entry["geometry_cand"] = geo_json(&prep.cand_geo);
+        entry["same_geometry"] = json!(prep.base_geo == prep.cand_geo);
+        if let Some(gpu) = &gpu {
+            let mut crec = json!({});
+            let res = match node.setup(gpu, o.seed) {
+                Ok(()) => {
+                    let res = gpu_run(o, node, &prep, gpu, &mut crec);
+                    node.teardown(gpu);
+                    res
+                }
+                Err(e) => Err(("setup".to_owned(), e)),
+            };
+            match res {
+                Ok(outcome) => {
+                    entry["identical_to_baseline"] = crec["identical_to_baseline"].clone();
+                    for k in ["identity", "identity_matrix", "identity_mode"] {
+                        if !crec[k].is_null() {
+                            entry[k] = crec[k].clone();
+                        }
+                    }
+                    match entry["identical_to_baseline"] {
+                        Value::Bool(true) => any_true = true,
+                        Value::Bool(false) => any_false = true,
+                        _ => {}
+                    }
+                    if outcome == Outcome::Ok && !crec["ratio_median"].is_null() {
+                        entry["timing"] = class_timing(&crec);
+                        for k in ["ratio_median", "p_faster", "p_slower"] {
+                            entry[k] = crec[k].clone();
+                        }
+                    }
+                    worst = worst.max(outcome.code());
+                }
+                Err((stage, e)) => {
+                    entry["error"] = json!({"stage": stage, "message": e});
+                    failed.push(format!("rows {r}: {stage}: {e}"));
+                    worst = worst.max(Outcome::Unusable.code());
+                }
+            }
+            eprintln!(
+                "hip_loop: rowclass {r}: identical={} ratio_median={}",
+                entry["identical_to_baseline"], entry["ratio_median"]
+            );
+        }
+        entries.push(entry);
+    }
+    rec["rowclasses"] = json!(entries);
+    rec["regime"] = json!(if any_pool { "pool" } else { "hot" });
+    rec["identical_to_baseline"] = match (any_false, any_true) {
+        (true, _) => json!(false),
+        (false, true) => json!(true),
+        _ => Value::Null,
+    };
+    if !failed.is_empty() {
+        rec["error"] = json!({"stage": "rowclasses", "message": failed.join("; ")});
+    }
+    let outcome = match worst {
+        0 => Outcome::Ok,
+        1 => Outcome::IdentityFailed,
+        _ => Outcome::Unusable,
+    };
+    (rec, outcome)
 }
 
 /// `--identity-only`: the adversarial identity matrix of the node over ALL its identity shapes (lane_proj: every
@@ -1227,7 +1657,8 @@ fn gpu_run(
     let sym = &prep.inc.symbol;
     let mut base =
         load(gpu, &prep.base, sym, prep.base_geo, karg.clone()).map_err(stage("load"))?;
-    let mut cand = load(gpu, &prep.cand, sym, prep.cand_geo, karg).map_err(stage("load"))?;
+    let mut cand =
+        load(gpu, &prep.cand, &prep.cand_inc.symbol, prep.cand_geo, karg).map_err(stage("load"))?;
 
     // `--identity full|smoke|skip` (default full). `smoke`: only the basic dispatch identity below (the
     // timed shape's pristine-reset launches of both arms, byte-compared); `skip`: no identity at all (A/A and
@@ -1314,6 +1745,7 @@ fn gpu_run(
         None
     };
     let before = clock_note(gpu);
+    let pci = gpu.hip.device_pci_bus_id(gpu.device_id).ok();
     let sampled = sample(
         gpu,
         node,
@@ -1321,14 +1753,15 @@ fn gpu_run(
         &mut cand,
         o.time,
         o.rounds,
+        pci.as_deref(),
         flush.as_ref(),
     );
     if let Some(f) = flush {
         f.free(&gpu.hip);
     }
-    let (b_ns, c_ns) = sampled.map_err(stage("timing"))?;
+    let (b_ns, c_ns, clocks) = sampled.map_err(stage("timing"))?;
     let after = clock_note(gpu);
-    let t = timing_record(&b_ns, &c_ns, o.time, node.work()).map_err(stage("timing"))?;
+    let t = timing_record(&b_ns, &c_ns, o.time, node.work(), &clocks).map_err(stage("timing"))?;
     if let Value::Object(m) = t {
         for (k, v) in m {
             rec[k] = v;
@@ -1433,13 +1866,27 @@ mod tests {
             flops: 1e6,
             bytes: 1e6,
         };
-        let t = timing_record(&base, &cand, n, w).unwrap();
+        let t = timing_record(&base, &cand, n, w, &[]).unwrap();
         assert_eq!(t["rounds"].as_array().unwrap().len(), 3);
         assert!((t["ratio_median"].as_f64().unwrap() - 0.9).abs() < 1e-12);
         assert_eq!(t["rounds_faster"], 3);
         assert!((t["p_faster"].as_f64().unwrap() - 0.125).abs() < 1e-15);
         assert_eq!(t["p_slower"].as_f64().unwrap(), 1.0);
         assert!((t["timing"]["baseline_tflops"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+        assert!(t.get("clock_summary").is_none());
+        assert!(t["rounds"][0].get("clock_start").is_none());
+        // Rounds + 1 clock samples: per-round start/end and a summary.
+        let clocks: Vec<Value> = [2400.0, 2300.0, 2100.0, 2200.0]
+            .iter()
+            .map(|m| json!({"sclk_mhz": m, "power_w": 200.0, "temp_c": 60.0}))
+            .collect();
+        let t = timing_record(&base, &cand, n, w, &clocks).unwrap();
+        assert_eq!(t["rounds"][1]["clock_start"]["sclk_mhz"], 2300.0);
+        assert_eq!(t["rounds"][1]["clock_end"]["sclk_mhz"], 2100.0);
+        assert_eq!(t["rounds"][2]["clock_end"]["sclk_mhz"], 2200.0);
+        assert_eq!(t["clock_summary"]["sclk_mhz"]["min"], 2100.0);
+        assert_eq!(t["clock_summary"]["sclk_mhz"]["max"], 2400.0);
+        assert_eq!(t["clock_summary"]["sclk_mhz"]["median"], 2250.0);
     }
 
     #[test]
@@ -1497,6 +1944,7 @@ mod tests {
             rounds: 1,
             seed: 1,
             out: Some(dir.join("out")),
+            contract: Default::default(),
         };
         let (rec, outcome) = run(&o);
         assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
@@ -1623,6 +2071,7 @@ mod tests {
             rounds: 1,
             seed: 1,
             out: Some(dir.join("out")),
+            contract: Default::default(),
         };
         let (rec, outcome) = run(&o);
         assert_eq!(outcome, Outcome::Unusable);
@@ -1667,6 +2116,7 @@ mod tests {
             rounds: 1,
             seed: 1,
             out: Some(dir),
+            contract: Default::default(),
         };
         let (rec, outcome) = run(&o);
         assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
@@ -1676,6 +2126,33 @@ mod tests {
             rec["baseline"]["source_path"],
             rec["candidate"]["source_path"]
         );
+    }
+
+    #[test]
+    fn offline_record_for_conv_rows_on_both_arches() {
+        if !jit::hipcc_available() {
+            eprintln!("SKIP: no hipcc");
+            return;
+        }
+        for (shape, arch, tag) in [
+            ("pp512", "gfx1100", "conv-a"),
+            ("pp512,arch=gfx1201", "gfx1201", "conv-b"),
+        ] {
+            let rec = &offline("conv_rows", shape, None, tag);
+            assert_eq!(rec["symbol"], "causal_conv_depthwise_silu_rows_f32");
+            assert_eq!(rec["identical_code"], true, "{arch}");
+            assert_eq!(
+                rec["baseline"]["geometry"]["grid_work_items"],
+                json!([5120, 1, 1])
+            );
+            assert_eq!(rec["baseline"]["max_flat_workgroup_size"], 1024);
+            assert_eq!(rec["baseline"]["spill"], 0);
+            assert_eq!(
+                rec["baseline"]["code_sha256"],
+                rec["candidate"]["code_sha256"]
+            );
+            assert_eq!(rec["baseline"]["code_sha256"].as_str().unwrap().len(), 64);
+        }
     }
 
     #[test]
@@ -1721,6 +2198,7 @@ mod object_tests {
             rounds: 1,
             seed: 1,
             out: Some(dir.join("out")),
+            contract: Default::default(),
         }
     }
 
@@ -1857,6 +2335,7 @@ mod base_object_tests {
             rounds: 1,
             seed: 1,
             out: Some(out),
+            contract: Default::default(),
         }
     }
 
@@ -2730,5 +3209,342 @@ mod lane_tests {
             assert!(ok, "{hz}");
             assert_eq!(hz["wave"], 64);
         }
+    }
+}
+
+/// `contract:` nodes (`hip_loop/generic.rs`): CLI, shape injection, offline records, row classes.
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    const TILED: &str = "contract:generic_gemm.bf16_xf32_tiled_rows.mpw16";
+    const BATCHED: &str = "contract:generic_gemm.bf16_xf32_batched.wave_per_output";
+    const Q8: &str = "contract:gemm_q8_0_wmma_gfx12";
+    const QT44: &str = "contract:moe_grouped_qt44_a8_sym_gfx1201_nt1r1";
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hip_loop-ctest-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// `argv --offline --out <tmp>` through the real CLI.
+    fn offline(argv: &str, tag: &str) -> (Value, Outcome) {
+        let out = tmp(tag).join("out");
+        let mut a = args(argv);
+        a.extend([
+            "--offline".to_owned(),
+            "--out".to_owned(),
+            out.display().to_string(),
+        ]);
+        run(&parse_args(&a).unwrap())
+    }
+
+    #[test]
+    fn contract_cli_parses_and_refuses() {
+        let o = parse_args(&args(&format!(
+            "--node {TILED} --vs {BATCHED} --shape M=8,K=64 --arch gfx1100 --pool --rowclasses --time 5"
+        )))
+        .unwrap();
+        assert_eq!(o.contract.vs.as_deref(), Some(BATCHED));
+        assert_eq!(o.contract.arch.as_deref(), Some("gfx1100"));
+        assert!(o.contract.pool && o.contract.rowclasses && o.contract.rowclass_list.is_none());
+        assert_eq!(o.time, 5);
+        let o = parse_args(&args(&format!(
+            "--node {Q8} --null-control aa --rowclasses 512,1,8,8 --pool"
+        )))
+        .unwrap();
+        assert_eq!(o.contract.rowclass_list, Some(vec![1, 8, 512]));
+        assert!(o.null_control && o.contract.pool);
+        for bad in [
+            "--node mq6_res --null-control aa --pool",
+            "--node mq6_res --null-control aa --arch gfx1100",
+            "--node mq6_res --vs contract:gemm_f32_batched",
+            "--node contract: --null-control aa",
+            "--node contract:gemm_f32_batched --null-control aa --vs contract:gemm_f32_tiled_rows",
+            "--node contract:gemm_f32_batched --vs gemm_f32_tiled_rows",
+            "--node contract:gemm_f32_batched --vs contract:",
+            "--node contract:gemm_f32_batched --null-control aa --rowclasses --emu",
+            "--node contract:gemm_f32_batched --null-control aa --rowclasses 0",
+            "--node contract:gemm_f32_batched --null-control aa --rowclasses 1,x",
+            "--node contract:gemm_f32_batched",
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn contract_shape_injects_the_reserved_keys() {
+        let c = ContractOpts {
+            vs: Some(BATCHED.into()),
+            arch: Some("gfx1201".into()),
+            pool: true,
+            ..ContractOpts::default()
+        };
+        assert_eq!(
+            contract_shape(Some("M=1,K=2".into()), &c).as_deref(),
+            Some(format!("M=1,K=2,arch=gfx1201,vs={BATCHED},pool=1").as_str())
+        );
+        assert_eq!(contract_shape(None, &ContractOpts::default()), None);
+        assert_eq!(
+            contract_shape(None, &c)
+                .as_deref()
+                .map(|s| s.starts_with("arch=")),
+            Some(true)
+        );
+        // the vs/arch/pool keys reach the generic node
+        let n = build_node(
+            TILED,
+            contract_shape(Some("M=128,K=2560,N=512".into()), &c).as_deref(),
+        )
+        .unwrap();
+        assert_eq!(n.arch(), "gfx1201");
+        assert!(n.candidate_incumbent().unwrap().is_some());
+        assert_eq!(n.incumbent().unwrap().symbol, "gemm_bf16_xf32_batched");
+    }
+
+    #[test]
+    fn offline_vs_compiles_both_shipped_arms() {
+        if !jit::hipcc_available() {
+            eprintln!("SKIP: no hipcc");
+            return;
+        }
+        let (rec, outcome) = offline(
+            &format!("--node {TILED} --vs {BATCHED} --shape M=128,K=2560,N=512"),
+            "vs",
+        );
+        assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
+        assert_eq!(rec["symbol"], "gemm_bf16_xf32_batched");
+        assert_eq!(
+            rec["vs"]["candidate"]["symbol"],
+            "gemm_bf16_xf32_tiled_rows"
+        );
+        assert_eq!(rec["vs"]["baseline"]["module"], "gemm_bf16_xf32_batched");
+        assert_eq!(rec["arch"], "gfx1201");
+        assert_eq!(
+            rec["baseline"]["geometry"]["grid_workgroups"],
+            json!([128, 512, 1])
+        );
+        assert_eq!(
+            rec["candidate"]["geometry"]["grid_workgroups"],
+            json!([1, 128, 1])
+        );
+        assert_eq!(rec["candidate"]["geometry"]["block"], json!([256, 1, 1]));
+        assert_eq!(rec["identical_code"], false);
+        assert_eq!(rec["same_geometry"], false);
+        assert_ne!(
+            rec["baseline"]["code_sha256"], rec["candidate"]["code_sha256"],
+            "two different kernels"
+        );
+        assert_eq!(rec["candidate"]["lds_bytes"], 16384, "{}", rec["candidate"]);
+        assert_eq!(
+            rec["contract"]["id"],
+            "generic_gemm.bf16_xf32_tiled_rows.mpw16"
+        );
+        assert_eq!(
+            rec["contract_vs"]["id"],
+            "generic_gemm.bf16_xf32_batched.wave_per_output"
+        );
+        assert_eq!(rec["rows_param"], "N");
+        assert_eq!(rec["regime"], "hot");
+        assert_eq!(
+            rec["bytes_per_call"],
+            128 * 2560 * 2 + (512 * 2560 + 512 * 128) * 4
+        );
+        assert_eq!(rec["work"]["flops"], 2.0 * 128.0 * 512.0 * 2560.0);
+        assert_eq!(rec["shape_dims"]["params"]["K"], 2560);
+    }
+
+    #[test]
+    fn offline_a_a_for_the_q8_and_qt44_contracts() {
+        if !jit::hipcc_available() {
+            eprintln!("SKIP: no hipcc");
+            return;
+        }
+        for (i, (argv, sym, grid)) in [
+            (
+                format!("--node {Q8} --shape M=2048,K=2560,N=512 --null-control aa"),
+                "gemm_q8_0_wmma_gfx12",
+                json!([128, 32, 1]),
+            ),
+            (
+                format!(
+                    "--node {QT44} --shape M=2176,K=2560,n_experts=128,topk=8,tokens=512 --null-control aa"
+                ),
+                "moe_grouped_qt44_a8_sym_gfx1201_nt1r1",
+                Value::Null,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (rec, outcome) = offline(&argv, &format!("aa{i}"));
+            assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
+            assert_eq!(rec["symbol"], sym);
+            assert_eq!(rec["identical_code"], true);
+            assert_eq!(rec["null_control"]["identical_objects"], true);
+            assert_eq!(rec["same_geometry"], true);
+            assert!(rec["vs"].is_null());
+            if i == 0 {
+                assert_eq!(rec["baseline"]["geometry"]["grid_workgroups"], grid);
+            } else {
+                // 4096 slots over 128 experts: m_total = the scatter bound
+                let mt = moe::m_total_bound(512 * 8, 128);
+                assert_eq!(
+                    rec["baseline"]["geometry"]["grid_workgroups"],
+                    json!([34, mt / 16, 1])
+                );
+                assert_eq!(rec["rows_param"], "tokens");
+            }
+        }
+    }
+
+    #[test]
+    fn offline_rowclasses_clips_and_records_admission() {
+        if !jit::hipcc_available() {
+            eprintln!("SKIP: no hipcc");
+            return;
+        }
+        let (rec, outcome) = offline(
+            &format!("--node {TILED} --vs {BATCHED} --shape M=128,K=2560 --rowclasses 1,512,70000"),
+            "rc",
+        );
+        assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
+        assert_eq!(rec["rows_param"], "N");
+        assert_eq!(rec["rowclasses_requested"], json!([1, 512, 70000]));
+        // 70000 rows exceed the batched kernel's grid-y limit (65535): clipped, with the contract's reason
+        let clipped = rec["clipped_classes"].as_array().unwrap();
+        assert_eq!(clipped.len(), 1, "{clipped:?}");
+        assert_eq!(clipped[0]["rows"], 70000);
+        assert!(
+            clipped[0]["reason"].as_str().unwrap().contains("grid y"),
+            "{clipped:?}"
+        );
+        let rc = rec["rowclasses"].as_array().unwrap();
+        assert_eq!(rc.len(), 2);
+        assert_eq!(
+            (rc[0]["rows"].as_u64(), rc[1]["rows"].as_u64()),
+            (Some(1), Some(512))
+        );
+        // the tiled kernel is admitted from 512 rows, the batched kernel everywhere
+        assert_eq!(
+            rc[0]["admitted"],
+            json!({"baseline": true, "candidate": false})
+        );
+        assert_eq!(
+            rc[1]["admitted"],
+            json!({"baseline": true, "candidate": true})
+        );
+        assert_eq!(
+            rc[0]["geometry_base"]["grid_workgroups"],
+            json!([128, 1, 1])
+        );
+        assert_eq!(rc[0]["geometry_cand"]["grid_workgroups"], json!([1, 1, 1]));
+        assert_eq!(
+            rc[1]["geometry_cand"]["grid_workgroups"],
+            json!([1, 128, 1])
+        );
+        assert_eq!(
+            rc[1]["bytes_per_call"],
+            128 * 2560 * 2 + (512 * 2560 + 512 * 128) * 4
+        );
+        assert_eq!(rc[1]["regime"], "hot");
+        assert!(rc[0]["timing"].is_null() && rc[0]["identical_to_baseline"].is_null());
+        assert_eq!(rec["regime"], "hot");
+        assert!(
+            rec["baseline"]["geometry"].is_null(),
+            "per-class geometry only"
+        );
+        // the sweep sets the row param itself
+        let (rec, outcome) = offline(
+            &format!("--node {TILED} --vs {BATCHED} --shape M=128,K=2560,N=512 --rowclasses 1"),
+            "rc2",
+        );
+        assert_eq!(outcome, Outcome::Unusable);
+        assert!(
+            rec["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("per class"),
+            "{rec}"
+        );
+        // a contract without activation rows has nothing to sweep
+        let (rec, outcome) = offline(
+            "--node contract:gemv_q8_0 --shape M=64,K=2048 --null-control aa --rowclasses",
+            "rc3",
+        );
+        assert_eq!(outcome, Outcome::Unusable);
+        assert_eq!(rec["error"]["stage"], "args");
+    }
+
+    #[test]
+    fn emu_gate_judges_the_bf16_pair_through_two_symbols() {
+        if !jit::hipcc_available() {
+            eprintln!("SKIP: no hipcc");
+            return;
+        }
+        let out = tmp("emu").join("out");
+        let o = parse_args(&args(&format!(
+            "--node {TILED} --vs {BATCHED} --shape M=40,K=96,N=10 --emu --out {}",
+            out.display()
+        )))
+        .unwrap();
+        let (rec, outcome) = run(&o);
+        assert_eq!(outcome, Outcome::Ok, "{}", rec["emu_gate"]["reason"]);
+        let g = &rec["emu_gate"];
+        assert_eq!(g["pass"], true);
+        assert_eq!(g["identical_to_baseline"], true);
+        assert_eq!(g["arms"]["baseline"]["symbol"], "gemm_bf16_xf32_batched");
+        assert_eq!(
+            g["arms"]["candidate"]["symbol"],
+            "gemm_bf16_xf32_tiled_rows"
+        );
+        // one wave per output (40 x 10) against 1 x ceil(10/4) tiled workgroups
+        assert_eq!(g["workgroups"], json!({"baseline": 400, "candidate": 3}));
+        assert_eq!(g["extent_cases"], json!([]));
+    }
+
+    #[test]
+    fn usage_errors_name_the_missing_params() {
+        let (rec, outcome) = offline(
+            &format!("--node {Q8} --shape M=64,K=256 --null-control aa"),
+            "miss",
+        );
+        assert_eq!(outcome, Outcome::Unusable);
+        assert_eq!(rec["error"]["stage"], "args");
+        assert!(
+            rec["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing params"),
+            "{rec}"
+        );
+        let (rec, _) = offline(
+            &format!("--node {Q8} --shape M=64,K=256,N=4,Z=1 --null-control aa"),
+            "unk",
+        );
+        assert!(
+            rec["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown key `Z`"),
+            "{rec}"
+        );
+        let (rec, _) = offline(
+            &format!("--node {TILED} --vs {Q8} --shape M=64,K=256,N=4"),
+            "compat",
+        );
+        assert!(
+            rec["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("signature compatible"),
+            "{rec}"
+        );
     }
 }

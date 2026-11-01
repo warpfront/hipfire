@@ -26,20 +26,28 @@ pub use sealed_moe::{
     MoeRouterInput, MoeSharedContribution, PrefillRouteMode, ResourceAlias, SealedMoeCall,
 };
 pub(crate) mod moe_program;
+pub mod q8_prefill;
 pub(crate) mod qt44_qt53_prefill;
 pub mod slab_moe_decode;
 pub mod slab_route;
 pub mod slowlink_prefill;
 pub mod sp_layer;
 pub use moe_program::{
-    execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
-    GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
-    GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
-    GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, RouterKind,
-    SharedExpertPolicy,
+    execute_gated_ffn, execute_grouped_moe, grouped_moe_iu4_shape_admits, grouped_moe_site_tiers,
+    CastPolicy, CombineOrder, FfnActivation, GatedFfnOp, GroupedMoeGroupedScratch,
+    GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy, GroupedMoeProtocol, GroupedMoeRouted,
+    GroupedMoeRouter, GroupedMoeScratch, GroupedMoeScratchPlan, GroupedMoeShared,
+    GroupedMoeSharedScratch, GroupedMoeSiteTiers, RouterKind, SharedExpertPolicy,
+    GROUPED_MOE_IU4_MIN_ROWS,
 };
 pub use moe_program::{MoeStage, SealedMoeOp};
+pub use q8_prefill::{
+    grouped_sym_tier_admits, prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_gemm_prepared,
+    q8_0_prefill_prepare, q8_0_prefill_runs, q8_0_weight_admits, PrefillActTier, PreparedA8,
+    Q8PrefillRun, PREFILL_QUANT_MIN_ROWS,
+};
 pub(crate) mod draft_head;
+pub mod moe_capture;
 pub mod moe_dump;
 pub(crate) mod norm_fold;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};

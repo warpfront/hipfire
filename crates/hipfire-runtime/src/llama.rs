@@ -1360,6 +1360,53 @@ pub fn fused_silu_mul_rotate_mq_f16_batched_for(
     )
 }
 
+/// Row-exact multi-row `weight_gemv`: `y[r, :] = W · x[r, :]` for `rows`
+/// activation rows (`x` F32 `[rows, w.k]`, `y` F32 `[rows, w.m]`), every output
+/// row bit-identical to what `weight_gemv` writes for that `x` row (the rows == 1
+/// decode GEMV), so a speculative-decode verify row equals the autoregressive
+/// decode row bit for bit.
+///
+/// Q8F16 (`DType::Q8_0`) weights run the multi-row kernels
+/// (`hipfire_dispatch::families::gemv::GemvFamily::run_rows_exact`,
+/// `Gpu::gemv_q8_0_rows_exact`: weights read once for up to 16 rows). Every other
+/// dtype runs `weight_gemv` once per row on row views of `x`/`y` — the singleton
+/// itself, exact by construction, weights re-read per row.
+pub fn weight_gemv_rows_exact(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+) -> HipResult<()> {
+    reject_mq4g128v2(w.gpu_dtype)?;
+    if w.gpu_dtype == DType::Q8_0 {
+        use hipfire_dispatch::context::DispatchCtx;
+        use hipfire_dispatch::families::gemv::WeightRef;
+        let ctx = DispatchCtx::new(gpu);
+        let wr = WeightRef {
+            buf: &w.buf,
+            dtype: w.gpu_dtype,
+            m: w.m,
+            k: w.k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+            lloyd_lut_f16: w.lloyd_lut_f16,
+            lloyd_lut_c16: w.lloyd_lut_c16,
+        };
+        return crate::llama::gemv_family()
+            .run_rows_exact(&ctx, gpu, &wr, x, y, rows)
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
+    }
+    for row in 0..rows {
+        let x_row = x.sub_offset(row * w.k, w.k);
+        let y_row = y.sub_offset(row * w.m, w.m);
+        weight_gemv(gpu, w, &x_row, &y_row)?;
+    }
+    Ok(())
+}
+
 /// GEMV with optional pre-rotated x for MagnumQuant weights.
 ///
 /// - MQ4 + `x_rot = Some(..)`: calls the arch-tuned HFQ4 GEMV on the pre-rotated buffer,
@@ -7930,13 +7977,12 @@ pub fn sample_top_k_p(
     top_k: Option<u32>,
     min_p: Option<f32>,
 ) -> u32 {
-    use std::sync::atomic::Ordering;
-    let mut state = SAMPLER_STATE.load(Ordering::Relaxed);
+    let mut state = sampler_state_load();
     if state == 0 {
         state = time_seed_rng_state();
     }
     let token = sample_top_k_p_with_state(logits, temperature, top_p, top_k, min_p, &mut state);
-    SAMPLER_STATE.store(state, Ordering::Relaxed);
+    sampler_state_store(state);
     token
 }
 
@@ -8496,13 +8542,11 @@ pub fn sample_top_p_from_candidates(
 /// to run two samplers against the same seed so token differences reflect
 /// real divergence and not just RNG stream drift.
 pub fn sampler_rng_snapshot() -> u32 {
-    use std::sync::atomic::Ordering;
-    SAMPLER_STATE.load(Ordering::Relaxed)
+    sampler_state_load()
 }
 
 pub fn sampler_rng_restore(state: u32) {
-    use std::sync::atomic::Ordering;
-    SAMPLER_STATE.store(state, Ordering::Relaxed);
+    sampler_state_store(state);
 }
 
 /// hunt3 M-E: deterministic per-request reset entry point for the CPU sampler
@@ -8512,20 +8556,51 @@ pub fn sampler_rng_restore(state: u32) {
 /// Note: `simple_rand` treats a stored 0 as "seed from time"; we map a 0 seed to
 /// 1 so the reset stays deterministic. The RNG algorithm itself is unchanged.
 pub fn reset_cpu_sampler_rng(seed: u32) {
-    use std::sync::atomic::Ordering;
     let s = if seed == 0 { 1 } else { seed };
-    SAMPLER_STATE.store(s, Ordering::Relaxed);
+    sampler_state_store(s);
 }
 
+#[cfg(not(test))]
 use std::sync::atomic::AtomicU32;
+#[cfg(not(test))]
 static SAMPLER_STATE: AtomicU32 = AtomicU32::new(0);
 
-/// Test-only exclusive hold on `SAMPLER_STATE`. The RNG is process-global and
-/// `cargo test` runs every test in the crate's lib binary on parallel threads,
-/// so ANY test in ANY module that resets or draws from the CPU sampler RNG
-/// must hold this guard for its whole reset→draw→assert span; otherwise a
-/// sibling's `simple_rand` advances the state mid-stream. Poison is ignored:
-/// the guarded value is `()`, and a failing test must not cascade into
+#[cfg(not(test))]
+#[inline]
+fn sampler_state_load() -> u32 {
+    SAMPLER_STATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn sampler_state_store(state: u32) {
+    SAMPLER_STATE.store(state, std::sync::atomic::Ordering::Relaxed);
+}
+
+// Under `cargo test` the state is per thread: every test runs on its own thread,
+// so a test that draws from the CPU sampler without holding
+// `sampler_rng_test_guard` can no longer advance another test's stream mid-run.
+// Production keeps the single process-global state above.
+#[cfg(test)]
+thread_local! {
+    static SAMPLER_STATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn sampler_state_load() -> u32 {
+    SAMPLER_STATE.with(|s| s.get())
+}
+
+#[cfg(test)]
+fn sampler_state_store(state: u32) {
+    SAMPLER_STATE.with(|s| s.set(state));
+}
+
+/// Test-only exclusive hold on the CPU sampler RNG. Under `cargo test` the
+/// state is already per thread (see `sampler_state_load`), so a sibling test can
+/// no longer advance it mid-stream; the guard still serializes tests that also
+/// touch other process-global sampler configuration. Poison is ignored: the
+/// guarded value is `()`, and a failing test must not cascade into
 /// `PoisonError`s in every later RNG test.
 #[cfg(test)]
 pub(crate) fn sampler_rng_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -8564,15 +8639,13 @@ fn time_seed_rng_state() -> u32 {
 /// Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampling.
 /// State lives in SAMPLER_STATE so that HIPFIRE_SAMPLE_COMPARE can snapshot/restore it.
 fn simple_rand() -> f32 {
-    use std::sync::atomic::Ordering;
-
     // Seed from time on first call
-    let mut s = SAMPLER_STATE.load(Ordering::Relaxed);
+    let mut s = sampler_state_load();
     if s == 0 {
         s = time_seed_rng_state();
     }
     let r = xorshift32_unit(&mut s);
-    SAMPLER_STATE.store(s, Ordering::Relaxed);
+    sampler_state_store(s);
     r
 }
 

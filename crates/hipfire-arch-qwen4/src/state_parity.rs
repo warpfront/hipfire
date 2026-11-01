@@ -2461,70 +2461,7 @@ pub fn run_mtp_head_d2_probe(model_path: &Path, max_seq: usize) -> Result<Value,
         })
     }
 
-    let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
-        .map_err(|error| format!("open {}: {error}", model_path.display()))?;
-    let mut gpu =
-        Gpu::init().map_err(|error| format!("hardware probe requires HIP GPU: {error}"))?;
-    let receipt = {
-        attach_state_validation_rows(
-            &mut hfq,
-            model_path,
-            hipfire_config::memory::ple_format(),
-            &gpu.arch,
-        )?;
-        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
-    }
-    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
-    let scratch_mode = crate::artifact::source_forward_scratch_mode(
-        &gpu,
-        &hfq,
-        &receipt.config,
-        &receipt.manifest,
-    )
-    .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
-    if gpu.is_uma() {
-        hfq.drop_mmap();
-    }
-    let mesh =
-        hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
-    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
-    let use_ranges = gpu.is_uma();
-    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
-    let weights = oracle_expert_placement(&gpu, &receipt.manifest.weights)?;
-    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &weights,
-        &mesh,
-        receipt.config.num_hidden_layers,
-        &mut gpu,
-        expected,
-        |entry| {
-            qwen4_oracle_payload(
-                &source,
-                &receipt.manifest.identity.recipe,
-                entry,
-                use_ranges,
-            )
-        },
-    )
-    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
-    let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
-        receipt.config,
-        &receipt.manifest.identity.recipe,
-        transaction,
-        &receipt.placements,
-        &mut gpu,
-        max_seq,
-        receipt.ple,
-        receipt.ple_rows,
-        crate::state::Qwen4StateFormat::F32,
-        backend,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
-    bundle
-        .attach_forward(&mut gpu, max_seq, scratch_mode)
-        .map_err(|error| error.to_string())?;
+    let (mut gpu, mut bundle) = load_probe_bundle_with_forward(model_path, max_seq)?;
     let before = trunk(&bundle);
     bundle
         .attach_mtp(&mut gpu, max_seq)
@@ -2598,6 +2535,175 @@ pub fn run_mtp_head_d2_probe(model_path: &Path, max_seq: usize) -> Result<Value,
         "capture_ok": captured.is_ok(),
         "capture_error": captured.err(),
     }))
+}
+
+/// What [`run_mtp_head_reference_pin_gpu`] reads back from the GPU head.
+#[derive(Clone, Debug)]
+pub struct MtpHeadPinGpu {
+    /// The head's own draft after the step (`mtp_forward_token`).
+    pub draft: u32,
+    /// The same draft head applied to the caller's reference collapsed hidden.
+    pub draft_from_reference: u32,
+    /// Collapsed hidden `[H]` (the final HC read feeding the draft).
+    pub collapsed: Vec<f32>,
+    /// Wide hidden `[4H]` after the step.
+    pub wide: Vec<f32>,
+}
+
+/// One input of [`run_mtp_head_reference_pin_gpu`].
+#[derive(Clone, Debug)]
+pub struct MtpHeadPinCase {
+    /// Head input token.
+    pub token: u32,
+    /// Backbone hidden `[4H]` (a draft depth-1 / prompt-fill row), or `None`
+    /// for a chained step that consumes the head's own previous wide output.
+    pub backbone: Option<Vec<f32>>,
+    /// The CPU reference's collapsed hidden for this step, ranked by the
+    /// production draft head.
+    pub reference_collapsed: Vec<f32>,
+}
+
+/// Production head steps at positions `0..cases.len()` on a real Flash-Next
+/// artifact: a case with a backbone is a step-0 row with a fresh QSA
+/// selection, a case without one a chained step reusing it. Per case, reads
+/// back the head's draft, collapsed and wide hidden and the draft head's
+/// ranking of the case's reference collapsed hidden. Pins
+/// `reference_mtp::mtp_forward_step` against the GPU lowering
+/// (`tests/mtp_head_reference_pin_hw.rs`).
+pub fn run_mtp_head_reference_pin_gpu(
+    model_path: &Path,
+    max_seq: usize,
+    cases: &[MtpHeadPinCase],
+) -> Result<Vec<MtpHeadPinGpu>, String> {
+    let (mut gpu, mut bundle) = load_probe_bundle_with_forward(model_path, max_seq)?;
+    bundle
+        .attach_mtp(&mut gpu, max_seq)
+        .map_err(|error| error.to_string())?;
+    map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
+    let hidden_size = bundle.config.hidden_size;
+    let wide_size = bundle.config.hc_count * hidden_size;
+    let mut results = Vec::with_capacity(cases.len());
+    for (position, case) in cases.iter().enumerate() {
+        if case.reference_collapsed.len() != hidden_size
+            || case.backbone.as_ref().is_some_and(|b| b.len() != wide_size)
+        {
+            return Err(format!("pin case {position}: input widths"));
+        }
+        let backbone = case
+            .backbone
+            .as_ref()
+            .map(|b| gpu.upload_f32(b, &[wide_size]))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let reference = gpu
+            .upload_f32(&case.reference_collapsed, &[hidden_size])
+            .map_err(|error| error.to_string())?;
+        let step = (|| -> Result<MtpHeadPinGpu, String> {
+            let draft = bundle
+                .mtp_forward_token(
+                    &mut gpu,
+                    case.token,
+                    backbone.as_ref(),
+                    position,
+                    backbone.is_some(),
+                )
+                .map_err(|error| error.to_string())?;
+            let mtp = bundle.mtp.as_mut().ok_or("MTP head not attached")?;
+            let (collapsed, wide) = mtp
+                .download_head_outputs(&gpu)
+                .map_err(|error| error.to_string())?;
+            let draft_from_reference = mtp
+                .draft_from_hidden(&mut gpu, &bundle.weights, &reference)
+                .map_err(|error| error.to_string())?;
+            Ok(MtpHeadPinGpu {
+                draft,
+                draft_from_reference,
+                collapsed,
+                wide,
+            })
+        })();
+        if let Some(backbone) = backbone {
+            let _ = gpu.free_tensor(backbone);
+        }
+        let _ = gpu.free_tensor(reference);
+        results.push(step?);
+    }
+    Ok(results)
+}
+
+/// Load a Flash-Next artifact the way the hardware oracles do (admission,
+/// fixed expert placement, manifest fulfillment, trunk forward attached) and
+/// return the GPU with its bundle, before the MTP head is attached.
+fn load_probe_bundle_with_forward(
+    model_path: &Path,
+    max_seq: usize,
+) -> Result<(Gpu, crate::bundle::Qwen4Bundle), String> {
+    use crate::bundle::Qwen4Bundle;
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
+        .map_err(|error| format!("open {}: {error}", model_path.display()))?;
+    let mut gpu =
+        Gpu::init().map_err(|error| format!("hardware probe requires HIP GPU: {error}"))?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    if gpu.is_uma() {
+        hfq.drop_mmap();
+    }
+    let mesh =
+        hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
+    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
+    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let weights = oracle_expert_placement(&gpu, &receipt.manifest.weights)?;
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
+        &weights,
+        &mesh,
+        receipt.config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            qwen4_oracle_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+                use_ranges,
+            )
+        },
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let backend = Qwen4KvBackend::automatic(&gpu);
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
+        receipt.config,
+        &receipt.manifest.identity.recipe,
+        transaction,
+        &receipt.placements,
+        &mut gpu,
+        max_seq,
+        receipt.ple,
+        receipt.ple_rows,
+        crate::state::Qwen4StateFormat::F32,
+        backend,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    bundle
+        .attach_forward(&mut gpu, max_seq, scratch_mode)
+        .map_err(|error| error.to_string())?;
+    Ok((gpu, bundle))
 }
 
 /// The hardware oracles' routed-expert placement: every expert resident

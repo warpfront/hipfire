@@ -809,6 +809,92 @@ fn write_hfq_to(
     Ok(())
 }
 
+/// One tensor index record for [`write_hfq_streamed`]; the payload is produced
+/// by the caller's emitter in index order.
+#[derive(Debug, Clone)]
+pub(crate) struct HfqIndexEntry {
+    pub(crate) name: String,
+    pub(crate) quant_type: u8,
+    pub(crate) shape: Vec<u32>,
+    pub(crate) group_size: u32,
+    pub(crate) data_len: u64,
+}
+
+/// Write an HFQ container whose tensor payloads are streamed by `emit`
+/// (called once per entry, in index order, and required to write exactly
+/// `entries[i].data_len` bytes). Same container layout and atomic
+/// tmp + fsync + rename discipline as [`write_hfq`]; no payload is held in RAM.
+pub(crate) fn write_hfq_streamed(
+    path: &Path,
+    arch: u32,
+    metadata_json: &str,
+    entries: &[HfqIndexEntry],
+    mut emit: impl FnMut(usize, &mut File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Seek;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let result = File::create(&tmp).and_then(|mut f| {
+        let metadata_bytes = metadata_json.as_bytes();
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata_bytes.len() as u64;
+        let mut index_bytes = Vec::new();
+        index_bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            let name_bytes = e.name.as_bytes();
+            index_bytes.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            index_bytes.extend_from_slice(name_bytes);
+            index_bytes.push(e.quant_type);
+            index_bytes.push(e.shape.len() as u8);
+            for &d in &e.shape {
+                index_bytes.extend_from_slice(&d.to_le_bytes());
+            }
+            index_bytes.extend_from_slice(&e.group_size.to_le_bytes());
+            index_bytes.extend_from_slice(&e.data_len.to_le_bytes());
+        }
+        let data_start_unaligned = index_offset + index_bytes.len() as u64;
+        let data_offset = (data_start_unaligned + 4095) & !4095;
+
+        f.write_all(HFQ_MAGIC)?;
+        f.write_all(&HFQ_VERSION.to_le_bytes())?;
+        f.write_all(&arch.to_le_bytes())?;
+        f.write_all(&(entries.len() as u32).to_le_bytes())?;
+        f.write_all(&metadata_offset.to_le_bytes())?;
+        f.write_all(&data_offset.to_le_bytes())?;
+        f.write_all(metadata_bytes)?;
+        f.write_all(&index_bytes)?;
+        f.write_all(&vec![0u8; (data_offset - data_start_unaligned) as usize])?;
+
+        let mut expect = data_offset;
+        for (i, e) in entries.iter().enumerate() {
+            emit(i, &mut f)?;
+            expect += e.data_len;
+            let pos = f.stream_position()?;
+            if pos != expect {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "tensor `{}`: emitter wrote {} bytes, index says {}",
+                        e.name,
+                        pos + e.data_len - expect,
+                        e.data_len
+                    ),
+                ));
+            }
+        }
+        f.flush()?;
+        f.sync_all()
+    });
+    match result.and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod maple_dtype_tests {
     use super::*;

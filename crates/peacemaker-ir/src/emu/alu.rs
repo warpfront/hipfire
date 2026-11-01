@@ -284,6 +284,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         _ if name.starts_with("v_dot") => super::dot::execute(arch, name, i, s),
         _ if super::wide::handles(name) => super::wide::execute(arch, name, i, s),
         "v_permlane16_b32" | "v_permlanex16_b32" => permlane(name, i, s),
+        "v_movreld_b32_e32" => movreld(i, s),
         "v_div_scale_f32" => div_scale(arch, i, s),
         "v_s_rcp_f32" => udiv_scalar_rcp(arch, i, s),
         "v_add_co_u32" | "v_add_co_ci_u32_e64" | "v_add_co_ci_u32_e32" => add_carry(name, i, s),
@@ -1646,6 +1647,34 @@ fn vector(
     })
 }
 
+/// `v_movreld_b32`: `VGPR[laneId][DST + M0] = SRC0` for every active lane (RDNA3 ISA V_MOVRELD_B32; the
+/// indexed-VGPR store the compiler emits for a runtime-indexed private array held in registers).
+fn movreld(i: &Inst, s: &mut State) -> Result<()> {
+    let o = &i.operands;
+    plain(i)?;
+    let Some(Operand::Reg(d)) = o.first() else {
+        return Err("v_movreld_b32: DST must be a VGPR".into());
+    };
+    if d.kind != crate::reg::Kind::V {
+        return Err("v_movreld_b32: DST must be a VGPR".into());
+    }
+    let idx = u64::from(d.base) + u64::from(s.m0);
+    if idx >= 256 {
+        return Err(format!("v_movreld_b32: v{idx} is outside the VGPR file"));
+    }
+    let src = o.get(1).ok_or("missing vector operand")?;
+    let mut vals = [None; 64];
+    for lane in active(s) {
+        vals[lane] = Some(s.read(src, lane, 0)?);
+    }
+    for (lane, v) in vals.into_iter().enumerate() {
+        if let Some(v) = v {
+            s.v[idx as usize][lane] = v;
+        }
+    }
+    Ok(())
+}
+
 fn cvt_pk_f32_fp8(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
     let mut out = [None; 64];
@@ -2571,6 +2600,8 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         "s_min_u32" => (a.min(b), Some(a < b)),
         "s_max_u32" => (a.max(b), Some(a >= b)),
         "s_ctz_i32_b32" => (if a == 0 { u32::MAX } else { a.trailing_zeros() }, None),
+        // D.i32 = -1 when S0 has no one bit, else the count of leading zeros of S0.u32; SCC is untouched.
+        "s_clz_i32_u32" => (if a == 0 { u32::MAX } else { a.leading_zeros() }, None),
         "s_sext_i32_i8" => (a as u8 as i8 as i32 as u32, None),
         "s_nor_b32" => nonzero(!(a | b)),
         // D0.u32[S0.u32[4:0]] = 1: the destination is read-modify-write, SCC is untouched.
@@ -3868,6 +3899,25 @@ mod tests {
         st.s[1] = u32::MAX - 1; // -2: the unbounded buffer-descriptor size 0x7fffffff
         run("s_brev_b32", &i, &mut st).unwrap();
         assert_eq!(st.s[0], 0x7fff_ffff);
+    }
+
+    #[test]
+    fn s_clz_i32_u32_counts_leading_zeros_minus_one_for_zero_and_keeps_scc() {
+        let i = insn("s_clz_i32_u32", vec![sreg(0), sreg(1)]);
+        let mut st = state();
+        st.scc = true;
+        for (x, want) in [
+            (1u32, 31u32),
+            (0x10, 27),
+            (0x8000_0000, 0),
+            (u32::MAX, 0),
+            (0, u32::MAX),
+        ] {
+            st.s[1] = x;
+            run("s_clz_i32_u32", &i, &mut st).unwrap();
+            assert_eq!(st.s[0], want, "clz({x:#x})");
+            assert!(st.scc);
+        }
     }
 
     #[test]

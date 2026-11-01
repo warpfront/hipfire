@@ -852,6 +852,7 @@ pub enum GenerationRoute {
     LfmAr,
     LfmSpec,
     RaonAr,
+    RaonSpec,
     LlamaAr,
     LlamaSpec,
     GlimmerAr,
@@ -884,6 +885,7 @@ impl GenerationRoute {
         Self::LfmAr,
         Self::LfmSpec,
         Self::RaonAr,
+        Self::RaonSpec,
         Self::LlamaAr,
         Self::LlamaSpec,
         Self::GlimmerAr,
@@ -896,7 +898,10 @@ impl GenerationRoute {
     /// Proven semantic-safe producers for non-empty tools.
     /// Exactly: Qwen AR, Qwen4 AR, Qwen4 native MTP, Qwen DFlash/spec, DS4 AR,
     /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR, Gemma 4, Raon AR
-    /// (`generate_raon`: shared `QwenArSemanticProducer` XML tool router).
+    /// and Raon spec (`generate_raon` / `generate_raon_spec`: the shared
+    /// `QwenArSemanticProducer` XML tool router, and the same router over the
+    /// committed tokens of the DFlash2 spec loop through the Raon carrier's
+    /// `SpecEmit`, tool-call grammar off).
     ///
     /// `Qwen4Spec` runs the same `<tool_call>` router (`Qwen35Emit` via the
     /// Qwen4 carrier) over committed tokens that `Qwen4Ar` runs through
@@ -936,6 +941,7 @@ impl GenerationRoute {
                 | Self::GlimmerSpec
                 | Self::MapleAr
                 | Self::RaonAr
+                | Self::RaonSpec
                 | Self::Gemma4Ar
         )
     }
@@ -946,12 +952,18 @@ impl GenerationRoute {
     /// `generate_ar_with_forward`'s `QwenArSemanticProducer`, native MTP via
     /// `Qwen35Emit`). Each matches only the answer channel, holds a possible
     /// stop prefix back, and never emits the stop text. `RaonAr` rides the
-    /// same `generate_ar_with_forward` producer as Qwen4 AR. Every other route
+    /// same `generate_ar_with_forward` producer as Qwen4 AR, and `RaonSpec`
+    /// the `Qwen35Emit` matcher like `Qwen4Spec`. Every other route
     /// would ignore `stop` or leak it, so `generate` refuses it.
     pub const fn supports_stop(self) -> bool {
         matches!(
             self,
-            Self::QwenAr | Self::Qwen4Ar | Self::Qwen4Spec | Self::QwenDflash | Self::RaonAr
+            Self::QwenAr
+                | Self::Qwen4Ar
+                | Self::Qwen4Spec
+                | Self::QwenDflash
+                | Self::RaonAr
+                | Self::RaonSpec
         )
     }
 
@@ -988,6 +1000,7 @@ impl GenerationRoute {
             Self::LfmSpec => "lfm_spec",
             Self::LlamaAr => "llama_ar",
             Self::RaonAr => "raon_ar",
+            Self::RaonSpec => "raon_spec",
             Self::LlamaSpec => "llama_spec",
             Self::GlimmerAr => "glimmer_ar",
             Self::GlimmerSpec => "glimmer_spec",
@@ -1365,6 +1378,7 @@ define_route_start!(minimax_spec_route_start, 10);
 define_route_start!(lfm_ar_route_start, 11);
 define_route_start!(lfm_spec_route_start, 11);
 define_route_start!(raon_ar_route_start, 19);
+define_route_start!(raon_spec_route_start, 19);
 define_route_start!(llama_ar_route_start, 0);
 define_route_start!(llama_spec_route_start, 0);
 define_route_start!(glimmer_ar_route_start, 14);
@@ -1396,6 +1410,7 @@ define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec
 define_route_terminal!(lfm_ar_route_terminal, GenerationRoute::LfmAr);
 define_route_terminal!(lfm_spec_route_terminal, GenerationRoute::LfmSpec);
 define_route_terminal!(raon_ar_route_terminal, GenerationRoute::RaonAr);
+define_route_terminal!(raon_spec_route_terminal, GenerationRoute::RaonSpec);
 define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
 define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
 define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
@@ -1506,6 +1521,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: raon_ar_route_start,
             terminal: raon_ar_route_terminal,
+        },
+        GenerationRoute::RaonSpec => GenerationRouteAdapter {
+            route,
+            start: raon_spec_route_start,
+            terminal: raon_spec_route_terminal,
         },
         GenerationRoute::LlamaAr => GenerationRouteAdapter {
             route,
@@ -1689,6 +1709,11 @@ pub struct GenerationRouteInputs {
     /// The loaded speculator is the shared DFlash2 drafter (`name() ==
     /// "dflash2"`), the one non-MTP speculator a Qwen4 load admits.
     pub speculator_is_dflash2: bool,
+    /// The loaded speculator reproduces AR under non-neutral penalties
+    /// ([`hipfire_runtime::spec::Speculator::supports_penalties`]). Only the
+    /// Raon route reads it today: a penalized request stays on that arch's
+    /// AR producer unless the speculator penalizes its verify rows.
+    pub speculator_supports_penalties: bool,
     pub deepseek4_spec_requested: bool,
     pub ngram_can_sample: bool,
     pub temp: f32,
@@ -1830,10 +1855,34 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         // speculator built by the carrier must NOT change the route — an
         // arch-15 turn is always plain AR.
         15 => return GenerationRoute::MapleAr,
-        // Raon-1-mini (arch 19). Single-GPU AR only: the carrier declares no
-        // speculator, no PP/TP/EP and no continuous batching, so a speculator
-        // can never change this route.
-        19 => return GenerationRoute::RaonAr,
+        // Raon-1-mini (arch 19). Single-GPU only (no PP/TP/EP, no continuous
+        // batching), so the choice is the AR producer or the DFlash2 spec
+        // route. The shared DFlash2 drafter (`--spec dflash`, opt-in) verifies
+        // greedy picks, or sampled rows with the selector-chain nucleus law,
+        // and penalizes every verify row with the generated-only history AR's
+        // sampler sees (`Speculator::supports_penalties`), so a penalized
+        // request keeps the spec route when the loaded speculator says so:
+        // `nonneutral_penalties` counts the card's presence default that the
+        // AR producer adds to an unset sampled request
+        // (`RaonSampling::penalized_after_defaults`), which is nearly every
+        // default request. A speculator without penalties keeps it on AR, as
+        // does any other speculator.
+        19 => {
+            let dflash2_ok = i.speculator_is_dflash2
+                && i.pp <= 1
+                && (!i.nonneutral_penalties || i.speculator_supports_penalties)
+                && (i.temp <= 1e-6 || (i.supports_temp_swor && i.supports_chain_nucleus_verify));
+            let spec_ok = i.has_speculator
+                && dflash2_ok
+                && !i.force_ar_chat
+                && !i.temp_spec_env_off
+                && !i.kv_adaptive;
+            return if spec_ok {
+                GenerationRoute::RaonSpec
+            } else {
+                GenerationRoute::RaonAr
+            };
+        }
         // Gemma 4. One route: the EAGLE speculator is a developer opt-in
         // (`HIPFIRE_GEMMA4_EAGLE=1`) decided inside `generate_gemma4` after
         // tokenization, and it never takes a tools request, so a tool turn is
@@ -2094,8 +2143,12 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // (and any decode capture/record): map context ahead for the whole
     // `max_tokens` budget (AR: no draft rows). Best effort; the model logs
     // and swallows a failure, leaving on-demand growth.
-    if let Some(state) = m.state.as_deref_mut() {
-        state.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, 0);
+    match (m.state.as_deref_mut(), m.pp_gpus.as_mut()) {
+        (Some(state), Some(gpus)) if state.owns_mesh_lifecycle() => {
+            state.map_ahead_for_decode_mesh(gpu, gpus, prompt_tokens.len(), max_tokens, 0)
+        }
+        (Some(state), _) => state.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, 0),
+        (None, _) => {}
     }
     let sampler_config = SamplerConfig {
         temperature: temp,
@@ -2562,14 +2615,35 @@ pub fn generate(
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
+        speculator_supports_penalties: m
+            .speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_penalties()),
         deepseek4_spec_requested: deepseek4_spec_requested(m),
         ngram_can_sample,
         temp,
         user_explicit_sampling,
         min_p,
+        // Raon: the AR producer adds the card's presence default to an unset
+        // sampled request, so those are penalized as far as route selection
+        // (which speculators may serve them) is concerned.
         nonneutral_penalties: repeat_penalty != 1.0
             || presence_penalty != 0.0
-            || frequency_penalty != 0.0,
+            || frequency_penalty != 0.0
+            || m.raon().is_some_and(|b| {
+                crate::raon::RaonSampling {
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    user_explicit: user_explicit_sampling,
+                }
+                .penalized_after_defaults(&b.config.generation)
+            }),
         force_ar_chat: hipfire_config::developer_var("HIPFIRE_DFLASH_CHAT")
             .ok()
             .as_deref()
@@ -3127,6 +3201,50 @@ pub fn generate(
                     frequency_penalty,
                     user_explicit: user_explicit_sampling,
                 },
+                max_tokens,
+                max_think_tokens,
+                stop,
+                enable_thinking,
+            );
+            return;
+        }
+        GenerationRoute::RaonSpec => {
+            // Arch 19 (Raon-1-mini) with the shared DFlash2 drafter. The
+            // shared spec body drives the turn; the adapter renders the same
+            // prompt and samples with the same resolved controls as
+            // `RaonAr`, and a speculative capacity miss falls through to it.
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                think_mode,
+                logprobs_top_k,
+                reasoning_effort,
+            );
+            crate::raon::generate_raon_spec(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                messages_history,
+                tools,
+                crate::raon::RaonSampling {
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    user_explicit: user_explicit_sampling,
+                },
+                cactus_delta,
+                request_seed as u64,
                 max_tokens,
                 max_think_tokens,
                 stop,
@@ -4002,6 +4120,14 @@ pub fn generate(
     };
 
     // ── Prompt cache (LCP-based) — Qwen3.5/3.6 only ──────────────────────
+    //
+    // This is the Qwen3.5/3.6 AR body's own live-extension cache (DeltaNet
+    // state continued from decode, session-exact). Other architectures reuse
+    // prompts through the engine session cache contract
+    // (`hipfire_runtime::session_cache::SessionState` + `SessionDriver`:
+    // Qwen4, Gemma 4, Raon-1-mini), which an arch implements by describing its
+    // cumulative state (fixed parts + append-only rows), its live position and
+    // the cold-prefill boundaries where a snapshot is canonical.
     //
     // Mirrors V4F's prefix-cache (daemon.rs ~5390). Eligible when:
     //   - HIPFIRE_QWEN_PROMPT_CACHE != "0"  (default on)
@@ -7146,6 +7272,7 @@ mod qwen4_pp_route_tests {
             has_speculator: false,
             speculator_is_mtp: false,
             speculator_is_dflash2: false,
+            speculator_supports_penalties: false,
             deepseek4_spec_requested: false,
             ngram_can_sample: false,
             temp: 0.0,

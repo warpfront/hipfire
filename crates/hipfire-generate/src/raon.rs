@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Raon-1-mini-preview (arch 19, `GenerationRoute::RaonAr`) serving body.
+//! Raon-1-mini-preview (arch 19, `GenerationRoute::RaonAr` / `RaonSpec`) serving
+//! body.
 //!
 //! A deliberately small adapter. Everything with a wire contract is the shared
 //! engine's: [`crate::ar::generate_ar_with_forward`] owns the
@@ -20,8 +21,15 @@
 //!   appended);
 //! * the `generation_config.json` sampling defaults and the generated-only
 //!   presence penalty ([`RaonSampling::resolve`]);
-//! * the two bundle callbacks (batched prefill in bounded chunks, one decode
-//!   step per token) that hand logits to the shared body.
+//! * the two bundle callbacks (batched prefill through the bundle's session
+//!   cache in bounded chunks, one decode step per token) that hand logits to
+//!   the shared body; prior turns and shared prefixes (system prompt, tools)
+//!   restore cold-exact prefill snapshots from the engine session cache
+//!   (`memory.session_cache_bytes`), so a hit is byte-identical to a cold
+//!   prefill, and decoded rows are recomputed;
+//! * the speculative adapter [`generate_raon_spec`]: the shared DFlash2 body
+//!   ([`crate::qwen::generate_dflash`]) serves the same turn, from the same
+//!   prompt tokens and sampling, under the same wire contract.
 //!
 //! Wire contract: semantic v2. The route emits typed `reasoning` / `token` /
 //! tool-call events through the router-backed producer, so the arch-19
@@ -34,7 +42,7 @@ use hipfire_runtime::tokenizer::Tokenizer;
 use std::io::Write;
 
 use crate::ar::{generate_ar_with_forward, GenerationRoute};
-use hipfire_engine::emit::render_assistant_prefix;
+use hipfire_engine::emit::{render_assistant_prefix, render_tail_opens_think};
 
 /// Request sampling knobs exactly as `generate` received them.
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +103,21 @@ impl RaonSampling {
             repeat_window: self.repeat_window.max(max_tokens),
         }
     }
+
+    /// Whether the AR producer runs a non-neutral repeat/presence/frequency
+    /// penalty for this request once [`Self::resolve`] has applied the model
+    /// defaults. Route selection reads this, not the request's raw penalties:
+    /// a sampled request that set nothing explicit is penalized by the card's
+    /// presence default, so it needs a speculator that penalizes its verify
+    /// rows ([`hipfire_runtime::spec::Speculator::supports_penalties`]).
+    pub fn penalized_after_defaults(
+        &self,
+        defaults: &hipfire_arch_raon::GenerationDefaults,
+    ) -> bool {
+        self.repeat_penalty != 1.0
+            || self.frequency_penalty != 0.0
+            || self.resolve(defaults, 0).presence_penalty != 0.0
+    }
 }
 
 /// A rendered, tokenized prompt plus the stream's starting channel.
@@ -119,12 +142,8 @@ fn message(role: Role, content: &str) -> Message {
     }
 }
 
-/// Render the official template over the whole conversation and tokenize it.
-///
-/// `started_in_think` comes from the rendered live assistant turn
-/// ([`render_assistant_prefix`]), never from `enable_thinking`, the request's
-/// `assistant_prefix`, or the tokenizer's token inventory.
-pub fn render_raon_prompt(
+/// Render the official template over the whole conversation to text.
+fn render_raon_text(
     tokenizer: &Tokenizer,
     template: &str,
     system_prompt: Option<&str>,
@@ -132,7 +151,7 @@ pub fn render_raon_prompt(
     messages_history: Option<&[Message]>,
     tools: Option<&[serde_json::Value]>,
     enable_thinking: bool,
-) -> Result<RaonPrompt, String> {
+) -> Result<String, String> {
     let frame = JinjaChatFrame {
         tokenizer,
         template,
@@ -157,9 +176,34 @@ pub fn render_raon_prompt(
         }
     };
     let tools = tools.filter(|t| !t.is_empty());
-    let text = frame
+    frame
         .render_messages(messages, tools, None)
-        .map_err(|e| format!("raon chat template render failed: {e}"))?;
+        .map_err(|e| format!("raon chat template render failed: {e}"))
+}
+
+/// Render the official template over the whole conversation and tokenize it.
+///
+/// `started_in_think` comes from the rendered live assistant turn
+/// ([`render_assistant_prefix`]), never from `enable_thinking`, the request's
+/// `assistant_prefix`, or the tokenizer's token inventory.
+pub fn render_raon_prompt(
+    tokenizer: &Tokenizer,
+    template: &str,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    messages_history: Option<&[Message]>,
+    tools: Option<&[serde_json::Value]>,
+    enable_thinking: bool,
+) -> Result<RaonPrompt, String> {
+    let text = render_raon_text(
+        tokenizer,
+        template,
+        system_prompt,
+        prompt,
+        messages_history,
+        tools,
+        enable_thinking,
+    )?;
     let started_in_think = render_assistant_prefix(&text) == AssistantPrefix::OpenThink;
     let tokens = tokenizer.encode(&text);
     Ok(RaonPrompt {
@@ -192,14 +236,27 @@ pub fn generate_raon(
     stop: &[String],
     enable_thinking: bool,
 ) {
-    let Some((vocab, eos_tokens, defaults, cap)) = m.raon().map(|b| {
-        (
-            b.config.vocab,
-            b.eos.clone(),
-            b.config.generation.clone(),
-            b.max_seq(),
-        )
-    }) else {
+    let Some((vocab, eos_tokens, defaults, cap)) = m
+        .raon()
+        .map(|b| {
+            (
+                b.config.vocab,
+                b.eos.clone(),
+                b.config.generation.clone(),
+                b.max_seq(),
+            )
+        })
+        .or_else(|| {
+            m.raon_mesh().map(|mesh| {
+                (
+                    mesh.dims().2,
+                    mesh.eos().to_vec(),
+                    mesh.generation().clone(),
+                    mesh.max_seq(),
+                )
+            })
+        })
+    else {
         raon_error(
             stdout,
             id,
@@ -272,10 +329,53 @@ pub fn generate_raon(
     }
 
     let resolved = sampling.resolve(&defaults, max_tokens);
-    // Prior turns reach the model through the rendered prompt, never through
-    // retained state (PLAN 3.5: no prefix hit until RDA+conv snapshots exist).
-    // The device reset itself runs inside the prefill callback, after
-    // `gen_start`, so a failed reset takes the one fail-closed terminal.
+    // Trace-only measurements, taken before the conversation mirror is
+    // cleared: how much of the previous turn the new render reproduces
+    // verbatim (what a live-extension cache could reuse) and how many prior
+    // assistant turns the turn cache still knows. The prompt is never changed
+    // (exact HF render parity; decoded rows are not reused).
+    let prev = m.conversation_tokens.len();
+    let lcp_prev = common_prefix_len(&m.conversation_tokens, &prompt_tokens);
+    let render_extends_prev = prev > 0 && lcp_prev == prev;
+    let (asst_turns, asst_fp_hits, asst_token_exact) =
+        asst_cache_probe(m, messages_history, &prompt_tokens);
+    // Prior turns and shared prefixes (system prompt, tools) reuse cold-exact
+    // prefill snapshots through the engine session cache
+    // (`memory.session_cache_bytes`): a hit restores the state a cold prefill
+    // of the same tokens leaves on the same chunk grid, so the output is
+    // byte-identical to a cold prefill. Decoded rows are never reused: they
+    // are recomputed by the batched prefill. Snapshots yield to this
+    // request's context growth first, so the plan never names a snapshot the
+    // release would then evict.
+    if let Some(b) = m.raon_mut() {
+        b.release_session_for_growth(gpu, prompt_tokens.len() + max_tokens + 1);
+    }
+    let reused = m.raon().map_or(0, |b| {
+        hipfire_runtime::arch_model::ArchModel::session_plan(
+            b,
+            &prompt_tokens,
+            hipfire_runtime::session_cache::SessionRoute::Ar,
+        )
+    });
+    let usage = m.raon().and_then(|b| b.session_usage());
+    let mib = |bytes: u64| bytes >> 20;
+    let (pool_mib, resident_mib, budget_mib) = match usage {
+        Some(u) => (
+            mib(u.pool_bytes).to_string(),
+            mib(u.resident_bytes).to_string(),
+            mib(u.budget_bytes).to_string(),
+        ),
+        None => ("off".to_string(), "off".to_string(), "off".to_string()),
+    };
+    eprintln!(
+        "[raon-cache] id={id} prompt={} reused={reused} prev={prev} lcp_prev={lcp_prev} \
+         render_extends_prev={render_extends_prev} asst_turns={asst_turns} \
+         asst_fp_hits={asst_fp_hits} asst_token_exact={asst_token_exact} \
+         pool_mib={pool_mib} resident_mib={resident_mib} budget_mib={budget_mib}",
+        prompt_tokens.len(),
+    );
+    // The device restore/reset itself runs inside the prefill callback, after
+    // `gen_start`, so a failed restore takes the one fail-closed terminal.
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
@@ -301,33 +401,48 @@ pub fn generate_raon(
         started_in_think,
         stop,
         tools.is_some_and(|t| !t.is_empty()),
-        // No prefix reuse: every prompt token is computed.
-        0,
+        // The prompt tokens the session plan restored from a snapshot; the
+        // prefill callback computes the rest.
+        reused,
         // The GPU penalty prepass is not wired for this arch: penalized greedy
         // downloads the row and samples on the host.
         false,
         true,
         |model, device, tokens, logits| {
+            if let Some((mesh, gpus)) = model.raon_mesh_mut() {
+                // Pipeline mesh: cold prefill (no session cache under pp), one
+                // drained epoch per chunk. The logits live on the last rank,
+                // which is the daemon's device (`OutputCardLast`), and the
+                // epoch drain orders them before the daemon-side copy.
+                mesh.reset(gpus)?;
+                mesh.prefill(gpus, tokens)?;
+                device.bind_thread().map_err(|e| e.to_string())?;
+                return copy_logits(device, mesh.logits(), logits, vocab);
+            }
             let bundle = model
                 .raon_mut()
                 .ok_or_else(|| "raon bundle disappeared before prefill".to_string())?;
-            bundle.reset(device)?;
-            let total = tokens.len();
-            let mut done = 0usize;
-            for chunk in tokens.chunks(hipfire_arch_raon::PREFILL_SCRATCH_ROWS) {
-                bundle.prefill(device, chunk)?;
-                done += chunk.len();
-                hipfire_runtime::prefill_progress::report(done, total);
-            }
+            bundle.session_prefill(device, tokens, reused)?;
             copy_logits(device, bundle.logits(), logits, vocab)
         },
         |model, device, token, logits| {
             let token = match token {
                 Some(t) => t,
-                None => device
-                    .argmax_f32(logits, vocab)
-                    .map_err(|e| format!("raon logits argmax failed: {e}"))?,
+                // Greedy token: argmax kernel on the decode stream and a 4-byte
+                // readback ordered on it (no per-token null-stream hop, no
+                // per-token malloc/free).
+                None => rdna_compute::tensor_ops::argmax_f32_host_stream_ordered(
+                    device,
+                    &logits.sub_offset(0, vocab),
+                )
+                .map_err(|e| format!("raon logits argmax failed: {e}"))?,
             };
+            if let Some((mesh, gpus)) = model.raon_mesh_mut() {
+                mesh.decode_step(gpus, token)?;
+                device.bind_thread().map_err(|e| e.to_string())?;
+                copy_logits(device, mesh.logits(), logits, vocab)?;
+                return Ok(token);
+            }
             let bundle = model
                 .raon_mut()
                 .ok_or_else(|| "raon bundle disappeared during decode".to_string())?;
@@ -335,8 +450,223 @@ pub fn generate_raon(
             copy_logits(device, bundle.logits(), logits, vocab)?;
             Ok(token)
         },
-        |_| {},
+        |model| {
+            if let Some(b) = model.raon_mut() {
+                hipfire_runtime::arch_model::ArchModel::session_commit(b);
+            }
+        },
     );
+}
+
+/// The shared speculative body classifies the opening channel from the
+/// rendered tail ([`render_tail_opens_think`]); the AR route classifies the
+/// live turn ([`render_assistant_prefix`]). A render on which the two
+/// disagree would start the two routes in different channels, so it is
+/// served by the AR route.
+fn spec_start_channel_matches_ar(rendered: &str) -> bool {
+    (render_assistant_prefix(rendered) == AssistantPrefix::OpenThink)
+        == render_tail_opens_think(rendered)
+}
+
+/// Whether the shared speculative body renders this request to exactly the
+/// prompt [`generate_raon`] renders. It always uses the model's Jinja
+/// template when `HIPFIRE_JINJA_CHAT` allows it and the model has one, and
+/// falls back to plain ChatML on a render error: a request that would take
+/// either of those differences, or whose start channel is classified
+/// differently, must run on the AR route.
+fn spec_prompt_matches_ar(
+    m: &LoadedModel,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    messages_history: Option<&[Message]>,
+    tools: Option<&[serde_json::Value]>,
+    enable_thinking: bool,
+) -> bool {
+    if hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        == Some("0")
+    {
+        return false;
+    }
+    let (Some(tokenizer), Some(template)) = (m.tokenizer.as_ref(), m.chat_template.as_deref())
+    else {
+        return false;
+    };
+    render_raon_text(
+        tokenizer,
+        template,
+        system_prompt,
+        prompt,
+        messages_history,
+        tools,
+        enable_thinking,
+    )
+    .is_ok_and(|text| spec_start_channel_matches_ar(&text))
+}
+
+/// Serve one Raon-1-mini turn on `GenerationRoute::RaonSpec`: the shared
+/// DFlash2 body ([`crate::qwen::generate_dflash`]) drives the spec loop and
+/// owns the wire lifecycle (`gen_start` contract v2, reasoning/tool events
+/// through the arch carrier's `SpecEmit`, stop handling, one terminal), and
+/// this adapter makes it commit the turn [`generate_raon`] would:
+///
+/// * the prompt is the same render: blank system prompts, empty histories and
+///   empty tool lists are dropped exactly as [`render_raon_text`] drops them,
+///   no `reasoning_effort` is forwarded (the template reads none), and a
+///   request the shared body would render differently
+///   ([`spec_prompt_matches_ar`]) takes the AR route;
+/// * the speculative route prefills cold and never touches the session
+///   cache (the AR route reuses cold-exact session snapshots): the device
+///   state (the bundle's public reset also forgets the live session state),
+///   the conversation mirror and the assistant-turn cache are cleared first,
+///   so the shared body plans a cold prefill of the full render and never
+///   splices cached tokens into it;
+/// * the sampling is the AR route's: `top_k` and the presence penalty after
+///   the card defaults ([`RaonSampling::resolve`]), the penalty window sized
+///   to cover the generation, and the penalties over the generated tokens
+///   only (the shared body installs `SpecRequestConfig::penalty_generated_only`
+///   for Raon, as [`generate_raon`] runs `penalty_generated_only`); route
+///   selection admits a penalized request here only for a speculator that
+///   penalizes its verify rows.
+///
+/// A speculative context-capacity miss emitted nothing, and falls through to
+/// [`generate_raon`].
+#[allow(clippy::too_many_arguments)]
+pub fn generate_raon_spec(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    messages_history: Option<&[Message]>,
+    tools: Option<&[serde_json::Value]>,
+    sampling: RaonSampling,
+    cactus_delta: f32,
+    request_seed: u64,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    stop: &[String],
+    enable_thinking: bool,
+) {
+    let ar = |m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout| {
+        generate_raon(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            messages_history,
+            tools,
+            sampling,
+            max_tokens,
+            max_think_tokens,
+            stop,
+            enable_thinking,
+        )
+    };
+    let Some(defaults) = m.raon().map(|b| b.config.generation.clone()) else {
+        return ar(m, gpu, stdout);
+    };
+    if !spec_prompt_matches_ar(
+        m,
+        system_prompt,
+        prompt,
+        messages_history,
+        tools,
+        enable_thinking,
+    ) {
+        return ar(m, gpu, stdout);
+    }
+    let resolved = sampling.resolve(&defaults, max_tokens);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    m.asst_turn_cache.clear();
+    // The speculative prefill and verify windows may grow the context up to
+    // the reserved rows: session snapshots (kept for the AR route) yield first.
+    if let Some(b) = m.raon_mut() {
+        let cap = b.max_seq();
+        b.release_session_for_growth(gpu, cap);
+    }
+    if crate::qwen::generate_dflash(
+        m,
+        gpu,
+        stdout,
+        id,
+        prompt,
+        system_prompt.filter(|s| !s.trim().is_empty()),
+        max_tokens,
+        max_think_tokens,
+        // The Jinja render owns the generation suffix once it succeeds, and
+        // `spec_prompt_matches_ar` proved that it does.
+        AssistantPrefix::Plain,
+        None,
+        None,
+        tools.filter(|t| !t.is_empty()),
+        messages_history.filter(|h| !h.is_empty()),
+        stop,
+        sampling.temp,
+        sampling.top_p,
+        resolved.top_k,
+        sampling.min_p.unwrap_or(0.0),
+        sampling.repeat_penalty,
+        resolved.repeat_window,
+        resolved.presence_penalty,
+        sampling.frequency_penalty,
+        cactus_delta,
+        request_seed,
+        None,
+        enable_thinking,
+    ) {
+        return;
+    }
+    ar(m, gpu, stdout)
+}
+
+/// Length of the longest common prefix of `a` and `b`.
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// `needle` (non-empty) occurs as a contiguous sub-slice of `hay`.
+fn contains_subslice(hay: &[u32], needle: &[u32]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Assistant-turn cache probe over the request history (measurement only):
+/// `(assistant turns, fingerprint hits, hits whose cached content token ids
+/// occur verbatim in `prompt_tokens`)`. Uses the Qwen AR path's fingerprint.
+fn asst_cache_probe(
+    m: &mut LoadedModel,
+    history: Option<&[Message]>,
+    prompt_tokens: &[u32],
+) -> (usize, usize, usize) {
+    let (mut turns, mut hits, mut exact) = (0usize, 0usize, 0usize);
+    for msg in history.unwrap_or(&[]) {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        turns += 1;
+        let stripped = crate::common::strip_think_for_fingerprint(&msg.content);
+        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint(&normalized, &msg.tool_calls);
+        if let Some(turn) = m
+            .asst_turn_cache
+            .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
+        {
+            hits += 1;
+            if turn
+                .content
+                .as_ref()
+                .is_some_and(|c| contains_subslice(prompt_tokens, &c.token_ids))
+            {
+                exact += 1;
+            }
+        }
+    }
+    (turns, hits, exact)
 }
 
 fn copy_logits(
@@ -435,6 +765,7 @@ mod tests {
             has_speculator: false,
             speculator_is_mtp: false,
             speculator_is_dflash2: false,
+            speculator_supports_penalties: false,
             deepseek4_spec_requested: false,
             ngram_can_sample: false,
             temp: 1.0,
@@ -456,7 +787,8 @@ mod tests {
             select_generation_route(&inputs(19)),
             GenerationRoute::RaonAr
         );
-        // A speculator, greedy temp or sampling penalties never change the route.
+        // A speculator that is not the DFlash2 drafter, greedy temp or sampling
+        // penalties never change the route.
         for (has_speculator, temp, pen) in
             [(true, 0.0, false), (false, 0.0, true), (true, 1.0, true)]
         {
@@ -475,13 +807,260 @@ mod tests {
         assert!(!GenerationRoute::RaonAr.runs_qwen35_ar_body());
         let adapter = generation_route_adapter(GenerationRoute::RaonAr).expect("adapter");
         assert_eq!(adapter.route, GenerationRoute::RaonAr);
-        // No other arch lands on the Raon route.
+        // No other arch lands on a Raon route.
         for arch in [0, 5, 6, 9, 11, 15, 16, 17, 18, 20] {
-            assert_ne!(
+            for route in [
                 select_generation_route(&inputs(arch)),
-                GenerationRoute::RaonAr
+                select_generation_route(&dflash2_inputs(arch, 0.0)),
+            ] {
+                assert_ne!(route, GenerationRoute::RaonAr);
+                assert_ne!(route, GenerationRoute::RaonSpec);
+            }
+        }
+    }
+
+    /// A loaded DFlash2 speculator (greedy or sampled with the selector-chain
+    /// nucleus verify) on a Raon load.
+    fn dflash2_inputs(arch_id: u32, temp: f32) -> GenerationRouteInputs {
+        GenerationRouteInputs {
+            has_speculator: true,
+            speculator_is_dflash2: true,
+            speculator_supports_penalties: true,
+            supports_temp_swor: true,
+            supports_chain_nucleus_verify: true,
+            temp,
+            ..inputs(arch_id)
+        }
+    }
+
+    #[test]
+    fn raon_dflash2_takes_the_spec_route_when_the_request_is_eligible() {
+        for temp in [0.0f32, 1.0] {
+            let request = dflash2_inputs(19, temp);
+            assert_eq!(
+                select_generation_route(&request),
+                GenerationRoute::RaonSpec,
+                "{request:?}"
+            );
+            // Penalties (the card's presence default included) ride the spec
+            // route because the DFlash2 verifiers penalize every row with the
+            // generated-only history; a drafter that does not
+            // (`supports_penalties` false) keeps the AR producer, and so do
+            // adaptive KV, the force-AR switches and a load without the
+            // drafter.
+            let penalized = GenerationRouteInputs {
+                nonneutral_penalties: true,
+                ..request
+            };
+            assert_eq!(
+                select_generation_route(&penalized),
+                GenerationRoute::RaonSpec,
+                "{penalized:?}"
+            );
+            for refused in [
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    speculator_supports_penalties: false,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    kv_adaptive: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    force_ar_chat: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    temp_spec_env_off: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    has_speculator: false,
+                    speculator_is_dflash2: false,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    speculator_is_dflash2: false,
+                    speculator_is_mtp: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    nonneutral_penalties: true,
+                    pp: 2,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    kv_adaptive: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    force_ar_chat: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    temp_spec_env_off: true,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    has_speculator: false,
+                    speculator_is_dflash2: false,
+                    ..request
+                },
+                GenerationRouteInputs {
+                    speculator_is_dflash2: false,
+                    speculator_is_mtp: true,
+                    ..request
+                },
+            ] {
+                assert_eq!(
+                    select_generation_route(&refused),
+                    GenerationRoute::RaonAr,
+                    "{refused:?}"
+                );
+            }
+        }
+        // A sampled request needs a drafter that verifies at temperature with
+        // the selector-chain nucleus law.
+        for incapable in [
+            GenerationRouteInputs {
+                supports_temp_swor: false,
+                ..dflash2_inputs(19, 1.0)
+            },
+            GenerationRouteInputs {
+                supports_chain_nucleus_verify: false,
+                ..dflash2_inputs(19, 1.0)
+            },
+        ] {
+            assert_eq!(
+                select_generation_route(&incapable),
+                GenerationRoute::RaonAr,
+                "{incapable:?}"
             );
         }
+        // Greedy needs neither capability.
+        let greedy = GenerationRouteInputs {
+            supports_temp_swor: false,
+            supports_chain_nucleus_verify: false,
+            ..dflash2_inputs(19, 0.0)
+        };
+        assert_eq!(select_generation_route(&greedy), GenerationRoute::RaonSpec);
+    }
+
+    #[test]
+    fn raon_spec_route_inventory_matches_the_ar_route_contract() {
+        let spec = GenerationRoute::RaonSpec;
+        assert!(GenerationRoute::ALL.contains(&spec));
+        assert_eq!(spec.name(), "raon_spec");
+        assert!(spec.supports_tools());
+        assert!(spec.supports_stop());
+        assert!(!spec.runs_qwen35_ar_body());
+        let adapter = generation_route_adapter(spec).expect("adapter");
+        assert_eq!(adapter.route, spec);
+        // Same gen_start contract as the AR route.
+        let mut start = Vec::new();
+        (adapter.start)(&mut start, "raon-spec", true);
+        let mut ar_start = Vec::new();
+        (generation_route_adapter(GenerationRoute::RaonAr)
+            .expect("adapter")
+            .start)(&mut ar_start, "raon-spec", true);
+        assert_eq!(start, ar_start);
+    }
+
+    #[test]
+    fn raon_defaults_that_penalize_count_as_penalized_for_route_selection() {
+        let d = hipfire_arch_raon::GenerationDefaults::default();
+        assert!(d.presence_penalty != 0.0, "the card default is penalized");
+        let base = RaonSampling {
+            temp: 1.0,
+            top_p: 0.95,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: 1.0,
+            repeat_window: 128,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user_explicit: false,
+        };
+        // Unset sampled request: the card's presence default applies.
+        assert!(base.penalized_after_defaults(&d));
+        // Greedy and explicit-neutral requests are unpenalized.
+        assert!(!RaonSampling { temp: 0.0, ..base }.penalized_after_defaults(&d));
+        assert!(!RaonSampling {
+            user_explicit: true,
+            ..base
+        }
+        .penalized_after_defaults(&d));
+        // Raw non-neutral controls always count.
+        for penalized in [
+            RaonSampling {
+                temp: 0.0,
+                repeat_penalty: 1.1,
+                ..base
+            },
+            RaonSampling {
+                temp: 0.0,
+                presence_penalty: 0.5,
+                ..base
+            },
+            RaonSampling {
+                temp: 0.0,
+                frequency_penalty: 0.5,
+                ..base
+            },
+        ] {
+            assert!(penalized.penalized_after_defaults(&d), "{penalized:?}");
+        }
+    }
+
+    #[test]
+    fn raon_spec_start_channel_agrees_with_the_ar_classifier_on_the_template() {
+        assert!(spec_start_channel_matches_ar(&render(true, None).text));
+        assert!(spec_start_channel_matches_ar(&render(false, None).text));
+        // A literal `<think>` in user content stays out of both classifiers.
+        let history = vec![message(Role::User, "what is <think> in xml?")];
+        for thinking in [true, false] {
+            let p = render_raon_prompt(
+                &tokenizer(),
+                TEMPLATE,
+                None,
+                "what is <think> in xml?",
+                Some(&history),
+                None,
+                thinking,
+            )
+            .unwrap();
+            assert!(spec_start_channel_matches_ar(&p.text), "{:?}", p.text);
+            assert_eq!(p.started_in_think, thinking);
+        }
+        // A seeded opener the tail classifier would miss is served by AR.
+        assert!(!spec_start_channel_matches_ar(
+            "<|im_start|>assistant\n<think>Let me"
+        ));
+    }
+
+    #[test]
+    fn raon_spec_render_drops_what_the_ar_render_drops() {
+        let blank =
+            render_raon_text(&tokenizer(), TEMPLATE, Some("  "), "hi", None, None, true).unwrap();
+        let none = render_raon_text(&tokenizer(), TEMPLATE, None, "hi", None, None, true).unwrap();
+        assert_eq!(blank, none, "a blank system prompt is not rendered");
+        let empty_history = render_raon_text(
+            &tokenizer(),
+            TEMPLATE,
+            None,
+            "hi",
+            Some(&[]),
+            Some(&[]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(empty_history, none, "empty history and tools are dropped");
     }
 
     #[test]
@@ -891,5 +1470,28 @@ mod tests {
             "arch 19 must never look like Qwen DFlash"
         );
         assert!(!caps.supports_continuous_batch);
+    }
+
+    #[test]
+    fn common_prefix_len_is_the_longest_shared_prefix() {
+        assert_eq!(common_prefix_len(&[], &[]), 0);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[]), 0);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3]), 3);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]), 3);
+        assert_eq!(common_prefix_len(&[1, 2, 9, 4], &[1, 2, 3, 4]), 2);
+        assert_eq!(common_prefix_len(&[7], &[8]), 0);
+    }
+
+    #[test]
+    fn contains_subslice_requires_a_contiguous_nonempty_match() {
+        let hay = [5u32, 6, 7, 8, 9];
+        assert!(contains_subslice(&hay, &[5, 6]));
+        assert!(contains_subslice(&hay, &[7, 8, 9]));
+        assert!(contains_subslice(&hay, &hay));
+        assert!(!contains_subslice(&hay, &[5, 7]));
+        assert!(!contains_subslice(&hay, &[9, 10]));
+        assert!(!contains_subslice(&hay, &[5, 6, 7, 8, 9, 10]));
+        assert!(!contains_subslice(&hay, &[]));
+        assert!(!contains_subslice(&[], &[1]));
     }
 }

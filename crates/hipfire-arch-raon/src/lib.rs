@@ -5,32 +5,50 @@
 //! SiTU dense/shared FFN and sigmoid top-6 MoE. Generic math lives in
 //! rdna-compute/hipfire-dispatch; this crate binds Raon parameters.
 pub mod arch_model;
+pub mod band;
 pub mod bundle;
 pub mod carrier;
+pub mod census;
 pub mod config;
 pub mod forward;
+pub mod mesh;
 pub mod mhc;
 pub mod mla;
 pub mod moe;
+pub mod precision;
 pub mod prefill;
 pub mod projection;
 pub mod rda;
+pub mod rollback;
+pub mod session;
+pub mod spec_impl;
 pub mod state;
+mod verify_graph;
 pub mod weights;
 
 /// Architecture id for Raon-1-mini.
 pub const ARCH_ID: u32 = 19;
 
+pub use band::{copy_edge_same_device, edge_bytes, edge_view, RaonBand};
 pub use bundle::{DecodeMode, PrefillMode, RaonBundle, PREFILL_SCRATCH_ROWS};
-pub use carrier::load_raon_bundle;
+pub use carrier::{load_raon_band_bundle, load_raon_bundle, load_raon_mesh_model, mesh_edge_rows};
+pub use census::{CensusReport, CensusStage};
 pub use config::{FfnKind, GenerationDefaults, LayerKind, RaonConfig};
 pub use forward::{
-    forward_rows, forward_rows_tapped, forward_token, forward_token_tapped, readout_logits,
-    LayerTap, RaonWork, TapSite,
+    band_admit, band_body, forward_band, forward_rows, forward_rows_tapped,
+    forward_rows_verify_tapped, forward_token, forward_token_tapped, readout_logits,
+    validate_extract_layers, BandInput, DflashCapture, LayerTap, RaonWork, TapSite,
+};
+pub use mesh::{
+    raon_edge_capacity_bytes, raon_manifest, raon_rank_op_ids, raon_step_graph, RaonMeshBindings,
+    RaonMeshModel, RaonMeshOutput, RaonMeshProgram, RAON_STREAMS_RESOURCE,
 };
 pub use projection::{project, project_row, project_rows, round_bf16_rows, OutRound};
+pub use rollback::{RollbackMode, ROLLBACK_ENV};
+pub use spec_impl::RaonSpecScratch;
 pub use weights::{
-    check_inventory, load_raon_weights, tensor_inventory, ExpertWeights, GatedFfnWeights,
-    MhcSiteWeights, MlaWeights, MoeFfnWeights, RaonFfn, RaonLayerWeights, RaonMixer, RaonWeights,
-    RdaWeights, TensorClass, TensorSpec,
+    check_inventory, index_for_band, load_raon_weights, load_raon_weights_band, tensor_inventory,
+    tensor_inventory_band, upload_rows_weight, ExpertWeights, GatedFfnWeights, MhcSiteWeights,
+    MlaWeights, MoeFfnWeights, RaonFfn, RaonLayerWeights, RaonMixer, RaonWeights, RdaWeights,
+    TensorClass, TensorSpec,
 };

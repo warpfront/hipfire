@@ -789,7 +789,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "eager-only-refusals",
         predicates: &[IsRecording, CaptureMode, ReplayEnabled, GraphSlotCapturing],
-        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199), DFlash CB GDN lane-table staging (Gpu::upload_gdn_lane_table, lane_gdn.rs:378-380: `capture_mode` returns an error before the copy; callers stage_gdn_lane_table and stage_gdn_lane_table_from, qwen35 prefill_multi.rs:751, 853), sealed MoE expert-parallel row gather (hipfire-dispatch pipeline/moe_program.rs row_gather:1103-1106: `capture_mode`, a verify or replay `capturing` slot, or `is_recording()` returns an error before the gather exchange; EP decode is eager-only), the MoE CPU expert splice and the CPU transfer refuse capture or recording before any copy (hipfire-dispatch src/cpu_exec.rs moe_cpu_experts:619, with_cpu_transfer:1532), the Qwen35 placement and serve loaders refuse CPU-executed host weights with an enabled retained-replay backend before loading weights (qwen35 src/arch.rs load_weights_with_placement:108, src/serve_engine.rs build:1015), and the narrow MTP verify graph refuses a nested capture or replay recording (qwen35 src/mtp_spec.rs mtp_verify_graph_eligible:1517-1518), and a bounded-wait kernel launched under capture before its wait-error block exists (dispatch.rs Gpu::device_wait_block: `capture_mode` without a block returns an error before any allocation; the blocks are preallocated by Gpus::prepare_tp_graph_signals, gfx1100 wavegrid Gpu init and DS4 rsqrt_once control-state setup)",
+        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199), DFlash CB GDN lane-table staging (Gpu::upload_gdn_lane_table, lane_gdn.rs:378-380: `capture_mode` returns an error before the copy; callers stage_gdn_lane_table and stage_gdn_lane_table_from, qwen35 prefill_multi.rs:751, 853), sealed MoE expert-parallel row gather (hipfire-dispatch pipeline/moe_program.rs row_gather:1103-1106: `capture_mode`, a verify or replay `capturing` slot, or `is_recording()` returns an error before the gather exchange; EP decode is eager-only), the MoE CPU expert splice and the CPU transfer refuse capture or recording before any copy (hipfire-dispatch src/cpu_exec.rs moe_cpu_experts:619, with_cpu_transfer:1532), the Qwen35 placement and serve loaders refuse CPU-executed host weights with an enabled retained-replay backend before loading weights (qwen35 src/arch.rs load_weights_with_placement:108, src/serve_engine.rs build:1015), and the narrow MTP verify graph refuses a nested capture or replay recording (qwen35 src/mtp_spec.rs mtp_verify_graph_eligible:1517-1518), and a bounded-wait kernel launched under capture before its wait-error block exists (dispatch.rs Gpu::device_wait_block: `capture_mode` without a block returns an error before any allocation; the blocks are preallocated by Gpus::prepare_tp_graph_signals, gfx1100 wavegrid Gpu init and DS4 rsqrt_once control-state setup), and the diagnostic MoE route dump / activation capture readback (hipfire-dispatch pipeline/moe_capture.rs read_device: `capture_mode`, `is_recording()` or an active retained body returns an error before the device synchronize and copy; HIPFIRE_MOE_ROUTE_DUMP / HIPFIRE_MOE_ACT_CAPTURE are developer diagnostics, off by default)",
         effect: Refusal,
         switches: "error before any launch; the admission predicate that routes to the eager-only entry is inventoried at the caller",
         kernels: &[],
@@ -1164,6 +1164,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "raon-dflash-verify-graph-abort",
+        predicates: &[GraphSlotCapturing],
+        condition: "hipfire-arch-raon verify_graph.rs record_verify_graph: a failed DFlash verify-body capture aborts the stream capture and clears `gpu.graphs.verify.capturing` before returning the error",
+        effect: Lifecycle,
+        switches: "failed capture: abort + clear the capturing slot + Err (no eager fallback); success: end_verify_graph_capture",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "capture bookkeeping only: no kernel, shape or argument depends on it; the recorded verify body is the eager body launch for launch (raon_dflash_oracle verifygraph: logits, features, argmax and RDA/conv/seq_len state bit-identical eager vs graph for K = 1..16 on R9700 and 7900 XTX)",
+        reaches: &[],
+    },
+    Decision {
         id: "dspark-capture-safe-verify-body",
         predicates: &[DeclaredCaptureBody, IsRecording, CaptureMode],
         condition: "DS4 DSpark verify body parameter `capture_safe` (spec_impl.rs:155-230; forward.rs forward_prefill_batch_chunk_impl, carried by rows_program.rs RowsWindow into push_attention / compressed_attention_rows and the hipfire-dispatch pipeline/mla/{rows,attention}.rs operations) and dspark_requires_typed_device_copy = is_recording() || capture_mode || force_blob_path (forward.rs)",
@@ -1280,12 +1291,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "select-regrid-row-selectors",
         predicates: &[IsRecording],
-        condition: "select_regrid_enabled: (exact gfx1201 || exact gfx1151) && !select_regrid_off && !is_recording() (select_regrid.rs:46-50), consulted by the batched top-K and argmax selectors (sampling.rs:129, 838) and the developer online draft tuner (dflash_online.rs)",
+        condition: "select_regrid_enabled: (exact gfx1201 || exact gfx1151 || exact gfx1100) && !select_regrid_off && !is_recording() (select_regrid.rs:64-70), consulted by the batched top-K and argmax selectors (sampling.rs:129, 838) and the developer online draft tuner (dflash_online.rs)",
         effect: KernelSelection,
-        switches: "eager or HipGraph: select_regrid 1024-thread row selectors (+ topk_values_fixup_f32 on tied rows); recorded: topk_values_batched_f32 / argmax_f32_batched",
+        switches: "eager or HipGraph: select_regrid 1024-thread row selectors (+ topk_values_tie_exact_f32 on tied rows); recorded: topk_values_batched_f32 / argmax_f32_batched",
         kernels: &["topk_values_batched_f32", "argmax_f32_batched"],
         verdict: ByteExact,
-        evidence: "select_regrid.rs module header: outputs byte-identical to the shipping kernels for every input, ties and NaNs included; examples/test_select_regrid checks it on gfx1201 and gfx1151",
+        evidence: "select_regrid.rs module header: outputs byte-identical to the shipping kernels for every input, ties and NaNs included; examples/test_select_regrid checks it on gfx1201, gfx1151 and gfx1100",
         reaches: &[reach(Program::DflashGfx1201, "DFlash2 selector top-K and verify argmax", "arm3")],
     },
     Decision {
@@ -1313,12 +1324,23 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-gdn-core-lanes",
         predicates: &[IsRecording],
-        condition: "gated_delta_core_lanes (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive one-row GDN Core steps with Q8 states, HIPFIRE_QWEN4_GDN_LANES (exact gfx1151 default on, 0 kills) and `!is_recording()`",
+        condition: "gated_delta_core_lanes (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive one-row GDN Core steps with Q8 states, HIPFIRE_QWEN4_GDN_LANES (exact gfx1151 and exact gfx1201 default on, 0 kills) and `!is_recording()`",
         effect: KernelSelection,
         switches: "eager lane step: gdn_lanes (gated_delta_conv_params_bf16_f32_lanes, gated_delta_step_gate_norm128_q8_lanes), one launch per kernel for every lane; recorded: the per-lane incumbent launches",
         kernels: &["gated_delta_conv_params_bf16_f32", "gated_delta_step_gate_norm128_q8"],
         verdict: ByteExact,
-        evidence: "fn_lane_oracle on gfx1151 (Flash-Next GPTQ3 MQ4): k = 1/2/8 lanes, every lane step and state checkpoint byte-identical to the singleton forward",
+        evidence: "gfx1151: fn_lane_oracle (Flash-Next GPTQ3 MQ4): k = 1/2/8 lanes, every lane step and state checkpoint byte-identical to the singleton forward. gfx1201 (default on): the same device bodies in the same translation unit and compile recipe (the `gdn_lanes` module = `tensor_ops` + gdn_lanes.hip); kernel byte oracle rdna-compute examples/gdn_lanes_oracle (N = 1..8 lanes, ragged cursors and Q8 frames, carried state) PASSED on gfx1201 (20 cases, 12 controls, mgmtp/gdnbatch/runs/oracle-k1-gdn; EP2 mq4 and PP2 mq3 A/B text md5 identical)",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-qsa-core-lanes",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "qsa_core_lanes_min (qsa_core_lanes.rs): 2..=QSA_CORE_LANES_MAX consecutive QSA Core steps (fp8 K/V, BF16 index keys, 1..=8 rows per lane, fused LDS-resident select below QSA_BF16_SPLIT_MIN_BLOCKS, per-head attention), HIPFIRE_QWEN4_QSA_LANES (exact gfx1201, default on, 0 kills) and `!is_recording() && !capture_mode`",
+        effect: KernelSelection,
+        switches: "eager lane step: qsa_lanes (indexed_attention_decode_prologue_fp8_lanes, indexed_attention_pool_rope_bf16_lanes, indexed_attention_select_bf16_lanes, indexed_attention_attention_fp8_lanes), one launch per kernel for every lane; recorded or captured: the per-lane incumbent launches",
+        kernels: &["indexed_attention_decode_prologue_fp8", "indexed_attention_pool_rope_bf16", "indexed_attention_select_bf16_batched", "indexed_attention_attention_fp8_batched"],
+        verdict: ByteExact,
+        evidence: "by construction: the lane kernels call the incumbent device templates (qsa_decode_prologue, qsa_pool_rope, qsa_select_batched, qsa_attention_row_parallel) on lane-derived pointers, positions and rows; the GPU byte oracle rdna-compute examples/qsa_lanes_oracle (per-lane singleton launches vs the grouped launches, N = 1..8 lanes, rows 1..8, cross-block-boundary and budget-saturating contexts, negative controls) PASSED on gfx1201 (126/126 cases, 3 controls detected, mgmtp/gdnbatch/runs/oracle-k1-qsa), and the EP2 mq4 / PP2 mq3 A/B text md5s are identical",
         reaches: &[],
     },
     Decision {
@@ -1380,6 +1402,17 @@ pub const DECISIONS: &[Decision] = &[
         kernels: &[],
         verdict: NotEquivalent,
         evidence: "different numerics (Q8 activations). Unreachable by default: packed_mq4_prefill is default-off and n % 256 == 0 excludes decode",
+        reaches: &[],
+    },
+    Decision {
+        id: "prefill-act-tier-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "quantized-activation prefill tiers (A4/A8/FP8), taken only eagerly: hipfire-dispatch q8_prefill.rs prefill_quant_admitted admits a caller's tier only when rows >= 64, `!gpu.graphs.capture_mode` and `!gpu.replay.is_recording()`; it gates the grouped routed-expert sites (moe_program.rs grouped_moe_site_tiers, plus load-verified symmetric qt44 experts and the grouped IU4 shape), the shared/dense gated FFN (gated_ffn_from_basis) and the tiered Q8_0 GEMM (q8_0_prefill_gemm); the arch half is per call site (grouped_sym_tier_admits: grouped W4A8 on gfx1201/gfx1100/gfx1151, W4A4/FP8 on gfx1201; q8_0_weight_admits / q8_0_prefill_runs: W8A8 on gfx1201 and, for K % 128 == 0, gfx1100 and gfx1151 (i8-MMQ), FP8 on exact gfx1201); otherwise every site runs its F16 route",
+        effect: KernelSelection,
+        switches: "eager: moe_grouped_qt44_{iu4,a8,fp8}_sym with their int4/int8/e4m3 activation producers (routed, shared, dense qt44 FFN) and gemm_q8_0_mmq_{i8,fp8} with quantize_x_{q8,fp8}_blk32 (Q8_0 projections), per the Raon per-site policy on gfx1201; hipGraph capture or a live Redline recording: the F16 grouped WMMA core / gemm_q8_0_batched_chunked for the same site",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "the quantized tiers quantize the GEMM activations, so their output differs from the F16 route's (code24/WT2 KLD deltas per site recorded in the CHANGELOG entry for the Raon per-site precision policy); the only callers are the Raon batched prefill sites, which are never graph-captured or Redline-recorded, so no recorded program reaches the quantized tiers; the excluded branch is the unchanged F16 route",
         reaches: &[],
     },
     Decision {
@@ -1720,6 +1753,12 @@ pub const SITES: &[Site] = &[
         function: "resolve",
         occurrences: 1,
         decisions: &["raon-decode-mode-retained-replay"],
+    },
+    Site {
+        file: "hipfire-arch-raon/src/verify_graph.rs",
+        function: "record_verify_graph",
+        occurrences: 1,
+        decisions: &["raon-dflash-verify-graph-abort"],
     },
     Site {
         file: "rdna-compute/src/mq6_railgun.rs",
@@ -2122,6 +2161,13 @@ pub const SITES: &[Site] = &[
         decisions: &["qwen4-decode-share-loan-capture-guard"],
     },
     Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward/ep_reserve_loan.rs",
+        function: "capturing",
+        occurrences: 4,
+        // The EP reserve loan drives the same LoanController through ExtentLoanOps.
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
         file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
         function: "capturing",
         occurrences: 1,
@@ -2165,7 +2211,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
-        function: "new_inner",
+        function: "new_inner_with_reserve",
         occurrences: 2,
         decisions: &["qwen4-cpu-splice-eager-only"],
     },
@@ -2368,6 +2414,12 @@ pub const SITES: &[Site] = &[
         decisions: &["qwen4-cpu-splice-eager-only"],
     },
     Site {
+        file: "hipfire-dispatch/src/pipeline/moe_capture.rs",
+        function: "read_device",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",
         function: "<item>",
         occurrences: 2,
@@ -2381,6 +2433,12 @@ pub const SITES: &[Site] = &[
         function: "absorbs_clear",
         occurrences: 2,
         decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/q8_prefill.rs",
+        function: "prefill_quant_admitted",
+        occurrences: 2,
+        decisions: &["prefill-act-tier-eager-only"],
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",
@@ -2511,6 +2569,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-runtime/src/dflash.rs",
+        function: "admit",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
         function: "begin_draft_ffn_graph_capture",
         occurrences: 1,
         decisions: &["graph-capture-lifecycle"],
@@ -2519,6 +2583,12 @@ pub const SITES: &[Site] = &[
         file: "hipfire-runtime/src/dflash.rs",
         function: "draft_ffn_layer",
         occurrences: 3,
+        decisions: &["dflash-draft-graph-safe-body"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "draft_layer_post",
+        occurrences: 1,
         decisions: &["dflash-draft-graph-safe-body"],
     },
     Site {
@@ -2773,6 +2843,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/dispatch.rs",
         function: "ensure_int8_mmq_x",
+        occurrences: 1,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_fp8_mmq_x",
         occurrences: 1,
         decisions: &["scratch-launch-plumbing"],
     },
@@ -3511,6 +3587,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/scratch.rs",
+        function: "ensure_fp8_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
         function: "ensure_q8_1_mmq_x",
         occurrences: 2,
         decisions: &["scratch-launch-plumbing"],
@@ -3640,6 +3722,12 @@ pub const SITES: &[Site] = &[
         function: "gated_delta_core_lanes",
         occurrences: 1,
         decisions: &["qwen4-gdn-core-lanes"],
+    },
+    Site {
+        file: "rdna-compute/src/qsa_core_lanes.rs",
+        function: "qsa_core_lanes_min",
+        occurrences: 2,
+        decisions: &["qwen4-qsa-core-lanes"],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",

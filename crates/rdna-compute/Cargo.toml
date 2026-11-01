@@ -37,6 +37,12 @@ peacemaker-ir = { path = "../peacemaker-ir" }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-rip = { path = "../peacemaker-rip" }
 [[example]]
+name = "bench_stream_mix_chain_gfx1201"
+required-features = ["lab"]
+[[example]]
+name = "bench_moe_grouped_qt44_iu4"
+required-features = ["lab"]
+[[example]]
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
 [[example]]
@@ -124,6 +130,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "qwen4_moe_f16_lds_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_scatter_scan_oracle"
 required-features = ["lab"]
 
 [[example]]
@@ -420,6 +430,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_q8_wmma_4w"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8_raon_shapes"
 required-features = ["lab"]
 
 [[example]]
@@ -1103,12 +1117,20 @@ name = "head_batch_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "gdn_lanes_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_gdn_oracle"
 required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "lane_fa_oracle"
 required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "qsa_lanes_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "qwen4_mq4_x4_pm_oracle"
@@ -1254,3 +1276,13 @@ required-features = ["lab"]
 [[example]]
 name = "latent_attention_flash_check"
 required-features = ["lab"]
+
+# W8A8 Q8_0 gfx12 node bench + accuracy (needs a gfx12 GPU).
+[[example]]
+name = "bench_q8_0_a8_gfx12"
+required-features = ["lab"]
+
+# Chunked RDA node gate/bench (needs a gfx1201 GPU).
+[[example]]
+name = "gated_delta_vector_chunk_node"
+required-features = ["deltanet"]

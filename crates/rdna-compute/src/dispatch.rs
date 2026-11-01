@@ -2283,6 +2283,41 @@ impl Gpu {
         Ok(self.emu_cap_mem_info(free.min(usize::MAX as u64) as usize, total))
     }
 
+    /// Capacity an auto admission may plan against: device total minus this
+    /// process's own live device allocations ([`hip_bridge::HipRuntime::own_device_bytes`])
+    /// minus this process's MEASURED unledgered residency (code objects, PM4/
+    /// graph pools, driver state: the process's own `drm-memory-vram` from
+    /// `/proc/self/fdinfo` less the ledger; [`own_vram_from_fdinfo`]) minus a
+    /// small fixed [`PLANNED_CAPACITY_RESERVE_BYTES`] margin. Unlike
+    /// [`Self::device_mem_info`]'s free figure it does not move when a foreign
+    /// process transiently allocates, so a route chosen from it is stable
+    /// across loads. Callers MUST still verify the real allocation and fall to
+    /// a smaller rung only when it truly fails. UMA parts and `HIPFIRE_EMU`
+    /// profiles share host memory / a capped ledger, so there the capped free
+    /// figure stays authoritative.
+    pub fn planned_capacity(&self) -> HipResult<PlannedCapacity> {
+        let (free, total) = self.device_mem_info()?;
+        let own = self.hip.own_device_bytes();
+        let stable = !self.is_uma() && self.emu.is_none();
+        let cap = PlannedCapacity::new(free, total, own, stable);
+        if !stable {
+            return Ok(cap);
+        }
+        // The process's own footprint is read from the kernel's per-client
+        // accounting, so a foreign process's allocation never enters it. When
+        // the accounting is unreadable, fall back to the conservative measured
+        // post-load residency.
+        let measured = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .ok()
+            .and_then(|bdf| own_vram_from_fdinfo(&bdf));
+        Ok(match measured {
+            Some(vram) => cap.with_unledgered(vram.saturating_sub(own), true),
+            None => cap.with_unledgered(PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES, false),
+        })
+    }
+
     /// Install a real stream if launches are still going to the null stream.
     ///
     /// HIP refuses to capture the legacy default stream, so anything that
@@ -3071,6 +3106,7 @@ impl Gpu {
                 fp8_x_source_ptr: std::ptr::null_mut(),
                 q8_1_mmq_x_scratch: None,
                 q8_1_mmq_x_scratch_bytes: 0,
+                q8_1_mmq_x_generation: 0,
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
                 int4_mmq_generation: 0,
@@ -3078,6 +3114,9 @@ impl Gpu {
                 int4_mmq_down_scratch_bytes: 0,
                 int4_mmq_down_generation: 0,
                 int4_mmq_slab_generation: None,
+                q8_a8_x_scratch: None,
+                q8_a8_x_scratch_bytes: 0,
+                q8_a8_x_generation: 0,
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
                 int8_mmq_generation: 0,
@@ -5661,6 +5700,49 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         self.scratch.ensure_int8_mmq_x(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.replay,
+            self.device_id,
+            x,
+            n,
+            k,
+        )
+    }
+
+    /// Quantize f32 activations into the gfx1201 `block_fp8_128` (e4m3) sidecar consumed by
+    /// [`Gpu::gemm_mq4g256v2_moe_grouped_fp8_sym`]. Shares the `ensure_int8_mmq_x` scratch, so it
+    /// overwrites a live int8 sidecar; gfx1201 only, `k % 128 == 0`.
+    pub fn ensure_fp8_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "ensure_fp8_mmq_x: gfx1201 only",
+            ));
+        }
+        if k == 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(0, "ensure_fp8_mmq_x: k % 128"));
+        }
+        let needed = crate::scratch::int8_mmq_x_needed(k, n);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.int8_mmq_x_scratch_bytes,
+            self.scratch.int8_mmq_x_scratch.is_some(),
+            needed,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch.ensure_fp8_mmq_x(
             &self.hip,
             &mut self.compiler,
             &mut self.modules,
@@ -8559,6 +8641,47 @@ impl Gpu {
         self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
         self.take_device_wait_error()?;
         Ok(data)
+    }
+
+    /// [`Self::download_f32`] for a decode loop that replays a graph on
+    /// [`Self::active_stream`]: the copy is ordered on that stream and the host
+    /// waits on that stream alone. The plain readback is a blocking copy on the
+    /// legacy null stream, which makes the runtime synchronize the null queue
+    /// with the decode stream's queue before every token; that cross-queue hop
+    /// costs a few percent in the good case and doubles the per-token time in
+    /// the bad one (R9700: queue placement / a second context on the card).
+    /// With no active stream this is exactly [`Self::download_f32`].
+    pub fn download_f32_stream_ordered(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
+        let Some(stream) = self.active_stream.as_ref() else {
+            return self.download_f32(tensor);
+        };
+        self.bind_thread()?;
+        let numel = tensor.numel();
+        let mut data = vec![0.0f32; numel];
+        // SAFETY: `data` holds exactly `numel` f32s; any byte pattern is a valid f32.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4) };
+        self.hip
+            .memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?;
+        self.hip.stream_synchronize(stream)?;
+        self.take_device_wait_error()?;
+        Ok(data)
+    }
+
+    /// Write one `u32` into the first word of `buf`, ordered on
+    /// [`Self::active_stream`] (the legacy stream when none is set) without
+    /// blocking the host: the value is the immediate of a `hipMemsetD32Async`,
+    /// so a decode loop restages its token id through the queue that replays
+    /// the graph instead of a blocking null-stream copy
+    /// (see [`Self::download_f32_stream_ordered`]).
+    pub fn write_u32_stream_ordered(
+        &self,
+        buf: &hip_bridge::DeviceBuffer,
+        value: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.hip
+            .memset_d32_async(buf, value as i32, 1, self.active_stream.as_ref())
     }
 
     /// [`Self::download_f32`] into a caller-owned buffer (resized to the
@@ -12636,5 +12759,206 @@ mod tests {
         drop(fd);
         assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (0, 0));
         gpu.ensure_vmm_cleaned().expect("exporter clean");
+    }
+}
+
+/// Fixed margin a planned admission leaves on top of the measured own
+/// footprint (lazy kernel/code-object loads and graph pools that appear after
+/// the admission, allocator rounding).
+pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 512 << 20;
+
+/// Unledgered residency assumed when the kernel's per-process VRAM accounting
+/// cannot be read. Measured after load: ~3.5 GiB (A3B R9700), ~4.0 GiB (Raon
+/// R9700), ~4.9 GiB (Raon 7900 XTX); the smallest is used so the fallback is not
+/// itself the cause of a placement regression.
+pub const PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES: usize = 3584 << 20;
+
+/// This process's VRAM on the device at PCI address `bdf`, in bytes: the sum of
+/// `drm-memory-vram` over its distinct DRM clients for that device
+/// (`/proc/self/fdinfo`). It counts everything the process holds, ledgered or
+/// not, and nothing a foreign process holds. `None` when no client for the
+/// device reports it.
+pub fn own_vram_from_fdinfo(bdf: &str) -> Option<usize> {
+    let entries = std::fs::read_dir("/proc/self/fdinfo").ok()?;
+    let mut clients: std::collections::HashMap<String, usize> = Default::default();
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some((id, kib)) = parse_drm_fdinfo(&text, bdf) {
+            clients.insert(id, kib);
+        }
+    }
+    if clients.is_empty() {
+        return None;
+    }
+    Some(clients.values().sum::<usize>().saturating_mul(1024))
+}
+
+/// `(drm-client-id, drm-memory-vram KiB)` of one fdinfo text when it belongs to
+/// the device at `bdf`.
+fn parse_drm_fdinfo(text: &str, bdf: &str) -> Option<(String, usize)> {
+    let (mut pdev, mut id, mut vram) = (None, None, None);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "drm-pdev" => pdev = Some(value),
+            "drm-client-id" => id = Some(value),
+            "drm-memory-vram" => {
+                vram = value.split_whitespace().next().and_then(|v| v.parse().ok())
+            }
+            _ => {}
+        }
+    }
+    if !pdev?.eq_ignore_ascii_case(bdf) {
+        return None;
+    }
+    Some((id?.to_string(), vram?))
+}
+
+/// Result of [`Gpu::planned_capacity`]; `Display` is the load-log input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedCapacity {
+    /// Bytes the admission plans against.
+    pub bytes: usize,
+    pub total: usize,
+    /// Live device bytes in this process's allocation ledger.
+    pub own: usize,
+    /// Residency this process holds outside the ledger (measured, or the
+    /// conservative fallback).
+    pub unledgered: usize,
+    /// The unledgered figure was measured from the kernel accounting.
+    pub unledgered_measured: bool,
+    pub reserve: usize,
+    /// Instantaneous free at query time (observation only when `planned`).
+    pub free_now: usize,
+    /// `bytes` is `total - own - unledgered - reserve`; false = free figure
+    /// used (UMA/emu).
+    pub planned: bool,
+}
+
+impl PlannedCapacity {
+    pub fn new(free_now: usize, total: usize, own: usize, planned: bool) -> Self {
+        Self {
+            bytes: 0,
+            total,
+            own,
+            unledgered: 0,
+            unledgered_measured: false,
+            reserve: PLANNED_CAPACITY_RESERVE_BYTES,
+            free_now,
+            planned,
+        }
+        .recomputed()
+    }
+
+    /// Account `bytes` of this process's residency outside the ledger.
+    pub fn with_unledgered(mut self, bytes: usize, measured: bool) -> Self {
+        self.unledgered = bytes;
+        self.unledgered_measured = measured;
+        self.recomputed()
+    }
+
+    fn recomputed(mut self) -> Self {
+        self.bytes = if self.planned {
+            self.total
+                .saturating_sub(self.own)
+                .saturating_sub(self.unledgered)
+                .saturating_sub(self.reserve)
+        } else {
+            self.free_now
+        };
+        self
+    }
+
+    /// The capacity before the fixed reserve: device total minus this
+    /// process's own live allocations when planned, the free figure under
+    /// UMA/emu. For a caller that carries its own measured runtime reserve in
+    /// its census (the Qwen4 expert-parallel plan: historical floor, 1408 MiB
+    /// of it HIP runtime residency), where [`Self::bytes`] would count the
+    /// runtime residency twice. Stable against a foreign process's transient
+    /// allocation like [`Self::bytes`].
+    pub fn before_reserve(&self) -> usize {
+        if self.planned {
+            self.total.saturating_sub(self.own)
+        } else {
+            self.bytes
+        }
+    }
+}
+
+impl std::fmt::Display for PlannedCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let m = |b: usize| b as f64 / (1024.0 * 1024.0);
+        if self.planned {
+            write!(
+                f,
+                "planned={:.0} MiB (total {:.0} - own {:.0} - unledgered {:.0} ({}) - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
+                m(self.bytes),
+                m(self.total),
+                m(self.own),
+                m(self.unledgered),
+                if self.unledgered_measured { "measured, fdinfo" } else { "fallback" },
+                m(self.reserve),
+                m(self.free_now)
+            )
+        } else {
+            write!(
+                f,
+                "capacity={:.0} MiB (free figure: UMA/emu)",
+                m(self.bytes)
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod planned_capacity_tests {
+    use super::*;
+    const G: usize = 1 << 30;
+    #[test]
+    fn foreign_allocation_does_not_change_planned_capacity() {
+        let a = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);
+        let b = PlannedCapacity::new(6 * G, 32 * G, 8 * G, true); // 14 GiB foreign
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.bytes, 24 * G - PLANNED_CAPACITY_RESERVE_BYTES);
+        // Measured unledgered residency is charged once, and is foreign-proof too.
+        let a = a.with_unledgered(4 * G, true);
+        let b = b.with_unledgered(4 * G, true);
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.bytes, 20 * G - PLANNED_CAPACITY_RESERVE_BYTES);
+    }
+    #[test]
+    fn fdinfo_parse_counts_only_the_named_device() {
+        let t = "pos:\t0\ndrm-driver:\tamdgpu\ndrm-pdev:\t0000:C3:00.0\ndrm-client-id:\t7\ndrm-memory-vram:\t1192100 KiB\ndrm-memory-gtt: 8240 KiB\n";
+        assert_eq!(
+            parse_drm_fdinfo(t, "0000:c3:00.0"),
+            Some(("7".to_string(), 1192100))
+        );
+        assert_eq!(parse_drm_fdinfo(t, "0000:03:00.0"), None);
+        assert_eq!(parse_drm_fdinfo("pos: 0\n", "0000:c3:00.0"), None);
+    }
+    #[test]
+    fn uma_uses_free() {
+        assert_eq!(
+            PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).bytes,
+            5 * G
+        );
+    }
+    #[test]
+    fn before_reserve_is_total_minus_own_and_ignores_foreign_allocations() {
+        let a = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);
+        let b = PlannedCapacity::new(6 * G, 32 * G, 8 * G, true); // 14 GiB foreign
+        assert_eq!(a.before_reserve(), 24 * G);
+        assert_eq!(a.before_reserve(), b.before_reserve());
+        assert_eq!(a.before_reserve(), a.bytes + PLANNED_CAPACITY_RESERVE_BYTES);
+        // UMA / emu: the free figure stays authoritative.
+        assert_eq!(
+            PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).before_reserve(),
+            5 * G
+        );
     }
 }
