@@ -48,14 +48,17 @@ fn main() {
     .expect("load_model");
     eprintln!("  arch_id={}  depth_decoder={}", model.arch_id, model.lfm3_depth_weights.is_some());
 
-    // Tokenize the prompt.
-    let tokens = model
+    // Tokenize the prompt. The omni model was trained on ChatML + BOS
+    // (<|startoftext|> = 124894); a bare prompt produces repetition collapse.
+    let chatml = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n IMDTextWriter");
+    let mut tokens = model
         .tokenizer
         .as_ref()
         .expect("tokenizer")
-        .encode(&prompt);
-    eprintln!("  prompt: {prompt:?}");
-    eprintln!("  tokens ({}): {tokens:?}", tokens.len());
+        .encode(&chatml);
+    tokens.insert(0, 124_894); // BOS <|startoftext|>
+    eprintln!("  prompt (ChatML+BOS): {chatml:?}");
+    eprintln!("  tokens ({}): {:?}…", tokens.len(), &tokens[..tokens.len().min(12)]);
 
     // Phase 1: run the text backbone (sequential prefill = decode_step per
     // token). After the last token, state.final_norm_buf holds the LM's
@@ -66,17 +69,35 @@ fn main() {
             Some(ModelState::Lfm3(b)) => b,
             _ => panic!("loaded model is not LFM3"),
         };
+        let mut last_logits: Option<Vec<f32>> = None;
         for (i, &tok_id) in tokens.iter().enumerate() {
-            decode_step(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                &mut gpu,
-                tok_id,
-                i as u32,
-            )
-            .unwrap_or_else(|e| panic!("decode_step @ {i}: {e}"));
+            last_logits = Some(
+                decode_step(&bundle.config, &bundle.weights, &mut bundle.state, &mut gpu, tok_id, i as u32)
+                    .unwrap_or_else(|e| panic!("decode_step @ {i}: {e}")),
+            );
         }
+        // Greedy text decode (coherence check — rules out a Q8 text-backbone
+        // regression as the cause of any downstream audio-path issue).
+        let mut pos = tokens.len() as u32 - 1;
+        let mut gen: Vec<u32> = Vec::with_capacity(24);
+        for _ in 0..24 {
+            let next = last_logits
+                .as_ref()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap()
+                .0 as u32;
+            gen.push(next);
+            pos += 1;
+            last_logits = Some(
+                decode_step(&bundle.config, &bundle.weights, &mut bundle.state, &mut gpu, next, pos)
+                    .unwrap_or_else(|e| panic!("greedy decode_step: {e}")),
+            );
+        }
+        let gen_text = model.tokenizer.as_ref().unwrap().decode(&gen);
+        eprintln!("  greedy text (24 tok): {gen_text:?}");
         gpu.download_f32(&bundle.state.final_norm_buf)
             .expect("download final_norm_buf")
     };

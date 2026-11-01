@@ -74,7 +74,7 @@ fn main() {
     // ── Build the prompt: ChatML user turn + assistant prefix + <|audio_start|> ──
     let tok = model.tokenizer.as_ref().expect("tokenizer");
     let chatml = format!(
-        "<|im_start|>user\n{prompt}<|im_end|><|im_start|>assistant\n"
+        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>"
     );
     let mut prompt_tokens = tok.encode(&chatml);
     // The chat template prepends bos_token (<|startoftext|> = 124894); the

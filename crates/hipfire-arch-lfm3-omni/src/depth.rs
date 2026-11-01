@@ -639,6 +639,23 @@ pub fn depth_forward(
             out[code] = s;
         }
     }
+    // EOS diagnostic: print the eos logit vs the max logit for codebook 0
+    // (gated by HIPFIRE_OMNI_EOS_DIAG). Tells whether the model ever considers
+    // end-of-audio (code audio_eos_code) during MaskGIT.
+    if std::env::var("HIPFIRE_OMNI_EOS_DIAG").is_ok() {
+        let eos = cfg.audio_eos_code as usize;
+        let row = &logits[0..cb];
+        let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let n_masked = masked.iter().filter(|&&b| b).count();
+        eprintln!(
+            "  [eos-diag] cb0: eos_logit={:.3} max_logit={:.3} gap={:.3} (masked={}/{})",
+            row[eos],
+            mx,
+            mx - row[eos],
+            n_masked,
+            ncb
+        );
+    }
     Ok(logits)
 }
 
