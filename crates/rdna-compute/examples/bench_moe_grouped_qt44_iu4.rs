@@ -9,6 +9,7 @@
 //! down `[2560, 1280]` (both qt44, symmetric headers `zp = -8 sc`).
 //!
 //! Usage: `bench_moe_grouped_qt44_iu4 [--tokens 512,4096] [--reps 15] [--route uniform|skew] [--out F.json]`
+//! gfx1100 / gfx1151 run the W4A8 entries only (`run_gfx11`): `[--route-file F --layer L --chunk C] [--entries nt2r1,nt2r2] [--warm 100]`.
 //!
 //! Per (tokens, projection) it reports median/min device time (device_synchronize bracketed, one
 //! 379 MB / 223 MB weight set > the 96 MB LLC so every call streams) of the F16 route (with and without
@@ -309,6 +310,208 @@ fn at(v: &[((usize, usize), f64)], e: (usize, usize)) -> f64 {
     v.iter().find(|x| x.0 == e).map(|x| x.1).unwrap_or(f64::NAN)
 }
 
+/// gfx11 (gfx1100 / gfx1151) W4A8 node path: no A4 / FP8 / F16 columns, the built W4A8 entries of the module
+/// (`a8_entries`), the production default (`select_entry_a8_gfx11`) and the order-independent FNV-64 of every
+/// live output row for identity between entries. Routing: synthetic (`--route uniform|skew`) or the real expert
+/// ids of a `HIPFIRE_MOE_ROUTE_DUMP` file (`--route-file F --layer L --chunk C`, `tokens` rows per chunk).
+/// Timing is a batch of back-to-back launches over two weight sets (the 337 MB weight stream does not fit the
+/// 96 MB cache) after a long clock warm-up; the card is idle between cases otherwise and DPM drops.
+fn run_gfx11(gpu: &mut Gpu, tokens: &[usize], reps: usize, sigma: f32, site_sel: &str, out_path: &str, args: &[String]) {
+    let arg = |k: &str, d: &str| -> String {
+        args.iter().position(|a| a == k).map(|i| args[i + 1].clone()).unwrap_or_else(|| d.into())
+    };
+    let warm: usize = arg("--warm", "100").parse().unwrap();
+    let route_file = arg("--route-file", "");
+    let layer: u32 = arg("--layer", "1").parse().unwrap();
+    let chunk: usize = arg("--chunk", "0").parse().unwrap();
+    let entries_sel = arg("--entries", "");
+    let arch = gpu.arch.clone();
+    let mut entries: Vec<(usize, usize)> = rdna_compute::moe_grouped_qt44_iu4::a8_entries(&arch).to_vec();
+    if !entries_sel.is_empty() {
+        entries.retain(|(nt, rf)| entries_sel.split(',').any(|e| e == format!("nt{nt}r{rf}")));
+    }
+    let mut results = Vec::new();
+    for site in SITES.iter() {
+        if !site_sel.split(',').any(|s| s == site.name) {
+            continue;
+        }
+        let (e_n, top_k) = (site.e, site.top_k);
+        let mut wrng = Rng(0x1234_5678_9abc_def1);
+        const NSET: usize = 2;
+        let mut wt: Vec<rdna_compute::GpuTensor> = Vec::new();
+        let mut ptr_t: Vec<Vec<rdna_compute::GpuTensor>> = vec![Vec::new(), Vec::new()];
+        let mut wp: Vec<Vec<Vec<u8>>> = vec![vec![Vec::new(); NSET]; 2];
+        let mut whost: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+        for _ in 0..e_n {
+            for p in 0..2 {
+                let (_, m, k) = site.projs[p];
+                let g = build_qt44(m, k, &mut wrng);
+                for set in 0..NSET {
+                    let t = gpu.upload_raw(&g, &[g.len()]).unwrap();
+                    wp[p][set].extend_from_slice(&(t.buf.as_ptr() as u64).to_le_bytes());
+                    wt.push(t);
+                }
+                whost[p].push(g);
+            }
+        }
+        for p in 0..2 {
+            for set in 0..NSET {
+                ptr_t[p].push(gpu.upload_raw(&wp[p][set], &[wp[p][set].len()]).unwrap());
+            }
+        }
+        for &rows in tokens {
+            let slots = rows * top_k;
+            let bound = {
+                let live = slots.min(e_n);
+                (slots + live * 15).div_ceil(16) * 16
+            };
+            let (topk_ids, route_name): (Vec<i32>, String) = if route_file.is_empty() {
+                (route(rows, e_n, top_k, sigma, 0x6D6F_655F_726F_7574).topk, if sigma == 0.0 { "uniform".into() } else { "skew".into() })
+            } else {
+                let b = std::fs::read(&route_file).expect("route file");
+                let (mut o, mut found) = (0usize, None);
+                while o + 16 <= b.len() {
+                    let u = |i: usize| u32::from_le_bytes(b[o + 4 * i..o + 4 * i + 4].try_into().unwrap());
+                    let (l, r, tk) = (u(0), u(1) as usize, u(2) as usize);
+                    let n = r * tk;
+                    if l == layer && tk == top_k {
+                        found = Some((o + 16, r));
+                        break;
+                    }
+                    o += 16 + 4 * n;
+                }
+                let (off, r) = found.expect("layer not in route file");
+                assert!((chunk + 1) * rows <= r, "chunk beyond the record");
+                let ids: Vec<i32> = b[off + 4 * chunk * rows * top_k..off + 4 * (chunk + 1) * rows * top_k]
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                (ids, format!("file-L{layer}c{chunk}"))
+            };
+            let topk = gpu.upload_raw(&i32s(&topk_ids), &[slots * 4]).unwrap();
+            let counts = gpu.zeros(&[e_n], DType::F32).unwrap();
+            let offsets = gpu.zeros(&[e_n + 1], DType::F32).unwrap();
+            let sorted_t = gpu.zeros(&[bound], DType::F32).unwrap();
+            let tiles_t = gpu.zeros(&[bound / 16], DType::F32).unwrap();
+            let inv = gpu.zeros(&[slots], DType::F32).unwrap();
+            gpu.moe_scatter_fused_k8(&topk, &counts, &offsets, &sorted_t, &tiles_t, &inv, slots, e_n, bound, 16).unwrap();
+            let sorted = dl_i32(gpu, &sorted_t);
+            let tiles = dl_i32(gpu, &tiles_t);
+            let offs = dl_i32(gpu, &offsets);
+            let m_total = offs[e_n] as usize;
+            println!("== site {} tokens {rows} route {route_name} slots {slots} bound {bound} m_total {m_total} live_tiles {} arch {arch}", site.name, tiles.iter().filter(|&&t| t >= 0).count());
+            for p in 0..2 {
+                let (proj, m, k) = site.projs[p];
+                let (x_row_div, x_rows) = if p == 0 { (top_k, rows) } else { (1usize, slots) };
+                let mut xr = Rng(0xABCD_EF01 ^ rows as u64 ^ m as u64);
+                let xf: Vec<f32> = (0..x_rows * k).map(|_| xr.normal()).collect();
+                let x32 = gpu.upload_f32(&xf, &[x_rows, k]).unwrap();
+                let xq8 = gpu.ensure_int8_mmq_x(&x32, x_rows, k).unwrap();
+                gpu.hip.device_synchronize().unwrap();
+                let mut xq8_host = vec![0u8; (k / 128) * x_rows * 136];
+                gpu.hip.memcpy_dtoh(&mut xq8_host, gpu.scratch.int8_mmq_x_scratch.as_ref().unwrap()).unwrap();
+                let default = rdna_compute::moe_grouped_qt44_iu4::select_entry_a8_gfx11(&arch, m_total.max(bound), m);
+                let live_ops = 2.0 * (m_total as f64) * m as f64 * k as f64;
+                let mut first_hash: Option<u64> = None;
+                let mut times: Vec<((usize, usize), f64)> = Vec::new();
+                let mut rows_json = Vec::new();
+                for &(nt, rf) in &entries {
+                    if m % (64 * rf) != 0 {
+                        continue;
+                    }
+                    let y = gpu.zeros(&[bound, m], DType::F32).unwrap();
+                    let mut launch = |gpu: &mut Gpu, set: usize| {
+                        gpu.gemm_mq4g256v2_moe_grouped_a8_sym(&ptr_t[p][set % NSET], &tiles_t, &offsets, &sorted_t, xq8, &y, m, k, x_row_div, bound, x_rows, nt, rf).unwrap();
+                    };
+                    for i in 0..warm {
+                        launch(gpu, i);
+                    }
+                    gpu.hip.device_synchronize().unwrap();
+                    let mut batch = Vec::new();
+                    for rep in 0..reps.max(3) {
+                        let t0 = Instant::now();
+                        for i in 0..8 {
+                            launch(gpu, rep * 8 + i);
+                        }
+                        gpu.hip.device_synchronize().unwrap();
+                        batch.push(t0.elapsed().as_secs_f64() * 1e6 / 8.0);
+                    }
+                    let mn = batch.iter().cloned().fold(f64::MAX, f64::min);
+                    let med = median(&mut batch);
+                    let yv = gpu.download_f32(&y).unwrap();
+                    // FNV-64 of each live position's row, summed (position-order independent of slot order within an expert only
+                    // through the grouped layout, which is shared by every entry of this case).
+                    let mut h = 0u64;
+                    for pos in 0..m_total {
+                        let mut f = 0xcbf29ce484222325u64;
+                        for v in &yv[pos * m..(pos + 1) * m] {
+                            for b in v.to_bits().to_le_bytes() {
+                                f = (f ^ b as u64).wrapping_mul(0x100000001b3);
+                            }
+                        }
+                        h = h.wrapping_add(f ^ (pos as u64).wrapping_mul(0x9E3779B97F4A7C15));
+                    }
+                    let identical = match first_hash {
+                        None => {
+                            first_hash = Some(h);
+                            true
+                        }
+                        Some(f0) => f0 == h,
+                    };
+                    // exact CPU recompute of sampled outputs
+                    let (mut checked, mut exact) = (0usize, 0usize);
+                    let mut srng = Rng(77);
+                    while checked < 128 {
+                        let pos = (srng.next() as usize) % m_total;
+                        if sorted[pos] < 0 {
+                            continue;
+                        }
+                        let row = (srng.next() as usize) % m;
+                        let e = tiles[pos / 16] as usize;
+                        let xrow = sorted[pos] as usize / x_row_div;
+                        let mut sum = 0f32;
+                        let rb = (k / 256) * 136;
+                        for hh in 0..k / 128 {
+                            let gb = &whost[p][e][row * rb + (hh / 2) * 136..row * rb + (hh / 2) * 136 + 136];
+                            let sc = f16_to_f32(u16::from_le_bytes([gb[4 * (hh & 1)], gb[4 * (hh & 1) + 1]]));
+                            let o = (hh * x_rows + xrow) * 136;
+                            let blk = &xq8_host[o..o + 136];
+                            let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
+                            let mut c = 0i32;
+                            for i in 0..128 {
+                                let wb = gb[8 + 64 * (hh & 1) + i / 2];
+                                let wn = if i % 2 == 0 { wb & 15 } else { wb >> 4 } as i32 - 8;
+                                c += wn * (blk[8 + pair_order(i)] as i8 as i32);
+                            }
+                            sum = (sc * d).mul_add(c as f32, sum);
+                        }
+                        checked += 1;
+                        if sum.to_bits() == yv[pos * m + row].to_bits() {
+                            exact += 1;
+                        }
+                    }
+                    println!(
+                        "  {proj} A8 nt{nt}r{rf}: med {med:.0} us min {mn:.0} us  ({:.1} TOPS on m_total)  fnv {h:016x} identical-to-first {identical}  exact CPU {exact}/{checked}",
+                        live_ops / med / 1e6
+                    );
+                    times.push(((nt, rf), med));
+                    rows_json.push(serde_json::json!({"nt": nt, "rf": rf, "med_us": med, "min_us": mn, "fnv": format!("{h:016x}"), "identical_to_first": identical, "exact_cpu": [exact, checked]}));
+                    if !identical || exact != checked {
+                        println!("  FAIL: {proj} nt{nt}r{rf} identity or CPU contract");
+                        std::process::exit(1);
+                    }
+                }
+                let (be, bt) = best(&times);
+                println!("  {proj}: default nt{}r{} {:.0} us; best nt{}r{} {:.0} us", default.0, default.1, at(&times, default), be.0, be.1, bt);
+                results.push(serde_json::json!({"site": site.name, "tokens": rows, "route": route_name, "proj": proj, "m": m, "k": k, "m_total": m_total, "default": [default.0, default.1], "default_us": at(&times, default), "entries": rows_json}));
+            }
+        }
+    }
+    if !out_path.is_empty() {
+        std::fs::write(out_path, serde_json::to_string_pretty(&serde_json::json!({"arch": arch, "sigma": sigma, "results": results})).unwrap()).unwrap();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str, d: &str| -> String {
@@ -332,8 +535,12 @@ fn main() {
     let run_a4 = arg("--a4", "1") == "1";
 
     let mut gpu = Gpu::init_with_device(0).unwrap();
+    if matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151") {
+        run_gfx11(&mut gpu, &tokens, reps, sigma, &site_sel, &out_path, &args);
+        return;
+    }
     if gpu.arch != "gfx1201" {
-        println!("skip: arch {} is not gfx1201", gpu.arch);
+        println!("skip: arch {} is not gfx1201 / gfx1100 / gfx1151", gpu.arch);
         return;
     }
     let mut mag = [0f64; 127];
