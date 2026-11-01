@@ -886,6 +886,20 @@ fn verify_source_tag(source: &Path, tag: &str) -> Result<(), String> {
     if actual == tag {
         return Ok(());
     }
+    // `describe` prefers one name when tags alias a commit. Resolve the
+    // literal requested ref first, then peel annotated tags to the commit.
+    let tag_ref = format!("refs/tags/{tag}");
+    let requested_commit = crate::git_output(source, &["show-ref", "--verify", "--hash", &tag_ref])
+        .and_then(|object| {
+            crate::git_output(
+                source,
+                &["rev-parse", "--verify", &format!("{object}^{{commit}}")],
+            )
+        });
+    let head_commit = crate::git_output(source, &["rev-parse", "--verify", "HEAD"]);
+    if matches!((requested_commit, head_commit), (Ok(requested), Ok(head)) if requested == head) {
+        return Ok(());
+    }
     Err(format!(
         "HEAD is at tag {actual}, not {tag}; the tag was not acquired (failed fetch or skipped checkout)"
     ))
@@ -1648,6 +1662,29 @@ mod tests {
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "one"]);
         git(&repo, &["tag", "v9.9.9"]);
+        assert!(verify_source_tag(&repo, "v9.9.9").is_ok());
+        // An annotated alias wins describe's preference over the requested
+        // lightweight tag, but both refs still name the same commit.
+        git(
+            &repo,
+            &[
+                "-c",
+                "tag.gpgSign=false",
+                "tag",
+                "-a",
+                "v9.9.9-alias",
+                "-m",
+                "alias",
+            ],
+        );
+        assert_eq!(
+            crate::git_output(&repo, &["describe", "--tags", "--exact-match", "HEAD"]).unwrap(),
+            "v9.9.9-alias"
+        );
+        verify_source_tag(&repo, "v9.9.9").unwrap();
+        assert!(verify_source_tag(&repo, "v9.9.9-alias").is_ok());
+        assert!(verify_source_tag(&repo, "v9.9.9^{}").is_err());
+        git(&repo, &["tag", "-d", "v9.9.9-alias"]);
         assert!(verify_source_tag(&repo, "v9.9.9").is_ok());
         // HEAD at a different exact tag: a verified mismatch must refuse.
         fs::write(repo.join("f"), b"x").unwrap();
