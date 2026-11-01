@@ -161,6 +161,10 @@ a new arm.
   for earlier rows` (`SelectorPenalty`, host-side walk), so `q` tracks the penalized `p` and tau
   holds; it never changes the output, only acceptance. A neutral request keeps the device argmax
   route and the raw walk unchanged.
+  A retired request (spec-retire) decodes its remaining tokens through `ar_step`: one stream wait
+  for the feature row and the logits (`SpecTarget::commit_row_logits`), then AR's own host sampler
+  (`apply_logit_policy_cpu` + `sample_top_k_p_with_state` against a speculator-owned xorshift32 state
+  seeded like AR's per-request reset), so the pick is `sample_cpu`'s for the same row, history and state.
 - **muse-glimmer 14:** a distinct arch-23 draft (not a `dflash_convert` arch-20 artifact), loaded via
   `HIPFIRE_DFLASH_DRAFT` / `params.draft` while `dflash_mode != off`.
 - **Genre conditionality** is a measured property (see the historical table in

@@ -269,29 +269,37 @@ fn spec_scratch<'a>(
         .ok_or_else(|| format!("raon1_mini {what}: scratch is not RaonSpecScratch"))
 }
 
-/// Append rows `[from, to)` of the capture buffer (`row_width` F32 each) to `out`.
+/// What [`RaonBundle::verify_forward`] does with the feature rows it captures.
+enum Features<'a> {
+    /// No capture (or DFlash disarmed).
+    Off,
+    /// Append the rows to the vector before returning.
+    Download(&'a mut Vec<f32>),
+    /// Capture on the device only; the caller reads the rows back together
+    /// with whatever else it needs ([`RaonBundle::commit_row_logits`]).
+    Deferred,
+}
+
+fn features_of(out: Option<&mut Vec<f32>>) -> Features<'_> {
+    match out {
+        Some(out) => Features::Download(out),
+        None => Features::Off,
+    }
+}
+
+/// Append rows `[0, rows)` of the capture buffer (`row_width` F32 each) to `out`.
 fn append_capture_rows(
     gpu: &Gpu,
     capture: &GpuTensor,
     row_width: usize,
-    from: usize,
-    to: usize,
+    rows: usize,
     out: &mut Vec<f32>,
 ) -> Result<(), String> {
-    // The capture copies may sit on the decode stream: drain every queue first.
-    gpu.hip
-        .device_synchronize()
-        .map_err(|e| format!("raon1_mini: synchronize before feature download: {e:?}"))?;
-    let elems = (to - from) * row_width;
-    let start = out.len();
-    out.resize(start + elems, 0.0);
-    // SAFETY: `out[start..]` holds exactly `elems` f32s; any byte pattern is a valid f32.
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(out[start..].as_mut_ptr() as *mut u8, elems * 4) };
-    gpu.hip
-        .memcpy_dtoh(bytes, &capture.sub_offset(from * row_width, elems).buf)
-        .map_err(|e| format!("raon1_mini: download DFlash feature rows: {e:?}"))?;
-    gpu.take_device_wait_error()
+    let part = capture.sub_offset(0, rows * row_width);
+    // The capture kernels run on the decode stream, like the forward that
+    // feeds them: one stream wait covers the copy. Without a decode stream the
+    // download drains the whole device first.
+    gpu.download_f32_stream_ordered_append(&mut [(&part, out)])
         .map_err(|e| format!("raon1_mini: download DFlash feature rows: {e:?}"))
 }
 
@@ -375,7 +383,7 @@ impl RaonBundle {
         block: &[u32],
         position: usize,
         scratch: &mut dyn SpecScratch,
-        hidden_out: Option<&mut Vec<f32>>,
+        features: Features<'_>,
         rollback: bool,
     ) -> Result<(usize, bool), String> {
         let ss = spec_scratch(scratch, "verify")?;
@@ -405,7 +413,7 @@ impl RaonBundle {
             ));
         }
         self.ensure_head_buffers(gpu, rows)?;
-        let with_features = hidden_out.is_some() && !self.spec.layers.is_empty();
+        let with_features = !matches!(features, Features::Off) && !self.spec.layers.is_empty();
         if with_features {
             self.ensure_capture(gpu, rows)?;
         }
@@ -449,9 +457,9 @@ impl RaonBundle {
                 self.verify_graph_mark_warm(gpu, rows, with_features);
             }
         }
-        if let (true, Some(out)) = (with_features, hidden_out) {
+        if let (true, Features::Download(out)) = (with_features, features) {
             let capture = self.spec.capture.as_ref().expect("capture just ensured");
-            append_capture_rows(gpu, capture, self.feature_row_width(), 0, rows, out)?;
+            append_capture_rows(gpu, capture, self.feature_row_width(), rows, out)?;
         }
         Ok((rows, graphed))
     }
@@ -715,7 +723,7 @@ impl SpecTarget for RaonBundle {
         hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         let (rows, argmax_done) =
-            self.verify_forward(gpu, block, position, scratch, hidden_out, true)?;
+            self.verify_forward(gpu, block, position, scratch, features_of(hidden_out), true)?;
         self.verify_picks(gpu, rows, argmax_done)
     }
 
@@ -727,7 +735,8 @@ impl SpecTarget for RaonBundle {
         scratch: &mut dyn SpecScratch,
         hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<f32>, String> {
-        let (rows, _) = self.verify_forward(gpu, block, position, scratch, hidden_out, true)?;
+        let (rows, _) =
+            self.verify_forward(gpu, block, position, scratch, features_of(hidden_out), true)?;
         self.verify_logits(gpu, rows)
     }
 
@@ -742,8 +751,14 @@ impl SpecTarget for RaonBundle {
         hidden_out: Option<&mut Vec<f32>>,
         want_logits: bool,
     ) -> Result<RowPick, String> {
-        let (rows, argmax_done) =
-            self.verify_forward(gpu, &[token], position, scratch, hidden_out, false)?;
+        let (rows, argmax_done) = self.verify_forward(
+            gpu,
+            &[token],
+            position,
+            scratch,
+            features_of(hidden_out),
+            false,
+        )?;
         // The forward armed the recurrence-input ring for a rollback that
         // cannot come.
         self.spec.clear_ring_ticket();
@@ -760,6 +775,53 @@ impl SpecTarget for RaonBundle {
             ));
         }
         Ok(pick)
+    }
+
+    /// [`SpecTarget::commit_row`] with logits into the caller's vector, the
+    /// feature row and the logits row enqueued back to back on the decode
+    /// stream and read with one wait; neither readback allocates.
+    fn commit_row_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        logits: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let features = if hidden_out.is_some() {
+            Features::Deferred
+        } else {
+            Features::Off
+        };
+        let (rows, _) = self.verify_forward(gpu, &[token], position, scratch, features, false)?;
+        // The forward armed the recurrence-input ring for a rollback that
+        // cannot come.
+        self.spec.clear_ring_ticket();
+        let vocab = self.config.vocab;
+        let head = self.spec.head.as_ref().expect("verify head just ensured");
+        let logits_part = head.logits.sub_offset(0, rows * vocab);
+        logits.clear();
+        let read = match (hidden_out, self.spec.layers.is_empty()) {
+            (Some(out), false) => {
+                let capture = self.spec.capture.as_ref().expect("capture just ensured");
+                let features_part = capture.sub_offset(0, rows * self.feature_row_width());
+                gpu.download_f32_stream_ordered_append(&mut [
+                    (&features_part, out),
+                    (&logits_part, logits),
+                ])
+            }
+            _ => gpu.download_f32_stream_ordered_append(&mut [(&logits_part, logits)]),
+        };
+        read.map_err(|e| format!("raon1_mini commit_row logits download: {e:?}"))?;
+        if self.state.n_tokens() != position + 1 {
+            return Err(format!(
+                "raon1_mini commit_row ended at {}, expected {}",
+                self.state.n_tokens(),
+                position + 1
+            ));
+        }
+        Ok(())
     }
 
     fn commit_prefix(

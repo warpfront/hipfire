@@ -8697,6 +8697,46 @@ impl Gpu {
         self.take_device_wait_error()
     }
 
+    /// Append each `parts[i].0` tensor's F32 contents to `parts[i].1` (the
+    /// vector grows by the tensor's element count; callers wanting a
+    /// replacement `clear` it first, so a reused buffer keeps its allocation),
+    /// enqueueing every copy on [`Self::active_stream`] and waiting on that
+    /// stream ONCE: one host round trip for a token's feature row and its
+    /// logits, with no legacy-stream hop ([`Self::download_f32_stream_ordered`]).
+    /// The tensors must have been written by work on the active stream (a
+    /// decode graph replay or the eager forward). With no active stream the
+    /// device is drained once and each part is a blocking copy.
+    pub fn download_f32_stream_ordered_append(
+        &self,
+        parts: &mut [(&GpuTensor, &mut Vec<f32>)],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self.active_stream.as_ref();
+        if stream.is_none() {
+            self.hip.device_synchronize()?;
+        }
+        for (tensor, out) in parts.iter_mut() {
+            let numel = tensor.numel();
+            let start = out.len();
+            out.resize(start + numel, 0.0);
+            // SAFETY: `out[start..]` holds exactly `numel` f32s; any byte pattern is a
+            // valid f32. No part's vector is resized again before the copies finish.
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(out[start..].as_mut_ptr() as *mut u8, numel * 4)
+            };
+            match stream {
+                Some(stream) => self
+                    .hip
+                    .memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?,
+                None => self.hip.memcpy_dtoh(bytes, &tensor.buf)?,
+            }
+        }
+        if let Some(stream) = stream {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.take_device_wait_error()
+    }
+
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
     /// reinterpretation, so a caller can compare code blobs bit-for-bit.
     ///
