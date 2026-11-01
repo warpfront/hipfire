@@ -734,9 +734,18 @@ pub struct RdaConvPrepareLaunch<'a> {
 
 impl Gpu {
     /// Whether the wave-per-tile RDA kernels (`raon_rda_conv_prepare_w128_f32`,
-    /// `gated_rmsnorm_sigmoid_rows_w128_f32`) are valid on this device: wave32 and verified on exact gfx1201.
+    /// `gated_rmsnorm_sigmoid_rows_w128_f32`) are valid on this device: wave32 and verified on exact gfx1201 (the gated norm); see
+    /// [`Self::rda_conv_prepare_arch_supported`] for the conv + prepare producer.
     pub fn rda_wave_kernels_arch_supported(&self) -> bool {
         self.arch == "gfx1201"
+    }
+
+    /// Whether `raon_rda_conv_prepare_w128_f32` is valid on this device: exact gfx1201, or exact gfx1100
+    /// (7900 XTX; wave32, byte-identical to the lifted `_pm_gfx1100` conv + `raon_rda_prepare_f32` chain on
+    /// the node oracle and the real model). The gated norm stays gfx1201-only
+    /// ([`Self::rda_wave_kernels_arch_supported`]): on gfx1100 it is no faster than the incumbent.
+    pub fn rda_conv_prepare_arch_supported(&self) -> bool {
+        self.arch == "gfx1201" || self.arch == "gfx1100"
     }
 
     /// The conv(q,k,v) + `raon_rda_prepare_f32` chain in one launch over `n_rows` rows; outputs and the
@@ -751,9 +760,9 @@ impl Gpu {
                 p.head_dim, p.conv_kernel
             )));
         }
-        if !self.rda_wave_kernels_arch_supported() {
+        if !self.rda_conv_prepare_arch_supported() {
             return Err(refuse(format!(
-                "raon_rda_conv_prepare_w128_f32: arch {} is not gfx1201",
+                "raon_rda_conv_prepare_w128_f32: arch {} is not gfx1201 / gfx1100",
                 self.arch
             )));
         }

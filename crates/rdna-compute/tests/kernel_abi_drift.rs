@@ -262,6 +262,7 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1100", "latent_attention_flash_prefill_q8"),
     ("gfx1100", "moe_scatter_fused_k8"),
     ("gfx1100", "mq_rotate_x"),
+    ("gfx1100", "raon_rda_conv_prepare_w128_f32"),
     ("gfx1100", "rotate_x_mq_awq"),
     ("gfx1151", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx11"),
     ("gfx1151", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx11_t256"),
