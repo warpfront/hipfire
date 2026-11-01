@@ -28,7 +28,8 @@
 //! # Shape (`--shape k=v,...`)
 //!
 //! Every contract param by name (`M`, `K`, `N`, `n_experts`, ...), plus the recipe knobs `tokens` (activation
-//! rows of a ROUTED contract), `topk`, `route_seed`, `prefix` (the value of a position device scalar, default 0),
+//! rows of a ROUTED contract), `topk`, `route_seed`, `route=uniform|hist:<route_hist.v1>[@L]` (real recorded per-token
+//! expert lists, sha-verified, cycled to `tokens`; E/topk must match; default uniform), `prefix` (the value of a position device scalar, default 0),
 //! and `rows=` (an alias of the activation-row key: for a
 //! dense contract the `WorkV1.rows` param, for a routed one the routed rows = `tokens * topk`). A missing
 //! param is an error listing every param; the `WorkV1.rows` param (the row class) is what `--rowclasses`
@@ -627,6 +628,8 @@ pub struct ContractNode {
     routed: bool,
     routing: Option<crate::moe::Routing>,
     route_seed: u64,
+    /// `route=hist:`: the recorded expert lists (None = the uniform shape-seeded routing).
+    hist: Option<RouteHist>,
     /// Value of a position device scalar operand (`prefix=`).
     prefix: u64,
     operands: Vec<OperandPlan>,
@@ -648,7 +651,156 @@ fn param_value(abi: &KernelAbiV1, params: &[u64], name: &str) -> Option<u64> {
     abi.param_index(name).map(|i| params[i])
 }
 
+/// `--shape route=hist:<route_hist.v1 json>[@L]`: the per-token expert lists of a pinned `route_hist.v1`
+/// (`pm-census extract route-hist`; headerless `i32` LE ids bin next to it, sha256-verified), layer `L` or
+/// every layer's records concatenated in record order. Token `t` takes recorded row `t % rows` (cycled).
+#[derive(Clone, Debug, PartialEq)]
+struct RouteHist {
+    path: String,
+    id: String,
+    layer: Option<u32>,
+    n_experts: usize,
+    topk: usize,
+    /// Row-major `rows x topk`.
+    ids: Vec<i32>,
+}
+
+impl RouteHist {
+    fn parse(spec: &str) -> BResult<Self> {
+        let (path, layer) = match spec.rsplit_once('@') {
+            Some((p, l)) => (
+                p,
+                Some(
+                    l.parse::<u32>()
+                        .map_err(|e| format!("--shape route=hist:{spec}: layer `{l}`: {e}"))?,
+                ),
+            ),
+            None => (spec, None),
+        };
+        Self::load(std::path::Path::new(path), layer).map_err(BuildError::Other)
+    }
+
+    fn load(path: &std::path::Path, layer: Option<u32>) -> std::result::Result<Self, String> {
+        let err = |m: String| format!("--shape route=hist:{}: {m}", path.display());
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| err(e.to_string()))?)
+                .map_err(|e| err(e.to_string()))?;
+        if doc["schema"] != "route_hist.v1" {
+            return Err(err(format!(
+                "schema {}: expected route_hist.v1",
+                doc["schema"]
+            )));
+        }
+        let id = doc["id"]
+            .as_str()
+            .filter(|s| s.len() == 64)
+            .map(str::to_owned)
+            .ok_or_else(|| err("missing 64-hex top-level `id`".into()))?;
+        let num = |v: &Value, what: &str| {
+            v.as_u64()
+                .map(|x| x as usize)
+                .ok_or_else(|| err(format!("missing or non-integer {what}")))
+        };
+        let n_experts = num(&doc["n_experts"], "n_experts")?;
+        let topk = num(&doc["topk"], "topk")?;
+        let rel = doc["ids"]["path"]
+            .as_str()
+            .ok_or_else(|| err("missing ids.path".into()))?;
+        let bin_path = if std::path::Path::new(rel).is_absolute() {
+            PathBuf::from(rel)
+        } else {
+            path.parent().unwrap_or(std::path::Path::new(".")).join(rel)
+        };
+        let bin =
+            std::fs::read(&bin_path).map_err(|e| err(format!("{}: {e}", bin_path.display())))?;
+        let (want, got) = (
+            doc["ids"]["sha256"].as_str().unwrap_or(""),
+            crate::elf::sha256_hex(&bin),
+        );
+        if want != got {
+            return Err(err(format!(
+                "ids sha256 mismatch ({}): manifest {want}, file {got}",
+                bin_path.display()
+            )));
+        }
+        let records = doc["records"]
+            .as_array()
+            .ok_or_else(|| err("missing records".into()))?;
+        let mut at = 0usize;
+        let mut ids = Vec::new();
+        for (i, r) in records.iter().enumerate() {
+            let (l, n, k) = (
+                num(&r["layer"], "record layer")?,
+                num(&r["n"], "record n")?,
+                num(&r["k"], "record k")?,
+            );
+            if k != topk {
+                return Err(err(format!("record {i}: k={k}, topk={topk}")));
+            }
+            let end = at + n * k * 4;
+            let part = bin.get(at..end).ok_or_else(|| {
+                err(format!(
+                    "record {i} runs past the ids bin ({} bytes)",
+                    bin.len()
+                ))
+            })?;
+            at = end;
+            if layer.is_some_and(|want| want as usize != l) {
+                continue;
+            }
+            for c in part.chunks_exact(4) {
+                let e = i32::from_le_bytes(c.try_into().unwrap());
+                if e < 0 || e as usize >= n_experts {
+                    return Err(err(format!(
+                        "record {i}: expert id {e} outside [0,{n_experts})"
+                    )));
+                }
+                ids.push(e);
+            }
+        }
+        if at != bin.len() {
+            return Err(err(format!(
+                "ids bin has {} bytes, records cover {at}",
+                bin.len()
+            )));
+        }
+        if ids.is_empty() {
+            return Err(err(match layer {
+                Some(l) => format!("no records for layer {l}"),
+                None => "no rows".into(),
+            }));
+        }
+        Ok(Self {
+            path: path.display().to_string(),
+            id,
+            layer,
+            n_experts,
+            topk,
+            ids,
+        })
+    }
+
+    /// `tokens x topk` expert ids, token `t` = recorded row `t % rows`.
+    fn table(&self, tokens: usize) -> Vec<i32> {
+        let rows = self.ids.len() / self.topk;
+        let mut out = Vec::with_capacity(tokens * self.topk);
+        for t in 0..tokens {
+            let r = t % rows;
+            out.extend_from_slice(&self.ids[r * self.topk..(r + 1) * self.topk]);
+        }
+        out
+    }
+}
+
 impl ContractNode {
+    /// The `route` record of the info JSON: `{kind, path, id, layer}`.
+    fn info_route(&self) -> Value {
+        match &self.hist {
+            Some(h) => json!({"kind": "hist", "path": h.path, "id": h.id, "layer": h.layer}),
+            None => json!({"kind": "uniform"}),
+        }
+    }
+
     /// Build from the full `--node` string (`contract:<spec>`) and `--shape`.
     pub fn build(name: &str, shape: &ShapeSpec) -> BResult<Self> {
         let spec = name
@@ -717,9 +869,29 @@ impl ContractNode {
         let rows_alias = take_u64(&mut kv, "rows")?;
         let route_seed = take_u64(&mut kv, "route_seed")?.unwrap_or(DEFAULT_ROUTE_SEED);
         let prefix = take_u64(&mut kv, "prefix")?.unwrap_or(0);
+        let hist = match kv.remove("route") {
+            None => None,
+            Some(r) if r == "uniform" => None,
+            Some(r) => match r.strip_prefix("hist:") {
+                Some(spec) => Some(RouteHist::parse(spec)?),
+                None => {
+                    return Err(format!(
+                        "--shape route={r}: expected uniform|hist:<route_hist.v1 json>[@layer]"
+                    )
+                    .into())
+                }
+            },
+        };
+        if hist.is_some() && !routed {
+            return Err(format!(
+                "{}: route= is a knob of routed (grouped) contracts only",
+                abi.id
+            )
+            .into());
+        }
         if let Some(k) = kv.keys().next() {
             let mut known: Vec<&str> = abi.params.iter().map(|p| p.name).collect();
-            known.extend(["tokens", "topk", "rows", "route_seed", "prefix"]);
+            known.extend(["tokens", "topk", "rows", "route_seed", "route", "prefix"]);
             return Err(format!(
                 "--shape: unknown key `{k}` for {} (params and knobs: {})",
                 abi.id,
@@ -823,14 +995,33 @@ impl ContractNode {
                 )
                 .into());
             }
-            let topk_ids = crate::moe::route_topk(
-                tokens as usize,
-                topk as usize,
-                e as usize,
-                crate::moe::Route::Uniform,
-                0.0,
-                route_seed,
-            );
+            let topk_ids = match &hist {
+                Some(h) => {
+                    if h.n_experts as u64 != e {
+                        return Err(format!(
+                            "route=hist: the recording has n_experts={}, the shape n_experts={e}",
+                            h.n_experts
+                        )
+                        .into());
+                    }
+                    if h.topk as u64 != topk {
+                        return Err(format!(
+                            "route=hist: the recording has topk={}, the shape topk={topk}",
+                            h.topk
+                        )
+                        .into());
+                    }
+                    h.table(tokens as usize)
+                }
+                None => crate::moe::route_topk(
+                    tokens as usize,
+                    topk as usize,
+                    e as usize,
+                    crate::moe::Route::Uniform,
+                    0.0,
+                    route_seed,
+                ),
+            };
             routing = Some(
                 crate::moe::scatter(&topk_ids, e as usize, m_total as usize)
                     .map_err(|err| BuildError::Other(format!("routing plan: {err}")))?,
@@ -1165,6 +1356,7 @@ impl ContractNode {
             routed,
             routing,
             route_seed,
+            hist,
             prefix,
             operands,
             ptr_fields,
@@ -1215,6 +1407,17 @@ impl ContractNode {
     /// The activation-row key and value (`N`, `tokens`, ...), if the contract has rows.
     pub fn rows(&self) -> Option<(&str, u64)> {
         self.rows_key.as_ref().map(|(k, v)| (k.as_str(), *v))
+    }
+
+    /// The size the PRODUCT launcher compares its row predicates against: for a routed (grouped) contract the launch's
+    /// `m_total` (the sentinel-padded grouped-row bound), else the row-class value itself (`rows`).
+    pub fn launch_rows(&self) -> Option<u64> {
+        if self.routing.is_some() {
+            if let Some(i) = self.base.abi.param_index("m_total") {
+                return Some(self.params[i]);
+            }
+        }
+        self.rows().map(|(_, v)| v)
     }
 
     pub fn bytes_per_call(&self) -> u64 {
@@ -1544,7 +1747,7 @@ impl Node for ContractNode {
         if let Some(r) = &self.routing {
             v["routing"] = json!({
                 "tokens": self.tokens, "topk": self.topk, "n_experts": self.n_experts(),
-                "route": "uniform", "route_seed": self.route_seed, "live_rows": r.live,
+                "route": self.info_route(), "route_seed": self.route_seed, "live_rows": r.live,
                 "live_tiles": r.live_tiles(), "touched_experts": r.touched_experts(),
                 "max_tiles_per_expert": r.max_tiles_per_expert(), "partial_tiles": r.partial_tiles(),
                 "slab_bytes": self.slab_bytes(),
@@ -2383,6 +2586,18 @@ mod tests {
     }
 
     #[test]
+    fn launch_rows_is_m_total_for_routed_and_rows_otherwise() {
+        let q = node(QT44, "M=2176,K=2560,n_experts=128,topk=6,tokens=512");
+        let mt = q.params()[q.base.abi.param_index("m_total").unwrap()];
+        assert_eq!(q.launch_rows(), Some(mt));
+        assert!(mt >= 512 * 6 && mt % 16 == 0);
+        assert_ne!(q.launch_rows(), q.rows().map(|(_, v)| v));
+        let b = node(BF16_BATCHED, "M=128,K=2560,N=512");
+        assert_eq!(b.launch_rows(), Some(512));
+        assert_eq!(b.launch_rows(), b.rows().map(|(_, v)| v));
+    }
+
+    #[test]
     fn regime_is_hot_unless_pool_and_above_the_llc() {
         let small = node(BF16_BATCHED, "M=128,K=2560,N=512,pool=1");
         assert!(small.bytes_per_call() < 64 << 20);
@@ -2742,5 +2957,110 @@ mod tests {
         assert_eq!(n.base.export.arch, Arch::Gfx1100);
         assert!(build("contract:gemm_q8_0_wmma_gfx12", "M=8,K=64,N=4,arch=gfx1100").is_err());
         assert!(build("contract:gemm_f32_batched", "M=8,K=64,N=4,arch=gfx900").is_err());
+    }
+
+    /// A synthetic `route_hist.v1` (E=8, top-2): layer 0 has 3 rows, layer 1 has 2.
+    fn hist_fixture(tag: &str, bad_sha: bool) -> PathBuf {
+        let rows: [[i32; 2]; 5] = [[0, 1], [1, 2], [7, 7 - 1], [3, 4], [1, 4]];
+        let mut bin = Vec::new();
+        for r in rows {
+            for e in r {
+                bin.extend_from_slice(&e.to_le_bytes());
+            }
+        }
+        let dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("moe_hist_fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_name = format!("{tag}.ids.bin");
+        std::fs::write(dir.join(&bin_name), &bin).unwrap();
+        let sha = if bad_sha {
+            "0".repeat(64)
+        } else {
+            crate::elf::sha256_hex(&bin)
+        };
+        let doc = json!({
+            "schema": "route_hist.v1", "n_experts": 8, "topk": 2, "id": "ab".repeat(32),
+            "ids": {"path": bin_name, "sha256": sha},
+            "records": [{"layer": 0, "n": 3, "k": 2}, {"layer": 1, "n": 2, "k": 2}],
+        });
+        let p = dir.join(format!("{tag}.json"));
+        std::fs::write(&p, serde_json::to_vec(&doc).unwrap()).unwrap();
+        p
+    }
+
+    #[test]
+    fn route_hist_replays_recorded_experts_cycled() {
+        let p = hist_fixture("det", false);
+        let shape = format!(
+            "M=128,K=512,n_experts=8,topk=2,tokens=7,route=hist:{}",
+            p.display()
+        );
+        let n = node(QT44, &shape);
+        let r = n.routing.as_ref().unwrap();
+        // token t takes recorded row t % 5 (all layers, record order)
+        assert_eq!(&r.topk[..4], &[0, 1, 1, 2]);
+        assert_eq!(&r.topk[10..14], &[0, 1, 1, 2], "token 5 replays row 0");
+        assert_eq!(r.topk.len(), 14);
+        // expert 1 owns tokens 0,1,4,5 -> 5 slots... recount from the table itself
+        let c1 = r.topk.iter().filter(|&&e| e == 1).count();
+        assert_eq!((r.offsets[2] - r.offsets[1]) as usize, c1.div_ceil(16) * 16);
+        let rt = n.info_route();
+        assert_eq!(
+            (rt["kind"].as_str(), rt["id"].as_str()),
+            (Some("hist"), Some("ab".repeat(32).as_str()))
+        );
+        assert!(rt["layer"].is_null());
+        // `@1` selects layer 1's two rows: tokens alternate rows [3,4], [1,4]
+        let n1 = node(QT44, &format!("{shape}@1"));
+        assert_eq!(&n1.routing.as_ref().unwrap().topk[..4], &[3, 4, 1, 4]);
+        assert_eq!(n1.info_route()["layer"], 1);
+        // uniform stays the default
+        let u = node(QT44, QT44_SHAPE);
+        assert_eq!(u.info_route()["kind"], "uniform");
+    }
+
+    #[test]
+    fn route_hist_refuses_mismatch_and_bad_sha() {
+        let p = hist_fixture("ok", false);
+        let at = |shape: &str| {
+            build(QT44, &format!("{shape},route=hist:{}", p.display()))
+                .err()
+                .map(|e| e.to_string())
+        };
+        let e = at("M=128,K=512,n_experts=16,topk=2,tokens=7").unwrap();
+        assert!(e.contains("n_experts"), "{e}");
+        let e = at("M=128,K=512,n_experts=8,topk=3,tokens=7").unwrap();
+        assert!(e.contains("topk"), "{e}");
+        let e = build(
+            QT44,
+            &format!(
+                "M=128,K=512,n_experts=8,topk=2,tokens=7,route=hist:{}@9",
+                p.display()
+            ),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("no records for layer 9"), "{e}");
+        let b = hist_fixture("bad", true);
+        let e = build(
+            QT44,
+            &format!(
+                "M=128,K=512,n_experts=8,topk=2,tokens=7,route=hist:{}",
+                b.display()
+            ),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("sha256 mismatch"), "{e}");
+        let e = build(QT44, "M=128,K=512,n_experts=8,topk=2,tokens=7,route=bogus")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("route"), "{e}");
     }
 }

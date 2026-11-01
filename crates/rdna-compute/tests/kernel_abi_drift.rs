@@ -318,6 +318,7 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt1r2"),
     ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt2r1"),
     ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt2r2"),
+    ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8"),
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt1r1"),
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt1r2"),
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt2r1"),

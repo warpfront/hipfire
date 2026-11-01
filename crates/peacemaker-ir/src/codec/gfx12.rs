@@ -1604,6 +1604,11 @@ mod tests {
         (Arch::Gfx1201, "v_cmpx_eq_u16_e32", &[0x7d74_1281]), // v_cmpx_eq_u16_e32 1, v9.l
         (
             Arch::Gfx1201,
+            "v_cmp_eq_u16_e64",
+            &[0xd43a_0001, 0x0202_8081],
+        ), // v_cmp_eq_u16_e64 s1, 1, v64.l
+        (
+            Arch::Gfx1201,
             "v_cmpx_eq_u32_e64",
             &[0xd4ca_007e, 0x0202_1204],
         ), // v_cmpx_eq_u32_e64 s4, v9
