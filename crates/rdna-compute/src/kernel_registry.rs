@@ -10801,10 +10801,10 @@ mod tests {
         // gathers, the 27B AR route's plain q8 attention and slab sigmoid
         // producer, plus the opt-in twins, decode twins, QSA modules, slab
         // planner, pruned router, Q8 wide module, the fast narrow Q8 GEMV
-        // module and DFlash-draft overwrite twins. Those 159 are the pre-S1 inventory; the S1 slow-link kernels
+        // module and DFlash-draft overwrite twins and the one-token-per-wave HC read-up twin. Those 160 are the pre-S1 inventory; the S1 slow-link kernels
         // add exactly the modules in `S1_ADDED_MODULES` (not P0 modules, not
         // in the provenance fixture), each its own isolated source.
-        const PRE_S1_ADDED_SINCE_P0: usize = 159;
+        const PRE_S1_ADDED_SINCE_P0: usize = 160;
         const S1_ADDED_MODULES: [&str; 1] = ["slowlink_prefill"];
         for module in S1_ADDED_MODULES {
             assert!(by_name.contains_key(module), "missing S1 module {module}");
