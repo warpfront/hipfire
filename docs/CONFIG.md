@@ -29,6 +29,7 @@ bundle with the dedicated profile command:
 ```bash
 hipfire config profile set default
 hipfire config profile set dev
+hipfire config profile set quality   # opt-in: F32 GDN recurrent state (memory.state_quant = "fp32")
 hipfire config profile set redline
 hipfire config profile create lab
 hipfire config profile              # interactive wizard
@@ -47,6 +48,11 @@ when all its keys are present with the same values. Custom snapshots live
 under `~/.hipfire/profiles/<name>.toml`. Profile names are not schema fields and
 are never written into `config.toml`. The Settings TUI and CLI share the
 hipfire-config helpers. Profiles are global-only.
+The built-in `quality` profile is the opt-in Flash-Next quality mode: it writes
+only `memory.state_quant = "fp32"` (F32 GDN recurrent state; lower KLD, costs
+decode/prefill speed and ~0.63 GiB/rank of lane reserve). It is never the
+default; `HIPFIRE_STATE_QUANT` still overrides it, and `hipfire config set
+state_quant auto` returns to the arch default.
 
 Edit global settings interactively with `hipfire config`. Per-model overlays use
 the typed commands: `hipfire config <tag> list|get|set|reset ...`. Global
