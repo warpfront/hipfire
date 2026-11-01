@@ -304,7 +304,19 @@ pub(crate) fn route_rows_of(invariant: bool, cap: usize, rows: usize) -> usize {
     }
 }
 
+/// `HIPFIRE_QWEN4_WIDE_GROUPED_MOE` (developer, default off, `1` on, read once): a
+/// 9..=`few_row_limit` eager verify keeps the grouped, expert-unioned routed-MoE
+/// route of the <=8-row call instead of the per-(row, slot) indexed route.
+static QWEN4_WIDE_GROUPED_MOE: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_WIDE_GROUPED_MOE", false));
+
 impl Gpu {
+    /// See [`QWEN4_WIDE_GROUPED_MOE`].
+    #[inline]
+    pub fn wide_grouped_moe(&self) -> bool {
+        *QWEN4_WIDE_GROUPED_MOE
+    }
+
     /// Row count to feed ROUTING predicates (never launch extents): the
     /// canonical prefill chunk under the invariant profile, else `rows`
     /// (clamped to [`Gpu::qwen4_route_rows_cap`] while the exact EP wave sets it).

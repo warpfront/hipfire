@@ -99,6 +99,10 @@ name = "qwen4_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_wide_grouped_moe_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "fn_lane_oracle"
 required-features = ["lab"]
 

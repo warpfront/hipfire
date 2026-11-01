@@ -282,6 +282,15 @@ pub(super) fn wide_exact_rows(gpu: &Gpu, rows: usize) -> bool {
     wide_exact_route(gpu.route_rows(rows), gpu.few_row_limit())
 }
 
+/// [`wide_exact_rows`] for the routed-expert chain of the sealed QT44/QT53 MoE.
+/// With `HIPFIRE_QWEN4_WIDE_GROUPED_MOE=1` (developer, default off) a 9..=limit verify
+/// keeps the grouped, expert-unioned route (scatter, grouped gate/up, unscatter,
+/// per-slot down) the <=8-row call takes, instead of the per-(row, slot) indexed
+/// singleton route; shared-expert and HC fusions keep [`wide_exact_rows`].
+pub(super) fn wide_exact_moe_rows(gpu: &Gpu, rows: usize) -> bool {
+    wide_exact_rows(gpu, rows) && !gpu.wide_grouped_moe()
+}
+
 fn wide_projection_uses_singletons(dtype: DType, route: usize, limit: usize) -> bool {
     wide_exact_route(route, limit)
         && matches!(
