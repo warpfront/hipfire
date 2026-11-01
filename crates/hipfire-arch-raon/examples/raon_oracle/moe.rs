@@ -2558,6 +2558,7 @@ fn gpu_shared_only(
                 rot: &ts[4],
                 out: &ts[5],
                 tables: &ts[6],
+                table_cache: None,
             },
             out: &ts[5],
             rows_exact: false,

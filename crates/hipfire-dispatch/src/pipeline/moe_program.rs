@@ -6872,6 +6872,82 @@ pub struct GroupedMoeSharedScratch<'a> {
     /// F32 words, at least `single_expert_table_words(rows)`: grouping tables
     /// that run the qt44 gate/up/down weights as one-entry expert tables.
     pub tables: &'a GpuTensor,
+    /// Optional owner-held cache of the single-expert tables, keyed by the three weight pointers
+    /// and the row count, so a layer's tables are built once instead of every call. `None`: built
+    /// into `tables` on every call.
+    pub table_cache: Option<&'a SingleExpertTableCache>,
+}
+
+/// Single-expert grouping tables ([`Gpu::ffn_single_expert_tables`]) kept per (weight pointers,
+/// rows). The tables are a pure function of those inputs, so an entry found under its key is
+/// exactly what a rebuild would write, whatever the weights' history. Admitted only for eager
+/// prefill-sized calls ([`prefill_quant_admitted`]: a table built while a graph is captured or
+/// recorded has not run yet) and bounded by [`Self::MAX_ENTRIES`]; beyond that, or for any other
+/// call, the caller's shared scratch is rebuilt in place as before.
+#[derive(Default)]
+pub struct SingleExpertTableCache {
+    entries: RefCell<std::collections::HashMap<([usize; 3], usize), GpuTensor>>,
+}
+
+impl SingleExpertTableCache {
+    /// Most (layer, rows) entries kept.
+    pub const MAX_ENTRIES: usize = 256;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Entries held.
+    pub fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.borrow().is_empty()
+    }
+
+    /// Release every cached table. Call before the owner drops.
+    pub fn free(&self, gpu: &mut Gpu) {
+        for (_, t) in self.entries.borrow_mut().drain() {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// A view of the tables for (`w`, `rows`), building them once on first use. `None` when this
+    /// call is not admitted or the cache is full (the caller then builds into its scratch).
+    fn tables(
+        &self,
+        gpu: &mut Gpu,
+        rows: usize,
+        w: [&GpuTensor; 3],
+    ) -> Result<Option<GpuTensor>, DispatchError> {
+        if !prefill_quant_admitted(gpu, rows) {
+            return Ok(None);
+        }
+        let key = (
+            [
+                w[0].buf.as_ptr() as usize,
+                w[1].buf.as_ptr() as usize,
+                w[2].buf.as_ptr() as usize,
+            ],
+            rows,
+        );
+        if let Some(t) = self.entries.borrow().get(&key) {
+            return Ok(Some(t.shallow_clone()));
+        }
+        if self.entries.borrow().len() >= Self::MAX_ENTRIES {
+            return Ok(None);
+        }
+        let words = rdna_compute::ffn_activation::single_expert_table_words(rows);
+        let t = hip!(gpu.alloc_tensor(&[words], DType::F32))?;
+        if let Err(e) = gpu.ffn_single_expert_tables(&t, rows, w) {
+            let _ = gpu.free_tensor(t);
+            return Err(DispatchError::Hip(e.to_string()));
+        }
+        let view = t.shallow_clone();
+        self.entries.borrow_mut().insert(key, t);
+        Ok(Some(view))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -7214,8 +7290,20 @@ fn gated_ffn_from_basis(
         .iter()
         .any(|p| p.dtype == DType::MQ4G256V2);
     let views = if any_qt44 && !(cast.bf16() && rows == 1) {
-        hip!(gpu.ffn_single_expert_tables(s.tables, rows, [w.gate.buf, w.up.buf, w.down.buf]))?;
-        Some(Gpu::single_expert_views(s.tables, rows))
+        let weights = [w.gate.buf, w.up.buf, w.down.buf];
+        // Built once per (weights, rows) when the owner keeps a cache and the call is an eager
+        // prefill; otherwise into the shared scratch on every call.
+        let cached = match s.table_cache {
+            Some(cache) => cache.tables(gpu, rows, weights)?,
+            None => None,
+        };
+        match cached {
+            Some(t) => Some(Gpu::single_expert_views(&t, rows)),
+            None => {
+                hip!(gpu.ffn_single_expert_tables(s.tables, rows, weights))?;
+                Some(Gpu::single_expert_views(s.tables, rows))
+            }
+        }
     } else {
         None
     };
@@ -7301,6 +7389,29 @@ fn gated_ffn_from_basis(
         } else {
             None
         };
+    // gfx11 F16-WMMA qt44 gate and up read the same rotated basis: convert it to F16 once into
+    // the caller's plane and hand that to both launches (they skip their own convert for an
+    // F16-typed X; one kernel, one cast, same bytes).
+    // The plane is the first `rows * hidden` F16 words of `s.act`, which is written only after both
+    // projections ran (no extra scratch).
+    let gate_up_x16 = match s.act.as_f16_view(rows * hidden) {
+        Some(plane)
+            if gate_up_xq.is_none()
+                && cast.bf16()
+                && views.is_some()
+                && w.gate.dtype == DType::MQ4G256V2
+                && w.up.dtype == DType::MQ4G256V2
+                && ctx.arch.has_wmma_w32()
+                && !ctx.arch.is_rdna4()
+                && x_rot.numel() >= rows * hidden
+                && !sym_ok(&w.gate, s.gate_out, mi, hidden)
+                && !sym_ok(&w.up, s.up_out, mi, hidden) =>
+        {
+            hip!(gpu.convert_f32_to_f16_into(x_rot, &plane, rows * hidden))?;
+            Some(plane)
+        }
+        _ => None,
+    };
     for (which, (weight, y)) in [(&w.gate, s.gate_out), (&w.up, s.up_out)]
         .into_iter()
         .enumerate()
@@ -7310,7 +7421,11 @@ fn gated_ffn_from_basis(
             gpu,
             weight,
             which,
-            if rotated { x_rot } else { x },
+            if rotated {
+                gate_up_x16.as_ref().unwrap_or(x_rot)
+            } else {
+                x
+            },
             y,
             key,
             mi,
@@ -7432,6 +7547,7 @@ fn gated_ffn_per_row(
             rot: &row_view(s.rot, down_k, r),
             out: &row_view(s.out, hidden, r),
             tables: s.tables,
+            table_cache: None,
         };
         gated_ffn_from_basis(
             gpu,

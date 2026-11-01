@@ -571,6 +571,21 @@ impl GpuTensor {
         }
     }
 
+    /// Non-owning F16 view of the leading `elems` words (`2 * elems` bytes) of an F32 tensor, or
+    /// `None` when the tensor is not F32 or is too small. For staging an F16 plane inside a scratch
+    /// tensor that is dead at that point. The view is not to be freed.
+    pub fn as_f16_view(&self, elems: usize) -> Option<GpuTensor> {
+        let bytes = elems.checked_mul(2)?;
+        if self.dtype != crate::DType::F32 || bytes > self.buf.size() {
+            return None;
+        }
+        Some(GpuTensor {
+            buf: self.buf.byte_view(0, bytes),
+            shape: vec![elems],
+            dtype: crate::DType::F16,
+        })
+    }
+
     /// Full-buffer non-owning alias (the whole-tensor form of `sub_offset`).
     /// The returned tensor shares the source's device pointer; it is a VIEW —
     /// do NOT pass it to `free_tensor`. `DeviceBuffer::from_raw` has no
@@ -5364,6 +5379,46 @@ impl Gpu {
             force_blob,
             &mut self.replay,
             x,
+            n_elems,
+        )
+    }
+
+    /// Convert the first `n_elems` F32 words of `x` into the caller-owned F16 tensor `dst` with
+    /// the same `convert_f32_to_f16` kernel the wmma launchers run on an F32 X
+    /// ([`Self::convert_fp16_x_uncached`]): the bytes written equal what that convert would stage,
+    /// so a GEMM given the F16 `dst` (the wmma launchers skip their convert for an F16-typed X)
+    /// is bit-identical to the GEMM given `x`. One convert then serves every consumer of `x`.
+    pub fn convert_f32_to_f16_into(
+        &mut self,
+        x: &GpuTensor,
+        dst: &GpuTensor,
+        n_elems: usize,
+    ) -> HipResult<()> {
+        if x.dtype != DType::F32
+            || dst.dtype != DType::F16
+            || x.numel() < n_elems
+            || dst.numel() < n_elems
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "convert_f32_to_f16_into: needs an F32 source and an F16 destination of at least n_elems words",
+            ));
+        }
+        self.bind_thread()?;
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
+        self.scratch.convert_f32_to_f16_to_ptr(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
+            x,
+            dst.buf.as_ptr(),
             n_elems,
         )
     }

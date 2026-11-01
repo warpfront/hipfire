@@ -27771,6 +27771,21 @@ impl Gpu {
         Ok(())
     }
 
+    /// Whether [`Self::gemm_q8_0_batched_chunked`] runs `gemm_q8_0_wmma` (or a gfx11 wmma sibling
+    /// that takes the same F16 X) for an `[n, k]` activation and `m` output rows on a gfx11
+    /// (RDNA3 / RDNA3.5) device. Those launchers skip their F32->F16 convert for an F16-typed X,
+    /// so a caller feeding several such GEMMs from one plane may convert it once
+    /// ([`Self::convert_f32_to_f16_into`]) and pass the F16 tensor. `false` on RDNA4 (its
+    /// callers keep their own converts) and wherever the selector would leave the wmma route.
+    pub fn q8_0_wmma_shared_f16_x_ok(&self, m: usize, k: usize, n: usize) -> bool {
+        !self.flags.q8_batched_legacy
+            && self.arch_caps.has_wmma()
+            && !self.arch_caps.is_rdna4()
+            && k % 32 == 0
+            && n > 0
+            && !(self.arch_caps.is_gfx1151() && m >= 4096 && m % 64 == 0 && n % 64 == 0)
+    }
+
     /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
     /// kernel's MAX_BATCH=64. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
     ///
@@ -27813,6 +27828,13 @@ impl Gpu {
                 return self.gemm_q8_0_wmma_4w(a_raw, x, y, m, k, n);
             }
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
+        }
+        if x.dtype == DType::F16 {
+            // An F16 X is only consumable by the wmma launchers above.
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_q8_0_batched_chunked: an F16 X needs the wmma route",
+            ));
         }
 
         self.gemm_q8_0_batched_f32_chunked(a_raw, x, y, m, k, n)

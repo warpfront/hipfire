@@ -2410,6 +2410,42 @@ impl ScratchState {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        let out_ptr = self.fp16_x_scratch_writable(hip, n_elems)?;
+        self.convert_f32_to_f16_to_ptr(
+            hip,
+            compiler,
+            modules,
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            replay,
+            x,
+            out_ptr,
+            n_elems,
+        )?;
+        Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// The `convert_f32_to_f16` launch of [`Self::convert_fp16_x_uncached`] with a caller-chosen
+    /// destination: the same kernel, grid and cast, so the F16 words written to `out_ptr` equal
+    /// the scratch's. `out_ptr` must hold `n_elems` F16 words.
+    pub fn convert_f32_to_f16_to_ptr(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        x: &GpuTensor,
+        out_ptr: *mut c_void,
+        n_elems: usize,
+    ) -> HipResult<()> {
         compile_and_load_kernel(
             compiler,
             hip,
@@ -2423,7 +2459,6 @@ impl ScratchState {
         )?;
 
         let in_ptr = x.buf.as_ptr();
-        let out_ptr = self.fp16_x_scratch_writable(hip, n_elems)?;
         let n_val = n_elems as i32;
         let mut in_ptr_m = in_ptr;
         let mut out_ptr_m = out_ptr;
@@ -2455,8 +2490,7 @@ impl ScratchState {
                 b.push_i32(n_val);
                 b
             },
-        )?;
-        Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+        )
     }
 
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`

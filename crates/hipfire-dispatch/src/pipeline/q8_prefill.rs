@@ -124,6 +124,42 @@ pub fn q8_0_prefill_runs(gpu: &Gpu, tier: PrefillActTier, m: usize, k: usize, ro
     }
 }
 
+/// Whether [`q8_0_prefill_gemm`] at `tier` runs the gfx11 F16 wmma GEMM
+/// (`gemm_q8_0_batched_chunked` -> `gemm_q8_0_wmma`) for this `[m, k]` projection over `rows`:
+/// the route whose launcher takes an F16-typed X and skips its own F32->F16 convert. Callers
+/// that feed several such projections from one F32 plane convert it once
+/// (`Gpu::convert_f32_to_f16_into`) and call [`q8_0_prefill_gemm_f16x`] with the F16 plane:
+/// the same `convert_f32_to_f16` kernel produced the same F16 words, so the outputs are
+/// bit-identical to [`q8_0_prefill_gemm`] on the F32 plane. Never true on gfx1201 (its callers
+/// keep their own converts) or for a tier whose quantized route would run.
+pub fn q8_0_f16_x_shareable(
+    gpu: &Gpu,
+    tier: PrefillActTier,
+    m: usize,
+    k: usize,
+    rows: usize,
+) -> bool {
+    tier == PrefillActTier::F16
+        && !q8_0_prefill_runs(gpu, tier, m, k, rows)
+        && gpu.q8_0_wmma_shared_f16_x_ok(m, k, rows)
+}
+
+/// The GEMM of a [`q8_0_f16_x_shareable`] projection whose F32 plane was already converted to the
+/// F16 plane `x16` (`Gpu::convert_f32_to_f16_into`): `gemm_q8_0_batched_chunked` reads it as
+/// staged. Bit-identical to [`q8_0_prefill_gemm`] on the F32 plane (`y` holds the F32
+/// accumulators exactly as that call leaves them).
+pub fn q8_0_prefill_gemm_f16x(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x16: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    hip!(gpu.gemm_q8_0_batched_chunked(w, x16, y, m, k, rows))
+}
+
 /// `y[rows, m] = x[rows, k] @ W_q8[m, k]^T` for a Q8_0 weight `w` (F32 `x`/`y`), at the activation
 /// precision `tier`: `A8` -> `gemm_q8_0_a8_batched` (int8 activations per 32-K block), `Fp8` ->
 /// `gemm_q8_0_fp8_batched`, each when the device and `k` support it and the runtime admission

@@ -38,13 +38,13 @@ pub use moe_program::{
     GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy, GroupedMoeProtocol, GroupedMoeRouted,
     GroupedMoeRouter, GroupedMoeScratch, GroupedMoeScratchPlan, GroupedMoeShared,
     GroupedMoeSharedScratch, GroupedMoeSiteTiers, RouterKind, SharedExpertPolicy,
-    GROUPED_MOE_IU4_MIN_ROWS,
+    SingleExpertTableCache, GROUPED_MOE_IU4_MIN_ROWS,
 };
 pub use moe_program::{MoeStage, SealedMoeOp};
 pub use q8_prefill::{
-    grouped_sym_tier_admits, prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_gemm_prepared,
-    q8_0_prefill_prepare, q8_0_prefill_runs, q8_0_weight_admits, PrefillActTier, PreparedA8,
-    Q8PrefillRun, PREFILL_QUANT_MIN_ROWS,
+    grouped_sym_tier_admits, prefill_quant_admitted, q8_0_f16_x_shareable, q8_0_prefill_gemm,
+    q8_0_prefill_gemm_f16x, q8_0_prefill_gemm_prepared, q8_0_prefill_prepare, q8_0_prefill_runs,
+    q8_0_weight_admits, PrefillActTier, PreparedA8, Q8PrefillRun, PREFILL_QUANT_MIN_ROWS,
 };
 pub(crate) mod draft_head;
 pub mod moe_capture;

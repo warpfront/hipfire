@@ -723,7 +723,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "scratch-launch-plumbing",
         predicates: &[CaptureMode],
-        condition: "`capture_mode` forwarded into scratch::launch_maybe_blob by rotate_x_mq*/rotate_quantize_x_mq8, ensure_q8_1_mmq_x(128), ensure_int4/int8_mmq_x, prepare_mq4v2_fp8_x*, convert_fp16_x_uncached, fp8_verify_pack_x / pack_fp8_verify_rows (dispatch.rs, gemv.rs, gemm_fp8_verify.rs, scratch.rs)",
+        condition: "`capture_mode` forwarded into scratch::launch_maybe_blob by rotate_x_mq*/rotate_quantize_x_mq8, ensure_q8_1_mmq_x(128), ensure_int4/int8_mmq_x, prepare_mq4v2_fp8_x*, convert_fp16_x_uncached / convert_f32_to_f16_into / convert_f32_to_f16_to_ptr, fp8_verify_pack_x / pack_fp8_verify_rows (dispatch.rs, gemv.rs, gemm_fp8_verify.rs, scratch.rs)",
         effect: LaunchMechanism,
         switches: "launch mechanism only (see launch-funnel-blob-path); rotations and quantizers always run",
         kernels: &[],
@@ -2806,6 +2806,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/dispatch.rs",
+        function: "convert_f32_to_f16_into",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
         function: "device_wait_block",
         occurrences: 1,
         decisions: &["eager-only-refusals"],
@@ -3552,6 +3558,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/scratch.rs",
         function: "convert_fp16_x_uncached",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "convert_f32_to_f16_to_ptr",
         occurrences: 2,
         decisions: &["scratch-launch-plumbing"],
     },
