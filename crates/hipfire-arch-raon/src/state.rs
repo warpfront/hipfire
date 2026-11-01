@@ -1039,8 +1039,11 @@ impl RaonState {
             ));
         }
         let v = i32::try_from(n).map_err(|_| "raon state: n_tokens exceeds i32".to_string())?;
+        // The length is the immediate of one memset-d32 enqueued on the decode stream (the
+        // legacy stream when there is none): ordered with the kernels that read it, no
+        // blocking null-stream copy between two graph replays.
         hip(
-            gpu.hip.memcpy_htod(&self.seq_len.buf, &v.to_le_bytes()),
+            gpu.write_u32_stream_ordered(&self.seq_len.buf, v as u32),
             "write seq_len",
         )?;
         self.n_tokens = n;

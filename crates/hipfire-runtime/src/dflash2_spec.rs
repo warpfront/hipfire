@@ -176,8 +176,9 @@ pub struct Dflash2Speculator {
     /// neutral): seeded at prefill, rebuilt from the loop's `emitted` at every
     /// window ([`PenaltyHistory`]).
     history: PenaltyHistory,
-    /// The request's penalty policy for [`apply_logit_policy_cpu`], the same
-    /// arithmetic AR's `sample_cpu` runs before its temperature stage.
+    /// The request's host sampler (`temperature`, `top_p`, `top_k`, `min_p`)
+    /// and penalty policy ([`apply_logit_policy_cpu`]): the config AR's
+    /// `sample_cpu` runs with.
     penalty_cfg: SamplerConfig,
     /// The selector scores its candidates after the request's penalties
     /// ([`SelectorPenalty`]); set at build from [`draft_penalty_enabled`].
@@ -185,6 +186,12 @@ pub struct Dflash2Speculator {
     /// The target's measured break-even line for this draft
     /// ([`SpecTarget::dflash_retire_break_even`]); `Some` arms the AR step.
     retire: Option<crate::spec_retire::BreakEven>,
+    /// The one-token window's target row, reused across tokens (a retired
+    /// request decodes hundreds of them, each a vocabulary-wide row).
+    logits_buf: Vec<f32>,
+    /// The host sampler stream of one-token picks: AR's xorshift32 state, so a
+    /// pick draws exactly what `sampler::sample_cpu` draws from that state.
+    ar_state: u32,
 }
 
 impl Dflash2Speculator {
@@ -205,24 +212,19 @@ impl Dflash2Speculator {
         )
     }
 
-    /// One draw (sampled) or argmax (greedy) from the target row `logits`
-    /// after the request's penalties over `self.history.row(0)`: AR's
-    /// `sample_cpu` pick. The window ([`PenaltyHistory::begin_window`] /
-    /// `set_prompt`) must be open.
-    fn pick_penalized_row(&mut self, logits: &mut [f32]) -> Result<u32, String> {
-        apply_logit_policy_cpu(logits, self.history.row(0), &self.penalty_cfg);
-        if self.sampled() {
-            self.sample_row(logits)
-        } else {
-            Ok(argmax(logits))
-        }
-    }
-
-    /// One draw from the target row `logits` with the AR sampler's law.
-    fn sample_row(&mut self, logits: &[f32]) -> Result<u32, String> {
-        let mut p = SparseDist::default();
-        p.build_from_logits(logits, self.sample_spec(), &mut Vec::new())?;
-        Ok(p.sample(self.rng.next_f32()))
+    /// The target row `logits` after the request's penalties over
+    /// `self.history.row(0)` (a no-op for a neutral request), then AR's pick:
+    /// the argmax when greedy, else a draw from the request's sampler stream.
+    /// The same function `sampler::sample_cpu` computes, so for one row, one
+    /// history and one stream state the token is AR's ([`ar_pick_token`]). The
+    /// window ([`PenaltyHistory::begin_window`] / `set_prompt`) must be open.
+    fn ar_pick(&mut self, logits: &mut [f32]) -> u32 {
+        ar_pick_token(
+            logits,
+            self.history.row(0),
+            &self.penalty_cfg,
+            &mut self.ar_state,
+        )
     }
 
     fn verify_scratch(&mut self) -> Result<&mut Box<dyn SpecScratch>, String> {
@@ -334,7 +336,10 @@ impl Dflash2Speculator {
     /// ([`SpecTarget::commit_row`], no rollback snapshot needed) with its
     /// feature capture, then the greedy or sampled pick, over the penalized
     /// row when the request has penalties (history = the loop's `emitted`,
-    /// seed last, which the caller opened with `begin_window`).
+    /// seed last, which the caller opened with `begin_window`). A row read as
+    /// logits goes into a buffer the speculator keeps, and the feature row
+    /// lands directly in the draft's feature log, so a token allocates and
+    /// copies nothing but the row itself.
     fn step_one_token(
         &mut self,
         gpu: &mut Gpu,
@@ -342,25 +347,72 @@ impl Dflash2Speculator {
         position: usize,
         seed: u32,
     ) -> Result<SpecStep, String> {
-        let mut rows = Vec::with_capacity(self.row_elems());
+        let before = self.target_hidden_host.len();
+        let result = self.commit_one_token(gpu, target, position, seed);
+        let token = match result {
+            Ok(token) => token,
+            Err(error) => {
+                self.target_hidden_host.truncate(before);
+                return Err(error);
+            }
+        };
+        let grown = self.target_hidden_host.len() - before;
+        if grown != self.row_elems() {
+            self.target_hidden_host.truncate(before);
+            return Err(format!(
+                "Dflash2Speculator: target captured {grown} feature floats, need {}",
+                self.row_elems()
+            ));
+        }
+        self.host_tokens.push(seed);
+        self.trim_host();
+        Ok(SpecStep::new(std::iter::once(token), token, 0, 0).cap_emit(1))
+    }
+
+    /// The target half of [`Self::step_one_token`]: commit `seed`, append its
+    /// feature row to the host log, return the next token.
+    fn commit_one_token(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
         let sampled = self.sampled();
         let penalized = self.request.penalties_active();
-        let vs = self.verify_scratch()?;
-        let pick = target.commit_row(
-            gpu,
-            seed,
-            position,
-            vs.as_mut(),
-            Some(&mut rows),
-            sampled || penalized,
-        )?;
-        let token = match pick {
-            RowPick::Logits(mut logits) if penalized => self.pick_penalized_row(&mut logits)?,
-            RowPick::Logits(logits) => self.sample_row(&logits)?,
-            RowPick::Argmax(token) => token,
-        };
-        self.append_rows(&rows, &[seed])?;
-        Ok(SpecStep::new(std::iter::once(token), token, 0, 0).cap_emit(1))
+        let vs = self
+            .verify_scratch
+            .as_mut()
+            .ok_or("Dflash2Speculator: verify scratch already freed")?;
+        if sampled || penalized {
+            let mut logits = std::mem::take(&mut self.logits_buf);
+            let read = target.commit_row_logits(
+                gpu,
+                seed,
+                position,
+                vs.as_mut(),
+                Some(&mut self.target_hidden_host),
+                &mut logits,
+            );
+            let read = read.map(|()| self.ar_pick(&mut logits));
+            self.logits_buf = logits;
+            let token = read?;
+            Ok(token)
+        } else {
+            match target.commit_row(
+                gpu,
+                seed,
+                position,
+                vs.as_mut(),
+                Some(&mut self.target_hidden_host),
+                false,
+            )? {
+                RowPick::Argmax(token) => Ok(token),
+                RowPick::Logits(_) => {
+                    Err("commit_row returned logits for an argmax request".into())
+                }
+            }
+        }
     }
 
     /// Append the feature rows of the committed `tokens`.
@@ -437,12 +489,13 @@ impl Speculator for Dflash2Speculator {
         self.check_host_rows(start + fill.len())?;
         let penalized = self.request.penalties_active();
         let first_token = match last_logits {
-            // The first token sees the history's prompt tail; an empty one
-            // (generated-only) leaves the row untouched.
-            Some(mut logits) if penalized && !self.history.row(0).is_empty() => {
-                self.pick_penalized_row(&mut logits)?
+            // The first token sees the history's prompt tail (empty when the
+            // request penalizes generated tokens only): AR's own pick.
+            Some(mut logits)
+                if self.sampled() || (penalized && !self.history.row(0).is_empty()) =>
+            {
+                self.ar_pick(&mut logits)
             }
-            Some(logits) if self.sampled() => self.sample_row(&logits)?,
             None if self.sampled() => {
                 return Err(
                     "Dflash2Speculator: a sampled prefill needs the target's final-row logits"
@@ -751,8 +804,15 @@ impl Speculator for Dflash2Speculator {
 
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.rng = SpecRng::new(cfg.rng_seed);
+        // AR's own seeding of the host sampler stream (`sampler_rng_reset`):
+        // the request seed, folded to 32 bits, never 0.
+        self.ar_state = ((cfg.rng_seed >> 32) as u32 ^ cfg.rng_seed as u32).max(1);
         self.history = PenaltyHistory::new(cfg.penalty_window());
         self.penalty_cfg = SamplerConfig {
+            temperature: if cfg.temp > 1e-6 { cfg.temp } else { 0.0 },
+            top_p: cfg.top_p,
+            top_k: cfg.top_k,
+            min_p: (cfg.min_p > 0.0).then_some(cfg.min_p),
             repeat_penalty: cfg.repeat_penalty,
             repeat_window: cfg.repeat_window,
             presence_penalty: cfg.presence_penalty,
@@ -875,6 +935,30 @@ impl Dflash2Speculator {
             },
         )
     }
+}
+
+/// AR's pick from one target row: [`apply_logit_policy_cpu`] over `history`
+/// (repeat, presence / frequency, blocked), then [`crate::llama::sample_top_k_p_with_state`]
+/// at `cfg`'s temperature, `top_p`, `top_k` and `min_p` against the xorshift32
+/// `state`: exactly the two calls of [`crate::sampler::sample_cpu`], so for one
+/// row, one history and one state the token and the advanced state are AR's.
+/// Greedy (`temperature <= 0`) is the argmax of the penalized row and leaves
+/// `state` alone. `state` must be nonzero.
+pub(crate) fn ar_pick_token(
+    logits: &mut [f32],
+    history: &[u32],
+    cfg: &SamplerConfig,
+    state: &mut u32,
+) -> u32 {
+    apply_logit_policy_cpu(logits, history, cfg);
+    crate::llama::sample_top_k_p_with_state(
+        logits,
+        cfg.temperature,
+        cfg.top_p,
+        cfg.top_k,
+        cfg.min_p,
+        state,
+    )
 }
 
 /// Penalize every row of a verify window's `logits` (`(drafts + 1) × vocab`)
@@ -1104,6 +1188,8 @@ pub fn build_dflash2_speculator(
         history: PenaltyHistory::default(),
         penalty_cfg: SamplerConfig::greedy(),
         retire,
+        logits_buf: Vec::new(),
+        ar_state: 1,
     }))
 }
 
@@ -1776,5 +1862,231 @@ mod tests {
         );
         assert_eq!(same.tokens, raw_greedy.tokens);
         assert_eq!(same.confidence, raw_greedy.confidence);
+    }
+
+    /// A retired (or one-token) step draws AR's token: for recorded logits
+    /// rows, a growing generated-only history and the request's seed, the
+    /// stream of `ar_pick_token` (the speculator's pick, its own xorshift32
+    /// state seeded as `configure_request` seeds it) is the stream of
+    /// `sampler::sample_cpu` over the same rows against the process sampler
+    /// state AR resets to the request seed, token for token and state for
+    /// state, across greedy and sampled configs, penalties and truncations.
+    #[test]
+    fn one_token_pick_is_the_ar_sampler_stream() {
+        use crate::llama::{sampler_rng_restore, sampler_rng_snapshot};
+        use crate::sampler::sample_cpu;
+        let vocab = 3000usize;
+        let mut s = 0x2545_f491u32;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        // Recorded rows: a few strong candidates, many ties, a negative tail.
+        let rows: Vec<Vec<f32>> = (0..48)
+            .map(|_| {
+                (0..vocab)
+                    .map(|i| {
+                        let jitter = (next() % 1000) as f32 / 250.0;
+                        if i % 97 == 0 {
+                            jitter + 5.0
+                        } else {
+                            jitter - 3.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let configs = [
+            // (temp, top_p, top_k, min_p, repeat, presence, frequency, window)
+            (
+                1.0f32,
+                0.95f32,
+                Some(20u32),
+                0.0f32,
+                1.0f32,
+                1.5f32,
+                0.0f32,
+                4096usize,
+            ),
+            (0.7, 0.9, Some(8), 0.05, 1.1, 0.5, 0.25, 32),
+            (1.0, 1.0, None, 0.0, 1.0, 0.0, 0.0, 0),
+            (1.3, 0.8, Some(0), 0.1, 1.2, 1.0, 0.0, 16),
+            (0.0, 1.0, None, 0.0, 1.0, 1.5, 0.0, 4096),
+        ];
+        for (temp, top_p, top_k, min_p, repeat, presence, frequency, window) in configs {
+            let request = SpecRequestConfig {
+                temp,
+                top_p,
+                top_k,
+                min_p,
+                rng_seed: 0xdead_beef,
+                repeat_penalty: repeat,
+                repeat_window: window,
+                presence_penalty: presence,
+                frequency_penalty: frequency,
+                ..SpecRequestConfig::default()
+            };
+            // The speculator's config and seeding (`configure_request`).
+            let cfg = SamplerConfig {
+                temperature: if temp > 1e-6 { temp } else { 0.0 },
+                top_p,
+                top_k,
+                min_p: (min_p > 0.0).then_some(min_p),
+                repeat_penalty: repeat,
+                repeat_window: window,
+                presence_penalty: presence,
+                frequency_penalty: frequency,
+                ..SamplerConfig::greedy()
+            };
+            let mut state = ((request.rng_seed >> 32) as u32 ^ request.rng_seed as u32).max(1);
+            // AR: the request seed in the process sampler state.
+            sampler_rng_restore(state);
+            let (mut gen_ar, mut gen_df) = (vec![7u32], vec![7u32]);
+            let mut history = PenaltyHistory::new(request.penalty_window());
+            history.set_prompt(&[]);
+            for row in &rows {
+                let mut ar_row = row.clone();
+                let ar = sample_cpu(&mut ar_row, &gen_ar, &cfg);
+                gen_ar.push(ar);
+                let mut df_row = row.clone();
+                history.begin_window(&gen_df);
+                let df = ar_pick_token(&mut df_row, history.row(0), &cfg, &mut state);
+                gen_df.push(df);
+                assert_eq!(df, ar, "config {temp}/{top_p}/{top_k:?}: token");
+                assert_eq!(ar_row, df_row, "the penalized row is AR's");
+                if temp > 0.0 {
+                    assert_eq!(state, sampler_rng_snapshot(), "stream state");
+                }
+            }
+            assert_eq!(gen_ar, gen_df);
+        }
+    }
+
+    /// Host-side cost of one retired-AR token (Raon-1-mini shapes: vocab
+    /// 259840, 51200-float feature row, presence 1.5, 256 generated tokens of
+    /// history in a 4096 window, top_k 20 / top_p 0.95), the readbacks
+    /// replaced by memcpy from a host source: the per-token allocations the
+    /// speculator used to make (a fresh logits Vec, a feature-row Vec copied
+    /// into the feature log, a `SparseDist` and its scratch) against the
+    /// buffers it keeps now, and each host stage alone. Prints microseconds;
+    /// run `cargo test --release -p hipfire-runtime --lib host_ar_path_costs
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing printout, not an assertion"]
+    fn host_ar_path_costs() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let (vocab, row_elems, n) = (259_840usize, 51_200usize, 600usize);
+        let mut state = 0x9e37_79b9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let src: Vec<f32> = (0..vocab)
+            .map(|_| (next() % 20_000) as f32 / 1000.0 - 6.0)
+            .collect();
+        let feat_src: Vec<f32> = (0..row_elems).map(|i| i as f32).collect();
+        let history: Vec<u32> = (0..256).map(|_| next() % 5000).collect();
+        let cfg = SamplerConfig {
+            presence_penalty: 1.5,
+            repeat_window: 4096,
+            ..SamplerConfig::greedy()
+        };
+        let spec = SampleSpec::cpu_ar(1.0, 0.95, Some(20), 0.0);
+        let med = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        let us = |t: Instant| t.elapsed().as_secs_f64() * 1e6;
+        let (warm, mut rng) = (20usize, SpecRng::new(7));
+
+        // Before: everything allocated per token.
+        let mut log: Vec<f32> = Vec::new();
+        let mut old = Vec::new();
+        for i in 0..n + warm {
+            let t = Instant::now();
+            let mut rows = Vec::with_capacity(row_elems);
+            rows.resize(row_elems, 0.0f32);
+            rows.copy_from_slice(&feat_src);
+            let mut logits = vec![0.0f32; vocab];
+            logits.copy_from_slice(&src);
+            apply_logit_policy_cpu(&mut logits, &history, &cfg);
+            let mut p = SparseDist::default();
+            p.build_from_logits(&logits, spec, &mut Vec::new()).unwrap();
+            let tok = p.sample(rng.next_f32());
+            log.clear();
+            log.extend_from_slice(&rows);
+            black_box((tok, &log));
+            if i >= warm {
+                old.push(us(t));
+            }
+        }
+        // After: kept buffers, the feature row written straight into the log.
+        let mut logits: Vec<f32> = Vec::new();
+        let (mut p, mut pool) = (SparseDist::default(), Vec::new());
+        let mut new = Vec::new();
+        for i in 0..n + warm {
+            let t = Instant::now();
+            log.clear();
+            log.resize(row_elems, 0.0);
+            log.copy_from_slice(&feat_src);
+            logits.clear();
+            logits.resize(vocab, 0.0);
+            logits.copy_from_slice(&src);
+            apply_logit_policy_cpu(&mut logits, &history, &cfg);
+            p.build_from_logits(&logits, spec, &mut pool).unwrap();
+            let tok = p.sample(rng.next_f32());
+            black_box((tok, &log));
+            if i >= warm {
+                new.push(us(t));
+            }
+        }
+        // Stages alone, on a kept row.
+        let (mut pen, mut dist, mut hist_fill, mut scalar) = (vec![], vec![], vec![], vec![]);
+        let mut row = src.clone();
+        let mut tokens = Vec::new();
+        let mut dst = PenaltyHistory::new(4096);
+        dst.set_prompt(&[]);
+        for i in 0..n + warm {
+            row.copy_from_slice(&src);
+            let t = Instant::now();
+            apply_logit_policy_cpu(&mut row, &history, &cfg);
+            let a = us(t);
+            let t = Instant::now();
+            p.build_from_logits(&row, spec, &mut pool).unwrap();
+            let b = us(t);
+            let t = Instant::now();
+            dst.begin_window(&history);
+            let c = us(t);
+            let t = Instant::now();
+            black_box(crate::llama::sample_top_k_p(
+                &row,
+                1.0,
+                0.95,
+                Some(20),
+                None,
+            ));
+            let d = us(t);
+            tokens.push(p.sample(0.5));
+            if i >= warm {
+                pen.push(a);
+                dist.push(b);
+                hist_fill.push(c);
+                scalar.push(d);
+            }
+        }
+        eprintln!(
+            "host AR path per token (us, median of {n}): per-token allocation {:.1} -> kept buffers {:.1}\n  stages: penalty {:.1}  SparseDist build {:.1}  (llama::sample_top_k_p {:.1})  history refill {:.1}",
+            med(old),
+            med(new),
+            med(pen),
+            med(dist),
+            med(scalar),
+            med(hist_fill)
+        );
     }
 }

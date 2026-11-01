@@ -1054,7 +1054,7 @@ pub fn upload_pooled_bytes(
     bytes: &[u8],
     logical_shape: &[usize],
 ) -> hip_bridge::HipResult<GpuTensor> {
-    let mut tensor = gpu.alloc_tensor(&[bytes.len()], DType::Raw)?;
+    let mut tensor = gpu.alloc_weight_tensor(&[bytes.len()], DType::Raw)?;
     if let Err(error) = gpu.hip.memcpy_htod(&tensor.buf, bytes) {
         let _ = gpu.free_tensor(tensor);
         return Err(error);
@@ -1421,7 +1421,7 @@ fn upload_range_pooled(
 ) -> Result<GpuTensor, String> {
     let payload_len = range_payload_len(descriptor, dtype)?;
     let mut tensor = gpu
-        .alloc_tensor(&[payload_len + tail_pad], DType::Raw)
+        .alloc_weight_tensor(&[payload_len + tail_pad], DType::Raw)
         .map_err(|error| format!("pooled allocation failed: {error}"))?;
     let result = (|| {
         if tail_pad != 0 {
@@ -1547,7 +1547,7 @@ fn upload_range_direct_device(
     check_direct_identity(direct, descriptor)?;
     let alloc_started = std::time::Instant::now();
     let mut tensor = gpu
-        .alloc_tensor(&[payload_len + tail_pad], DType::Raw)
+        .alloc_weight_tensor(&[payload_len + tail_pad], DType::Raw)
         .map_err(|error| format!("pooled allocation failed: {error}"))?;
     rdna_compute::load_phases::add(
         "weights.device_alloc",

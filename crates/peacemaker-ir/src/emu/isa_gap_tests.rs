@@ -401,6 +401,29 @@ fn v_med3_i32_is_the_signed_median() {
     }
 }
 
+/// `v_med3_u32 v1, s9, 1, 0x100`
+const V_MED3_U32: &[u32] = &[0xd6210001, 0x03fd0209, 0x00000100];
+
+/// V_MED3_U32: the unsigned median (max3 chain of the pseudocode); 0x8000_0000 is above 0x100 unsigned.
+#[test]
+fn v_med3_u32_is_the_unsigned_median() {
+    let mut st = state();
+    st.exec = 1;
+    // median(S0, 1, 0x100)
+    for (s9, want) in [
+        (5u32, 5u32),
+        (0, 1),
+        (1000, 0x100),
+        (1, 1),
+        (0x100, 0x100),
+        (0x8000_0000, 0x100),
+    ] {
+        st.s[9] = s9;
+        run(V_MED3_U32, &mut st).unwrap();
+        assert_eq!(st.v[1][0], want, "median({s9}, 1, 256)");
+    }
+}
+
 /// RDNA3 ISA V_MOVRELS_B32: `D0 = VGPR[laneId][SRC0 + M0]`.
 #[test]
 fn v_movrels_b32_reads_the_vgpr_offset_by_m0() {

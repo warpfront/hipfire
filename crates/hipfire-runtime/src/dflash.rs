@@ -5862,10 +5862,7 @@ pub fn propose_candidates_host(
     )?;
     // D2H projected hidden
     let mut host_proj = vec![0f32; rows * rank];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
+    gpu.dtoh_stream_ordered_batch(&mut [(&proj_slice.buf, f32_bytes_mut(&mut host_proj))])?;
     // CPU top-K per row (raw logits)
     let mut top_ids = Vec::with_capacity(rows * k);
     let mut top_vals = Vec::with_capacity(rows * k);
@@ -5962,9 +5959,9 @@ pub fn propose_candidates_device_penalized(
     if logits.buf.size() < rows * vocab * 4 {
         return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
     }
-    // Project hidden -> rank
-    let host_proj = selector_projection_host(gpu, weights, scratch, hidden, rows, rank)?;
-    // GPU top-K raw values (small D2H)
+    // Project hidden -> rank, then the raw GPU top-K; all three readbacks (projection, ids,
+    // values) are enqueued behind both kernels on the decode stream and read with one wait.
+    let proj_slice = selector_projection_enqueue(gpu, weights, scratch, hidden, rows, rank)?;
     let top_ids_gpu = scratch
         .topk_ids
         .as_ref()
@@ -5982,7 +5979,15 @@ pub fn propose_candidates_device_penalized(
         let _ = _marker;
     }
     gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
-    let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows * k)?;
+    let mut host_proj = vec![0f32; rows * rank];
+    let mut ids_bytes = vec![0u8; rows * k * 4];
+    let mut vals_bytes = vec![0u8; rows * k * 4];
+    gpu.dtoh_stream_ordered_batch(&mut [
+        (&proj_slice.buf, f32_bytes_mut(&mut host_proj)),
+        (&ids_slice.buf, &mut ids_bytes[..]),
+        (&vals_slice.buf, &mut vals_bytes[..]),
+    ])?;
+    let (top_ids, top_vals) = decode_top(&ids_bytes, &vals_bytes);
     propose_candidates_from_rows_penalized(
         weights,
         &host_proj,
@@ -6518,16 +6523,16 @@ pub fn propose_candidates_lanes_device(
         .collect()
 }
 
-/// Selector hidden projection `[rows × rank]` (one `gemm_dispatch`),
-/// downloaded to the host.
-fn selector_projection_host(
+/// Enqueue the selector hidden projection `[rows × rank]` (one `gemm_dispatch`) and return
+/// the device view of its result.
+fn selector_projection_enqueue(
     gpu: &mut Gpu,
     weights: &DflashWeights,
     scratch: &DflashScratch,
     hidden: &GpuTensor,
     rows: usize,
     rank: usize,
-) -> HipResult<Vec<f32>> {
+) -> HipResult<GpuTensor> {
     let proj = scratch
         .selector_proj
         .as_ref()
@@ -6543,25 +6548,31 @@ fn selector_projection_host(
         scratch.mq_x_rot.as_ref(),
         scratch.mq_x_rot_f16.as_ref(),
     )?;
+    Ok(proj_slice)
+}
+
+fn f32_bytes_mut(v: &mut [f32]) -> &mut [u8] {
+    // SAFETY: `v` is initialized f32s; any byte pattern is a valid f32.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+}
+
+/// Selector hidden projection `[rows × rank]` (one `gemm_dispatch`),
+/// downloaded to the host on the decode stream.
+fn selector_projection_host(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    rows: usize,
+    rank: usize,
+) -> HipResult<Vec<f32>> {
+    let proj_slice = selector_projection_enqueue(gpu, weights, scratch, hidden, rows, rank)?;
     let mut host_proj = vec![0f32; rows * rank];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
+    gpu.dtoh_stream_ordered_batch(&mut [(&proj_slice.buf, f32_bytes_mut(&mut host_proj))])?;
     Ok(host_proj)
 }
 
-/// Download `n` top-K ids (i32 stored in an F32 buffer) and values (f32).
-fn download_top(
-    gpu: &mut Gpu,
-    ids: &GpuTensor,
-    vals: &GpuTensor,
-    n: usize,
-) -> HipResult<(Vec<u32>, Vec<f32>)> {
-    let mut ids_bytes = vec![0u8; n * 4];
-    let mut vals_bytes = vec![0u8; n * 4];
-    gpu.hip.memcpy_dtoh(&mut ids_bytes, &ids.buf)?;
-    gpu.hip.memcpy_dtoh(&mut vals_bytes, &vals.buf)?;
+fn decode_top(ids_bytes: &[u8], vals_bytes: &[u8]) -> (Vec<u32>, Vec<f32>) {
     let top_ids = ids_bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -6570,5 +6581,22 @@ fn download_top(
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    Ok((top_ids, top_vals))
+    (top_ids, top_vals)
+}
+
+/// Download `n` top-K ids (i32 stored in an F32 buffer) and values (f32) on the decode
+/// stream, one wait.
+fn download_top(
+    gpu: &mut Gpu,
+    ids: &GpuTensor,
+    vals: &GpuTensor,
+    n: usize,
+) -> HipResult<(Vec<u32>, Vec<f32>)> {
+    let mut ids_bytes = vec![0u8; n * 4];
+    let mut vals_bytes = vec![0u8; n * 4];
+    gpu.dtoh_stream_ordered_batch(&mut [
+        (&ids.buf, &mut ids_bytes[..]),
+        (&vals.buf, &mut vals_bytes[..]),
+    ])?;
+    Ok(decode_top(&ids_bytes, &vals_bytes))
 }

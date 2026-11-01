@@ -15,8 +15,12 @@
 //! `latent_attention_split.12a4195b…`, `latent_attention_absorb.cb9897ad…`, and the five single-hash
 //! `stream_mix_*` modules.
 //!
-//! Scope. Only `Arch::Gfx1201` is exported: no gfx1100 object of these modules exists in
-//! `~/.hipfire_kernels/gfx1100`, so a gfx1100 export would be unverified. The gfx1100/gfx1201 PM twins of the
+//! Scope. Only `Arch::Gfx1201` is exported, with one exception: no gfx1100 object of these modules exists in
+//! `~/.hipfire_kernels/gfx1100`, so a gfx1100 export would be unverified. The exception is
+//! `latent_attention_flash_prefill_q8`, which also has a gfx1100 entry: its layout was verified against a
+//! local hipcc `--genco` build of `kernels/src/latent_attention_flash.hip` for gfx1201 and gfx1100
+//! (`llvm-readelf --notes`; kernarg layout identical on both, only the sgpr/vgpr counts differ:
+//! 97/191 on gfx1201, 101/202 on gfx1100). The gfx1100/gfx1201 PM twins of the
 //! gated-delta and conv kernels (`gated_delta_vector_pm`) are separate embedded objects with their own
 //! symbols and are not covered here.
 //!
@@ -30,7 +34,7 @@
 //!   by a domain rule (`head_dim == 128`, `width == 2560`, `wa/wb/dv == 128/64/128`): other geometries need
 //!   another contract. The pins are Raon's, the only model these generic launchers are exercised with.
 
-use crate::work::{op_class, BindSource, BindV1, Pipe, WorkSpecV1, WorkV1, ALL_ROWS};
+use crate::work::{op_class, BindSource, BindV1, Pipe, RowDomainV1, WorkSpecV1, WorkV1, ALL_ROWS};
 use crate::{
     Access, Arch, Axis, DomainRuleV1, ExportV1, Expr, FieldKind, FieldV1, FormatId, HiddenKind,
     HiddenV1, KernelAbiV1, NumericContractId, ObjectRefV1, OperandV1, ParamV1, Rule, ScalarTy,
@@ -44,6 +48,10 @@ use super::ggml_convert::FORMAT_F32_FLAT;
 pub const FORMAT_BF16_FLAT: FormatId = FormatId("bf16.flat");
 /// BF16 token/head strided view of the flash prefill (`(t * tok_stride + h * head_stride + c)`).
 pub const FORMAT_BF16_TOKEN_HEAD_VIEW: FormatId = FormatId("bf16.token_head_view");
+/// INT8 expanded-mirror plane view of the Q8 flash prefill, in BYTE units: one plane row is
+/// `n_heads * (w + 2)` bytes, `[n_heads * w int8 codes | n_heads F16 scales]`; head `h`'s codes start at byte
+/// `h * w` and its scale sits at byte `n_heads * w + 2 * h`. Token strides are whole plane rows.
+pub const FORMAT_I8_MIRROR_PLANE_VIEW: FormatId = FormatId("i8.mirror_plane_view");
 /// Device-resident `i32` scalar (row position / slot / token count).
 pub const FORMAT_I32_DEVICE_SCALAR: FormatId = FormatId("i32.device_scalar");
 /// Norm gamma `[n]`, F32 (`gamma_kind`/`gamma_bf16` = 0) or BF16 bits (= 1).
@@ -772,7 +780,7 @@ mod conv {
 mod flash {
     use super::*;
 
-    const PARAMS: &[ParamV1] = &[
+    pub(super) const PARAMS: &[ParamV1] = &[
         ip("n_rows", "query rows of this call"),
         ip("n_heads", "heads (grid y)"),
         ip("wa", "k_a width (nope)"),
@@ -790,7 +798,7 @@ mod flash {
         ip("round_y", "1: round y to bf16"),
     ];
 
-    const OPERANDS: &[OperandV1] = &[
+    pub(super) const OPERANDS: &[OperandV1] = &[
         opd(
             "q",
             FORMAT_F32_FLAT,
@@ -853,7 +861,7 @@ mod flash {
         ),
     ];
 
-    const FIELDS: &[FieldV1] = &[
+    pub(super) const FIELDS: &[FieldV1] = &[
         f_ptr("q", 0),
         f_ptr("y", 8),
         f_ptr("ka", 16),
@@ -877,7 +885,7 @@ mod flash {
         f_i32("round_y", 104, "round_y"),
     ];
 
-    const DOMAIN: &[DomainRuleV1] = &[
+    pub(super) const DOMAIN: &[DomainRuleV1] = &[
         rule(Rule::Positive(p!("n_rows")), "n_rows > 0"),
         rule(Rule::Positive(p!("n_heads")), "n_heads > 0"),
         rule(Rule::AtMost(p!("n_heads"), 65535), "grid y limit"),
@@ -932,7 +940,7 @@ mod flash {
         exports: EXPORTS,
     };
 
-    const BIND: &[BindV1] = &[
+    pub(super) const BIND: &[BindV1] = &[
         bind("n_rows", BindSource::ChunkRows),
         bind("prefix", BindSource::CausalPrefix),
         bind("wa", CFG_NOPE),
@@ -968,6 +976,320 @@ mod flash {
             admit: ALL_ROWS,
             bind: BIND,
             note: "n_heads exact from grid y; grid x only bounds n_rows (chunk rows binds it). prefix = rows already processed in the pass. Bytes: q read + y written once, K/V (prefix + rows) rows read once per head (an upper bound when the rope tail is shared across heads).",
+        },
+    };
+}
+
+// ================================================================================
+// latent_attention_flash_prefill_fa2_q128w8 (GEN-FA2 F2a)
+// ================================================================================
+
+mod flash_fa2 {
+    use super::*;
+
+    const EXPORTS: &[ExportV1] = &[ExportV1 {
+        symbol: "latent_attention_flash_prefill_fa2_q128w8",
+        arch: Arch::Gfx1201,
+        object: ObjectRefV1::HipccSource {
+            module: "latent_attention_flash_fa2",
+            source: "kernels/src/latent_attention_flash_fa2.hip",
+        },
+        block: [256, 1, 1],
+        dynamic_lds: 44032,
+        group_segment_fixed: 0,
+        // 8 waves x 16 query rows per workgroup; grid z is 1 (dv pinned to 128).
+        grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
+        consts: &[],
+    }];
+
+    /// Same encoding, operands, domain and numerics as `generic_seq.latent_attention_flash_prefill`
+    /// (bit-identical, j6115); only the schedule differs: 256 threads, 128 query rows per CTA, K/V
+    /// streamed through 44032 bytes of LDS.
+    pub static ABI: KernelAbiV1 = KernelAbiV1 {
+        id: "generic_seq.latent_attention_flash_prefill_fa2_q128w8",
+        version: 1,
+        wave: 32,
+        numeric: NumericContractId("latent_attention.flash_prefill.bf16_wmma_f32"),
+        params: flash::PARAMS,
+        operands: flash::OPERANDS,
+        fields: flash::FIELDS,
+        hidden: hidden_std!(112, dyn_lds 232),
+        explicit_bytes: 108,
+        segment_bytes: 368,
+        segment_align: 8,
+        domain: flash::DOMAIN,
+        exports: EXPORTS,
+    };
+
+    const FA2_ADMIT: RowDomainV1 = RowDomainV1 {
+        min_rows: 17,
+        max_rows: None,
+        predicate: "crates/rdna-compute/src/latent_attention_flash.rs::FA2_MIN_ROWS",
+        kill_env: Some("HIPFIRE_ATTN_FA2_GENERIC"),
+    };
+
+    /// The incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default on; `0` kills).
+    pub static WORK: WorkSpecV1 = WorkSpecV1 {
+        abi: &ABI,
+        work: WorkV1 {
+            admit: FA2_ADMIT,
+            note: "FA2 route (default ON, gfx1201): same work as the incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
+            ..flash::WORK.work
+        },
+    };
+}
+
+// ================================================================================
+// latent_attention_flash_prefill_q8 (INT8 expanded-mirror K_nope / V planes)
+// ================================================================================
+
+mod flash_q8 {
+    use super::*;
+
+    pub(super) const PARAMS: &[ParamV1] = &[
+        ip("n_rows", "query rows of this call"),
+        ip("n_heads", "heads (grid y)"),
+        ip("wa", "k_a width (nope)"),
+        ip("wb", "k_b width (rope tail)"),
+        ip("dv", "value width"),
+        ip("pos_offset", "added to *pos_ptr"),
+        ip("max_rows", "keys visible at most (rows < max_rows)"),
+        ip(
+            "ka_tok",
+            "k_a plane row stride, BYTES (= n_heads * (wa + 2))",
+        ),
+        ip("ka_head", "k_a head stride in the int8 codes, bytes (= wa)"),
+        ip("kb_tok", "k_b token stride, elements"),
+        ip("kb_head", "k_b head stride, elements"),
+        ip("v_tok", "v plane row stride, BYTES (= n_heads * (dv + 2))"),
+        ip("v_head", "v head stride in the int8 codes, bytes (= dv)"),
+        up("scale_bits", "f32 bits of the score scale"),
+        ip("round_y", "1: round y to bf16"),
+    ];
+
+    pub(super) const OPERANDS: &[OperandV1] = &[
+        opd(
+            "q",
+            FORMAT_F32_FLAT,
+            Access::ReadOnly,
+            16,
+            f32b!(mul!(p!("n_rows"), p!("n_heads"), add!(p!("wa"), p!("wb")))),
+            "[n_rows, H, dq] f32, rounded to bf16 at LDS staging",
+        ),
+        opd(
+            "y",
+            FORMAT_F32_FLAT,
+            Access::WriteOnly,
+            16,
+            f32b!(mul!(p!("n_rows"), p!("n_heads"), p!("dv"))),
+            "[n_rows, H, dv] f32",
+        ),
+        opd(
+            "ka",
+            FORMAT_I8_MIRROR_PLANE_VIEW,
+            Access::ReadOnly,
+            16,
+            add!(
+                mul!(sub!(p!("max_rows"), c!(1)), p!("ka_tok")),
+                mul!(p!("n_heads"), add!(p!("wa"), c!(2)))
+            ),
+            "K_nope int8 mirror plane, bytes: rows of [n_heads * wa codes | n_heads f16 scales]; view offset 0",
+        ),
+        opd(
+            "kb",
+            FORMAT_BF16_TOKEN_HEAD_VIEW,
+            Access::ReadOnly,
+            16,
+            bf16b!(add!(
+                mul!(sub!(p!("max_rows"), c!(1)), p!("kb_tok")),
+                mul!(sub!(p!("n_heads"), c!(1)), p!("kb_head")),
+                p!("wb")
+            )),
+            "shared BF16 latent tail (head stride may be 0), as in the BF16 contract",
+        ),
+        opd(
+            "vv",
+            FORMAT_I8_MIRROR_PLANE_VIEW,
+            Access::ReadOnly,
+            16,
+            add!(
+                mul!(sub!(p!("max_rows"), c!(1)), p!("v_tok")),
+                mul!(p!("n_heads"), add!(p!("dv"), c!(2)))
+            ),
+            "V int8 mirror plane, bytes: rows of [n_heads * dv codes | n_heads f16 scales]; view offset 0",
+        ),
+        opd(
+            "pos_ptr",
+            FORMAT_I32_DEVICE_SCALAR,
+            Access::ReadOnly,
+            4,
+            c!(4),
+            "rows cached before this call",
+        ),
+    ];
+
+    pub(super) const DOMAIN: &[DomainRuleV1] = &[
+        rule(Rule::Positive(p!("n_rows")), "n_rows > 0"),
+        rule(Rule::Positive(p!("n_heads")), "n_heads > 0"),
+        rule(Rule::AtMost(p!("n_heads"), 65535), "grid y limit"),
+        rule(Rule::Positive(p!("max_rows")), "max_rows > 0"),
+        rule(Rule::Equal(p!("wa"), c!(128)),
+            "dynamic LDS is a constant of the export: 4 waves * 16 * (dq + 8) * 2 + min(dv,128) * 36 * 4 + 64 * (wa + 8) * 2 = 25600 + 18432 + 17408 = 61440 for wa 128, wb 64, dv 128 (launcher latent_attention_flash.rs::latent_attention_flash_prefill_q8)"),
+        rule(Rule::Equal(p!("wb"), c!(64)), "see wa"),
+        rule(Rule::Equal(p!("dv"), c!(128)), "see wa; also grid z = ceil(dv / 128) = 1"),
+        rule(Rule::Equal(p!("ka_head"), p!("wa")),
+            "TiledAttention::validate_q8 (latent_attention_tiled.rs:196): the code plane's head stride is the width"),
+        rule(Rule::Equal(p!("v_head"), p!("dv")), "see ka_head"),
+        rule(Rule::Equal(p!("ka_tok"), mul!(p!("n_heads"), add!(p!("wa"), c!(2)))),
+            "validate_q8: ka_tok is the whole plane row in bytes, n_heads * (wa + 2) (view offset 0)"),
+        rule(Rule::Equal(p!("v_tok"), mul!(p!("n_heads"), add!(p!("dv"), c!(2)))),
+            "validate_q8: v_tok is the whole plane row in bytes, n_heads * (dv + 2) (view offset 0)"),
+        rule(Rule::MultipleOf(p!("ka_tok"), 16), "launcher q8_view_ptr: plane rows 16-byte aligned (n_heads a multiple of 8)"),
+        rule(Rule::MultipleOf(p!("v_tok"), 16), "launcher q8_view_ptr: plane rows 16-byte aligned (n_heads a multiple of 8)"),
+        rule(Rule::MultipleOf(p!("kb_tok"), 8), "16-byte aligned operand loads"),
+        rule(Rule::MultipleOf(p!("kb_head"), 8), "16-byte aligned operand loads"),
+        rule(Rule::OneOf(p!("round_y"), BOOL), "round_y is a flag"),
+    ];
+
+    const EXPORTS: &[ExportV1] = &[
+        ExportV1 {
+            symbol: "latent_attention_flash_prefill_q8",
+            arch: Arch::Gfx1100,
+            object: ObjectRefV1::HipccSource {
+                module: "latent_attention_flash",
+                source: "kernels/src/latent_attention_flash.hip",
+            },
+            block: [128, 1, 1],
+            dynamic_lds: 61440,
+            group_segment_fixed: 0,
+            grid: [
+                Expr::DivCeil(&p!("n_rows"), 64),
+                p!("n_heads"),
+                Expr::DivCeil(&p!("dv"), 128),
+            ],
+            consts: &[],
+        },
+        ExportV1 {
+            symbol: "latent_attention_flash_prefill_q8",
+            arch: Arch::Gfx1201,
+            object: ObjectRefV1::HipccSource {
+                module: "latent_attention_flash",
+                source: "kernels/src/latent_attention_flash.hip",
+            },
+            block: [128, 1, 1],
+            dynamic_lds: 61440,
+            group_segment_fixed: 0,
+            grid: [
+                Expr::DivCeil(&p!("n_rows"), 64),
+                p!("n_heads"),
+                Expr::DivCeil(&p!("dv"), 128),
+            ],
+            consts: &[],
+        },
+    ];
+
+    /// `latent_attention_flash_prefill_q8`: the incumbent flash prefill with K_nope and V read from INT8
+    /// mirror planes (F16 per-head-row scales), K_rope tail BF16. Kernarg layout identical to the BF16
+    /// symbol: verified against a local hipcc `--genco` build of `kernels/src/latent_attention_flash.hip`
+    /// for gfx1201 and gfx1100 (`llvm-readelf --notes`): 6 pointers + 15 four-byte scalars (explicit 108),
+    /// hidden block at 112, `.kernarg_segment_size` 368, `.group_segment_fixed_size` 0,
+    /// `.max_flat_workgroup_size` 128.
+    pub static ABI: KernelAbiV1 = KernelAbiV1 {
+        id: "generic_seq.latent_attention_flash_prefill_q8",
+        version: 1,
+        wave: 32,
+        numeric: NumericContractId("latent_attention.flash_prefill_q8.int8_dequant_bf16_wmma_f32"),
+        params: PARAMS,
+        operands: OPERANDS,
+        fields: flash::FIELDS,
+        hidden: hidden_std!(112, dyn_lds 232),
+        explicit_bytes: 108,
+        segment_bytes: 368,
+        segment_align: 8,
+        domain: DOMAIN,
+        exports: EXPORTS,
+    };
+
+    /// The BF16 flash work with the planes counted at int8 (+ f16 scales) and the shared BF16 tail.
+    pub static WORK: WorkSpecV1 = WorkSpecV1 {
+        abi: &ABI,
+        work: WorkV1 {
+            codec: "q8_0",
+            bytes: Some(add!(
+                f32b!(mul!(p!("n_rows"), p!("n_heads"), add!(p!("wa"), p!("wb"), p!("dv")))),
+                mul!(
+                    add!(p!("prefix"), p!("n_rows")),
+                    p!("n_heads"),
+                    add!(p!("wa"), c!(2), p!("dv"), c!(2))
+                ),
+                bf16b!(mul!(
+                    add!(p!("prefix"), p!("n_rows")),
+                    p!("n_heads"),
+                    p!("wb")
+                ))
+            )),
+            note: "INT8 mirror route: same MACs and binding as the BF16 flash prefill. prefix = rows already processed in the pass. Bytes: q read + y written once, int8 K_nope/V planes (+ f16 scales) and the BF16 rope tail for (prefix + rows) rows per head (an upper bound: the tail is shared across heads).",
+            ..flash::WORK.work
+        },
+    };
+}
+
+// ================================================================================
+// latent_attention_flash_prefill_fa2_q8_q128w8 (GEN-FA2 F2a-Q8)
+// ================================================================================
+
+mod flash_fa2_q8 {
+    use super::*;
+
+    const EXPORTS: &[ExportV1] = &[ExportV1 {
+        symbol: "latent_attention_flash_prefill_fa2_q8_q128w8",
+        arch: Arch::Gfx1201,
+        object: ObjectRefV1::HipccSource {
+            module: "latent_attention_flash_fa2_q8",
+            source: "kernels/src/latent_attention_flash_fa2_q8.hip",
+        },
+        block: [256, 1, 1],
+        dynamic_lds: 44032,
+        group_segment_fixed: 0,
+        // 8 waves x 16 query rows per workgroup; grid z is 1 (dv pinned to 128).
+        grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
+        consts: &[],
+    }];
+
+    /// Same encoding, operands, domain and numerics as `generic_seq.latent_attention_flash_prefill_q8`;
+    /// only the schedule differs: 256 threads, 128 query rows per CTA, K/V streamed through 44032 bytes of LDS.
+    /// The next tile's global prefetch carries the raw F16 scale bits (unconditional loads from a clamped row) and the
+    /// F16 -> F32 widening and the partial-tile zero fill happen at the LDS store; the output bits are unchanged.
+    pub static ABI: KernelAbiV1 = KernelAbiV1 {
+        id: "generic_seq.latent_attention_flash_prefill_fa2_q8_q128w8",
+        version: 1,
+        wave: 32,
+        numeric: NumericContractId("latent_attention.flash_prefill_q8.int8_dequant_bf16_wmma_f32"),
+        params: flash_q8::PARAMS,
+        operands: flash_q8::OPERANDS,
+        fields: flash::FIELDS,
+        hidden: hidden_std!(112, dyn_lds 232),
+        explicit_bytes: 108,
+        segment_bytes: 368,
+        segment_align: 8,
+        domain: flash_q8::DOMAIN,
+        exports: EXPORTS,
+    };
+
+    const FA2_ADMIT: RowDomainV1 = RowDomainV1 {
+        min_rows: 17,
+        max_rows: None,
+        predicate: "crates/rdna-compute/src/latent_attention_flash.rs::FA2_Q8_MIN_ROWS",
+        kill_env: Some("HIPFIRE_ATTN_FA2_GENERIC"),
+    };
+
+    /// The Q8 incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default on; `0` kills).
+    pub static WORK: WorkSpecV1 = WorkSpecV1 {
+        abi: &ABI,
+        work: WorkV1 {
+            admit: FA2_ADMIT,
+            note: "FA2 Q8 route (default ON, gfx1201): same work as the Q8 incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
+            ..flash_q8::WORK.work
         },
     };
 }
@@ -2652,6 +2974,9 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &gdn::ABI,
     &conv::ABI,
     &flash::ABI,
+    &flash_fa2::ABI,
+    &flash_q8::ABI,
+    &flash_fa2_q8::ABI,
     &rda_prepare::ABI,
     &gated_rms::ABI,
     &postmix::ABI,
@@ -2672,6 +2997,9 @@ pub static WORK: &[&WorkSpecV1] = &[
     &gdn::WORK,
     &conv::WORK,
     &flash::WORK,
+    &flash_fa2::WORK,
+    &flash_q8::WORK,
+    &flash_fa2_q8::WORK,
     &rda_prepare::WORK,
     &gated_rms::WORK,
     &postmix::WORK,
@@ -2785,6 +3113,92 @@ mod tests {
         let (dq, dv) = (128u32 + 64, 128u32);
         assert_eq!(e.dynamic_lds, 4 * 16 * (dq + 8) * 2 + dv.min(128) * 36 * 4);
         assert_eq!(e.dynamic_lds, 44032);
+    }
+
+    #[test]
+    fn flash_fa2_contract_and_grid_inversion() {
+        flash_fa2::WORK.self_check().unwrap();
+        let e = &flash_fa2::ABI.exports[0];
+        assert_eq!(e.block, [256, 1, 1]);
+        assert_eq!(e.dynamic_lds, 44032);
+        assert_eq!(e.dynamic_lds, flash::ABI.exports[0].dynamic_lds);
+        assert_eq!(flash_fa2::ABI.explicit_bytes, flash::ABI.explicit_bytes);
+        assert_eq!(flash_fa2::ABI.segment_bytes, flash::ABI.segment_bytes);
+        assert_eq!(flash_fa2::ABI.numeric, flash::ABI.numeric);
+        let w = &flash_fa2::WORK.work;
+        assert_eq!(w.admit.min_rows, 17);
+        assert_eq!(
+            w.admit.predicate,
+            "crates/rdna-compute/src/latent_attention_flash.rs::FA2_MIN_ROWS"
+        );
+        assert_eq!(w.admit.kill_env, Some("HIPFIRE_ATTN_FA2_GENERIC"));
+        // Raon dispatch: 512 rows / 128 = 4 tiles x 256 threads, 40 heads.
+        let (x, y) = work_items(
+            &flash_fa2::ABI,
+            &[
+                ("n_rows", 512),
+                ("n_heads", 40),
+                ("wa", 128),
+                ("wb", 64),
+                ("dv", 128),
+            ],
+        );
+        assert_eq!((x, y), (1024, 40));
+        // 129 rows -> 2 tiles -> grid x 512 work items.
+        let (x, _) = work_items(
+            &flash_fa2::ABI,
+            &[
+                ("n_rows", 129),
+                ("n_heads", 40),
+                ("wa", 128),
+                ("wb", 64),
+                ("dv", 128),
+            ],
+        );
+        assert_eq!(x, 512);
+    }
+
+    #[test]
+    fn flash_fa2_q8_contract_and_grid_inversion() {
+        flash_fa2_q8::WORK.self_check().unwrap();
+        let e = &flash_fa2_q8::ABI.exports[0];
+        assert_eq!(e.block, [256, 1, 1]);
+        assert_eq!(e.dynamic_lds, 44032);
+        assert_eq!(
+            flash_fa2_q8::ABI.explicit_bytes,
+            flash_q8::ABI.explicit_bytes
+        );
+        assert_eq!(flash_fa2_q8::ABI.segment_bytes, flash_q8::ABI.segment_bytes);
+        assert_eq!(flash_fa2_q8::ABI.numeric, flash_q8::ABI.numeric);
+        let w = &flash_fa2_q8::WORK.work;
+        assert_eq!(w.admit.min_rows, 17);
+        assert_eq!(
+            w.admit.predicate,
+            "crates/rdna-compute/src/latent_attention_flash.rs::FA2_Q8_MIN_ROWS"
+        );
+        assert_eq!(w.admit.kill_env, Some("HIPFIRE_ATTN_FA2_GENERIC"));
+        let (x, y) = work_items(
+            &flash_fa2_q8::ABI,
+            &[
+                ("n_rows", 512),
+                ("n_heads", 40),
+                ("wa", 128),
+                ("wb", 64),
+                ("dv", 128),
+            ],
+        );
+        assert_eq!((x, y), (1024, 40));
+        let (x, _) = work_items(
+            &flash_fa2_q8::ABI,
+            &[
+                ("n_rows", 129),
+                ("n_heads", 40),
+                ("wa", 128),
+                ("wb", 64),
+                ("dv", 128),
+            ],
+        );
+        assert_eq!(x, 512);
     }
 
     #[test]

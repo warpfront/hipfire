@@ -2109,6 +2109,20 @@ pub fn load_raon_weights_band(
     cfg: &RaonConfig,
     band: &RaonBand,
 ) -> Result<RaonWeights, String> {
+    // The band's weight uploads are packed into slabs (`HIPFIRE_WEIGHT_SLAB`);
+    // the scope seals them on success and on error.
+    gpu.weight_slab_scope_begin();
+    let loaded = load_raon_weights_band_unscoped(hfq, gpu, cfg, band);
+    gpu.weight_slab_scope_end();
+    loaded
+}
+
+fn load_raon_weights_band_unscoped(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    cfg: &RaonConfig,
+    band: &RaonBand,
+) -> Result<RaonWeights, String> {
     cfg.validate()?;
     if band.total != cfg.n_layers {
         return Err(format!(

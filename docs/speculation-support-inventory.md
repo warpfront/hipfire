@@ -84,10 +84,10 @@ n-gram arch gate in `build_speculator`:
 | muse-glimmer | 14 (+23 drafter) | Muse Glimmer dense text | DFlash with the arch-23 `muse_glimmer_assistant` draft | DFlash arch-23 drafter when supplied | Draft is loaded only when a draft path is set and `dflash_mode != off`; load failure falls back to AR. Route `GlimmerSpec` when a speculator exists. Gemma EAGLE `params.drafter` refused; n-gram not in the gate |
 | maple | 15 | Maple-Preview natively-ternary MoE | None | No | `MapleCarrier::caps()` declares no DFlash and no MTP; route is always `MapleAr` |
 | qwen4 | 16 | Qwen3.8-Flash-Next (Qwen4) | **Native MTP** (in-trunk layer) + MTP/ngram-mod takeover windows + **DFlash2** (arch-20 draft, explicit only) + SpecTarget (`mtp_spec.rs`, `dflash_target.rs`) | Yes — native MTP; external DFlash2 draft | Native greedy MTP attaches by default on admitted loads (`.mq4r` retained route keeps AR; `speculation.mtp off` disables). DFlash2 runs only on `--spec dflash` / `speculation.dflash = on` with a draft (`--model-draft`), single card, GPU-resident experts. Admission **refuses** DSpark, standalone n-gram, DDTree, EAGLE, adaptive KV, CASK, PFlash, a draft path without `dflash = on`, and DFlash under EP/PP. Route `Qwen4Spec` greedy, and sampled via rejection sampling (MTP when `mtp_sampled` is on; DFlash2 always, unpenalized requests). EP (2..=8 ranks) admits MTP only on explicit `--spec mtp` (see [`CHANGELOG.md`](../CHANGELOG.md)) |
-| raon | 19 | Raon-1-mini-preview (RDA + MLA + 4-stream mHC MoE) | **DFlash2** (KRAFTON `Raon-1-mini-preview-dflash2` draft through `dflash_convert`, shipped as the registry sidecar `raon-1-mini-preview-dflash2.mq4`, explicit only) + SpecTarget (`spec_impl.rs`) | Registry sidecar `raon-1-mini-preview-dflash2.mq4` (`raon-1-mini-preview:draft`, pulled with the model) | Opt-in only: `--spec dflash` / `speculation.dflash = on` with `--model-draft`, single card. `RaonCarrier` refuses a draft without `dflash = on`, `dflash = on` without a draft, and native MTP / DSpark / n-gram. Route `RaonSpec` (`generate_dflash` over the Raon carrier's `Qwen35Emit`, grammar off) for greedy and sampled requests, penalized or not: `Dflash2Speculator::supports_penalties()` is true, so the card's presence default (an unset sampled request) and explicit repeat/presence/frequency penalties keep the spec route, each verify row penalized against the generated-only history AR uses (`penalty_generated_only`); the prompt render, reasoning split, tool router and stop handling are `RaonAr`'s |
+| raon | 19 | Raon-1-mini-preview (RDA + MLA + 4-stream mHC MoE) | **DFlash2** (KRAFTON `Raon-1-mini-preview-dflash2` draft through `dflash_convert`, shipped as the registry sidecar `raon-1-mini-preview-dflash2.mq4`, registry `auto` default) + SpecTarget (`spec_impl.rs`) | Registry sidecar `raon-1-mini-preview-dflash2.mq4` (`raon-1-mini-preview:draft`, pulled with the model) | Registry `speculation.dflash = auto` (explicit allow-list: `raon-1-mini-preview` declares the sidecar) wires the pulled draft; `--spec dflash` / `speculation.dflash = on` (with `--model-draft` or the pulled sidecar) forces it and fails closed without one; without the file `auto` logs and runs plain AR (Raon has no MTP); `speculation.dflash = off` opts out; a `topology.pp` load under `auto` ignores the draft and runs plain AR. Single card. `RaonCarrier` refuses a draft under `dflash = off`, `dflash = on` without a draft, and native MTP / DSpark / n-gram. Route `RaonSpec` (`generate_dflash` over the Raon carrier's `Qwen35Emit`, grammar off) for greedy and sampled requests, penalized or not: `Dflash2Speculator::supports_penalties()` is true, so the card's presence default (an unset sampled request) and explicit repeat/presence/frequency penalties keep the spec route, each verify row penalized against the generated-only history AR uses (`penalty_generated_only`); the prompt render, reasoning split, tool router and stop handling are `RaonAr`'s |
 
 **Has a learned or diffusion drafter path in-tree today:** qwen35 (DSpark ± DFlash ± MTP),
-qwen4 (native MTP, or DFlash2 on request), raon (DFlash2 on request), deepseek4 (DSpark/MTP), llama/plain-Qwen3 dense (DSpark and/or generic
+qwen4 (native MTP, or DFlash2 on request), raon (DFlash2, registry `auto` when the draft is pulled), deepseek4 (DSpark/MTP), llama/plain-Qwen3 dense (DSpark and/or generic
 DFlash when draft/sidecar loaded), muse-glimmer (DFlash arch-23 draft). gemma4 has an EAGLE
 drafter path that is gated off. **n-gram-capable with SpecTarget:** arch ids in the gate above
 (qwen4 excluded by admission). Everything else remains plain autoregressive unless source gains
@@ -131,10 +131,10 @@ a new arm.
   session / prefix cache (every request prefills cold; HIPF-143).
 - **raon 19 (DFlash2):** `RaonCarrier` builds the shared `Dflash2Speculator` from the KRAFTON
   `Raon-1-mini-preview-dflash2` draft (`dflash_convert`; `target_streams_per_layer = 4`) only on
-  `--spec dflash` / `speculation.dflash = on` with `--model-draft`. The shipped draft is the
+  `speculation.dflash = auto` (registry default for this tag when the sidecar is pulled; off with `speculation.dflash = off`) or `--spec dflash` / `speculation.dflash = on`. The shipped draft is the
   registry sidecar `raon-1-mini-preview-dflash2.mq4` (tag `raon-1-mini-preview:draft`; declared as
   the target's `dflash` file, so `hipfire pull raon-1-mini-preview` fetches it with the model and
-  `--spec dflash` finds it without `--model-draft`). It is produced with
+  the draft resolves without `--model-draft`). It is produced with
   `dflash_convert --input Raon-1-mini-preview-dflash2 --output raon-1-mini-preview-dflash2.mq4 --mq4v2`:
   MQ4V2-G256 for the 2-D weights, while the converter keeps `fc.weight` F16 for a multi-stream draft
   (`crates/hipfire-quantize/src/bin/dflash_convert.rs`, the `name == "fc.weight" &&
@@ -161,6 +161,10 @@ a new arm.
   for earlier rows` (`SelectorPenalty`, host-side walk), so `q` tracks the penalized `p` and tau
   holds; it never changes the output, only acceptance. A neutral request keeps the device argmax
   route and the raw walk unchanged.
+  A retired request (spec-retire) decodes its remaining tokens through `ar_step`: one stream wait
+  for the feature row and the logits (`SpecTarget::commit_row_logits`), then AR's own host sampler
+  (`apply_logit_policy_cpu` + `sample_top_k_p_with_state` against a speculator-owned xorshift32 state
+  seeded like AR's per-request reset), so the pick is `sample_cpu`'s for the same row, history and state.
 - **muse-glimmer 14:** a distinct arch-23 draft (not a `dflash_convert` arch-20 artifact), loaded via
   `HIPFIRE_DFLASH_DRAFT` / `params.draft` while `dflash_mode != off`.
 - **Genre conditionality** is a measured property (see the historical table in

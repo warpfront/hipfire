@@ -26,16 +26,17 @@ use hipfire_runtime::hfq::HfqFile;
 
 /// The DFlash2 draft a load asks for, or `None` for plain AR.
 ///
-/// DFlash2 is opt-in: the draft runs only under `speculation.dflash = on` and
-/// needs its draft path. A draft without `dflash = on`, `dflash = on` without
-/// a draft, a second speculator beside it (native MTP, DSpark, n-gram) and
-/// any speculator this arch has no producer for are refused up front, before
-/// any allocation.
+/// The draft runs under `speculation.dflash = on` (needs its draft path; fails
+/// closed without one) and under `auto` when a draft path was wired (the
+/// registry pairs `raon-1-mini-preview` with its pulled DFlash2 sidecar and
+/// lowers `auto`; opt out with `speculation.dflash = off`). `auto` with no
+/// draft is plain AR, as Raon has no MTP. A draft under an explicit `off`, a
+/// second speculator beside it (native MTP, DSpark, n-gram) and any speculator
+/// this arch has no producer for are refused up front, before any allocation.
 pub fn dflash_draft<'a>(
     draft_path: Option<&'a str>,
     spec: SpecLoadCfg,
 ) -> Result<Option<&'a str>, String> {
-    let dflash = spec.dflash == Some(true);
     let other = [
         (spec.mtp == Some(true), "native MTP (speculation.mtp)"),
         (spec.dspark == Some(true), "DSpark (speculation.dspark)"),
@@ -54,19 +55,19 @@ pub fn dflash_draft<'a>(
             other.join(", ")
         ));
     }
-    match (dflash, draft_path) {
-        (true, Some(draft)) => Ok(Some(draft)),
-        (true, None) => Err(
+    match (spec.dflash, draft_path) {
+        (Some(true) | None, Some(draft)) => Ok(Some(draft)),
+        (Some(true), None) => Err(
             "raon1_mini: DFlash (speculation.dflash = on) needs a DFlash2 draft \
              (--model-draft / params.draft)"
                 .into(),
         ),
-        (false, Some(_)) => Err(
-            "raon1_mini: a draft model needs speculation.dflash = on (--spec dflash runs a \
-             DFlash2 draft)"
+        (Some(false), Some(_)) => Err(
+            "raon1_mini: a draft model conflicts with speculation.dflash = off (drop the draft \
+             or use speculation.dflash = on|auto)"
                 .into(),
         ),
-        (false, None) => Ok(None),
+        (Some(false) | None, None) => Ok(None),
     }
 }
 
@@ -83,6 +84,12 @@ pub fn pp_option_refusal(
 ) -> Result<(), String> {
     if pp < 2 {
         return Ok(());
+    }
+    // `speculation.dflash = auto` (the registry's paired draft) on a pipeline
+    // load: the draft is not run and the bands decode plain AR, as `auto`
+    // without a draft does; the other speculator refusals still apply.
+    if spec.dflash.is_none() {
+        return dflash_draft(None, spec).map(|_| ());
     }
     if dflash_draft(draft_path, spec)?.is_some() {
         return Err(format!(
@@ -578,9 +585,11 @@ struct ChunkAdmission {
 /// served, unless the whole reserved context is still covered); the 512-row
 /// rung is the floor and is always admitted, exactly as before. A forced rung
 /// ignores the mirror comparison but must fit `available`, else a named error.
+/// `policy` bounds the auto ladder (a forced rung ignores it): [`auto_policy`].
 fn select_prefill_rows(
     max_seq: usize,
     forced: Option<usize>,
+    policy: AutoPolicy,
     available: usize,
     extra: &mut dyn FnMut(usize) -> Result<usize, String>,
     mirror_rows: &dyn Fn(usize) -> usize,
@@ -622,16 +631,50 @@ fn select_prefill_rows(
         if rows <= base_rows {
             break;
         }
+        if rows > policy.cap {
+            continue;
+        }
         let e = extra(rows)?;
         if e > available {
             continue;
         }
         let adm = admit(rows, e);
-        if adm.mirror_rows >= baseline_mirror_rows {
+        if adm.mirror_rows >= baseline_mirror_rows.min(policy.mirror_floor) {
             return Ok(adm);
         }
     }
     Ok(admit(base_rows, base_extra))
+}
+
+/// Bounds of the auto ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoPolicy {
+    /// Widest rung tried.
+    cap: usize,
+    /// A rung is admitted when its mirror budget reaches
+    /// `min(512-row policy's budget, mirror_floor)`.
+    mirror_floor: usize,
+}
+
+/// Auto-ladder policy on `arch`. gfx1100 (7900 XTX) is measured only up to
+/// 1024 rows and with the expanded K/V mirror held: pp4096 5,335 -> 6,123 tok/s
+/// with 13,360 mirror rows (`wslab/ev/raon-xtx`; the pre-slab 512-row policy
+/// held 7,282). So it takes 1024 when the mirror still reaches 8,192 rows (or
+/// the whole reserved context, or the 512-row policy's budget if that is
+/// smaller) and 512 otherwise; every other arch keeps the whole ladder and the
+/// strict "never below the 512-row mirror" rule.
+fn auto_policy(arch: &str) -> AutoPolicy {
+    if arch.starts_with("gfx1100") {
+        AutoPolicy {
+            cap: 1024,
+            mirror_floor: 8192,
+        }
+    } else {
+        AutoPolicy {
+            cap: usize::MAX,
+            mirror_floor: usize::MAX,
+        }
+    }
 }
 
 /// Admit the prefill chunk rows against the device's free memory right now
@@ -653,9 +696,14 @@ fn admit_prefill_rows(
                 gpu.gated_delta_vector_chunked_arch_supported(),
             )?)
     };
-    let adm = select_prefill_rows(state.max_seq(), forced, available, &mut extra, &|usable| {
-        state.projected_mirror_budget_rows(usable)
-    })?;
+    let adm = select_prefill_rows(
+        state.max_seq(),
+        forced,
+        auto_policy(&gpu.arch),
+        available,
+        &mut extra,
+        &|usable| state.projected_mirror_budget_rows(usable),
+    )?;
     eprintln!(
         "raon1_mini: admission decision: prefill chunk rows from {cap}; requested={} admitted={} (scratch+work {:.0} MiB; \
          projected expanded K/V mirror budget {} rows of {} reserved context, 512-row policy {} rows)",
@@ -684,6 +732,7 @@ mod tests {
         select_prefill_rows(
             max_seq,
             forced,
+            auto_policy("gfx1201"),
             available_mib * MIB,
             &mut |rows| Ok(rows * MIB),
             &|usable| (usable / MIB).min(max_seq),
@@ -703,6 +752,42 @@ mod tests {
         assert_eq!(before.rows, 4096);
         assert_eq!(during.rows, before.rows);
         assert_eq!(during.mirror_rows, before.mirror_rows);
+    }
+
+    #[test]
+    fn gfx1100_auto_takes_1024_when_the_mirror_reaches_the_floor_else_512() {
+        assert_eq!(auto_policy("gfx1100").cap, 1024);
+        assert_eq!(auto_policy("gfx1201"), auto_policy("gfx9999"));
+        let on = |max_seq: usize, avail_mib: usize| {
+            select_prefill_rows(
+                max_seq,
+                None,
+                auto_policy("gfx1100"),
+                avail_mib * MIB,
+                &mut |rows| Ok(rows * MIB),
+                &|usable| (usable / MIB).min(max_seq),
+            )
+            .unwrap()
+        };
+        // Room for everything: 1024, not 4096.
+        assert_eq!(on(50000, 60000).rows, 1024);
+        // 512-row mirror 21,488 rows, 1024 leaves 20,976: still above the 8,192 floor.
+        assert_eq!(on(50000, 22000).rows, 1024);
+        // 1024 would leave 8,100 (< floor) of a 512-row 8,612: stay on 512.
+        assert_eq!(on(50000, 9124).rows, 512);
+        // The whole reserved context (4,000 rows) is still covered at 1024.
+        assert_eq!(on(4000, 5100).rows, 1024);
+        // A forced rung ignores the policy.
+        let forced = select_prefill_rows(
+            50000,
+            Some(2048),
+            auto_policy("gfx1100"),
+            60000 * MIB,
+            &mut |r| Ok(r * MIB),
+            &|u| (u / MIB).min(50000),
+        )
+        .unwrap();
+        assert_eq!(forced.rows, 2048);
     }
 
     #[test]
@@ -804,12 +889,19 @@ mod dflash_tests {
     }
 
     #[test]
-    fn a_draft_without_dflash_on_is_refused() {
-        for dflash in [None, Some(false)] {
-            let spec = cfg(|s| s.dflash = dflash);
-            let error = dflash_draft(Some("d.hfq"), spec).unwrap_err();
-            assert!(error.contains("speculation.dflash = on"), "{error}");
-        }
+    fn auto_with_a_wired_draft_runs_it() {
+        // `dflash = auto` is `None` on the wire (`parse_tri_state`).
+        assert_eq!(
+            dflash_draft(Some("d.mq4"), SpecLoadCfg::default()),
+            Ok(Some("d.mq4"))
+        );
+    }
+
+    #[test]
+    fn a_draft_under_dflash_off_is_refused() {
+        let off = cfg(|s| s.dflash = Some(false));
+        let error = dflash_draft(Some("d.mq4"), off).unwrap_err();
+        assert!(error.contains("speculation.dflash = off"), "{error}");
     }
 
     #[test]
@@ -863,8 +955,14 @@ mod dflash_tests {
         assert!(error.contains("topology.pp = 2"), "{error}");
         assert!(error.contains("does not run speculation"), "{error}");
         // The single-device refusals of `dflash_draft` stay first.
-        let error = pp_option_refusal(2, Some("d.hfq"), SpecLoadCfg::default()).unwrap_err();
-        assert!(error.contains("speculation.dflash = on"), "{error}");
+        let off = cfg(|s| s.dflash = Some(false));
+        let error = pp_option_refusal(2, Some("d.hfq"), off).unwrap_err();
+        assert!(error.contains("speculation.dflash = off"), "{error}");
+        // `auto` with the registry's paired draft loads the bands as plain AR.
+        assert_eq!(
+            pp_option_refusal(2, Some("d.hfq"), SpecLoadCfg::default()),
+            Ok(())
+        );
         // Plain AR and the single-device load are untouched.
         assert_eq!(pp_option_refusal(2, None, SpecLoadCfg::default()), Ok(()));
         assert_eq!(pp_option_refusal(1, Some("d.hfq"), on), Ok(()));

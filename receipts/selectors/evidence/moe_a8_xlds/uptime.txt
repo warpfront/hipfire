@@ -1,0 +1,22 @@
+job start 12:55:25 GPU_MAX_HW_QUEUES=1 uptime:  12:55:25 up 17 days, 16:25,  6 users,  load average: 6.71, 9.09, 15.13 | S: 41Mhz * 1: 2059Mhz * 1: 1348Mhz * S: 0Mhz * 
+== gu-A vs moe_grouped_qt44_a8_sym_gfx1201_nt2r1 rc=1,2,4,8,16,32,64,256 12:55:25 GPU_MAX_HW_QUEUES=1 uptime:  12:55:25 up 17 days, 16:25,  6 users,  load average: 6.71, 9.09, 15.13 | S: 41Mhz * S: 96Mhz * S: 0Mhz * 1: 640Mhz * 
+rc=0 gu-A
+== dn-A vs moe_grouped_qt44_a8_sym_gfx1201_nt2r1 rc=1,2,4,8,16,32,64,256 12:55:32 GPU_MAX_HW_QUEUES=1 uptime:  12:55:32 up 17 days, 16:25,  6 users,  load average: 6.57, 9.02, 15.08 | 1: 2128Mhz * 1: 2853Mhz * S: 3Mhz * S: 2Mhz * 
+rc=0 dn-A
+== gu-B vs moe_grouped_qt44_a8_sym_gfx1201_nt2r2 rc=512,1024,2048,4096 12:55:38 GPU_MAX_HW_QUEUES=1 uptime:  12:55:38 up 17 days, 16:25,  6 users,  load average: 6.84, 9.03, 15.05 | 1: 2210Mhz * S: 122Mhz * 1: 1309Mhz * S: 1Mhz * 
+rc=0 gu-B
+== dn-B vs moe_grouped_qt44_a8_sym_gfx1201_nt2r2 rc=512,1024,2048,4096 12:55:55 GPU_MAX_HW_QUEUES=1 uptime:  12:55:55 up 17 days, 16:26,  6 users,  load average: 6.43, 8.80, 14.84 | 1: 2350Mhz * 1: 2350Mhz * 1: 3333Mhz * S: 0Mhz * 
+rc=0 dn-B
+== gu-F vs moe_grouped_qt44_a8_sym_gfx1201_nt2r1 rc=2,3,4,5,6,7,8,12 12:56:08 GPU_MAX_HW_QUEUES=1 uptime:  12:56:08 up 17 days, 16:26,  6 users,  load average: 6.06, 8.64, 14.73 | 1: 2350Mhz * 1: 2079Mhz * 1: 3280Mhz * S: 1Mhz * 
+rc=0 gu-F
+== dn-F vs moe_grouped_qt44_a8_sym_gfx1201_nt2r1 rc=2,3,4,5,6,7,8,12 12:56:13 GPU_MAX_HW_QUEUES=1 uptime:  12:56:13 up 17 days, 16:26,  6 users,  load average: 6.13, 8.62, 14.69 | 1: 2308Mhz * 1: 2143Mhz * 1: 3275Mhz * S: 2Mhz * 
+rc=0 dn-F
+== aa-gu-A (aa) moe_grouped_qt44_a8_sym_gfx1201_nt2r1 rc=1,2,4,8,16,32,64,256 12:56:16 GPU_MAX_HW_QUEUES=1 uptime:  12:56:16 up 17 days, 16:26,  6 users,  load average: 6.04, 8.56, 14.63 | 1: 2204Mhz * 1: 2847Mhz * 1: 3287Mhz * S: 2Mhz * 
+rc=0 aa-gu-A
+== aa-gu-B (aa) moe_grouped_qt44_a8_sym_gfx1201_nt2r2 rc=512,1024,2048,4096 12:56:23 GPU_MAX_HW_QUEUES=1 uptime:  12:56:23 up 17 days, 16:26,  6 users,  load average: 5.96, 8.50, 14.58 | 1: 2241Mhz * 1: 2583Mhz * 1: 3258Mhz * S: 1Mhz * 
+rc=0 aa-gu-B
+== aa-dn-A (aa) moe_grouped_qt44_a8_sym_gfx1201_nt2r1 rc=1,2,4,8,16,32,64,256 12:56:39 GPU_MAX_HW_QUEUES=1 uptime:  12:56:39 up 17 days, 16:26,  6 users,  load average: 6.12, 8.37, 14.41 | 1: 2350Mhz * 1: 2171Mhz * 1: 3259Mhz * S: 1Mhz * 
+rc=0 aa-dn-A
+== aa-dn-B (aa) moe_grouped_qt44_a8_sym_gfx1201_nt2r2 rc=512,1024,2048,4096 12:56:45 GPU_MAX_HW_QUEUES=1 uptime:  12:56:45 up 17 days, 16:26,  6 users,  load average: 6.11, 8.33, 14.36 | 1: 2227Mhz * 1: 2551Mhz * 1: 3233Mhz * S: 1Mhz * 
+rc=0 aa-dn-B
+runs done 12:56:58 GPU_MAX_HW_QUEUES=1 uptime:  12:56:58 up 17 days, 16:27,  6 users,  load average: 6.40, 8.32, 14.29 | 1: 2482Mhz * 1: 2099Mhz * 1: 3282Mhz * S: 0Mhz *  elapsed 93s

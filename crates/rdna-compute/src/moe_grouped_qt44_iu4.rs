@@ -27,6 +27,32 @@ pub const A8_MODULE: &str = "moe_grouped_qt44_a8_sym_gfx12";
 /// Entries of the W4A8 module (`nt4r1` spills the VGPR file and is not built).
 pub const A8_ENTRIES: [(usize, usize); 4] = [(1, 1), (2, 1), (1, 2), (2, 2)];
 
+/// GEN-MOE packet A winner M3 (`kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip`): nt4 x rf1, 8 waves, the X epoch tile
+/// of a 4-tile (64-slot) expert run staged once per CTA in a 2-stage LDS ring. Same 72-byte kernarg ABI and bit-identical output
+/// as the `nt{1,2}r{1,2}` entries; own module, so the incumbent module's code is untouched.
+pub const A8_XLDS_SRC: &str =
+    include_str!("../../../kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip");
+pub const A8_XLDS_MODULE: &str = "moe_grouped_qt44_a8_sym_xlds_gfx12";
+pub const A8_XLDS_SYMBOL: &str = "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8";
+/// Developer switch of the xlds route (default ON; `0` kills and restores the incumbent entry).
+pub const A8_XLDS_FLAG: &str = "HIPFIRE_MOE_A8_XLDS";
+/// Threads per xlds CTA (8 waves, each one 16-row weight fragment: 128 weight rows per CTA).
+pub const A8_XLDS_BLOCK: u32 = 256;
+/// Dynamic LDS of the xlds body (2 stages x 64 rows x (136 B qs pitch + 4 B d)).
+pub const A8_XLDS_LDS: u32 = 17920;
+/// Smallest launch size routed to the xlds entry, in GROUPED rows (`m_total`, the sentinel-padded launch bound: the unit
+/// `select_entry_a8` uses, grid y = `m_total / 16`), NOT tokens: the launcher never sees the token count. Receipt j6313
+/// (`--row-key launch_rows`, Raon route histogram, vs the dispatched `nt2r1`/`nt2r2`): 1-16 tokens (`m_total` 96-1536)
+/// are 1.00-1.16x, 32 tokens (2112) 0.994x, 64 tokens (2304) 0.99x, 4096 tokens (26496) 0.825x.
+// selector-receipt: receipts/selectors/moe_a8_xlds_min_rows.json
+pub(crate) const MOE_A8_XLDS_MIN_ROWS: usize = 2304;
+
+/// Whether the xlds entry takes a W4A8 launch: exact gfx1201, the flag on, `m_total >= MOE_A8_XLDS_MIN_ROWS` and
+/// `m % 128 == 0` (8 waves x 16 weight rows per CTA; grid x = `m / 128`). Every other launch runs `select_entry_a8`'s entry.
+pub(crate) fn a8_xlds_admits(arch: &str, flag: bool, m_total: usize, m: usize) -> bool {
+    arch == "gfx1201" && flag && m_total >= MOE_A8_XLDS_MIN_ROWS && m > 0 && m % 128 == 0
+}
+
 /// gfx11 (gfx1100 / gfx1151) twin of the W4A8 module: RDNA3 K16 iu8 operand form, same fold, so its
 /// output is bit-identical to the gfx1201 module's for equal inputs.
 pub const A8_GFX11_SRC: &str =
@@ -322,11 +348,22 @@ impl Gpu {
                 "grouped qt44 symmetric GEMM: W4A8 on gfx1201/gfx1100/gfx1151, W4A4/FP8 on gfx1201 only",
             ));
         }
-        let (func, module, src) = match act {
-            SymAct::A4 => (symbol(nt, rf), MODULE, SRC),
-            SymAct::A8 if gfx11 => (symbol_a8_gfx11(nt, rf), A8_GFX11_MODULE, A8_GFX11_SRC),
-            SymAct::A8 => (symbol_a8(nt, rf), A8_MODULE, A8_SRC),
-            SymAct::Fp8 => (symbol_fp8(nt, rf), FP8_MODULE, FP8_SRC),
+        let xlds = matches!(act, SymAct::A8)
+            && a8_xlds_admits(
+                &self.arch,
+                hipfire_config::developer_bool(A8_XLDS_FLAG, true),
+                m_total,
+                m,
+            );
+        let (func, module, src) = if xlds {
+            (Some(A8_XLDS_SYMBOL), A8_XLDS_MODULE, A8_XLDS_SRC)
+        } else {
+            match act {
+                SymAct::A4 => (symbol(nt, rf), MODULE, SRC),
+                SymAct::A8 if gfx11 => (symbol_a8_gfx11(nt, rf), A8_GFX11_MODULE, A8_GFX11_SRC),
+                SymAct::A8 => (symbol_a8(nt, rf), A8_MODULE, A8_SRC),
+                SymAct::Fp8 => (symbol_fp8(nt, rf), FP8_MODULE, FP8_SRC),
+            }
         };
         let func = func.ok_or_else(|| err("grouped qt44 symmetric GEMM: unbuilt (nt, rf)"))?;
         if m == 0
@@ -373,10 +410,16 @@ impl Gpu {
             &xs as *const _ as *mut c_void,
             &nev as *const _ as *mut c_void,
         ];
-        let grid = [(m / (64 * rf)) as u32, (m_total / 16) as u32, 1];
+        // xlds: 8 waves x 16 rows = 128 weight rows per CTA, 256 threads, dynamic LDS ring; same grid y.
+        let (grid_x, block, lds) = if xlds {
+            (m / 128, A8_XLDS_BLOCK, A8_XLDS_LDS)
+        } else {
+            (m / (64 * rf), 128, 0)
+        };
+        let grid = [grid_x as u32, (m_total / 16) as u32, 1];
         let bytes = m_total * (k / 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
-        let result = self.launch_maybe_blob(func, grid, [128, 1, 1], 0, &mut params, || {
+        let result = self.launch_maybe_blob(func, grid, [block, 1, 1], lds, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ep);
             b.push_ptr(tp);
@@ -481,5 +524,54 @@ mod tests {
         assert_eq!(select_entry_a8(7152, 2176), (2, 2));
         assert_eq!(select_entry_a8(4096, 2560), (2, 2));
         assert_eq!(select_entry_a8(4096, 1088), (2, 1));
+    }
+
+    #[test]
+    fn a8_xlds_route_predicate() {
+        let ok = |arch, flag, m_total, m| a8_xlds_admits(arch, flag, m_total, m);
+        // gate/up (M 2176) and down (M 2560) of the Raon layer, routed launch bounds.
+        for (m_total, m) in [(2304, 2176), (4992, 2560), (26496, 2560), (26496, 2176)] {
+            assert!(ok("gfx1201", true, m_total, m), "{m_total} {m}");
+            assert!(!ok("gfx1201", false, m_total, m), "flag off {m_total} {m}");
+        }
+        // decode / verify launch bounds (1-16 tokens on the Raon route histogram) stay on the incumbent
+        for m_total in [96, 768, 1536, 2112] {
+            assert!(!ok("gfx1201", true, m_total, 2176), "{m_total}");
+        }
+        // the floor is inclusive and is in grouped rows (m_total)
+        assert!(ok("gfx1201", true, MOE_A8_XLDS_MIN_ROWS, 2176));
+        assert!(!ok("gfx1201", true, MOE_A8_XLDS_MIN_ROWS - 1, 2176));
+        assert!(!ok("gfx1201", true, 0, 2176));
+        // 128 weight rows per CTA: an M that is only a multiple of 64 stays on the incumbent
+        assert!(!ok("gfx1201", true, 26496, 2112));
+        assert!(!ok("gfx1201", true, 26496, 64));
+        assert!(!ok("gfx1201", true, 26496, 0));
+        // exact gfx1201 only
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx1030", ""] {
+            assert!(!ok(arch, true, 26496, 2176), "{arch}");
+        }
+        assert_eq!(MOE_A8_XLDS_MIN_ROWS, 2304);
+        assert_eq!(A8_XLDS_FLAG, "HIPFIRE_MOE_A8_XLDS");
+    }
+
+    #[test]
+    fn a8_xlds_launch_constants_match_the_contract() {
+        use hipfire_kernel_abi::families::generic_gemm;
+        let abi = generic_gemm::ABIS
+            .iter()
+            .find(|a| a.id == "generic_gemm.moe_grouped_qt44_a8_sym_xlds_nt4r1w8")
+            .expect("xlds contract");
+        assert_eq!(abi.exports.len(), 1);
+        let e = &abi.exports[0];
+        assert_eq!(e.symbol, A8_XLDS_SYMBOL);
+        assert_eq!(e.block, [A8_XLDS_BLOCK, 1, 1]);
+        assert_eq!(e.dynamic_lds, A8_XLDS_LDS);
+        // 2 stages x 64 rows x (136 B qs pitch + 4 B d)
+        assert_eq!(A8_XLDS_LDS as usize, 2 * 64 * (136 + 4));
+        assert_eq!(abi.explicit_bytes, 72);
+        assert!(A8_XLDS_SRC.contains(A8_XLDS_SYMBOL));
+        assert!(!A8_XLDS_SRC.contains("hip_loop"));
+        // the incumbent module's source must not carry the new entry (separate module, code untouched)
+        assert!(!A8_SRC.contains("xlds"));
     }
 }

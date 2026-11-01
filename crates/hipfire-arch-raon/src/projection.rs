@@ -17,7 +17,8 @@
 //! silent per-token loop.
 
 use hipfire_dispatch::pipeline::{
-    q8_0_prefill_gemm_prepared, q8_0_prefill_prepare, PrefillActTier, PreparedA8,
+    q8_0_f16_x_shareable, q8_0_prefill_gemm_f16x, q8_0_prefill_gemm_prepared, q8_0_prefill_prepare,
+    PrefillActTier, PreparedA8,
 };
 use hipfire_runtime::llama::{weight_gemm, weight_gemv, weight_gemv_rows_exact, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -225,8 +226,9 @@ fn project_batched(
     Ok(())
 }
 
-/// `HIPFIRE_RAON_A8_FUSE_ROUND=0` runs the A8 projection's BF16 output round as its own pass
-/// (`bf16_round_trip_f32_strided`) instead of the GEMM epilogue; bit-identical either way. Read once.
+/// `HIPFIRE_RAON_A8_FUSE_ROUND=0` runs the Q8_0 projection's BF16 output round as its own pass
+/// (`bf16_round_trip_f32_strided`) instead of the GEMM epilogue (the W8A8 i8-MMQ `_bf16` entries on
+/// gfx1201 / gfx1100, the F16 wmma `gemm_q8_0_wmma_bf16` on gfx1100); bit-identical either way. Read once.
 fn a8_fuse_round_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         hipfire_config::developer_bool("HIPFIRE_RAON_A8_FUSE_ROUND", true)
@@ -341,4 +343,91 @@ pub fn project(
     tier: PrefillActTier,
 ) -> Result<(), String> {
     project_rows(gpu, w, x, y, rows, round, tier)
+}
+
+/// Whether [`project`] on `w` takes the batched F16-WMMA Q8_0 route that reads an F16 X it is
+/// handed without converting (see [`share_f16_x`]).
+fn f16_x_route(gpu: &Gpu, w: &WeightTensor, rows: usize, tier: PrefillActTier) -> bool {
+    rows >= 2
+        && !rows_exact(&gpu.arch, rows)
+        && w.gpu_dtype == DType::Q8_0
+        && q8_0_f16_x_shareable(gpu, tier, w.m, w.k, rows)
+}
+
+/// Convert the F32 activation plane `x[rows, k]` to F16 once into `x16` for the F16-tier Q8_0
+/// projections `ws` that read it, and return the plane to pass to [`project_shared_f16`].
+/// `None` (nothing launched) unless *every* `ws` entry takes the batched F16-WMMA route
+/// ([`project`] would run `gemm_q8_0_batched_chunked` for each) with the same `k`, so a `None`
+/// leaves each projection on its ordinary route. The convert is the launcher's own
+/// `convert_f32_to_f16` kernel writing the words the launcher would stage, so every output is
+/// bit-identical to the unshared route; `x16` is overwritten by the next convert into it and
+/// holds `x` only until then (one node).
+pub fn share_f16_x<'a>(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    x16: Option<&'a GpuTensor>,
+    rows: usize,
+    tier: PrefillActTier,
+    ws: &[&WeightTensor],
+) -> Result<Option<&'a GpuTensor>, String> {
+    let (Some(first), Some(x16)) = (ws.first(), x16) else {
+        return Ok(None);
+    };
+    let k = first.k;
+    if ws
+        .iter()
+        .any(|w| w.k != k || !f16_x_route(gpu, w, rows, tier))
+    {
+        return Ok(None);
+    }
+    let n = rows
+        .checked_mul(k)
+        .ok_or_else(|| "raon projection: shared F16 input extent overflows".to_string())?;
+    if x.dtype != DType::F32 || x16.dtype != DType::F16 || x.numel() < n || x16.numel() < n {
+        return Ok(None);
+    }
+    gpu.convert_f32_to_f16_into(x, x16, n)
+        .map_err(|e| format!("raon projection (rows={rows}): shared F16 convert: {e:?}"))?;
+    Ok(Some(x16))
+}
+
+/// [`project`] for a consumer of [`share_f16_x`]: with `Some(x16)` the F16 plane feeds the
+/// F16-WMMA GEMM directly (no convert of its own) and the output is rounded exactly as
+/// [`project`] rounds it; with `None` this is [`project`] on `x`.
+#[allow(clippy::too_many_arguments)]
+pub fn project_shared_f16(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    x16: Option<&GpuTensor>,
+    y: &GpuTensor,
+    rows: usize,
+    round: OutRound,
+    tier: PrefillActTier,
+) -> Result<(), String> {
+    let Some(x16) = x16 else {
+        return project(gpu, w, x, y, rows, round, tier);
+    };
+    check(w, x, y, rows, "rows")?;
+    if !f16_x_route(gpu, w, rows, tier) {
+        return Err(
+            "raon projection: a shared F16 input was passed to a projection off the F16-WMMA route"
+                .into(),
+        );
+    }
+    let fused = q8_0_prefill_gemm_f16x(
+        gpu,
+        &w.buf,
+        x16,
+        y,
+        w.m,
+        w.k,
+        rows,
+        round == OutRound::Bf16 && a8_fuse_round_enabled(),
+    )
+    .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;
+    if round == OutRound::Bf16 && !fused {
+        round_bf16_rows(gpu, y, rows, w.m)?;
+    }
+    Ok(())
 }

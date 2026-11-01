@@ -490,6 +490,30 @@ pub trait SpecTarget {
         Ok(pick)
     }
 
+    /// [`commit_row`](Self::commit_row) with `want_logits`, into caller-owned
+    /// storage: `logits` is replaced by the row's full logits, reusing its
+    /// allocation, and the feature row is appended to `hidden_out`, which a
+    /// drafter may point straight at its own feature log. A target that can
+    /// enqueue both readbacks and wait once overrides it. Default: the
+    /// allocating [`commit_row`](Self::commit_row).
+    fn commit_row_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        logits: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        match self.commit_row(gpu, token, position, scratch, hidden_out, true)? {
+            RowPick::Logits(row) => {
+                *logits = row;
+                Ok(())
+            }
+            RowPick::Argmax(_) => Err("commit_row returned an argmax for a logits request".into()),
+        }
+    }
+
     /// Like [`verify_block`](Self::verify_block), but captures the per-position
     /// extract-layer residual hidden into the caller-owned GPU buffer
     /// `hidden_gpu` (position-major `[n_pos × dflash_extract_layers().len() ×

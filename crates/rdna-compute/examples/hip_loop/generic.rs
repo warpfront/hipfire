@@ -28,13 +28,25 @@
 //! # Shape (`--shape k=v,...`)
 //!
 //! Every contract param by name (`M`, `K`, `N`, `n_experts`, ...), plus the recipe knobs `tokens` (activation
-//! rows of a ROUTED contract), `topk`, `route_seed`, and `rows=` (an alias of the activation-row key: for a
+//! rows of a ROUTED contract), `topk`, `route_seed`, `route=uniform|hist:<route_hist.v1>[@L]` (real recorded per-token
+//! expert lists, sha-verified, cycled to `tokens`; E/topk must match; default uniform), `prefix` (the value of a position device scalar, default 0),
+//! and `rows=` (an alias of the activation-row key: for a
 //! dense contract the `WorkV1.rows` param, for a routed one the routed rows = `tokens * topk`). A missing
 //! param is an error listing every param; the `WorkV1.rows` param (the row class) is what `--rowclasses`
 //! injects per class. `m_total`, `x_src_rows`, `x_row_div` of a routed contract default from the routing plan
 //! (`x_row_div = topk` = the gate/up form; give `x_row_div=1` for the down form). The bare preset `emu` fills
 //! small ragged defaults (`N=37`, `K=256`, `n_experts=8`, `topk=2`, `tokens=37`, the smallest of M in
 //! 32/64/128/256 the domain admits). Reserved keys (set by the CLI): `arch`, `vs`, `pool`.
+//!
+//! The grouped MoE combine (`ffn_moe_combine_f32`: operands `topk_idx` and `row_of_slot`, both `i32.flat`, told apart by
+//! name) is a DENSE contract (row class `rows`) with routed index planes: `route=uniform|hist:` picks the per-token expert
+//! ids (token `t` = recorded row `t % recorded`; E and `top_k` must match), `row_of_slot` is the `inverse_perm` of their
+//! `moe::scatter` (slot -> grouped row), and `n_down_rows` defaults per row class to `moe::m_total_bound(rows * top_k,
+//! n_experts)` (the production size of the down plane). `null=<operand>[+<operand>]` binds nullable operands as null
+//! addresses (`routed_out`: the production prefill call passes none; `row_of_slot`: the expanded decode / row-exact
+//! layout, where `down_rows` holds `rows * top_k` rows in slot order) and allocates them nowhere. `edge=<seed>`
+//! perturbs the planes with skipped and tied ranks (`edge_planes`: ids -1 / `n_experts` / `i32::MAX`, ties, unrouted and
+//! out-of-range `row_of_slot`, all-skipped tokens) for emulator identity runs.
 //!
 //! # Buffers and recipes
 //!
@@ -46,13 +58,16 @@
 //! |---|---|
 //! | `f32.flat`, `f32.rows_n_k`, `f32.rows_x_s01`, `f32.m`, `f32.n_x_m` | uniform f32 in [-1, 1) |
 //! | `f16.flat` | uniform f16 in [-1, 1) |
-//! | `bf16.flat` | uniform bf16 in [-1, 1) |
+//! | `bf16.flat`, `bf16.token_head_view` | uniform bf16 in [-1, 1) over the whole extent (a strided view's padding included) |
+//! | `i8.mirror_plane_view` | INT8 expanded-mirror plane of the Q8 flash prefill (operand `ka`: width `wa`, `vv`: width `dv`; `n_heads` from the shape): `max_rows` rows of `n_heads*(w+2)` B, each `n_heads*w` seeded i8 codes uniform in [-127, 127] then `n_heads` f16 scales, finite and positive, `(0.5 + 0.5 u)/127`, u in [0, 1) |
 //! | `ggml.q8_0.34` | blocks of 34 B: f16 scale in [0.001, 0.021) + 32 random i8 codes |
 //! | `moe_grouped.expert_ptr_table.u64` | `n_experts` slabs of `M x K/256` MQ4G256V2 groups (136 B, symmetric `zp = f16(-8 sc)`, `moe::synth_rows`), the table holds their device addresses |
 //! | `moe_grouped.expert_tile_ids.i32.per_tile16`, `...sorted_slot_index.i32.minus1_padding`, `...expert_offsets.i32.e_plus_1` | the ONE grouped routing plan: `tokens` tokens routed to `topk` of `n_experts` experts (uniform Gumbel-top-k, shape-seeded), scattered like `moe_scatter_fused_k8` (`moe::scatter`) |
 //! | `block_i8_128.kb_x_n.136b` | `[K/128][x_src_rows]` records `{f32 d in [0.005, 0.05); i32 s = sum(qs); i8 qs[128]}` |
 //! | `block_i4_128.kb_x_n.72b` | `[K/128][x_src_rows]` records `{f32 d; i32 s = sum of the signed nibbles; u8 qs[64]}` ([INFERENCE]: `s` is not read by the symmetric kernels) |
 //! | `i32.token_ids` | ids uniform in `[0, vocab)` |
+//! | `i32.flat` (`topk_idx`, `row_of_slot` of the combine only) | `topk_idx`: the `rows x top_k` expert ids of the `route=` plan; `row_of_slot`: `inverse_perm` of its scatter (see Shape) |
+//! | `i32.device_scalar` (operands `pos_ptr`, `base_ptr`: a position) | one `i32` = `prefix=` (default 0). A contract with such an operand and a `max_rows` param refuses `prefix + <rows> > max_rows` (a clippable domain error, so `--rowclasses` drops the classes that do not fit). Any other device scalar (`slot_idx`, `n_dev`) has no recipe |
 //!
 //! `WriteOnly` operands are pre-poisoned (f32 -1234.5 pattern), `ReadWrite` ones start from their input recipe;
 //! `reset` restores both from a pristine device copy; `read_output` concatenates the outputs in operand order.
@@ -406,6 +421,9 @@ pub enum Recipe {
     F16,
     Bf16,
     Q8_0,
+    /// INT8 mirror plane (`[n_heads*w codes | n_heads f16 scales]` rows); geometry from `n_heads` and the
+    /// operand's width param, see [`ContractNode::q8_plane_geom`].
+    Q8Plane,
     /// u64 table of expert slab addresses (slabs of MQ4G256V2 groups).
     ExpertPtrTable,
     TileIds,
@@ -414,8 +432,16 @@ pub enum Recipe {
     BlockI8,
     BlockI4,
     TokenIds,
+    /// A position device scalar (`pos_ptr`, `base_ptr`): one `i32` = the `prefix=` knob.
+    DeviceScalar,
     /// Pre-poisoned output (any format).
     Poison,
+    /// `topk_idx` of the grouped combine: `rows x top_k` expert ids (the recorded `route=hist:` ids or the
+    /// uniform plan), in rank order.
+    RouteIds,
+    /// `row_of_slot` of the grouped combine: `rows x top_k` grouped-row indices, `inverse_perm` of the
+    /// scatter of `RouteIds` (slot -> sorted position).
+    RowOfSlot,
 }
 
 impl Recipe {
@@ -423,7 +449,13 @@ impl Recipe {
     fn is_index(self) -> bool {
         matches!(
             self,
-            Recipe::TileIds | Recipe::SortedSlots | Recipe::ExpertOffsets | Recipe::TokenIds
+            Recipe::TileIds
+                | Recipe::SortedSlots
+                | Recipe::ExpertOffsets
+                | Recipe::RouteIds
+                | Recipe::RowOfSlot
+                | Recipe::TokenIds
+                | Recipe::DeviceScalar
         )
     }
     fn is_routing(self) -> bool {
@@ -442,7 +474,8 @@ pub fn recipe_for(format: FormatId, access: Access) -> Result<Recipe> {
     Ok(match format.0 {
         "f32.flat" | "f32.rows_n_k" | "f32.rows_x_s01" | "f32.m" | "f32.n_x_m" => Recipe::F32,
         "f16.flat" => Recipe::F16,
-        "bf16.flat" => Recipe::Bf16,
+        "bf16.flat" | "bf16.token_head_view" => Recipe::Bf16,
+        "i8.mirror_plane_view" => Recipe::Q8Plane,
         "ggml.q8_0.34" => Recipe::Q8_0,
         "moe_grouped.expert_ptr_table.u64" => Recipe::ExpertPtrTable,
         "moe_grouped.expert_tile_ids.i32.per_tile16" => Recipe::TileIds,
@@ -451,6 +484,7 @@ pub fn recipe_for(format: FormatId, access: Access) -> Result<Recipe> {
         "block_i8_128.kb_x_n.136b" => Recipe::BlockI8,
         "block_i4_128.kb_x_n.72b" => Recipe::BlockI4,
         "i32.token_ids" => Recipe::TokenIds,
+        "i32.device_scalar" => Recipe::DeviceScalar,
         other => {
             return Err(format!(
                 "no input recipe for format {other} ({access:?} operand): hip_loop's generic node does not \
@@ -458,6 +492,16 @@ pub fn recipe_for(format: FormatId, access: Access) -> Result<Recipe> {
             ))
         }
     })
+}
+
+/// [`recipe_for`] with the operand name: `i32.flat` is a plain index plane of several contracts, so the
+/// grouped combine's `topk_idx` / `row_of_slot` are told apart by name (the only `i32.flat` operands with a recipe).
+pub fn operand_recipe(name: &str, format: FormatId, access: Access) -> Result<Recipe> {
+    match (format.0, name, access) {
+        ("i32.flat", "topk_idx", Access::ReadOnly) => Ok(Recipe::RouteIds),
+        ("i32.flat", "row_of_slot", Access::ReadOnly) => Ok(Recipe::RowOfSlot),
+        _ => recipe_for(format, access),
+    }
 }
 
 fn put_f32(out: &mut Vec<u8>, v: f32) {
@@ -531,7 +575,34 @@ fn gen_bytes(r: Recipe, bytes: usize, seed: u64, vocab: u64) -> Vec<u8> {
             let pat = SENTINEL.to_le_bytes();
             out.extend((0..bytes).map(|i| pat[i % 4]));
         }
-        Recipe::ExpertPtrTable | Recipe::TileIds | Recipe::SortedSlots | Recipe::ExpertOffsets => {}
+        // Routing tables and the position scalar are built by `host_operand`, never here.
+        Recipe::ExpertPtrTable
+        | Recipe::TileIds
+        | Recipe::SortedSlots
+        | Recipe::ExpertOffsets
+        | Recipe::DeviceScalar
+        | Recipe::RouteIds
+        | Recipe::RowOfSlot
+        | Recipe::Q8Plane => {}
+    }
+    out.resize(bytes, 0);
+    out
+}
+
+/// An INT8 mirror plane of `bytes` bytes: rows of `row_bytes` = `[code_bytes codes | f16 scales]`. Codes are
+/// uniform in [-127, 127] (the quantizer never emits -128); each scale is `(0.5 + 0.5 u) / 127`, u in [0, 1),
+/// as f16, so `code * scale` spans about +-1 like the bf16 recipes.
+fn gen_q8_plane(bytes: usize, row_bytes: usize, code_bytes: usize, seed: u64) -> Vec<u8> {
+    let mut rng = Xs64::new(seed);
+    let mut out = Vec::with_capacity(bytes);
+    for _ in 0..bytes / row_bytes.max(1) {
+        out.extend(
+            (0..code_bytes).map(|_| (((rng.next_u64() >> 33) % 255) as i64 - 127) as i8 as u8),
+        );
+        for _ in 0..(row_bytes - code_bytes) / 2 {
+            let u = (rng.unit() + 1.0) * 0.5;
+            out.extend_from_slice(&f16_bits((0.5 + 0.5 * u) / 127.0).to_le_bytes());
+        }
     }
     out.resize(bytes, 0);
     out
@@ -539,6 +610,47 @@ fn gen_bytes(r: Recipe, bytes: usize, seed: u64, vocab: u64) -> Vec<u8> {
 
 fn i32s(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// `edge=<seed>` of the grouped combine: perturb the index planes with every case the kernel's skip rules and its stable
+/// sort must honour. Per slot (hash of seed and slot): an expert id of -1, of `n_experts`, or of `i32::MAX` (skipped
+/// rank); an id equal to the token's rank-0 or last-rank id (a tie: stable order); a `row_of_slot` of -1 (unrouted),
+/// `n_down_rows` (first row past the plane) or `i32::MIN`. Per token: every 13th (t % 13 == 5) has all ids invalid, every
+/// 13th (t % 13 == 7) all slots unrouted. The rows the surviving ranks point at stay valid grouped rows.
+fn edge_planes(
+    seed: u64,
+    top_k: usize,
+    n_experts: usize,
+    n_down_rows: usize,
+    ids: &mut [i32],
+    row_of_slot: &mut [i32],
+) {
+    for s in 0..ids.len() {
+        let (t, j) = (s / top_k, s % top_k);
+        match t % 13 {
+            5 => {
+                ids[s] = -1;
+                continue;
+            }
+            7 => {
+                row_of_slot[s] = -1;
+                continue;
+            }
+            _ => {}
+        }
+        let h = (seed ^ (s as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        match (h >> 33) % 24 {
+            0 => ids[s] = -1,
+            1 => ids[s] = n_experts as i32,
+            2 => ids[s] = i32::MAX,
+            3 => ids[s] = ids[s - j],
+            4 => ids[s] = ids[s - j + top_k - 1],
+            5 => row_of_slot[s] = -1,
+            6 => row_of_slot[s] = n_down_rows as i32,
+            7 => row_of_slot[s] = i32::MIN,
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -555,6 +667,23 @@ pub struct OperandPlan {
     pub bytes: usize,
     /// The explicit-image offset of the pointer field that carries it.
     pub field_offset: u32,
+    /// `null=<operand>`: the operand is bound as a null address (nullable operands only), allocated nowhere.
+    pub nulled: bool,
+}
+
+/// The grouped combine's index planes (`ffn_moe_combine_f32`): the expert ids of each token and the grouped row of
+/// every slot, as the scatter of those ids lays them (`inverse_perm`).
+#[derive(Clone, Debug)]
+struct CombinePlan {
+    /// `rows x top_k` expert ids (`topk_idx`), rank order.
+    ids: Vec<i32>,
+    /// `rows x top_k` grouped rows (`row_of_slot`).
+    row_of_slot: Vec<i32>,
+    /// Live (tile-padded) rows of the grouped plane.
+    live_rows: usize,
+    touched_experts: usize,
+    /// `edge=<seed>`: the plan was perturbed with skipped / tied ranks (see [`edge_planes`]).
+    edge: Option<u64>,
 }
 
 struct Set {
@@ -588,6 +717,10 @@ pub struct ContractNode {
     routed: bool,
     routing: Option<crate::moe::Routing>,
     route_seed: u64,
+    /// `route=hist:`: the recorded expert lists (None = the uniform shape-seeded routing).
+    hist: Option<RouteHist>,
+    /// Value of a position device scalar operand (`prefix=`).
+    prefix: u64,
     operands: Vec<OperandPlan>,
     /// `(explicit-image offset, operand)` of every pointer field.
     ptr_fields: Vec<(u32, usize)>,
@@ -601,13 +734,164 @@ pub struct ContractNode {
     bytes_per_call: u64,
     work_flops: f64,
     st: Option<State>,
+    /// The grouped-combine plan (`topk_idx` / `row_of_slot` bytes), `Some` for a contract with a `topk_idx` operand.
+    combine: Option<CombinePlan>,
 }
 
 fn param_value(abi: &KernelAbiV1, params: &[u64], name: &str) -> Option<u64> {
     abi.param_index(name).map(|i| params[i])
 }
 
+/// `--shape route=hist:<route_hist.v1 json>[@L]`: the per-token expert lists of a pinned `route_hist.v1`
+/// (`pm-census extract route-hist`; headerless `i32` LE ids bin next to it, sha256-verified), layer `L` or
+/// every layer's records concatenated in record order. Token `t` takes recorded row `t % rows` (cycled).
+#[derive(Clone, Debug, PartialEq)]
+struct RouteHist {
+    path: String,
+    id: String,
+    layer: Option<u32>,
+    n_experts: usize,
+    topk: usize,
+    /// Row-major `rows x topk`.
+    ids: Vec<i32>,
+}
+
+impl RouteHist {
+    fn parse(spec: &str) -> BResult<Self> {
+        let (path, layer) = match spec.rsplit_once('@') {
+            Some((p, l)) => (
+                p,
+                Some(
+                    l.parse::<u32>()
+                        .map_err(|e| format!("--shape route=hist:{spec}: layer `{l}`: {e}"))?,
+                ),
+            ),
+            None => (spec, None),
+        };
+        Self::load(std::path::Path::new(path), layer).map_err(BuildError::Other)
+    }
+
+    fn load(path: &std::path::Path, layer: Option<u32>) -> std::result::Result<Self, String> {
+        let err = |m: String| format!("--shape route=hist:{}: {m}", path.display());
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| err(e.to_string()))?)
+                .map_err(|e| err(e.to_string()))?;
+        if doc["schema"] != "route_hist.v1" {
+            return Err(err(format!(
+                "schema {}: expected route_hist.v1",
+                doc["schema"]
+            )));
+        }
+        let id = doc["id"]
+            .as_str()
+            .filter(|s| s.len() == 64)
+            .map(str::to_owned)
+            .ok_or_else(|| err("missing 64-hex top-level `id`".into()))?;
+        let num = |v: &Value, what: &str| {
+            v.as_u64()
+                .map(|x| x as usize)
+                .ok_or_else(|| err(format!("missing or non-integer {what}")))
+        };
+        let n_experts = num(&doc["n_experts"], "n_experts")?;
+        let topk = num(&doc["topk"], "topk")?;
+        let rel = doc["ids"]["path"]
+            .as_str()
+            .ok_or_else(|| err("missing ids.path".into()))?;
+        let bin_path = if std::path::Path::new(rel).is_absolute() {
+            PathBuf::from(rel)
+        } else {
+            path.parent().unwrap_or(std::path::Path::new(".")).join(rel)
+        };
+        let bin =
+            std::fs::read(&bin_path).map_err(|e| err(format!("{}: {e}", bin_path.display())))?;
+        let (want, got) = (
+            doc["ids"]["sha256"].as_str().unwrap_or(""),
+            crate::elf::sha256_hex(&bin),
+        );
+        if want != got {
+            return Err(err(format!(
+                "ids sha256 mismatch ({}): manifest {want}, file {got}",
+                bin_path.display()
+            )));
+        }
+        let records = doc["records"]
+            .as_array()
+            .ok_or_else(|| err("missing records".into()))?;
+        let mut at = 0usize;
+        let mut ids = Vec::new();
+        for (i, r) in records.iter().enumerate() {
+            let (l, n, k) = (
+                num(&r["layer"], "record layer")?,
+                num(&r["n"], "record n")?,
+                num(&r["k"], "record k")?,
+            );
+            if k != topk {
+                return Err(err(format!("record {i}: k={k}, topk={topk}")));
+            }
+            let end = at + n * k * 4;
+            let part = bin.get(at..end).ok_or_else(|| {
+                err(format!(
+                    "record {i} runs past the ids bin ({} bytes)",
+                    bin.len()
+                ))
+            })?;
+            at = end;
+            if layer.is_some_and(|want| want as usize != l) {
+                continue;
+            }
+            for c in part.chunks_exact(4) {
+                let e = i32::from_le_bytes(c.try_into().unwrap());
+                if e < 0 || e as usize >= n_experts {
+                    return Err(err(format!(
+                        "record {i}: expert id {e} outside [0,{n_experts})"
+                    )));
+                }
+                ids.push(e);
+            }
+        }
+        if at != bin.len() {
+            return Err(err(format!(
+                "ids bin has {} bytes, records cover {at}",
+                bin.len()
+            )));
+        }
+        if ids.is_empty() {
+            return Err(err(match layer {
+                Some(l) => format!("no records for layer {l}"),
+                None => "no rows".into(),
+            }));
+        }
+        Ok(Self {
+            path: path.display().to_string(),
+            id,
+            layer,
+            n_experts,
+            topk,
+            ids,
+        })
+    }
+
+    /// `tokens x topk` expert ids, token `t` = recorded row `t % rows`.
+    fn table(&self, tokens: usize) -> Vec<i32> {
+        let rows = self.ids.len() / self.topk;
+        let mut out = Vec::with_capacity(tokens * self.topk);
+        for t in 0..tokens {
+            let r = t % rows;
+            out.extend_from_slice(&self.ids[r * self.topk..(r + 1) * self.topk]);
+        }
+        out
+    }
+}
+
 impl ContractNode {
+    /// The `route` record of the info JSON: `{kind, path, id, layer}`.
+    fn info_route(&self) -> Value {
+        match &self.hist {
+            Some(h) => json!({"kind": "hist", "path": h.path, "id": h.id, "layer": h.layer}),
+            None => json!({"kind": "uniform"}),
+        }
+    }
+
     /// Build from the full `--node` string (`contract:<spec>`) and `--shape`.
     pub fn build(name: &str, shape: &ShapeSpec) -> BResult<Self> {
         let spec = name
@@ -653,6 +937,10 @@ impl ContractNode {
             .operands
             .iter()
             .any(|o| recipe_for(o.format, o.access).is_ok_and(|r| r.is_routing()));
+        // The grouped combine (`ffn_moe_combine_f32`): index planes from the recorded / uniform routing.
+        let combine = abi.operands.iter().any(|o| {
+            operand_recipe(o.name, o.format, o.access).is_ok_and(|r| r == Recipe::RouteIds)
+        });
         let rows_key_name: Option<String> = match rows_param_of(&node_arm) {
             Some(r) if abi.param_index(r).is_some() => Some(r.to_owned()),
             Some(_) if routed => Some("tokens".to_owned()),
@@ -675,9 +963,64 @@ impl ContractNode {
         let topk_kv = take_u64(&mut kv, "topk")?;
         let rows_alias = take_u64(&mut kv, "rows")?;
         let route_seed = take_u64(&mut kv, "route_seed")?.unwrap_or(DEFAULT_ROUTE_SEED);
+        let prefix = take_u64(&mut kv, "prefix")?.unwrap_or(0);
+        let hist = match kv.remove("route") {
+            None => None,
+            Some(r) if r == "uniform" => None,
+            Some(r) => match r.strip_prefix("hist:") {
+                Some(spec) => Some(RouteHist::parse(spec)?),
+                None => {
+                    return Err(format!(
+                        "--shape route={r}: expected uniform|hist:<route_hist.v1 json>[@layer]"
+                    )
+                    .into())
+                }
+            },
+        };
+        // `null=<operand>[+<operand>]`: bind those nullable operands as null addresses (the production call
+        // passes `routed_out = None`).
+        let null_ops: Vec<String> = kv
+            .remove("null")
+            .map(|v| v.split('+').map(|s| s.trim().to_owned()).collect())
+            .unwrap_or_default();
+        let edge = take_u64(&mut kv, "edge")?;
+        if edge.is_some() && !combine {
+            return Err(format!("{}: edge= is a knob of the grouped combine only", abi.id).into());
+        }
+        for n in &null_ops {
+            match abi.operands.iter().find(|o| o.name == n) {
+                Some(o) if o.nullable => {}
+                Some(_) => {
+                    return Err(format!(
+                        "--shape null={n}: {}'s operand {n} is not nullable",
+                        abi.id
+                    )
+                    .into())
+                }
+                None => {
+                    return Err(format!("--shape null={n}: {} has no operand {n}", abi.id).into())
+                }
+            }
+        }
+        if hist.is_some() && !routed && !combine {
+            return Err(format!(
+                "{}: route= is a knob of routed (grouped) contracts only",
+                abi.id
+            )
+            .into());
+        }
         if let Some(k) = kv.keys().next() {
             let mut known: Vec<&str> = abi.params.iter().map(|p| p.name).collect();
-            known.extend(["tokens", "topk", "rows", "route_seed"]);
+            known.extend([
+                "tokens",
+                "topk",
+                "rows",
+                "route_seed",
+                "route",
+                "prefix",
+                "null",
+                "edge",
+            ]);
             return Err(format!(
                 "--shape: unknown key `{k}` for {} (params and knobs: {})",
                 abi.id,
@@ -781,14 +1124,33 @@ impl ContractNode {
                 )
                 .into());
             }
-            let topk_ids = crate::moe::route_topk(
-                tokens as usize,
-                topk as usize,
-                e as usize,
-                crate::moe::Route::Uniform,
-                0.0,
-                route_seed,
-            );
+            let topk_ids = match &hist {
+                Some(h) => {
+                    if h.n_experts as u64 != e {
+                        return Err(format!(
+                            "route=hist: the recording has n_experts={}, the shape n_experts={e}",
+                            h.n_experts
+                        )
+                        .into());
+                    }
+                    if h.topk as u64 != topk {
+                        return Err(format!(
+                            "route=hist: the recording has topk={}, the shape topk={topk}",
+                            h.topk
+                        )
+                        .into());
+                    }
+                    h.table(tokens as usize)
+                }
+                None => crate::moe::route_topk(
+                    tokens as usize,
+                    topk as usize,
+                    e as usize,
+                    crate::moe::Route::Uniform,
+                    0.0,
+                    route_seed,
+                ),
+            };
             routing = Some(
                 crate::moe::scatter(&topk_ids, e as usize, m_total as usize)
                     .map_err(|err| BuildError::Other(format!("routing plan: {err}")))?,
@@ -839,6 +1201,28 @@ impl ContractNode {
             }
         }
 
+        // The grouped combine: `n_down_rows` defaults to the production bound of the routed down plane
+        // (`m_total_bound(rows * top_k, n_experts)`), so every row class carries its own plane size.
+        if combine {
+            for k in ["rows", "top_k", "n_experts", "hidden", "n_down_rows"] {
+                if abi.param_index(k).is_none() {
+                    return Err(
+                        format!("{}: the combine recipes need the param `{k}`", abi.id).into(),
+                    );
+                }
+            }
+            let at = |k: &str| vals[abi.param_index(k).expect("checked above")];
+            if let (Some(r), Some(k), Some(e)) = (at("rows"), at("top_k"), at("n_experts")) {
+                if r > 0 && k > 0 && e > 0 && r.saturating_mul(k) < i32::MAX as u64 / 2 {
+                    set_default(
+                        &mut vals,
+                        "n_down_rows",
+                        crate::moe::m_total_bound((r * k) as usize, e as usize) as u64,
+                    );
+                }
+            }
+        }
+
         let missing: Vec<String> = abi
             .params
             .iter()
@@ -859,6 +1243,42 @@ impl ContractNode {
             .into());
         }
         let params: Vec<u64> = vals.into_iter().map(|v| v.unwrap()).collect();
+
+        // Position device scalars: `prefix=` is their value; the rest have no recipe.
+        let mut has_position = false;
+        for o in abi.operands {
+            if recipe_for(o.format, o.access).is_ok_and(|r| r == Recipe::DeviceScalar) {
+                if !matches!(o.name, "pos_ptr" | "base_ptr") {
+                    return Err(format!(
+                        "{} operand {}: an i32.device_scalar other than a position (pos_ptr, base_ptr) has no input recipe",
+                        abi.id, o.name
+                    )
+                    .into());
+                }
+                has_position = true;
+            }
+        }
+        if prefix > 0 && !has_position {
+            return Err(format!(
+                "{}: prefix={prefix}, but the contract has no position device scalar (pos_ptr, base_ptr)",
+                abi.id
+            )
+            .into());
+        }
+        if prefix > i32::MAX as u64 {
+            return Err(format!("prefix={prefix} does not fit the i32 device scalar").into());
+        }
+        if has_position {
+            if let (Some(max_rows), Some(rows)) =
+                (param_value(abi, &params, "max_rows"), rows_value)
+            {
+                if prefix.saturating_add(rows) > max_rows {
+                    return Err(BuildError::Domain(format!(
+                        "prefix {prefix} + rows {rows} exceeds max_rows {max_rows}: the keys of the last rows would lie outside the K/V views"
+                    )));
+                }
+            }
+        }
 
         // Launcher rule: `gemm_bf16_xf32_tiled_rows` at M <= 32 launches the mp4 entry.
         let mut resolved_from = None;
@@ -903,11 +1323,74 @@ impl ContractNode {
             load_source(arm.export)?;
         }
 
+        // ---- grouped combine: the recorded (or uniform) expert ids and their scatter's `inverse_perm`
+        let combine_plan = if combine {
+            let pv = |n: &str| -> Result<usize> {
+                param_value(base.abi, &params, n)
+                    .map(|v| v as usize)
+                    .ok_or_else(|| {
+                        format!("{}: the combine recipes need the param `{n}`", base.abi.id)
+                    })
+            };
+            let (rows_n, top_k, e, n_down) = (
+                pv("rows")?,
+                pv("top_k")?,
+                pv("n_experts")?,
+                pv("n_down_rows")?,
+            );
+            if n_down % 16 != 0 {
+                return Err(BuildError::Domain(format!(
+                    "n_down_rows = {n_down} is not a multiple of 16: the grouped plane is laid in 16-row tiles"
+                )));
+            }
+            let ids = match &hist {
+                Some(h) => {
+                    if h.n_experts != e || h.topk != top_k {
+                        return Err(format!(
+                            "route=hist: the recording has n_experts={} topk={}, the shape n_experts={e} top_k={top_k}",
+                            h.n_experts, h.topk
+                        )
+                        .into());
+                    }
+                    h.table(rows_n)
+                }
+                None => crate::moe::route_topk(
+                    rows_n,
+                    top_k,
+                    e,
+                    crate::moe::Route::Uniform,
+                    0.0,
+                    route_seed,
+                ),
+            };
+            let r = crate::moe::scatter(&ids, e, n_down)
+                .map_err(|err| BuildError::Other(format!("combine routing plan: {err}")))?;
+            let mut row_of_slot = vec![-1i32; ids.len()];
+            for (pos, &s) in r.sorted.iter().enumerate() {
+                if s >= 0 {
+                    row_of_slot[s as usize] = pos as i32;
+                }
+            }
+            let (mut ids, mut row_of_slot) = (ids, row_of_slot);
+            if let Some(seed) = edge {
+                edge_planes(seed, top_k, e, n_down, &mut ids, &mut row_of_slot);
+            }
+            Some(CombinePlan {
+                ids,
+                row_of_slot,
+                live_rows: r.live,
+                touched_experts: r.touched_experts(),
+                edge,
+            })
+        } else {
+            None
+        };
+
         // ---- operand plans: bytes = the larger extent of the arms; recipe per format
         let mut operands = Vec::new();
         let mut ptr_fields = Vec::new();
         for (i, o) in base.abi.operands.iter().enumerate() {
-            let recipe = recipe_for(o.format, o.access)
+            let recipe = operand_recipe(o.name, o.format, o.access)
                 .map_err(|e| format!("{} operand {}: {e}", base.abi.id, o.name))?;
             let mut bytes = 0u64;
             for arm in std::iter::once(&base).chain(cand.iter()) {
@@ -939,7 +1422,30 @@ impl ContractNode {
                 bytes: usize::try_from(bytes)
                     .map_err(|_| format!("operand {} is {bytes} B", o.name))?,
                 field_offset: off,
+                nulled: null_ops.iter().any(|n| n == o.name),
             });
+        }
+        for o in operands.iter().filter(|o| o.recipe == Recipe::Q8Plane) {
+            let w = match o.name {
+                "ka" => "wa",
+                "vv" => "dv",
+                n => {
+                    return Err(format!(
+                        "{} operand {n}: the i8.mirror_plane_view recipe knows the planes `ka` (width wa) and `vv` (width dv) only",
+                        base.abi.id
+                    )
+                    .into())
+                }
+            };
+            for k in ["n_heads", w] {
+                if base.abi.param_index(k).is_none() {
+                    return Err(format!(
+                        "{} operand {}: the i8.mirror_plane_view recipe needs the param `{k}`",
+                        base.abi.id, o.name
+                    )
+                    .into());
+                }
+            }
         }
         if operands.iter().any(|o| o.recipe == Recipe::ExpertPtrTable) {
             for k in ["M", "K", "n_experts"] {
@@ -968,6 +1474,7 @@ impl ContractNode {
         }
         env.insert("topk".into(), topk);
         env.insert("tokens".into(), tokens);
+        env.insert("prefix".into(), prefix);
         let stack = param_value(base.abi, &params, "n_experts").unwrap_or(1);
         env.insert("stack".into(), stack);
         if let Some(w) = base.work {
@@ -1003,6 +1510,7 @@ impl ContractNode {
         // the routing touches (the work spec's `bytes` of a routed contract is a one-slab lower bound).
         let footprint_bytes: u64 = operands
             .iter()
+            .filter(|o| !o.nulled)
             .map(|o| match (o.recipe, &routing) {
                 (Recipe::ExpertPtrTable, Some(r)) => {
                     let m = param_value(base.abi, &params, "M").unwrap_or(0);
@@ -1015,7 +1523,7 @@ impl ContractNode {
         let pool_active = pool && bytes_per_call.max(footprint_bytes) > llc_bytes(arch)?;
         let pool_set_bytes: usize = operands
             .iter()
-            .filter(|o| o.access == Access::ReadOnly && !o.recipe.is_index())
+            .filter(|o| o.access == Access::ReadOnly && !o.recipe.is_index() && !o.nulled)
             .map(|o| {
                 if o.recipe == Recipe::ExpertPtrTable {
                     let m = param_value(base.abi, &params, "M").unwrap_or(0) as usize;
@@ -1047,6 +1555,15 @@ impl ContractNode {
         if routed {
             label.push_str(&format!("-tokens{tokens}-topk{topk}"));
         }
+        if combine {
+            label.push_str("-combine");
+            for n in &null_ops {
+                label.push_str(&format!("-null_{n}"));
+            }
+        }
+        if prefix > 0 {
+            label.push_str(&format!("-prefix{prefix}"));
+        }
         Ok(Self {
             spec: spec.to_owned(),
             label,
@@ -1061,6 +1578,9 @@ impl ContractNode {
             routed,
             routing,
             route_seed,
+            hist,
+            combine: combine_plan,
+            prefix,
             operands,
             ptr_fields,
             pool,
@@ -1110,6 +1630,17 @@ impl ContractNode {
     /// The activation-row key and value (`N`, `tokens`, ...), if the contract has rows.
     pub fn rows(&self) -> Option<(&str, u64)> {
         self.rows_key.as_ref().map(|(k, v)| (k.as_str(), *v))
+    }
+
+    /// The size the PRODUCT launcher compares its row predicates against: for a routed (grouped) contract the launch's
+    /// `m_total` (the sentinel-padded grouped-row bound), else the row-class value itself (`rows`).
+    pub fn launch_rows(&self) -> Option<u64> {
+        if self.routing.is_some() {
+            if let Some(i) = self.base.abi.param_index("m_total") {
+                return Some(self.params[i]);
+            }
+        }
+        self.rows().map(|(_, v)| v)
     }
 
     pub fn bytes_per_call(&self) -> u64 {
@@ -1184,6 +1715,11 @@ impl ContractNode {
         param_value(self.base.abi, &self.params, "n_experts").unwrap_or(0) as usize
     }
 
+    /// `top_k` param of the grouped combine.
+    fn topk_of_combine(&self) -> usize {
+        param_value(self.base.abi, &self.params, "top_k").unwrap_or(1) as usize
+    }
+
     /// One expert slab of set `set`.
     pub fn host_slab(&self, seed: u64, set: usize, e: usize) -> Vec<u8> {
         let (m, g) = self.slab_dims();
@@ -1205,6 +1741,18 @@ impl ContractNode {
     /// emulator matter). Deterministic in `seed` and `set`.
     pub fn host_operand(&self, i: usize, seed: u64, set: usize) -> Vec<u8> {
         let o = &self.operands[i];
+        if o.recipe == Recipe::DeviceScalar {
+            let mut b = (self.prefix as i32).to_le_bytes().to_vec();
+            b.resize(o.bytes, 0);
+            return b;
+        }
+        if let Some(c) = &self.combine {
+            match o.recipe {
+                Recipe::RouteIds => return i32s(&c.ids),
+                Recipe::RowOfSlot => return i32s(&c.row_of_slot),
+                _ => {}
+            }
+        }
         if let Some(b) = self.routing_bytes(i) {
             debug_assert_eq!(b.len(), o.bytes, "{}: routing table vs extent", o.name);
             return b;
@@ -1212,12 +1760,35 @@ impl ContractNode {
         if o.recipe == Recipe::ExpertPtrTable {
             return vec![0u8; o.bytes];
         }
-        gen_bytes(
-            o.recipe,
-            o.bytes,
-            seed ^ fnv(o.name) ^ ((set as u64) << 40),
-            self.vocab(),
-        )
+        let seed = seed ^ fnv(o.name) ^ ((set as u64) << 40);
+        if o.recipe == Recipe::Q8Plane {
+            let (row_bytes, code_bytes) = self
+                .q8_plane_geom(o.name)
+                .expect("Q8Plane geometry is checked at build");
+            return gen_q8_plane(o.bytes, row_bytes, code_bytes, seed);
+        }
+        gen_bytes(o.recipe, o.bytes, seed, self.vocab())
+    }
+
+    /// `(row bytes, code bytes per row)` of the INT8 mirror plane operand `name`: `ka` has width `wa`, `vv`
+    /// width `dv`; a row is `n_heads*(w+2)` bytes, its codes `n_heads*w`.
+    fn q8_plane_geom(&self, name: &str) -> Result<(usize, usize)> {
+        let w = match name {
+            "ka" => "wa",
+            "vv" => "dv",
+            _ => {
+                return Err(format!(
+                    "operand {name}: the i8.mirror_plane_view recipe knows the planes `ka` (width wa) and `vv` (width dv) only"
+                ))
+            }
+        };
+        let get = |k: &str| {
+            param_value(self.base.abi, &self.params, k).ok_or_else(|| {
+                format!("operand {name}: the i8.mirror_plane_view recipe needs the param `{k}`")
+            })
+        };
+        let (h, w) = (get("n_heads")? as usize, get(w)? as usize);
+        Ok((h * (w + 2), h * w))
     }
 
     /// The explicit kernarg image (padded to 16 B) for `arm` with `addrs[i]` the base address of operand
@@ -1405,10 +1976,27 @@ impl Node for ContractNode {
             "params": params, "operands": ops, "arch": self.arch.name(),
             "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
         });
+        if self.prefix > 0 {
+            v["prefix"] = json!(self.prefix);
+        }
+        if let Some(c) = &self.combine {
+            let nulled: Vec<&str> = self
+                .operands
+                .iter()
+                .filter(|o| o.nulled)
+                .map(|o| o.name)
+                .collect();
+            v["routing"] = json!({
+                "kind": "combine", "tokens": c.ids.len() / self.topk_of_combine().max(1),
+                "topk": self.topk_of_combine(), "n_experts": self.n_experts(),
+                "route": self.info_route(), "route_seed": self.route_seed, "live_rows": c.live_rows,
+                "touched_experts": c.touched_experts, "null": nulled, "edge": c.edge,
+            });
+        }
         if let Some(r) = &self.routing {
             v["routing"] = json!({
                 "tokens": self.tokens, "topk": self.topk, "n_experts": self.n_experts(),
-                "route": "uniform", "route_seed": self.route_seed, "live_rows": r.live,
+                "route": self.info_route(), "route_seed": self.route_seed, "live_rows": r.live,
                 "live_tiles": r.live_tiles(), "touched_experts": r.touched_experts(),
                 "max_tiles_per_expert": r.max_tiles_per_expert(), "partial_tiles": r.partial_tiles(),
                 "slab_bytes": self.slab_bytes(),
@@ -1491,7 +2079,7 @@ impl Node for ContractNode {
             .iter()
             .position(|o| o.recipe == Recipe::ExpertPtrTable);
         let outs: Vec<usize> = (0..self.operands.len())
-            .filter(|&i| self.operands[i].access != Access::ReadOnly)
+            .filter(|&i| self.operands[i].access != Access::ReadOnly && !self.operands[i].nulled)
             .collect();
         // Regions in mapping order: expert slabs, then every non-output operand in operand order, then the
         // outputs (one region each, or one packed region with poison pads when several).
@@ -1514,7 +2102,7 @@ impl Node for ContractNode {
         let n_slab_regions = regions.len();
         let mut region_of: Vec<Option<usize>> = vec![None; self.operands.len()];
         for i in 0..self.operands.len() {
-            if outs.contains(&i) {
+            if outs.contains(&i) || self.operands[i].nulled {
                 continue;
             }
             region_of[i] = Some(regions.len());
@@ -1571,6 +2159,10 @@ impl Node for ContractNode {
             match f.kind {
                 FieldKind::Pointer { operand } => {
                     let i = abi.operand_index(operand).expect("validated pointer field");
+                    if self.operands[i].nulled {
+                        args.push(EmuArg::U64(0));
+                        continue;
+                    }
                     let r = region_of[i].expect("every operand has a region");
                     args.push(match packed_off[i] {
                         Some(off) => EmuArg::BufOff(r, off),
@@ -1605,7 +2197,7 @@ impl Node for ContractNode {
             let mut bufs: Vec<Option<Buf>> = (0..n).map(|_| None).collect();
             let mut slabs = Vec::new();
             for i in 0..n {
-                if s > 0 && !self.pooled(i) {
+                if self.operands[i].nulled || (s > 0 && !self.pooled(i)) {
                     continue;
                 }
                 if Some(i) == table {
@@ -1634,7 +2226,7 @@ impl Node for ContractNode {
         }
         let mut pristine = Vec::new();
         for (i, o) in self.operands.iter().enumerate() {
-            if o.access != Access::ReadOnly {
+            if o.access != Access::ReadOnly && !o.nulled {
                 let b = Buf::alloc(gpu, o.bytes)?;
                 b.copy_from(
                     gpu,
@@ -1661,7 +2253,7 @@ impl Node for ContractNode {
         let addrs: Vec<u64> = s.sets[0]
             .bufs
             .iter()
-            .map(|b| b.as_ref().expect("set 0 holds every operand").ptr() as u64)
+            .map(|b| b.as_ref().map_or(0, |b| b.ptr() as u64))
             .collect();
         let img = self.kernarg_image(&self.base, &addrs)?;
         if let Some(c) = &self.cand {
@@ -2247,6 +2839,18 @@ mod tests {
     }
 
     #[test]
+    fn launch_rows_is_m_total_for_routed_and_rows_otherwise() {
+        let q = node(QT44, "M=2176,K=2560,n_experts=128,topk=6,tokens=512");
+        let mt = q.params()[q.base.abi.param_index("m_total").unwrap()];
+        assert_eq!(q.launch_rows(), Some(mt));
+        assert!(mt >= 512 * 6 && mt % 16 == 0);
+        assert_ne!(q.launch_rows(), q.rows().map(|(_, v)| v));
+        let b = node(BF16_BATCHED, "M=128,K=2560,N=512");
+        assert_eq!(b.launch_rows(), Some(512));
+        assert_eq!(b.launch_rows(), b.rows().map(|(_, v)| v));
+    }
+
+    #[test]
     fn regime_is_hot_unless_pool_and_above_the_llc() {
         let small = node(BF16_BATCHED, "M=128,K=2560,N=512,pool=1");
         assert!(small.bytes_per_call() < 64 << 20);
@@ -2370,6 +2974,235 @@ mod tests {
         assert_eq!((e.params[0], e.rows()), (128, Some(("tokens", 37))));
     }
 
+    const FLASH: &str = "contract:latent_attention_flash_prefill";
+    /// The Raon expanded-mirror layout (kb the latent cache's shared 64-wide tail: token stride 576,
+    /// head stride 0), 2 heads.
+    const FLASH_SHAPE: &str = "n_heads=2,wa=128,wb=64,dv=128,pos_offset=0,max_rows=200,ka_tok=256,\
+        ka_head=128,kb_tok=576,kb_head=0,v_tok=256,v_head=128,scale_bits=1033096506,round_y=1";
+
+    fn flash(extra: &str) -> String {
+        format!("{FLASH_SHAPE},{extra}")
+    }
+
+    #[test]
+    fn flash_view_and_position_recipes() {
+        let n = node(FLASH, &flash("n_rows=48,prefix=100"));
+        let by_name = |s: &str| n.operands.iter().position(|o| o.name == s).unwrap();
+        for (name, extent) in [
+            ("ka", ((200 - 1) * 256 + 128 + 128) * 2),
+            ("kb", ((200 - 1) * 576 + 64) * 2),
+            ("vv", ((200 - 1) * 256 + 128 + 128) * 2),
+        ] {
+            let i = by_name(name);
+            assert_eq!(n.operands[i].recipe, Recipe::Bf16, "{name}");
+            assert_eq!(n.operands[i].bytes, extent, "{name} extent");
+            let b = n.host_operand(i, 3, 0);
+            assert_eq!(b.len(), extent, "{name} fill covers the whole view extent");
+            assert_eq!(b, n.host_operand(i, 3, 0), "{name} deterministic");
+            assert!(b.chunks_exact(2).any(|c| c != [0, 0]), "{name} is filled");
+            for c in b.chunks_exact(2) {
+                let v = half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+                assert!(v.is_finite() && (-1.0..=1.0).contains(&v), "{name}: {v}");
+            }
+        }
+        let p = by_name("pos_ptr");
+        assert_eq!(n.operands[p].recipe, Recipe::DeviceScalar);
+        assert_eq!(n.host_operand(p, 3, 0), 100i32.to_le_bytes().to_vec());
+        // the default prefix is 0; the scalar is an index-like operand, never replicated into a pool
+        let z = node(FLASH, &flash("n_rows=48"));
+        assert_eq!(z.host_operand(p, 9, 0), 0i32.to_le_bytes().to_vec());
+        assert!(n.operands[p].recipe.is_index());
+        assert_eq!(n.shape_json()["prefix"], 100);
+        assert!(z.shape_json().get("prefix").is_none());
+        assert!(n.shape_label().ends_with("-prefix100"));
+        // the scalar reaches the emulator case as its own region
+        let c = n.emu_case(1).unwrap();
+        let r = c.bufs.iter().find(|b| b.name == "pos_ptr").unwrap();
+        assert_eq!(r.bytes, 100i32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn flash_prefix_is_bounded_by_max_rows_and_counts_work() {
+        // prefix + rows <= max_rows (a clippable domain error: --rowclasses drops the class)
+        for shape in [
+            flash("n_rows=48,prefix=153"),
+            FLASH_SHAPE.replace("max_rows=200", "max_rows=48") + ",n_rows=48,prefix=1",
+        ] {
+            assert!(
+                matches!(build(FLASH, &shape), Err(BuildError::Domain(_))),
+                "{shape}"
+            );
+        }
+        assert!(build(FLASH, &flash("n_rows=48,prefix=152")).is_ok());
+        // the row class rebuilds with `rows=`: a class that no longer fits is clipped
+        assert!(matches!(
+            build(FLASH, &flash("prefix=152,rows=49")),
+            Err(BuildError::Domain(_))
+        ));
+        assert!(build(FLASH, &flash("prefix=100,rows=100")).is_ok());
+        // causal-triangle work with the prefix: H * (wa + wb + dv) * (rows * prefix + rows (rows + 1) / 2)
+        let n = node(FLASH, &flash("n_rows=48,prefix=100"));
+        let macs = 2.0 * 320.0 * (48.0 * 100.0 + 48.0 * 49.0 / 2.0);
+        assert_eq!(n.work().flops, 2.0 * macs);
+        assert_eq!(n.rows(), Some(("n_rows", 48)));
+        // a prefix is meaningless without a position scalar; it never exceeds i32
+        let e = build(BF16_BATCHED, "M=128,K=2560,N=512,prefix=4")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("no position device scalar"), "{e}");
+        let e = build(FLASH, &flash("n_rows=48,prefix=4294967296"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("i32"), "{e}");
+    }
+
+    const FLASH_Q8: &str = "contract:latent_attention_flash_prefill_q8";
+    /// 8 heads: plane rows of 8 * 130 = 1040 B (a multiple of 16).
+    const FLASH_Q8_SHAPE: &str =
+        "n_heads=8,wa=128,wb=64,dv=128,pos_offset=0,max_rows=200,ka_tok=1040,\
+        ka_head=128,kb_tok=576,kb_head=0,v_tok=1040,v_head=128,scale_bits=1033096506,round_y=1";
+
+    fn flash_q8(extra: &str) -> String {
+        format!("{FLASH_Q8_SHAPE},{extra}")
+    }
+
+    #[test]
+    fn flash_q8_plane_and_view_recipes() {
+        let n = node(FLASH_Q8, &flash_q8("n_rows=48,prefix=100"));
+        let by_name = |s: &str| n.operands.iter().position(|o| o.name == s).unwrap();
+        let extent = (200 - 1) * 1040 + 8 * 130;
+        assert_eq!(extent, 200 * 1040);
+        let mut planes = Vec::new();
+        for name in ["ka", "vv"] {
+            let i = by_name(name);
+            assert_eq!(n.operands[i].recipe, Recipe::Q8Plane, "{name}");
+            assert_eq!(n.operands[i].bytes, extent, "{name} extent");
+            assert!(!n.operands[i].recipe.is_index());
+            let b = n.host_operand(i, 3, 0);
+            assert_eq!(b.len(), extent, "{name} fill covers the whole extent");
+            assert_eq!(b, n.host_operand(i, 3, 0), "{name} deterministic");
+            assert_ne!(b, n.host_operand(i, 3, 1), "{name} pool sets differ");
+            for row in b.chunks_exact(1040) {
+                let (codes, scales) = row.split_at(8 * 128);
+                assert!(
+                    codes.iter().all(|&c| (c as i8) >= -127),
+                    "{name}: -128 code"
+                );
+                assert!(
+                    codes.iter().any(|&c| (c as i8) > 100)
+                        && codes.iter().any(|&c| (c as i8) < -100)
+                );
+                assert_eq!(scales.len(), 8 * 2);
+                for c in scales.chunks_exact(2) {
+                    let v = half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+                    assert!(
+                        v.is_finite()
+                            && v > 0.0
+                            && (0.5 / 127.0 - 1e-5..=1.0 / 127.0 + 1e-5).contains(&v),
+                        "{name}: scale {v}"
+                    );
+                }
+            }
+            planes.push(b);
+        }
+        assert_ne!(
+            planes[0], planes[1],
+            "the planes have different operand seeds"
+        );
+        let kb = by_name("kb");
+        assert_eq!(n.operands[kb].recipe, Recipe::Bf16);
+        assert_eq!(n.operands[kb].bytes, ((200 - 1) * 576 + 64) * 2);
+        let p = by_name("pos_ptr");
+        assert_eq!(n.operands[p].recipe, Recipe::DeviceScalar);
+        assert_eq!(n.host_operand(p, 3, 0), 100i32.to_le_bytes().to_vec());
+        // the emulator case maps the planes at their extent, the scale bytes after the codes of row 0
+        let c = n.emu_case(1).unwrap();
+        for name in ["ka", "vv"] {
+            let r = c.bufs.iter().find(|b| b.name == name).unwrap();
+            assert_eq!(r.bytes.len(), extent, "{name} region");
+            let scale0 =
+                half::f16::from_bits(u16::from_le_bytes([r.bytes[8 * 128], r.bytes[8 * 128 + 1]]))
+                    .to_f32();
+            assert!(
+                scale0 > 0.0 && scale0 <= 1.0 / 127.0 + 1e-5,
+                "{name}: {scale0}"
+            );
+            assert_eq!(r.bytes, n.host_operand(by_name(name), 1, 0));
+        }
+    }
+
+    #[test]
+    fn flash_q8_domain_geometry_and_work() {
+        for shape in [
+            flash_q8("n_rows=48").replace("ka_tok=1040", "ka_tok=1024"),
+            flash_q8("n_rows=48").replace("v_tok=1040", "v_tok=1024"),
+            flash_q8("n_rows=48").replace("ka_head=128", "ka_head=256"),
+            flash_q8("n_rows=48").replace("v_head=128", "v_head=256"),
+            flash_q8("n_rows=48").replace("n_heads=8", "n_heads=2"),
+            flash_q8("n_rows=48").replace("wa=128", "wa=64"),
+            flash_q8("n_rows=48,prefix=153"),
+        ] {
+            assert!(
+                matches!(build(FLASH_Q8, &shape), Err(BuildError::Domain(_))),
+                "{shape}"
+            );
+        }
+        // n_heads = 2 with tok 260 (the whole plane row) fails the 16-byte alignment rule too
+        let s = flash_q8("n_rows=48")
+            .replace("n_heads=8", "n_heads=2")
+            .replace("1040", "260");
+        assert!(
+            matches!(build(FLASH_Q8, &s), Err(BuildError::Domain(_))),
+            "{s}"
+        );
+        assert!(build(FLASH_Q8, &flash_q8("n_rows=48,prefix=152")).is_ok());
+        assert!(matches!(
+            build(FLASH_Q8, &flash_q8("prefix=152,rows=49")),
+            Err(BuildError::Domain(_))
+        ));
+        let n = node(FLASH_Q8, &flash_q8("n_rows=100,prefix=100"));
+        let bf = node(
+            FLASH,
+            &flash("n_rows=100,prefix=100").replace("n_heads=2", "n_heads=8"),
+        );
+        assert_eq!(n.work().flops, bf.work().flops);
+        assert_eq!(n.rows(), Some(("n_rows", 100)));
+        let (prefix, rows, h) = (100u64, 100u64, 8u64);
+        assert_eq!(
+            n.bytes_per_call(),
+            4 * rows * h * 320 + (prefix + rows) * h * (130 + 130) + 2 * (prefix + rows) * h * 64
+        );
+        let g = n.arm_geometry(&n.base).unwrap();
+        assert_eq!((g.grid, g.block, g.lds), ([2, 8, 1], [128, 1, 1], 61440));
+        // both archs resolve
+        let o = node(FLASH_Q8, &flash_q8("n_rows=48,arch=gfx1100"));
+        assert_eq!(o.arch(), "gfx1100");
+        assert_eq!(o.base.export.arch, Arch::Gfx1100);
+        assert_eq!(o.base.export.symbol, "latent_attention_flash_prefill_q8");
+        assert_eq!(o.arm_geometry(&o.base).unwrap().lds, 61440);
+        assert_eq!(node(FLASH_Q8, &flash_q8("n_rows=48")).arch(), "gfx1201");
+    }
+
+    #[test]
+    fn a_non_position_device_scalar_has_no_recipe() {
+        // gated_delta_net: `slot_idx` / `n_dev` are i32.device_scalar operands, not positions
+        let e = build(
+            "contract:gated_delta_net_vector_serial_f32",
+            "n_tokens=4,n_heads=2,qk_group=1,decay_per_key=0,round_out_bf16=0,slot=0,q_row_stride=256,\
+             k_row_stride=256,v_row_stride=256,decay_row_stride=2,beta_row_stride=2,out_row_stride=256,\
+             state_head_stride=16384,state_row_stride=128,state_slot_stride=32768,n_qk_heads=2",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            e.contains("slot_idx") && e.contains("no input recipe"),
+            "{e}"
+        );
+    }
+
     #[test]
     fn offline_arch_picks_the_arch_export() {
         let n = node("contract:gemm_f32_batched", "M=8,K=64,N=4,arch=gfx1100");
@@ -2377,5 +3210,222 @@ mod tests {
         assert_eq!(n.base.export.arch, Arch::Gfx1100);
         assert!(build("contract:gemm_q8_0_wmma_gfx12", "M=8,K=64,N=4,arch=gfx1100").is_err());
         assert!(build("contract:gemm_f32_batched", "M=8,K=64,N=4,arch=gfx900").is_err());
+    }
+
+    /// A synthetic `route_hist.v1` (E=8, top-2): layer 0 has 3 rows, layer 1 has 2.
+    fn hist_fixture(tag: &str, bad_sha: bool) -> PathBuf {
+        let rows: [[i32; 2]; 5] = [[0, 1], [1, 2], [7, 7 - 1], [3, 4], [1, 4]];
+        let mut bin = Vec::new();
+        for r in rows {
+            for e in r {
+                bin.extend_from_slice(&e.to_le_bytes());
+            }
+        }
+        let dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("moe_hist_fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_name = format!("{tag}.ids.bin");
+        std::fs::write(dir.join(&bin_name), &bin).unwrap();
+        let sha = if bad_sha {
+            "0".repeat(64)
+        } else {
+            crate::elf::sha256_hex(&bin)
+        };
+        let doc = json!({
+            "schema": "route_hist.v1", "n_experts": 8, "topk": 2, "id": "ab".repeat(32),
+            "ids": {"path": bin_name, "sha256": sha},
+            "records": [{"layer": 0, "n": 3, "k": 2}, {"layer": 1, "n": 2, "k": 2}],
+        });
+        let p = dir.join(format!("{tag}.json"));
+        std::fs::write(&p, serde_json::to_vec(&doc).unwrap()).unwrap();
+        p
+    }
+
+    #[test]
+    fn route_hist_replays_recorded_experts_cycled() {
+        let p = hist_fixture("det", false);
+        let shape = format!(
+            "M=128,K=512,n_experts=8,topk=2,tokens=7,route=hist:{}",
+            p.display()
+        );
+        let n = node(QT44, &shape);
+        let r = n.routing.as_ref().unwrap();
+        // token t takes recorded row t % 5 (all layers, record order)
+        assert_eq!(&r.topk[..4], &[0, 1, 1, 2]);
+        assert_eq!(&r.topk[10..14], &[0, 1, 1, 2], "token 5 replays row 0");
+        assert_eq!(r.topk.len(), 14);
+        // expert 1 owns tokens 0,1,4,5 -> 5 slots... recount from the table itself
+        let c1 = r.topk.iter().filter(|&&e| e == 1).count();
+        assert_eq!((r.offsets[2] - r.offsets[1]) as usize, c1.div_ceil(16) * 16);
+        let rt = n.info_route();
+        assert_eq!(
+            (rt["kind"].as_str(), rt["id"].as_str()),
+            (Some("hist"), Some("ab".repeat(32).as_str()))
+        );
+        assert!(rt["layer"].is_null());
+        // `@1` selects layer 1's two rows: tokens alternate rows [3,4], [1,4]
+        let n1 = node(QT44, &format!("{shape}@1"));
+        assert_eq!(&n1.routing.as_ref().unwrap().topk[..4], &[3, 4, 1, 4]);
+        assert_eq!(n1.info_route()["layer"], 1);
+        // uniform stays the default
+        let u = node(QT44, QT44_SHAPE);
+        assert_eq!(u.info_route()["kind"], "uniform");
+    }
+
+    #[test]
+    fn route_hist_refuses_mismatch_and_bad_sha() {
+        let p = hist_fixture("ok", false);
+        let at = |shape: &str| {
+            build(QT44, &format!("{shape},route=hist:{}", p.display()))
+                .err()
+                .map(|e| e.to_string())
+        };
+        let e = at("M=128,K=512,n_experts=16,topk=2,tokens=7").unwrap();
+        assert!(e.contains("n_experts"), "{e}");
+        let e = at("M=128,K=512,n_experts=8,topk=3,tokens=7").unwrap();
+        assert!(e.contains("topk"), "{e}");
+        let e = build(
+            QT44,
+            &format!(
+                "M=128,K=512,n_experts=8,topk=2,tokens=7,route=hist:{}@9",
+                p.display()
+            ),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("no records for layer 9"), "{e}");
+        let b = hist_fixture("bad", true);
+        let e = build(
+            QT44,
+            &format!(
+                "M=128,K=512,n_experts=8,topk=2,tokens=7,route=hist:{}",
+                b.display()
+            ),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("sha256 mismatch"), "{e}");
+        let e = build(QT44, "M=128,K=512,n_experts=8,topk=2,tokens=7,route=bogus")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("route"), "{e}");
+    }
+
+    const COMBINE: &str = "contract:ffn_moe_combine_f32";
+    const COMBINE_SHAPE: &str = "rows=7,hidden=512,top_k=2,n_experts=8,order=1,round_expert_outputs=1,round_routed_sum=1,round_final=1";
+
+    #[test]
+    fn combine_planes_come_from_the_recorded_routing_and_n_down_rows_defaults_to_the_bound() {
+        let p = hist_fixture("combine", false);
+        let n = node(
+            COMBINE,
+            &format!("{COMBINE_SHAPE},route=hist:{}", p.display()),
+        );
+        let ndr = n.params[n.base.abi.param_index("n_down_rows").unwrap()];
+        assert_eq!(ndr, crate::moe::m_total_bound(14, 8) as u64);
+        let ix = |name: &str| n.operands.iter().position(|o| o.name == name).unwrap();
+        assert_eq!(n.operands[ix("topk_idx")].recipe, Recipe::RouteIds);
+        assert_eq!(n.operands[ix("row_of_slot")].recipe, Recipe::RowOfSlot);
+        assert!(n.operands[ix("topk_idx")].recipe.is_index());
+        let ids: Vec<i32> = n
+            .host_operand(ix("topk_idx"), 3, 0)
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        // token t takes recorded row t % 5 (all layers, record order)
+        assert_eq!(&ids[..4], &[0, 1, 1, 2]);
+        assert_eq!(&ids[10..14], &[0, 1, 1, 2]);
+        let ros: Vec<i32> = n
+            .host_operand(ix("row_of_slot"), 3, 0)
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let r = crate::moe::scatter(&ids, 8, ndr as usize).unwrap();
+        assert_eq!(ros.len(), 14);
+        for (slot, &row) in ros.iter().enumerate() {
+            assert_eq!(r.sorted[row as usize], slot as i32, "slot {slot}");
+            assert_eq!(
+                r.tiles[row as usize / 16],
+                ids[slot],
+                "slot {slot} sits in its expert's tile"
+            );
+        }
+        assert_eq!(n.info_route()["kind"], "hist");
+        assert_eq!(n.shape_json()["routing"]["live_rows"], r.live);
+        // uniform stays the default, and an explicit n_down_rows wins
+        let u = node(COMBINE, COMBINE_SHAPE);
+        assert_eq!(u.info_route()["kind"], "uniform");
+        let big = node(COMBINE, &format!("{COMBINE_SHAPE},n_down_rows=256"));
+        assert_eq!(
+            big.params[big.base.abi.param_index("n_down_rows").unwrap()],
+            256
+        );
+        let e = build(COMBINE, &format!("{COMBINE_SHAPE},n_down_rows=24"))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("multiple of 16"), "{e}");
+    }
+
+    #[test]
+    fn combine_null_knob_binds_a_null_address_and_drops_the_operand_from_the_outputs() {
+        let n = node(COMBINE, &format!("{COMBINE_SHAPE},null=routed_out"));
+        let ix = |name: &str| n.operands.iter().position(|o| o.name == name).unwrap();
+        assert!(n.operands[ix("routed_out")].nulled && !n.operands[ix("out")].nulled);
+        let mut addrs = fake_addrs(&n);
+        addrs[ix("routed_out")] = 0;
+        let img = n.kernarg_image(&n.base, &addrs).unwrap();
+        assert_eq!(&img[40..48], &[0u8; 8], "routed_out pointer field is null");
+        assert_ne!(&img[48..56], &[0u8; 8], "out pointer field is bound");
+        assert!(n.label.contains("-null_routed_out"));
+        let e = build(COMBINE, &format!("{COMBINE_SHAPE},null=out"))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("not nullable"), "{e}");
+        let e = build(COMBINE, &format!("{COMBINE_SHAPE},null=nope"))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("no operand"), "{e}");
+    }
+
+    #[test]
+    fn combine_edge_knob_plants_skips_and_ties_deterministically() {
+        let shape = "rows=130,hidden=512,top_k=2,n_experts=8,order=1,round_expert_outputs=1,round_routed_sum=1,round_final=1,edge=3";
+        let n = node(COMBINE, shape);
+        let m = node(COMBINE, shape);
+        let ix = |name: &str| n.operands.iter().position(|o| o.name == name).unwrap();
+        let ids = n.host_operand(ix("topk_idx"), 1, 0);
+        let ros = n.host_operand(ix("row_of_slot"), 1, 0);
+        assert_eq!(
+            ids,
+            m.host_operand(ix("topk_idx"), 9, 0),
+            "deterministic, seed independent"
+        );
+        let w = |b: &[u8]| -> Vec<i32> {
+            b.chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let (ids, ros) = (w(&ids), w(&ros));
+        assert!(
+            ids.iter().any(|&e| e == -1)
+                && ids.iter().any(|&e| e == 8)
+                && ids.iter().any(|&e| e == i32::MAX)
+        );
+        assert!(ros.iter().any(|&r| r == -1) && ros.iter().any(|&r| r == i32::MIN));
+        // token 5: every id invalid; token 7: every slot unrouted
+        assert!(ids[10..12].iter().all(|&e| e == -1));
+        assert!(ros[14..16].iter().all(|&r| r == -1));
+        // a tie: some token has two equal valid ids
+        assert!(ids
+            .chunks_exact(2)
+            .any(|c| c[0] == c[1] && c[0] >= 0 && c[0] < 8));
+        assert_eq!(n.shape_json()["routing"]["edge"], 3);
+        assert!(build(QT44, &format!("{QT44_SHAPE},edge=1")).is_err());
     }
 }

@@ -27771,6 +27771,28 @@ impl Gpu {
         Ok(())
     }
 
+    /// Whether [`Self::gemm_q8_0_batched_chunked`] runs `gemm_q8_0_wmma` (or a gfx11 wmma sibling
+    /// that takes the same F16 X) for an `[n, k]` activation and `m` output rows on a gfx11
+    /// (RDNA3 / RDNA3.5) device. Those launchers skip their F32->F16 convert for an F16-typed X,
+    /// so a caller feeding several such GEMMs from one plane may convert it once
+    /// ([`Self::convert_f32_to_f16_into`]) and pass the F16 tensor. `false` on RDNA4 (its
+    /// callers keep their own converts) and wherever the selector would leave the wmma route.
+    pub fn q8_0_wmma_shared_f16_x_ok(&self, m: usize, k: usize, n: usize) -> bool {
+        !self.flags.q8_batched_legacy
+            && self.arch_caps.has_wmma()
+            && !self.arch_caps.is_rdna4()
+            && k % 32 == 0
+            && n > 0
+            && !(self.arch_caps.is_gfx1151() && m >= 4096 && m % 64 == 0 && n % 64 == 0)
+    }
+
+    /// Whether [`Self::gemm_q8_0_batched_chunked`] on this device and shape runs `gemm_q8_0_wmma`
+    /// (the launch [`Self::gemm_q8_0_wmma_bf16`] replaces to round in the epilogue): exact gfx1100
+    /// only. Every other arch (gfx1151, gfx12) keeps its separate BF16 round.
+    pub fn q8_0_wmma_bf16_epilogue_ok(&self, m: usize, k: usize, n: usize) -> bool {
+        self.arch == "gfx1100" && self.q8_0_wmma_shared_f16_x_ok(m, k, n)
+    }
+
     /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
     /// kernel's MAX_BATCH=64. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
     ///
@@ -27813,6 +27835,13 @@ impl Gpu {
                 return self.gemm_q8_0_wmma_4w(a_raw, x, y, m, k, n);
             }
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
+        }
+        if x.dtype == DType::F16 {
+            // An F16 X is only consumable by the wmma launchers above.
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_q8_0_batched_chunked: an F16 X needs the wmma route",
+            ));
         }
 
         self.gemm_q8_0_batched_f32_chunked(a_raw, x, y, m, k, n)
@@ -27954,6 +27983,43 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.gemm_q8_0_wmma_impl(a, x, y, m, k, batch_size, false)
+    }
+
+    /// [`Self::gemm_q8_0_wmma`] with a BF16 epilogue: every output is rounded RN-even to BF16
+    /// before its store (`gemm_q8_0_wmma_bf16`, the incumbent body with `q8g11_bf16_rn` on each
+    /// accumulator; non-finite values pass through), bit-identical to `gemm_q8_0_wmma` followed by
+    /// `bf16_round_trip_f32_strided`. An F16-typed `x` is consumed as staged, like the incumbent.
+    /// gfx11 only (the gfx12 sibling has no BF16 entry): any RDNA4 device is an error.
+    pub fn gemm_q8_0_wmma_bf16(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if self.arch_caps.is_rdna4() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_q8_0_wmma_bf16: gfx11 only (RDNA4 has no BF16-epilogue wmma entry)",
+            ));
+        }
+        self.gemm_q8_0_wmma_impl(a, x, y, m, k, batch_size, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q8_0_wmma_impl(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        bf16: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert_eq!(
             k % 32,
@@ -27972,10 +28038,13 @@ impl Gpu {
         // RDNA3.5; `_gfx12` is its RDNA4 sibling. Exact gfx1151 at 1..=16 rows
         // takes `_gfx1151_xlds` (byte-identical outputs, 4 waves x 16 rows per
         // block, b128 weight loads; needs a 16 B aligned A, K % 256 == 0).
-        let xlds = !self.arch_caps.is_rdna4()
+        let xlds = !bf16
+            && !self.arch_caps.is_rdna4()
             && self.gfx1151_xlds_active(batch_size, k)
             && (a.buf.as_ptr() as usize).is_multiple_of(16);
-        let (kname, ksrc): (&str, &str) = if self.arch_caps.is_rdna4() {
+        let (kname, ksrc): (&str, &str) = if bf16 {
+            ("gemm_q8_0_wmma_bf16", kernels::GEMM_Q8_0_WMMA_BF16_SRC)
+        } else if self.arch_caps.is_rdna4() {
             ("gemm_q8_0_wmma_gfx12", kernels::GEMM_Q8_0_WMMA_GFX12_SRC)
         } else if xlds {
             (

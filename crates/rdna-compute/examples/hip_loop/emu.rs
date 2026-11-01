@@ -269,7 +269,16 @@ pub fn run_arm(
     case: &mut EmuCase,
     sel: &WgSel,
 ) -> std::result::Result<ArmRun, ArmFail> {
-    run_arm_model(tag, image, symbol, geo, case, sel, Model::Gate)
+    // Developer audit switch (GEN-MOE packet A): `HIP_LOOP_EMU_BASE_LEGACY=1` runs the `baseline` arm under the
+    // `Legacy` model (loads retire at issue) while the candidate keeps the full gate model. The shipped W4A8 MoE
+    // incumbent trips the gate model's in-flight tracking on its conditional flat/global load clauses; the
+    // candidate's own gate verdict is unchanged. Never set by the production gates.
+    let model = if tag == "baseline" && std::env::var_os("HIP_LOOP_EMU_BASE_LEGACY").is_some() {
+        Model::Legacy
+    } else {
+        Model::Gate
+    };
+    run_arm_model(tag, image, symbol, geo, case, sel, model)
 }
 
 /// Which emulator model an arm runs under. Every gate path uses `Gate` (in-flight memory, LDS races, schedules).
@@ -293,7 +302,9 @@ pub fn run_arm_model(
     model: Model,
 ) -> std::result::Result<ArmRun, ArmFail> {
     debug_assert!(
-        model == Model::Gate || cfg!(test),
+        model == Model::Gate
+            || cfg!(test)
+            || std::env::var_os("HIP_LOOP_EMU_BASE_LEGACY").is_some(),
         "only tests may run a non-gate emulator model"
     );
     let pristine = case.bufs[case.out].bytes.clone();

@@ -2,19 +2,24 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Byte-exactness gate for the Flash-Next HC read tail twin `hyper_read_up_fused_f32_sx`
-//! (module `hyper_read_up_fused_twin`, admitted on gfx1201 for decode-sized batches of at most
-//! 8 rows) against the incumbent `hyper_read_up_fused_f32`: the production launcher entry run
-//! with `twin = false` (oracle) and `twin = true` (candidate) on the same randomized inputs,
-//! raw f32 bits of the whole `[rows, hidden]` mixed output compared. Both F32 and BF16-bits
-//! `normalized` inputs are covered. The compiler's FMA contraction of the incumbent is not
-//! reproducible by a CPU model, so the incumbent is the oracle.
+//! Byte-exactness gate for the Flash-Next HC read tail twins `hyper_read_up_fused_f32_sx`
+//! (module `hyper_read_up_fused_twin`) and `hyper_read_up_fused_f32_sx_t1` (module
+//! `hyper_read_up_fused_twin_t1`, one token per wave; both admitted on gfx1201 for decode-sized
+//! batches of at most 8 rows, t1 by default) against the incumbent `hyper_read_up_fused_f32`:
+//! the production launcher entry run with `Incumbent` (oracle), `Twin` and `TwinT1` (candidates)
+//! on the same randomized inputs, raw f32 bits of the whole `[rows, hidden]` mixed output
+//! compared. Both F32 and BF16-bits `normalized` inputs are covered; row counts above 8 are
+//! covered too (the entries must be correct when called directly). The compiler's FMA
+//! contraction of the incumbent is not reproducible by a CPU model, so the incumbent is the
+//! oracle.
 //!
 //! `#[ignore]`d: needs an exact gfx1201 device, no model files.
 //!
 //!   cargo test -p rdna-compute --release --test hyper_read_up_twin_hw -- --ignored --nocapture
 
-use rdna_compute::tensor_ops::{hyper_read_up_fused_entry, HyperReadUpFused};
+use rdna_compute::tensor_ops::{
+    hyper_read_up_fused_entry, HyperReadUpFused, HyperReadUpFusedEntry,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 struct Lcg(u64);
@@ -72,10 +77,10 @@ fn hyper_read_up_twin_matches_incumbent_hw() {
         eprintln!("SKIP: requires exact gfx1201.");
         return;
     }
-    let mut mismatches = 0usize;
+    let mut mismatches = [0usize; 2];
     let mut words = 0usize;
     let mut cases = 0usize;
-    let mut first: Option<(usize, usize, u32, u32)> = None;
+    let mut first: [Option<(usize, usize, u32, u32)>; 2] = [None, None];
     for seed in 0..6u64 {
         let mut rng = Lcg(0x48C1_0000 + seed);
         // BF16 up projection [WIDE, LOW_RANK], magnitudes spread over a few binades.
@@ -111,7 +116,7 @@ fn hyper_read_up_twin_matches_incumbent_hw() {
                 };
                 let norm_t = upload_bytes(&mut gpu, DType::F32, rows * WIDE, &norm_bytes);
                 let canary = f32::from_bits(0x7FC0_DEAD);
-                let run = |gpu: &mut Gpu, twin: bool| -> Vec<u32> {
+                let run = |gpu: &mut Gpu, entry: HyperReadUpFusedEntry| -> Vec<u32> {
                     let mixed = upload_f32(gpu, &vec![canary; rows * HIDDEN]);
                     let p = HyperReadUpFused {
                         up_weight: &up_t,
@@ -123,16 +128,21 @@ fn hyper_read_up_twin_matches_incumbent_hw() {
                         low_rank: LOW_RANK,
                         normalized_bf16,
                     };
-                    hyper_read_up_fused_entry(gpu, &p, twin).expect("hyper_read_up_fused");
+                    hyper_read_up_fused_entry(gpu, &p, entry).expect("hyper_read_up_fused");
                     gpu.hip.device_synchronize().expect("sync");
                     download_u32(gpu, &mixed, rows * HIDDEN)
                 };
-                let want = run(&mut gpu, false);
-                let got = run(&mut gpu, true);
-                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                    if g != w {
-                        mismatches += 1;
-                        first.get_or_insert((cases, i, *g, *w));
+                let want = run(&mut gpu, HyperReadUpFusedEntry::Incumbent);
+                for (ei, entry) in [HyperReadUpFusedEntry::Twin, HyperReadUpFusedEntry::TwinT1]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let got = run(&mut gpu, entry);
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        if g != w {
+                            mismatches[ei] += 1;
+                            first[ei].get_or_insert((cases, i, *g, *w));
+                        }
                     }
                 }
                 words += rows * HIDDEN;
@@ -141,10 +151,15 @@ fn hyper_read_up_twin_matches_incumbent_hw() {
         }
     }
     eprintln!(
-        "hyper_read_up_twin: {cases} cases (6 seeds x 13 row counts x F32/BF16 normalized), {words} output words, {mismatches} mismatches, first {first:?}"
+        "hyper_read_up_twin: {cases} cases (6 seeds x 13 row counts x F32/BF16 normalized), {words} output words per entry, mismatches sx twin {} / t1 {}, first sx {:?} / t1 {:?}",
+        mismatches[0], mismatches[1], first[0], first[1]
     );
     assert_eq!(
-        mismatches, 0,
+        mismatches[0], 0,
         "the sx twin is not bit-identical to hyper_read_up_fused_f32"
+    );
+    assert_eq!(
+        mismatches[1], 0,
+        "the sx_t1 twin is not bit-identical to hyper_read_up_fused_f32"
     );
 }

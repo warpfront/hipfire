@@ -18,6 +18,7 @@
 //! | [`EMBEDDING_Q8_BATCHED`] | `embedding_q8_batched` (gfx1201, gfx1100) | `Gpu::embedding_lookup_q8_batched` (`crates/rdna-compute/src/embedding.rs`) |
 //! | [`MOE_GROUPED_QT44_A8_SYM`] | `moe_grouped_qt44_a8_sym_gfx1201_nt{1,2}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` (`crates/rdna-compute/src/moe_grouped_qt44_iu4.rs`) |
 //! | [`MOE_GROUPED_QT44_IU4_SYM`] | `moe_grouped_qt44_iu4_sym_gfx1201_nt{1,2,4}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_iu4_sym` (same file) |
+//! | [`MOE_GROUPED_QT44_A8_SYM_XLDS`] | `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` (gfx1201, `HIPFIRE_MOE_A8_XLDS`, default on) | same launcher, X-in-LDS body (own module) |
 //!
 //! Evidence for every layout: the JIT-cached objects in `~/.hipfire_kernels/<arch>/` (clang offload
 //! bundles; unbundled with `clang-offload-bundler --type=o --targets=hipv4-amdgcn-amd-amdhsa--<arch>`,
@@ -1964,6 +1965,71 @@ pub static WORK_MOE_GROUPED_QT44_IU4_SYM: WorkSpecV1 = WorkSpecV1 {
     },
 };
 
+// ---- GEN-MOE packet A winner M3: `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` ---------------------------------
+
+const A8_XLDS_SRC: &str = "kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip";
+const A8_XLDS_MODULE: &str = "moe_grouped_qt44_a8_sym_xlds_gfx12";
+
+/// W4A8 grouped routed experts, X-in-LDS body (`Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` behind
+/// `HIPFIRE_MOE_A8_XLDS`, default ON, gfx1201 only): ONE export in its own module
+/// (`kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip`; the `nt{1,2}r{1,2}` module is untouched). Kernarg layout,
+/// operands, fields, numerics and domain are those of [`MOE_GROUPED_QT44_A8_SYM`] (72 B, `n_experts@68`, no hidden
+/// words): the arithmetic is identical (bit-identical output, card-proven at every row class), only the data movement
+/// differs. Schedule: nt4 x rf1, 8 waves = 128 weight rows per CTA, block 256, dynamic LDS 17920 B (2 stages x 64 slots x
+/// 140 B: the X epoch tile of a 4-tile run staged once per CTA). Grid `(M / 128, m_total / 16)` (the `nt2r2` grid; only
+/// every fourth tile of an expert's run is a leader, the rest return), so `M % 128 == 0` is enforced by the exact grid
+/// division.
+pub static MOE_GROUPED_QT44_A8_SYM_XLDS: KernelAbiV1 = KernelAbiV1 {
+    id: "generic_gemm.moe_grouped_qt44_a8_sym_xlds_nt4r1w8",
+    version: 1,
+    wave: 32,
+    numeric: NUMERIC_QT44_A8,
+    params: PARAMS_QT44,
+    operands: OPS_QT44_A8,
+    fields: FIELDS_QT44,
+    hidden: &[],
+    explicit_bytes: 72,
+    segment_bytes: 72,
+    segment_align: 8,
+    domain: DOMAIN_QT44,
+    exports: &[ExportV1 {
+        symbol: "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8",
+        arch: Arch::Gfx1201,
+        object: ObjectRefV1::HipccSource {
+            module: A8_XLDS_MODULE,
+            source: A8_XLDS_SRC,
+        },
+        block: [256, 1, 1],
+        dynamic_lds: 17920,
+        group_segment_fixed: 0,
+        grid: [QT44_GRID_X_RF2, GRID_Y_QT44, ONE],
+        consts: &[("NT", 4), ("RF", 1)],
+    }],
+};
+
+/// Row admission of the xlds body: `MOE_A8_XLDS_MIN_ROWS` is compared by the launcher against `m_total` (grouped rows,
+/// the launch bound), the receipt classes (`hip_loop --rowclasses`) are tokens; `min_rows` here is the placeholder
+/// floor until the card receipt lands.
+const ADMIT_QT44_A8_XLDS: RowDomainV1 = RowDomainV1 {
+    min_rows: 16,
+    max_rows: None,
+    predicate: "crates/rdna-compute/src/moe_grouped_qt44_iu4.rs::MOE_A8_XLDS_MIN_ROWS",
+    kill_env: Some("HIPFIRE_MOE_A8_XLDS"),
+};
+
+/// The A8 work, admitted behind `HIPFIRE_MOE_A8_XLDS` (default on; `0` kills) from `MOE_A8_XLDS_MIN_ROWS` grouped rows.
+pub static WORK_MOE_GROUPED_QT44_A8_SYM_XLDS: WorkSpecV1 = WorkSpecV1 {
+    abi: &MOE_GROUPED_QT44_A8_SYM_XLDS,
+    work: WorkV1 {
+        admit: ADMIT_QT44_A8_XLDS,
+        note: "X-in-LDS body of the W4A8 route (default ON, gfx1201): same work, bindings (routed `rows`/`tokens` \
+               from `m_total`, expert K match) and lower-bound byte model as the A8 contract; bit-identical output. \
+               Replaces the `select_entry_a8` entry when `HIPFIRE_MOE_A8_XLDS=1`, `M % 128 == 0` and `m_total >= \
+               MOE_A8_XLDS_MIN_ROWS`; block 256, dynamic LDS 17920, grid (M/128, m_total/16).",
+        ..WORK_MOE_GROUPED_QT44_A8_SYM.work
+    },
+};
+
 // ================================================================================================
 
 /// Every contract of this module.
@@ -1984,6 +2050,7 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &EMBEDDING_Q8_BATCHED,
     &MOE_GROUPED_QT44_A8_SYM,
     &MOE_GROUPED_QT44_IU4_SYM,
+    &MOE_GROUPED_QT44_A8_SYM_XLDS,
 ];
 
 /// Every work spec of this module (one per contract in [`ABIS`]).
@@ -2004,6 +2071,7 @@ pub static WORK: &[&WorkSpecV1] = &[
     &WORK_EMBEDDING_Q8_BATCHED,
     &WORK_MOE_GROUPED_QT44_A8_SYM,
     &WORK_MOE_GROUPED_QT44_IU4_SYM,
+    &WORK_MOE_GROUPED_QT44_A8_SYM_XLDS,
 ];
 
 #[cfg(test)]
@@ -2128,7 +2196,7 @@ mod tests {
 
     #[test]
     fn every_contract_self_checks() {
-        assert_eq!(ABIS.len(), 16);
+        assert_eq!(ABIS.len(), 17);
         for abi in ABIS {
             if let Err(e) = abi.self_check() {
                 panic!("{}: {e:#?}", abi.id);
@@ -2388,6 +2456,29 @@ mod tests {
         }
         assert_eq!(MOE_GROUPED_QT44_A8_SYM.exports.len(), 4);
         assert_eq!(MOE_GROUPED_QT44_IU4_SYM.exports.len(), 5);
+        assert_eq!(MOE_GROUPED_QT44_A8_SYM_XLDS.exports.len(), 1);
+
+        // GEN-MOE packet A M3: block 256, dynamic LDS 17920, the nt2r2 grid; M % 128 is the exact grid division.
+        let abi = &MOE_GROUPED_QT44_A8_SYM_XLDS;
+        let e = &abi.exports[0];
+        assert_eq!(
+            (e.block, e.dynamic_lds, e.group_segment_fixed),
+            ([256, 1, 1], 17920, 0)
+        );
+        for m in [2176u64, 2560] {
+            assert_eq!(eval_grid(abi, e, &base(m)), [m / 128, 1600, 1]);
+        }
+        let vals = [2112u64, 2560, 1, 25600, 4096, 128];
+        assert!(eval(&e.grid[0], abi, e, &vals).is_err());
+        // same operands, fields and domain as the incumbent contract (the launcher passes one kernarg image).
+        assert_eq!(abi.params.len(), MOE_GROUPED_QT44_A8_SYM.params.len());
+        assert_eq!(abi.fields.len(), MOE_GROUPED_QT44_A8_SYM.fields.len());
+        assert_eq!(abi.numeric, MOE_GROUPED_QT44_A8_SYM.numeric);
+        assert_eq!(WORK_MOE_GROUPED_QT44_A8_SYM_XLDS.work.admit.min_rows, 16);
+        assert_eq!(
+            WORK_MOE_GROUPED_QT44_A8_SYM_XLDS.work.admit.kill_env,
+            Some("HIPFIRE_MOE_A8_XLDS")
+        );
     }
 
     // ---- layouts equal the inspected metadata --------------------------------------------------
@@ -2401,7 +2492,7 @@ mod tests {
                 .chain((0..ns).map(|i| (8 * np + 4 * i, 4)))
                 .collect()
         };
-        let cases: [(&KernelAbiV1, u32, u32, Vec<(u32, u32)>); 16] = [
+        let cases: [(&KernelAbiV1, u32, u32, Vec<(u32, u32)>); 17] = [
             (&GEMM_Q8_0_WMMA, 36, 36, ptr_scalar(3, 3)),
             (&GEMM_MQ4G256V2_MOE_GROUPED_WMMA, 60, 60, ptr_scalar(5, 5)),
             (&GEMM_F32_BATCHED, 36, 36, ptr_scalar(3, 3)),
@@ -2418,6 +2509,7 @@ mod tests {
             (&EMBEDDING_Q8_BATCHED, 28, 288, ptr_scalar(3, 1)),
             (&MOE_GROUPED_QT44_A8_SYM, 72, 72, ptr_scalar(6, 6)),
             (&MOE_GROUPED_QT44_IU4_SYM, 72, 72, ptr_scalar(6, 6)),
+            (&MOE_GROUPED_QT44_A8_SYM_XLDS, 72, 72, ptr_scalar(6, 6)),
         ];
         for (abi, explicit, segment, fields) in cases {
             assert_eq!(abi.explicit_bytes, explicit, "{}", abi.id);
@@ -2718,6 +2810,7 @@ mod tests {
             &WORK_GEMM_MQ4G256V2_MOE_GROUPED_WMMA,
             &WORK_MOE_GROUPED_QT44_A8_SYM,
             &WORK_MOE_GROUPED_QT44_IU4_SYM,
+            &WORK_MOE_GROUPED_QT44_A8_SYM_XLDS,
         ] {
             assert_eq!(w.work.op_class, op_class::GROUPED_GEMM);
             assert_eq!(w.work.codec, "mq4g256v2");

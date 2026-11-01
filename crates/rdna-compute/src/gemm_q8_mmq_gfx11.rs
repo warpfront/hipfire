@@ -57,11 +57,15 @@ impl Q8MmqTile {
         }
     }
 
-    fn symbol(self) -> &'static str {
-        match self {
-            Q8MmqTile::T64x64 => "gemm_q8_0_mmq_i8_gfx11_t64x64",
-            Q8MmqTile::T64x128 => "gemm_q8_0_mmq_i8_gfx11_t64x128",
-            Q8MmqTile::T128x128 => "gemm_q8_0_mmq_i8_gfx11_t128x128",
+    /// Entry symbol; `bf16` selects the `_bf16` twin whose epilogue rounds every output to BF16.
+    fn symbol(self, bf16: bool) -> &'static str {
+        match (self, bf16) {
+            (Q8MmqTile::T64x64, false) => "gemm_q8_0_mmq_i8_gfx11_t64x64",
+            (Q8MmqTile::T64x128, false) => "gemm_q8_0_mmq_i8_gfx11_t64x128",
+            (Q8MmqTile::T128x128, false) => "gemm_q8_0_mmq_i8_gfx11_t128x128",
+            (Q8MmqTile::T64x64, true) => "gemm_q8_0_mmq_i8_gfx11_t64x64_bf16",
+            (Q8MmqTile::T64x128, true) => "gemm_q8_0_mmq_i8_gfx11_t64x128_bf16",
+            (Q8MmqTile::T128x128, true) => "gemm_q8_0_mmq_i8_gfx11_t128x128_bf16",
         }
     }
 }
@@ -193,6 +197,21 @@ impl Gpu {
         self.gemm_q8_0_mmq_gfx11_gemm_tile(w_q8, acts, y, m, tile)
     }
 
+    /// As [`Self::gemm_q8_0_mmq_gfx11_gemm`] with the BF16 epilogue: every output is rounded
+    /// RN-even to BF16 before its store (`q8g11_bf16_rn`, the operation of
+    /// `bf16_round_trip_f32_strided`; non-finite values pass through). Bit-identical to the plain
+    /// GEMM followed by that round kernel.
+    pub fn gemm_q8_0_mmq_gfx11_gemm_bf16(
+        &mut self,
+        w_q8: &GpuTensor,
+        acts: &Q8MmqActivations,
+        y: &GpuTensor,
+        m: usize,
+    ) -> HipResult<()> {
+        let tile = q8_mmq_pick_tile(m, acts.n);
+        self.gemm_q8_0_mmq_gfx11_gemm_tile_bf16(w_q8, acts, y, m, tile)
+    }
+
     /// As [`Self::gemm_q8_0_mmq_gfx11_gemm`] with an explicit tile (bench / tests).
     pub fn gemm_q8_0_mmq_gfx11_gemm_tile(
         &mut self,
@@ -201,6 +220,30 @@ impl Gpu {
         y: &GpuTensor,
         m: usize,
         tile: Q8MmqTile,
+    ) -> HipResult<()> {
+        self.gemm_q8_0_mmq_gfx11_launch(w_q8, acts, y, m, tile, false)
+    }
+
+    /// As [`Self::gemm_q8_0_mmq_gfx11_gemm_bf16`] with an explicit tile (bench / tests).
+    pub fn gemm_q8_0_mmq_gfx11_gemm_tile_bf16(
+        &mut self,
+        w_q8: &GpuTensor,
+        acts: &Q8MmqActivations,
+        y: &GpuTensor,
+        m: usize,
+        tile: Q8MmqTile,
+    ) -> HipResult<()> {
+        self.gemm_q8_0_mmq_gfx11_launch(w_q8, acts, y, m, tile, true)
+    }
+
+    fn gemm_q8_0_mmq_gfx11_launch(
+        &mut self,
+        w_q8: &GpuTensor,
+        acts: &Q8MmqActivations,
+        y: &GpuTensor,
+        m: usize,
+        tile: Q8MmqTile,
+        bf16: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let (n, k) = (acts.n, acts.k);
@@ -238,7 +281,7 @@ impl Gpu {
                 "gemm_q8_0_mmq_gfx11_gemm: n too large for the launch grid",
             ));
         }
-        let symbol = tile.symbol();
+        let symbol = tile.symbol(bf16);
         self.ensure_kernel(MODULE, kernels::GEMM_Q8_0_MMQ_I8_GFX11_SRC, symbol)?;
 
         let wp = w_q8.buf.as_ptr();

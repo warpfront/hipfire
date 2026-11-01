@@ -172,6 +172,8 @@
 
 #[path = "support/abba.rs"]
 mod abba;
+#[path = "support/clk.rs"]
+mod clk;
 #[path = "support/cold.rs"]
 mod cold;
 #[path = "hip_loop/conv.rs"]
@@ -1141,7 +1143,13 @@ fn stats_json(s: &abba::TimingStats) -> Value {
 }
 
 /// The timing record from the arms' samples (ns, schedule order, whole rounds).
-fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, work: node::Work) -> Result<Value> {
+fn timing_record(
+    base_ns: &[f64],
+    cand_ns: &[f64],
+    n: usize,
+    work: node::Work,
+    clocks: &[Value],
+) -> Result<Value> {
     let bs = abba::timing_stats(base_ns)?;
     let cs = abba::timing_stats(cand_ns)?;
     let bm = abba::block_medians(base_ns, n)?;
@@ -1153,7 +1161,12 @@ fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, work: node::Work) -
         .map(|(i, r)| {
             let b = (bm[2 * i] + bm[2 * i + 1]) / 2.0;
             let c = (cm[2 * i] + cm[2 * i + 1]) / 2.0;
-            json!({"round": i, "base_us": b / 1e3, "cand_us": c / 1e3, "ratio": r})
+            let mut e = json!({"round": i, "base_us": b / 1e3, "cand_us": c / 1e3, "ratio": r});
+            if clocks.len() == ratios.len() + 1 {
+                e["clock_start"] = clocks[i].clone();
+                e["clock_end"] = clocks[i + 1].clone();
+            }
+            e
         })
         .collect();
     let mut sorted = ratios.clone();
@@ -1168,7 +1181,7 @@ fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, work: node::Work) -
     let slower = ratios.iter().filter(|x| **x > 1.0).count();
     let tflops = |ns: f64| work.flops / ns / 1e3;
     let gbps = |ns: f64| work.bytes / ns;
-    Ok(json!({
+    let mut rec = json!({
         "rounds": rounds,
         "ratio_median": median,
         "ratio_min": sorted[0],
@@ -1187,7 +1200,11 @@ fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, work: node::Work) -
                      device idle at the start (output reset + sync outside the interval), \
                      so launch latency is inside the interval for both arms",
         },
-    }))
+    });
+    if !clocks.is_empty() {
+        rec["clock_summary"] = clk::summary(clocks);
+    }
+    Ok(rec)
 }
 
 fn sample(
@@ -1197,10 +1214,12 @@ fn sample(
     cand: &mut Arm,
     n: usize,
     rounds: usize,
+    pci: Option<&str>,
     flush: Option<&cold::Flush>,
-) -> Result<(Vec<f64>, Vec<f64>)> {
+) -> Result<(Vec<f64>, Vec<f64>, Vec<Value>)> {
     let (per_arm, _) = abba::timing_counts(n, rounds)?;
     let (mut b, mut c) = (Vec::with_capacity(per_arm), Vec::with_capacity(per_arm));
+    let mut clocks: Vec<Value> = Vec::with_capacity(rounds + 1);
     let start = gpu.hip.event_create().map_err(err)?;
     let stop = match gpu.hip.event_create() {
         Ok(e) => e,
@@ -1214,7 +1233,13 @@ fn sample(
     let evict = |gpu: &rdna_compute::Gpu| -> Result<()> { cold::evict(&gpu.hip, flush) };
     let measured = (|| -> Result<()> {
         evict(gpu)?;
+        let round_len = 4 * n;
         for (i, which) in abba::timing_schedule(n, rounds)?.into_iter().enumerate() {
+            // Clock sample at every round start (outside any hipEvent interval; the previous
+            // launch is synchronized and evicted), plus one after the last launch.
+            if i % round_len == 0 {
+                clocks.extend(pci.map(clk::sample));
+            }
             let (arm, sink) = match which {
                 abba::TimingArm::Incumbent => (&mut *base, &mut b),
                 abba::TimingArm::Candidate => (&mut *cand, &mut c),
@@ -1230,6 +1255,7 @@ fn sample(
             sink.push(f64::from(gpu.hip.event_elapsed_ms(&start, &stop).map_err(err)?) * 1e6);
             evict(gpu)?;
         }
+        clocks.extend(pci.map(clk::sample));
         Ok(())
     })();
     let d1 = gpu.hip.event_destroy(start).map_err(err);
@@ -1237,7 +1263,7 @@ fn sample(
     measured?;
     d1?;
     d2?;
-    Ok((b, c))
+    Ok((b, c, clocks))
 }
 
 /// Open the device, record it and check its arch against the node's.
@@ -1309,6 +1335,7 @@ fn class_timing(crec: &Value) -> Value {
         "p_slower",
         "timing",
         "clock_note",
+        "clock_summary",
     ] {
         if let Some(v) = crec.get(k) {
             t.insert(k.to_owned(), v.clone());
@@ -1432,6 +1459,7 @@ fn run_rowclasses(o: &Opts, mut rec: Value, shape: Option<String>) -> (Value, Ou
         let w = node.work();
         let mut entry = json!({
             "rows": r,
+            "launch_rows": node.launch_rows().unwrap_or(r),
             "shape": node.shape_label(),
             "shape_dims": node.shape_json(),
             "bytes_per_call": extra["bytes_per_call"],
@@ -1718,6 +1746,7 @@ fn gpu_run(
         None
     };
     let before = clock_note(gpu);
+    let pci = gpu.hip.device_pci_bus_id(gpu.device_id).ok();
     let sampled = sample(
         gpu,
         node,
@@ -1725,14 +1754,15 @@ fn gpu_run(
         &mut cand,
         o.time,
         o.rounds,
+        pci.as_deref(),
         flush.as_ref(),
     );
     if let Some(f) = flush {
         f.free(&gpu.hip);
     }
-    let (b_ns, c_ns) = sampled.map_err(stage("timing"))?;
+    let (b_ns, c_ns, clocks) = sampled.map_err(stage("timing"))?;
     let after = clock_note(gpu);
-    let t = timing_record(&b_ns, &c_ns, o.time, node.work()).map_err(stage("timing"))?;
+    let t = timing_record(&b_ns, &c_ns, o.time, node.work(), &clocks).map_err(stage("timing"))?;
     if let Value::Object(m) = t {
         for (k, v) in m {
             rec[k] = v;
@@ -1837,13 +1867,27 @@ mod tests {
             flops: 1e6,
             bytes: 1e6,
         };
-        let t = timing_record(&base, &cand, n, w).unwrap();
+        let t = timing_record(&base, &cand, n, w, &[]).unwrap();
         assert_eq!(t["rounds"].as_array().unwrap().len(), 3);
         assert!((t["ratio_median"].as_f64().unwrap() - 0.9).abs() < 1e-12);
         assert_eq!(t["rounds_faster"], 3);
         assert!((t["p_faster"].as_f64().unwrap() - 0.125).abs() < 1e-15);
         assert_eq!(t["p_slower"].as_f64().unwrap(), 1.0);
         assert!((t["timing"]["baseline_tflops"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+        assert!(t.get("clock_summary").is_none());
+        assert!(t["rounds"][0].get("clock_start").is_none());
+        // Rounds + 1 clock samples: per-round start/end and a summary.
+        let clocks: Vec<Value> = [2400.0, 2300.0, 2100.0, 2200.0]
+            .iter()
+            .map(|m| json!({"sclk_mhz": m, "power_w": 200.0, "temp_c": 60.0}))
+            .collect();
+        let t = timing_record(&base, &cand, n, w, &clocks).unwrap();
+        assert_eq!(t["rounds"][1]["clock_start"]["sclk_mhz"], 2300.0);
+        assert_eq!(t["rounds"][1]["clock_end"]["sclk_mhz"], 2100.0);
+        assert_eq!(t["rounds"][2]["clock_end"]["sclk_mhz"], 2200.0);
+        assert_eq!(t["clock_summary"]["sclk_mhz"]["min"], 2100.0);
+        assert_eq!(t["clock_summary"]["sclk_mhz"]["max"], 2400.0);
+        assert_eq!(t["clock_summary"]["sclk_mhz"]["median"], 2250.0);
     }
 
     #[test]
@@ -3410,6 +3454,9 @@ mod contract_tests {
             rc[1]["bytes_per_call"],
             128 * 2560 * 2 + (512 * 2560 + 512 * 128) * 4
         );
+        // a dense contract: the launch size is the row class itself
+        assert_eq!(rc[0]["launch_rows"], rc[0]["rows"]);
+        assert_eq!(rc[1]["launch_rows"], rc[1]["rows"]);
         assert_eq!(rc[1]["regime"], "hot");
         assert!(rc[0]["timing"].is_null() && rc[0]["identical_to_baseline"].is_null());
         assert_eq!(rec["regime"], "hot");

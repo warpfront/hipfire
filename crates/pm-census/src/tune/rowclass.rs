@@ -502,6 +502,55 @@ fn same_str(recs: &[Value], key: &str) -> Result<String, String> {
     Ok(first.to_owned())
 }
 
+/// Which per-class quantity the receipt's classes (and `--value`) are in. `Rows` is the class value the sweep injected
+/// (`rowclasses[].rows`: tokens for a routed contract); `LaunchRows` is the size the product launcher compares its
+/// predicate against (`rowclasses[].launch_rows`: a grouped contract's `m_total`; equal to `rows` for dense contracts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKey {
+    Rows,
+    LaunchRows,
+}
+
+impl RowKey {
+    pub fn parse(s: &str) -> Result<RowKey, String> {
+        match s {
+            "rows" => Ok(RowKey::Rows),
+            "launch_rows" => Ok(RowKey::LaunchRows),
+            o => Err(format!("--row-key: want rows|launch_rows, got {o:?}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RowKey::Rows => "rows",
+            RowKey::LaunchRows => "launch_rows",
+        }
+    }
+}
+
+/// Copy of a row-class record whose every class's `rows` is replaced by the chosen key (`launch_rows` must be present
+/// on every class: records from before it was written are refused, never guessed).
+fn keyed_record(rec: &Value, key: RowKey) -> Result<Value, String> {
+    let mut v = rec.clone();
+    if key == RowKey::Rows {
+        return Ok(v);
+    }
+    let classes = v
+        .get_mut("rowclasses")
+        .and_then(Value::as_array_mut)
+        .ok_or("record has no rowclasses array")?;
+    for (i, c) in classes.iter_mut().enumerate() {
+        let lr = c
+            .get("launch_rows")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                format!("rowclasses[{i}]: no launch_rows (re-run with a hip_loop that writes it)")
+            })?;
+        c["rows"] = Value::from(lr);
+    }
+    Ok(v)
+}
+
 /// Build a `pm.selector_receipt.v1` from `(path, file bytes, parsed record)`
 /// triples. Every record must pass the regime check and agree on
 /// `node`/`vs`/`arch`; classes merge across shapes ([`merge`]).
@@ -514,11 +563,37 @@ pub fn receipt(
     policy: &ClaimPolicyV1,
     judge_argv: &[String],
 ) -> Result<Value, String> {
+    receipt_keyed(
+        recs,
+        constant,
+        path,
+        value,
+        kind,
+        policy,
+        judge_argv,
+        RowKey::Rows,
+    )
+}
+
+/// [`receipt`] with the classes taken from `row_key` (recorded as `"row_key"` in the document).
+#[allow(clippy::too_many_arguments)]
+pub fn receipt_keyed(
+    recs: &[(String, Vec<u8>, Value)],
+    constant: &str,
+    path: &str,
+    value: u64,
+    kind: Kind,
+    policy: &ClaimPolicyV1,
+    judge_argv: &[String],
+    row_key: RowKey,
+) -> Result<Value, String> {
     if recs.is_empty() {
         return Err("no --record given".to_owned());
     }
     // hip_loop writes `vs` as `{baseline:{contract,..}, candidate:{..}}`; older/synthetic
-    // records carry a plain string. Normalize to `contract:<baseline id>`.
+    // records carry a plain string. Normalize to `contract:<baseline id>`. A `--cand FILE`
+    // record has no `vs`: its incumbent is the node's own contract (the shipped body) and its
+    // candidate is the judged file, identified by the candidate code sha256.
     let values: Vec<Value> = recs
         .iter()
         .map(|r| {
@@ -529,6 +604,18 @@ pub fn receipt(
                 .map(|s| format!("contract:{s}"))
             {
                 v["vs"] = Value::String(id);
+            } else if v.get("vs").is_none() {
+                if let (Some(id), Some(sha)) = (
+                    v.pointer("/contract/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    v.pointer("/candidate/code_sha256")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                ) {
+                    v["vs"] = Value::String(format!("contract:{id}"));
+                    v["node"] = Value::String(format!("cand:{sha}"));
+                }
             }
             v
         })
@@ -542,6 +629,7 @@ pub fn receipt(
         if !has_rowclasses(r) {
             return Err(format!("{p}: not a row-class record (no rowclasses)"));
         }
+        let r = &keyed_record(r, row_key).map_err(|e| format!("{p}: {e}"))?;
         check_regime(r).map_err(|e| format!("{p}: {e}"))?;
         let v = verdicts(r, policy).map_err(|e| format!("{p}: {e}"))?;
         for c in &v {
@@ -569,6 +657,7 @@ pub fn receipt(
         "constant": constant,
         "path": path,
         "value": value,
+        "row_key": row_key.as_str(),
         "kind": kind.as_str(),
         "arch": arch,
         "candidate": candidate,
@@ -590,7 +679,7 @@ pub fn receipt(
     Ok(doc)
 }
 
-const USAGE: &str = "usage: pm-census tune selector-receipt --record R.json [--record R2.json ...] --constant NAME --path FILE --value N [--kind min|max] [--shares rows=share,...] [--policy P.json] --out receipts/selectors/NAME.json";
+const USAGE: &str = "usage: pm-census tune selector-receipt --record R.json [--record R2.json ...] --constant NAME --path FILE --value N [--kind min|max] [--row-key rows|launch_rows] [--shares rows=share,...] [--policy P.json] --out receipts/selectors/NAME.json";
 
 /// `pm-census tune selector-receipt ...` (`args` starts at `selector-receipt`).
 pub fn cli(args: &[String]) -> Result<(), String> {
@@ -610,7 +699,8 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             .strip_prefix("--")
             .filter(|n| {
                 [
-                    "record", "constant", "path", "value", "kind", "shares", "policy", "out",
+                    "record", "constant", "path", "value", "kind", "row-key", "shares", "policy",
+                    "out",
                 ]
                 .contains(n)
             })
@@ -630,6 +720,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         .parse()
         .map_err(|_| "--value: want a non-negative integer".to_owned())?;
     let kind = Kind::parse(one("kind")?.unwrap_or("min"))?;
+    let row_key = RowKey::parse(one("row-key")?.unwrap_or("rows"))?;
     let mut policy: ClaimPolicyV1 = match one("policy")? {
         Some(p) => {
             let t = std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))?;
@@ -646,7 +737,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse {p}: {e}"))?;
         recs.push(((*p).to_owned(), bytes, v));
     }
-    let doc = receipt(
+    let doc = receipt_keyed(
         &recs,
         need("constant")?,
         need("path")?,
@@ -654,6 +745,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         kind,
         &policy,
         &argv,
+        row_key,
     )?;
     let out = need("out")?;
     if let Some(dir) = std::path::Path::new(out)
@@ -934,6 +1026,47 @@ mod tests {
     }
 
     #[test]
+    fn receipt_accepts_a_cand_file_record_against_the_node_contract() {
+        let mut r = signature();
+        let o = r.as_object_mut().unwrap();
+        o.remove("vs");
+        o.insert(
+            "contract".into(),
+            json!({"id": "generic_seq.latent_attention_flash_prefill"}),
+        );
+        o.insert("candidate".into(), json!({"code_sha256": "ab12"}));
+        let d = receipt(
+            &[rec_bytes(&r, "c.json")],
+            "FA2_MIN_ROWS",
+            "x.rs",
+            512,
+            Kind::Min,
+            &pol(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            d["incumbent"],
+            "contract:generic_seq.latent_attention_flash_prefill"
+        );
+        assert_eq!(d["candidate"], "cand:ab12");
+        assert_eq!(d["covers"], true);
+        // a record with neither `vs` nor a candidate code identity is still refused
+        let mut bare = signature();
+        bare.as_object_mut().unwrap().remove("vs");
+        assert!(receipt(
+            &[rec_bytes(&bare, "d.json")],
+            "X",
+            "x.rs",
+            512,
+            Kind::Min,
+            &pol(),
+            &[]
+        )
+        .is_err());
+    }
+
+    #[test]
     fn receipt_merges_shapes_and_slower_wins() {
         let a = rec_bytes(&signature(), "a.json");
         // a second shape that is Slower at 512: the merged class is Slower
@@ -1032,6 +1165,119 @@ mod tests {
         .unwrap_err()
         .contains("rowclasses"));
         assert!(receipt(&[], "C", "x.rs", 1, Kind::Min, &pol(), &[]).is_err());
+    }
+
+    /// A grouped record: tokens 1,8,32,64 launch 96,768,2112,2304 grouped rows; slower below 32 tokens, faster from it.
+    fn grouped_record() -> Value {
+        let mut r = record(vec![slow(1), slow(8), fast(32), fast(64)]);
+        for (c, lr) in r["rowclasses"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip([96u64, 768, 2112, 2304])
+        {
+            c["launch_rows"] = json!(lr);
+        }
+        r
+    }
+
+    #[test]
+    fn row_key_selects_the_class_unit_and_is_recorded() {
+        let rec = rec_bytes(&grouped_record(), "g.json");
+        let mk = |value, key| {
+            receipt_keyed(
+                &[rec.clone()],
+                "G_MIN_ROWS",
+                "x.rs",
+                value,
+                Kind::Min,
+                &pol(),
+                &[],
+                key,
+            )
+            .unwrap()
+        };
+        // default key = rows (tokens): min 32 tokens
+        let d = receipt(
+            &[rec.clone()],
+            "G_MIN_ROWS",
+            "x.rs",
+            32,
+            Kind::Min,
+            &pol(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            (d["row_key"].as_str(), d["derived_min_rows"].as_u64()),
+            (Some("rows"), Some(32))
+        );
+        assert_eq!(d["covers"], true);
+        // launch_rows key: classes are m_total, min 2112, value is in m_total
+        let d = mk(2112, RowKey::LaunchRows);
+        assert_eq!(d["row_key"], "launch_rows");
+        assert_eq!(d["derived_min_rows"], 2112);
+        assert_eq!(d["covers"], true);
+        let rows: Vec<u64> = d["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["rows"].as_u64().unwrap())
+            .collect();
+        assert_eq!(rows, vec![96, 768, 2112, 2304]);
+        // a floor inside the slower region does not cover; the token-unit value 32 is below every m_total class
+        assert_eq!(mk(768, RowKey::LaunchRows)["covers"], false);
+        assert_eq!(mk(16, RowKey::LaunchRows)["covers"], false);
+        // records without launch_rows are refused under the launch_rows key, never guessed
+        let old = rec_bytes(&signature(), "old.json");
+        let e = receipt_keyed(
+            &[old],
+            "C",
+            "x.rs",
+            512,
+            Kind::Min,
+            &pol(),
+            &[],
+            RowKey::LaunchRows,
+        )
+        .unwrap_err();
+        assert!(e.contains("launch_rows"), "{e}");
+        assert!(RowKey::parse("tokens").is_err());
+    }
+
+    #[test]
+    fn cli_row_key_flag() {
+        let dir = std::env::temp_dir().join(format!("pmrk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rp = dir.join("g.json");
+        std::fs::write(&rp, serde_json::to_vec(&grouped_record()).unwrap()).unwrap();
+        let out = dir.join("G.json");
+        let s = |v: &str| v.to_owned();
+        let args = vec![
+            s("selector-receipt"),
+            s("--record"),
+            rp.to_str().unwrap().to_owned(),
+            s("--constant"),
+            s("G_MIN_ROWS"),
+            s("--path"),
+            s("a.rs"),
+            s("--value"),
+            s("2112"),
+            s("--row-key"),
+            s("launch_rows"),
+            s("--out"),
+            out.to_str().unwrap().to_owned(),
+        ];
+        cli(&args).unwrap();
+        let d: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(
+            (d["row_key"].as_str(), d["covers"].as_bool()),
+            (Some("launch_rows"), Some(true))
+        );
+        let mut bad = args.clone();
+        bad[10] = s("tokens");
+        assert!(cli(&bad).unwrap_err().contains("--row-key"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

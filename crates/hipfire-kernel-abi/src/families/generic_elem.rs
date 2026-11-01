@@ -4,8 +4,9 @@
 
 //! Generic-op elementwise/glue launchers (hipcc): converts, rounding, MoE route/scatter/combine, activations, rotations.
 //!
-//! Eleven contracts, one per symbol, each with a [`WorkSpecV1`] sidecar:
+//! Twelve contracts, one per symbol, each with a [`WorkSpecV1`] sidecar:
 //! `convert_f32_to_f16`, `bf16_round_trip_f32_strided`, `ffn_round_bf16_f32`, `ffn_moe_combine_f32`,
+//! `ffn_moe_combine_f32_w2` (the gfx1201 two-column export of the same combine, its own module),
 //! `ffn_situ_grouped_f32`, `ffn_situ_rows_f32`, `ffn_moe_router_topk_f32`, `moe_scatter_fused_k8`,
 //! `ffn_single_expert_tables`, `mq_rotate_x`, `rotate_x_mq_awq`.
 //!
@@ -682,14 +683,15 @@ const EXPORTS_COMBINE: &[ExportV1] = &[
     ),
 ];
 
-/// `ffn_moe_combine_f32`: routed expert-row combine with an explicit rounding policy (no fma: separate
-/// rounded multiply and add), one thread per output column, grid `(rows, ceil(hidden / 256))`, block 256,
+/// `ffn_moe_combine_f32`: routed expert-row combine with an explicit rounding policy (each rank is one fused
+/// multiply-add, `acc = fma(v, w, acc)`: the shipped objects contract `__fadd_rn(acc, __fmul_rn(v, w))` into
+/// `v_fmac_f32`), one thread per output column, grid `(rows, ceil(hidden / 256))`, block 256,
 /// segment 92/8, no hidden words. gfx1100 layout from a local hipcc build (see the module docs).
 pub static FFN_MOE_COMBINE_F32: KernelAbiV1 = KernelAbiV1 {
     id: "generic_elem.ffn_moe_combine_f32",
     version: 1,
     wave: 32,
-    numeric: NumericContractId("elem.ffn_moe_combine.policy_nofma"),
+    numeric: NumericContractId("elem.ffn_moe_combine.policy_fma"),
     params: PARAMS_COMBINE,
     operands: OPS_COMBINE,
     fields: FIELDS_COMBINE,
@@ -731,6 +733,49 @@ pub static WORK_FFN_MOE_COMBINE_F32: WorkSpecV1 = WorkSpecV1 {
             },
         ],
         note: "bytes: gathered expert rows (rows*top_k*hidden) + idx/weights + out; excludes the optional shared/routed_out planes; n_down_rows (a tensor extent, >= rows*top_k) and the policy flags are unbound and unused; hidden is cross-checked against the grid.y tile interval",
+    },
+};
+
+const OBJ_COMBINE_W2: ObjectRefV1 = ObjectRefV1::HipccSource {
+    module: "ffn_moe_combine_policy_w2",
+    source: "kernels/src/ffn_moe_combine_policy_w2.hip",
+};
+
+const EXPORTS_COMBINE_W2: &[ExportV1] = &[export(
+    "ffn_moe_combine_f32_w2",
+    Arch::Gfx1201,
+    OBJ_COMBINE_W2,
+    128,
+    0,
+    0,
+    GRID_COMBINE,
+)];
+
+/// `ffn_moe_combine_f32_w2`: the gfx1201 export of the same combine (same operands, domain, numerics and bits as
+/// [`FFN_MOE_COMBINE_F32`]) with two output columns per thread: block 128, same grid `(rows, ceil(hidden / 256))`,
+/// segment 92/8, no hidden words. The launcher takes it on exact gfx1201 for every row count (R9700 card j6433,
+/// identity full: 0.39-0.85x of the incumbent at every judged row class); other arches run the incumbent.
+pub static FFN_MOE_COMBINE_F32_W2: KernelAbiV1 = KernelAbiV1 {
+    id: "generic_elem.ffn_moe_combine_f32_w2",
+    version: 1,
+    wave: 32,
+    numeric: NumericContractId("elem.ffn_moe_combine.policy_fma"),
+    params: PARAMS_COMBINE,
+    operands: OPS_COMBINE,
+    fields: FIELDS_COMBINE,
+    hidden: &[],
+    explicit_bytes: 92,
+    segment_bytes: 92,
+    segment_align: 8,
+    domain: DOMAIN_COMBINE,
+    exports: EXPORTS_COMBINE_W2,
+};
+
+pub static WORK_FFN_MOE_COMBINE_F32_W2: WorkSpecV1 = WorkSpecV1 {
+    abi: &FFN_MOE_COMBINE_F32_W2,
+    work: WorkV1 {
+        note: "the w2 export of the combine: same work as ffn_moe_combine_f32 (block 128, two columns per thread, same grid); no row floor, taken on exact gfx1201 for every row count",
+        ..WORK_FFN_MOE_COMBINE_F32.work
     },
 };
 
@@ -1907,6 +1952,7 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &BF16_ROUND_TRIP_F32_STRIDED,
     &FFN_ROUND_BF16_F32,
     &FFN_MOE_COMBINE_F32,
+    &FFN_MOE_COMBINE_F32_W2,
     &FFN_SITU_GROUPED_F32,
     &FFN_SITU_ROWS_F32,
     &FFN_MOE_ROUTER_TOPK_F32,
@@ -1922,6 +1968,7 @@ pub static WORK: &[&WorkSpecV1] = &[
     &WORK_BF16_ROUND_TRIP_F32_STRIDED,
     &WORK_FFN_ROUND_BF16_F32,
     &WORK_FFN_MOE_COMBINE_F32,
+    &WORK_FFN_MOE_COMBINE_F32_W2,
     &WORK_FFN_SITU_GROUPED_F32,
     &WORK_FFN_SITU_ROWS_F32,
     &WORK_FFN_MOE_ROUTER_TOPK_F32,
@@ -1958,7 +2005,7 @@ mod tests {
 
     #[test]
     fn every_contract_self_checks() {
-        assert_eq!(ABIS.len(), 11);
+        assert_eq!(ABIS.len(), 12);
         for abi in ABIS {
             if let Err(e) = abi.self_check() {
                 panic!("{}: {e:#?}", abi.id);
@@ -1985,6 +2032,10 @@ mod tests {
                 assert_eq!(ex.symbol, e.symbol);
             }
             for arch in [Arch::Gfx1201, Arch::Gfx1100] {
+                if arch == Arch::Gfx1100 && abi.id == FFN_MOE_COMBINE_F32_W2.id {
+                    // exact-gfx1201 export; the gfx1100 combine is the incumbent symbol
+                    continue;
+                }
                 assert!(
                     abi.exports.iter().any(|e| e.arch == arch),
                     "{} lacks {}",
@@ -2060,6 +2111,22 @@ mod tests {
             &[512, 2560, 6, 128, 0, 0, 0, 0, 3072],
         );
         assert_eq!((x, y), (131_072, 10));
+    }
+
+    #[test]
+    fn ffn_moe_combine_f32_w2_shares_the_combine_contract() {
+        WORK_FFN_MOE_COMBINE_F32_W2.self_check().unwrap();
+        let (inc, w2) = (&FFN_MOE_COMBINE_F32, &FFN_MOE_COMBINE_F32_W2);
+        assert_eq!(inc.numeric, w2.numeric);
+        assert_eq!(inc.explicit_bytes, w2.explicit_bytes);
+        assert_eq!(inc.segment_bytes, w2.segment_bytes);
+        assert_eq!(w2.exports.len(), 1);
+        assert_eq!(w2.exports[0].symbol, "ffn_moe_combine_f32_w2");
+        assert_eq!(w2.exports[0].arch, Arch::Gfx1201);
+        assert_eq!(w2.exports[0].block, [128, 1, 1]);
+        assert_eq!(w2.exports[0].grid, inc.exports[0].grid);
+        // no row floor
+        assert_eq!(WORK_FFN_MOE_COMBINE_F32_W2.work.admit, ALL_ROWS);
     }
 
     #[test]

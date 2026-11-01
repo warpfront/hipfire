@@ -571,6 +571,21 @@ impl GpuTensor {
         }
     }
 
+    /// Non-owning F16 view of the leading `elems` words (`2 * elems` bytes) of an F32 tensor, or
+    /// `None` when the tensor is not F32 or is too small. For staging an F16 plane inside a scratch
+    /// tensor that is dead at that point. The view is not to be freed.
+    pub fn as_f16_view(&self, elems: usize) -> Option<GpuTensor> {
+        let bytes = elems.checked_mul(2)?;
+        if self.dtype != crate::DType::F32 || bytes > self.buf.size() {
+            return None;
+        }
+        Some(GpuTensor {
+            buf: self.buf.byte_view(0, bytes),
+            shape: vec![elems],
+            dtype: crate::DType::F16,
+        })
+    }
+
     /// Full-buffer non-owning alias (the whole-tensor form of `sub_offset`).
     /// The returned tensor shares the source's device pointer; it is a VIEW —
     /// do NOT pass it to `free_tensor`. `DeviceBuffer::from_raw` has no
@@ -2268,10 +2283,15 @@ impl Gpu {
     }
 
     /// Capacity an auto admission may plan against: device total minus this
-    /// process's own live device allocations ([`hip_bridge::HipRuntime::own_device_bytes`])
-    /// minus this process's MEASURED unledgered residency (code objects, PM4/
+    /// process's own live device allocations
+    /// ([`hip_bridge::HipRuntime::own_device_bytes`], each charged at the
+    /// bytes ROCr really occupies: 4 KiB rounded up to 1 MiB, 2 MiB rounded
+    /// above it, a weight slab at its slab bytes) minus the HIP queue/ring
+    /// BOs ([`HIP_RING_BYTES`], once the process has allocated) minus this
+    /// process's MEASURED remaining unledgered residency (code objects, PM4/
     /// graph pools, driver state: the process's own `drm-memory-vram` from
-    /// `/proc/self/fdinfo` less the ledger; [`own_vram_from_fdinfo`]) minus a
+    /// `/proc/self/fdinfo` less the ledger and the ring;
+    /// [`own_vram_from_fdinfo`]) minus a
     /// small fixed [`PLANNED_CAPACITY_RESERVE_BYTES`] margin. Unlike
     /// [`Self::device_mem_info`]'s free figure it does not move when a foreign
     /// process transiently allocates, so a route chosen from it is stable
@@ -2297,8 +2317,17 @@ impl Gpu {
             .ok()
             .and_then(|bdf| own_vram_from_fdinfo(&bdf));
         Ok(match measured {
-            Some(vram) => cap.with_unledgered(vram.saturating_sub(own), true),
-            None => cap.with_unledgered(PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES, false),
+            Some(vram) => {
+                // The ring is charged at its measured size, never more than
+                // the process holds beyond the ledger (it exists only once a
+                // stream does), and the rest is what is genuinely unledgered.
+                let beyond = vram.saturating_sub(own);
+                let ring = HIP_RING_BYTES.min(beyond);
+                cap.with_ring(ring).with_unledgered(beyond - ring, true)
+            }
+            None => cap
+                .with_ring(if own > 0 { HIP_RING_BYTES } else { 0 })
+                .with_unledgered(PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES, false),
         })
     }
 
@@ -5368,6 +5397,46 @@ impl Gpu {
         )
     }
 
+    /// Convert the first `n_elems` F32 words of `x` into the caller-owned F16 tensor `dst` with
+    /// the same `convert_f32_to_f16` kernel the wmma launchers run on an F32 X
+    /// ([`Self::convert_fp16_x_uncached`]): the bytes written equal what that convert would stage,
+    /// so a GEMM given the F16 `dst` (the wmma launchers skip their convert for an F16-typed X)
+    /// is bit-identical to the GEMM given `x`. One convert then serves every consumer of `x`.
+    pub fn convert_f32_to_f16_into(
+        &mut self,
+        x: &GpuTensor,
+        dst: &GpuTensor,
+        n_elems: usize,
+    ) -> HipResult<()> {
+        if x.dtype != DType::F32
+            || dst.dtype != DType::F16
+            || x.numel() < n_elems
+            || dst.numel() < n_elems
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "convert_f32_to_f16_into: needs an F32 source and an F16 destination of at least n_elems words",
+            ));
+        }
+        self.bind_thread()?;
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
+        self.scratch.convert_f32_to_f16_to_ptr(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
+            x,
+            dst.buf.as_ptr(),
+            n_elems,
+        )
+    }
+
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
     /// (an F32 GpuTensor). Returns the FP8 device pointer. gfx12 only —
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
@@ -6378,6 +6447,63 @@ impl Gpu {
             shape: shape.to_vec(),
             dtype,
         })
+    }
+
+    /// Allocate a **weight** tensor. Inside a weight-load scope
+    /// ([`Self::weight_slab_scope_begin`]) with `HIPFIRE_WEIGHT_SLAB` on, a
+    /// tensor of at most the mode's threshold is a view into a shared
+    /// 2 MiB-multiple slab (exact size, 4 KiB aligned, zero-filled); anything
+    /// else is [`Self::alloc_tensor`]. Free it with [`Self::free_tensor`].
+    pub fn alloc_weight_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel: usize = shape.iter().product();
+        let byte_size = numel * dtype.size();
+        match self.hip.slab_alloc(byte_size)? {
+            Some(buf) => Ok(GpuTensor {
+                buf,
+                shape: shape.to_vec(),
+                dtype,
+            }),
+            None => self.alloc_tensor(shape, dtype),
+        }
+    }
+
+    /// Open a weight-load scope on this device: weight uploads
+    /// ([`Self::upload_raw`], [`Self::upload_f32`], [`Self::upload_f16_bits`],
+    /// [`Self::alloc_weight_tensor`]) are packed into slabs per
+    /// `HIPFIRE_WEIGHT_SLAB` until the matching [`Self::weight_slab_scope_end`].
+    /// Scopes nest; a model load wraps its whole weight upload in one.
+    pub fn weight_slab_scope_begin(&self) {
+        // bind_thread: skip — host-side bookkeeping only.
+        self.hip.slab_scope_begin();
+    }
+
+    /// Close a weight-load scope. The outermost close seals every open slab
+    /// and logs what the scope packed.
+    pub fn weight_slab_scope_end(&self) {
+        // bind_thread: skip — host-side bookkeeping only.
+        if let Some(s) = self.hip.slab_scope_end() {
+            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "  weight-slab[{}]: {} tensors ({:.1} MiB) packed into {} slabs ({:.1} MiB, {:.1} MiB slack) on device {}",
+                s.mode.map_or("?", |m| m.name()),
+                s.tensors,
+                mib(s.payload_bytes),
+                s.slabs,
+                mib(s.slab_bytes),
+                mib(s.slab_bytes.saturating_sub(s.payload_bytes)),
+                self.device_id,
+            );
+        }
+    }
+
+    /// Slabs still allocated (live views, or retired and not yet flushed), for
+    /// the post-unload check that no weight view outlived its model. `None`
+    /// when no slab remains.
+    pub fn pinned_weight_slabs(&self) -> Option<hip_bridge::SlabStats> {
+        // bind_thread: skip — host-side bookkeeping only.
+        let stats = self.hip.slab_stats();
+        (stats.slabs > 0).then_some(stats)
     }
 
     /// Allocate a tensor with a direct, EXACT-size `hipMalloc` (owning, non-VMM),
@@ -8365,10 +8491,29 @@ impl Gpu {
         Ok(tensor)
     }
 
+    /// [`Self::alloc_then_init`] for a weight tensor ([`Self::alloc_weight_tensor`]).
+    fn alloc_weight_then_init(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        init: impl FnOnce(&HipRuntime, Option<&hip_bridge::Stream>, &GpuTensor) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
+        let tensor = self.alloc_weight_tensor(shape, dtype)?;
+        let init_result = {
+            let stream = self.active_stream.as_ref();
+            init(&self.hip, stream, &tensor)
+        };
+        if let Err(err) = init_result {
+            let _ = self.free_tensor(tensor);
+            return Err(err);
+        }
+        Ok(tensor)
+    }
+
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
-        self.alloc_then_init(shape, DType::F32, |hip, _stream, tensor| {
+        self.alloc_weight_then_init(shape, DType::F32, |hip, _stream, tensor| {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
             hip.memcpy_htod(&tensor.buf, bytes)
@@ -8419,7 +8564,7 @@ impl Gpu {
     pub fn upload_f16_bits(&mut self, data: &[u16], shape: &[usize]) -> HipResult<GpuTensor> {
         HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
-        let tensor = self.alloc_tensor(shape, DType::F16)?;
+        let tensor = self.alloc_weight_tensor(shape, DType::F16)?;
         let want = tensor.numel();
         if data.len() != want {
             return Err(hip_bridge::HipError::new(
@@ -8555,6 +8700,98 @@ impl Gpu {
         self.take_device_wait_error()
     }
 
+    /// Append each `parts[i].0` tensor's F32 contents to `parts[i].1` (the
+    /// vector grows by the tensor's element count; callers wanting a
+    /// replacement `clear` it first, so a reused buffer keeps its allocation),
+    /// enqueueing every copy on [`Self::active_stream`] and waiting on that
+    /// stream ONCE: one host round trip for a token's feature row and its
+    /// logits, with no legacy-stream hop ([`Self::download_f32_stream_ordered`]).
+    /// The tensors must have been written by work on the active stream (a
+    /// decode graph replay or the eager forward). With no active stream the
+    /// device is drained once and each part is a blocking copy.
+    pub fn download_f32_stream_ordered_append(
+        &self,
+        parts: &mut [(&GpuTensor, &mut Vec<f32>)],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self.active_stream.as_ref();
+        if stream.is_none() {
+            self.hip.device_synchronize()?;
+        }
+        for (tensor, out) in parts.iter_mut() {
+            let numel = tensor.numel();
+            let start = out.len();
+            out.resize(start + numel, 0.0);
+            // SAFETY: `out[start..]` holds exactly `numel` f32s; any byte pattern is a
+            // valid f32. No part's vector is resized again before the copies finish.
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(out[start..].as_mut_ptr() as *mut u8, numel * 4)
+            };
+            match stream {
+                Some(stream) => self
+                    .hip
+                    .memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?,
+                None => self.hip.memcpy_dtoh(bytes, &tensor.buf)?,
+            }
+        }
+        if let Some(stream) = stream {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.take_device_wait_error()
+    }
+
+    /// H→D copy of `src` into `dst[dst_offset..]` ordered on [`Self::active_stream`]: with a
+    /// stream (the decode stream of a graph route) the copy is enqueued there and the call
+    /// returns once that stream has executed it, so `src` is free on return and no legacy
+    /// (null) stream hop is paid, which is what the plain blocking copy costs whenever the
+    /// runtime synchronizes the null queue with the decode queue. While a graph is being
+    /// captured the copy is enqueued on the capturing stream without a wait (the caller
+    /// keeps `src` alive and rewrites it in place, as with [`Self::memcpy_htod_auto`]).
+    /// With no active stream this is the blocking `hipMemcpy` as before.
+    pub fn htod_stream_ordered(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        src: &[u8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.active_stream.as_ref() {
+            Some(stream) if self.graphs.capture_mode => {
+                self.hip.memcpy_htod_async_at(dst, dst_offset, src, stream)
+            }
+            Some(stream) => {
+                self.hip
+                    .memcpy_htod_async_at(dst, dst_offset, src, stream)?;
+                self.hip.stream_synchronize(stream)?;
+                self.take_device_wait_error()
+            }
+            None => self.hip.memcpy_htod_offset(dst, dst_offset, src),
+        }
+    }
+
+    /// D→H copies of every `(source, destination)` pair, all enqueued on
+    /// [`Self::active_stream`] and read with ONE wait on that stream (the readbacks of one
+    /// step's selector, say): no legacy stream hop and one host round trip. Each source must
+    /// have been written by work on the active stream. With no active stream each part is a
+    /// blocking copy.
+    pub fn dtoh_stream_ordered_batch(
+        &self,
+        parts: &mut [(&hip_bridge::DeviceBuffer, &mut [u8])],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self.active_stream.as_ref();
+        for (src, dst) in parts.iter_mut() {
+            match stream {
+                Some(stream) => self.hip.memcpy_dtoh_async(dst, src, Some(stream))?,
+                None => self.hip.memcpy_dtoh(dst, src)?,
+            }
+        }
+        if let Some(stream) = stream {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.take_device_wait_error()
+    }
+
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
     /// reinterpretation, so a caller can compare code blobs bit-for-bit.
     ///
@@ -8614,9 +8851,12 @@ impl Gpu {
         copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
-        let buf = self.hip.malloc(data.len())?;
+        let buf = match self.hip.slab_alloc(data.len())? {
+            Some(buf) => buf,
+            None => self.hip.malloc(data.len())?,
+        };
         if let Err(err) = copy(&self.hip, &buf, data) {
-            // hip.malloc owner — hip.free only. free_tensor would pool it.
+            // hip.malloc / slab owner — hip.free only. free_tensor would pool it.
             let _ = self.hip.free(buf);
             return Err(err);
         }
@@ -8653,6 +8893,12 @@ impl Gpu {
     /// and returns the error (never a false clean free).
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
+        if tensor.buf.is_slab_view() {
+            // A weight-slab view is never pooled (a pooled view would pin its
+            // slab past the model): release the range; a slab left with no
+            // view is freed by the next `drain_pool`.
+            return self.hip.slab_release(tensor.buf, true);
+        }
         let key = tensor.buf.as_ptr() as usize;
         if tensor.buf.is_host_mapped() {
             // Host-mapped owners are never pooled: hipHostFree takes the host
@@ -9077,6 +9323,7 @@ impl Gpu {
     pub fn drain_pool(&mut self) {
         self.bind_thread_or_warn();
         self.pool.drain(&self.hip);
+        self.hip.slab_flush();
     }
 
     /// Invalidate every weight-pointer-keyed cache on the Gpu. Must be called
@@ -12625,11 +12872,20 @@ mod tests {
 /// the admission, allocator rounding).
 pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 512 << 20;
 
-/// Unledgered residency assumed when the kernel's per-process VRAM accounting
-/// cannot be read. Measured after load: ~3.5 GiB (A3B R9700), ~4.0 GiB (Raon
-/// R9700), ~4.9 GiB (Raon 7900 XTX); the smallest is used so the fallback is not
-/// itself the cause of a placement regression.
-pub const PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES: usize = 3584 << 20;
+/// Residency beyond the ledger and the HIP ring ([`HIP_RING_BYTES`]) assumed
+/// when the kernel's per-process VRAM accounting cannot be read: loaded code
+/// objects (~55 MiB for 1,039 modules, `raon/pfx/ev/xtx-resid`) and driver
+/// state. The ledger charges every allocation at its ROCr-rounded size, so the
+/// allocator rounding that this constant used to carry (3.5-4.9 GiB on
+/// A3B/Raon) is now in `own` and must not be counted twice.
+pub const PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES: usize = 128 << 20;
+
+/// HIP queue/ring/EOP buffer objects the runtime creates at the first stream
+/// and the fdinfo `drm-memory-vram` shows beyond every `hipMalloc`: 140.1 MiB
+/// measured on a 7900 XTX, identical with `GPU_MAX_HW_QUEUES=1`
+/// (`raon/pfx/ev/xtx-resid`, section 3 row B). Not reducible by any HIP knob
+/// tested, so it is a constant of the ledger.
+pub const HIP_RING_BYTES: usize = 140 << 20;
 
 /// This process's VRAM on the device at PCI address `bdf`, in bytes: the sum of
 /// `drm-memory-vram` over its distinct DRM clients for that device
@@ -12683,8 +12939,12 @@ pub struct PlannedCapacity {
     /// Bytes the admission plans against.
     pub bytes: usize,
     pub total: usize,
-    /// Live device bytes in this process's allocation ledger.
+    /// Live device bytes in this process's allocation ledger (rounded to the
+    /// ROCr allocation granule, slabs at their slab bytes).
     pub own: usize,
+    /// HIP queue/ring buffer objects charged on top of the ledger
+    /// ([`HIP_RING_BYTES`], or what the measured accounting shows of it).
+    pub ring: usize,
     /// Residency this process holds outside the ledger (measured, or the
     /// conservative fallback).
     pub unledgered: usize,
@@ -12704,6 +12964,7 @@ impl PlannedCapacity {
             bytes: 0,
             total,
             own,
+            ring: 0,
             unledgered: 0,
             unledgered_measured: false,
             reserve: PLANNED_CAPACITY_RESERVE_BYTES,
@@ -12711,6 +12972,12 @@ impl PlannedCapacity {
             planned,
         }
         .recomputed()
+    }
+
+    /// Account `bytes` of HIP queue/ring residency ([`HIP_RING_BYTES`]).
+    pub fn with_ring(mut self, bytes: usize) -> Self {
+        self.ring = bytes;
+        self.recomputed()
     }
 
     /// Account `bytes` of this process's residency outside the ledger.
@@ -12724,6 +12991,7 @@ impl PlannedCapacity {
         self.bytes = if self.planned {
             self.total
                 .saturating_sub(self.own)
+                .saturating_sub(self.ring)
                 .saturating_sub(self.unledgered)
                 .saturating_sub(self.reserve)
         } else {
@@ -12754,10 +13022,11 @@ impl std::fmt::Display for PlannedCapacity {
         if self.planned {
             write!(
                 f,
-                "planned={:.0} MiB (total {:.0} - own {:.0} - unledgered {:.0} ({}) - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
+                "planned={:.0} MiB (total {:.0} - own {:.0} - ring {:.0} - unledgered {:.0} ({}) - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
                 m(self.bytes),
                 m(self.total),
                 m(self.own),
+                m(self.ring),
                 m(self.unledgered),
                 if self.unledgered_measured { "measured, fdinfo" } else { "fallback" },
                 m(self.reserve),
@@ -12777,6 +13046,20 @@ impl std::fmt::Display for PlannedCapacity {
 mod planned_capacity_tests {
     use super::*;
     const G: usize = 1 << 30;
+    #[test]
+    fn ring_is_charged_once_and_before_reserve_ignores_it() {
+        let base = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);
+        let ringed = base.with_ring(HIP_RING_BYTES);
+        assert_eq!(ringed.bytes, base.bytes - HIP_RING_BYTES);
+        // The EP planner carries its own runtime reserve: no ring in its figure.
+        assert_eq!(ringed.before_reserve(), base.before_reserve());
+        // The measured split keeps own + ring + unledgered == the process's VRAM.
+        let vram = 8 * G + 141 * (1 << 20);
+        let beyond = vram - 8 * G;
+        let ring = HIP_RING_BYTES.min(beyond);
+        let cap = base.with_ring(ring).with_unledgered(beyond - ring, true);
+        assert_eq!(cap.own + cap.ring + cap.unledgered, vram);
+    }
     #[test]
     fn foreign_allocation_does_not_change_planned_capacity() {
         let a = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);

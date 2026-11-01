@@ -6335,7 +6335,7 @@ fn read_string(path: &Path) -> Result<String> {
 ///
 /// Custom profiles live under `~/.hipfire/profiles/<name>.toml`. Profile names are
 /// control-plane identifiers only; they are never persisted inside `config.toml`.
-pub const CONFIG_PROFILE_NAMES: &[&str] = &["default", "dev", "hip", "redline"];
+pub const CONFIG_PROFILE_NAMES: &[&str] = &["default", "dev", "hip", "quality", "redline"];
 
 /// Origin of a selectable configuration profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6643,6 +6643,9 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("developer.dspark_profile", ConfigValue::Bool(true)),
         ],
         "hip" => vec![("replay.backend", ConfigValue::String("hip".to_owned()))],
+        // Opt-in Flash-Next quality mode: F32 GDN recurrent state (no per-token
+        // requantization). Costs memory and speed; `auto` stays the default.
+        "quality" => vec![("memory.state_quant", ConfigValue::String("fp32".to_owned()))],
         "redline" => vec![
             ("replay.backend", ConfigValue::String("redline".to_owned())),
             ("replay.transport", ConfigValue::String("pm4".to_owned())),
@@ -9507,6 +9510,21 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
+    fn quality_profile_opts_into_fp32_gdn_state_and_default_is_unchanged() {
+        let paths = ConfigPaths::under(temp_root("profile-quality"));
+        let layer = load_config_profile(&paths, "quality").unwrap();
+        assert_eq!(
+            layer.get("memory.state_quant"),
+            Some(&ConfigValue::String("fp32".to_owned()))
+        );
+        // The default profile and an empty layer never pin the state format.
+        let default = load_config_profile(&paths, "default").unwrap();
+        assert!(default.get("memory.state_quant").is_none());
+        assert!(ConfigLayer::default().get("memory.state_quant").is_none());
+        let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
     fn apply_config_profile_rejects_unknown_names() {
         let root = temp_root("profile-unknown");
         let paths = ConfigPaths::under(&root);
@@ -9551,6 +9569,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             "dev",
             "redline",
             "hip",
+            "quality",
             "..",
             "../x",
             "a/b",
@@ -9631,6 +9650,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 ("default".into(), ConfigProfileKind::Builtin),
                 ("dev".into(), ConfigProfileKind::Builtin),
                 ("hip".into(), ConfigProfileKind::Builtin),
+                ("quality".into(), ConfigProfileKind::Builtin),
                 ("redline".into(), ConfigProfileKind::Builtin),
                 ("alpha".into(), ConfigProfileKind::Custom),
                 ("zeta".into(), ConfigProfileKind::Custom),

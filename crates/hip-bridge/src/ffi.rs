@@ -181,6 +181,8 @@ unsafe fn open_library(candidate: &str) -> Result<Library, libloading::Error> {
 #[cfg(feature = "kernel-timing")]
 pub mod kernel_timing;
 
+pub(crate) mod weight_slab;
+
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
 /// clock to specific HIP runtime calls.
@@ -799,12 +801,18 @@ pub struct HipRuntime {
     /// configures is unguarded.
     launch_grid_yz_limit: AtomicU32,
     /// Device bytes this runtime has allocated and not yet freed (hipMalloc +
-    /// fine-grained + VMM physical handles). The process's own footprint, so
+    /// fine-grained + VMM physical handles), each hipMalloc charged at what
+    /// ROCr really occupies ([`weight_slab::device_alloc_charge`]: 4 KiB
+    /// rounded up to 1 MiB, 2 MiB rounded above it), so it tracks the
+    /// process's `drm-memory-vram`. The process's own footprint, so
     /// admission can plan from `total - own - reserve` instead of the
     /// instantaneous (foreign-allocation-sensitive) free figure.
     own_device_bytes: AtomicUsize,
     /// VMM physical handle -> size, so `mem_release` can debit the ledger.
     own_vmm_handles: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+    /// Weight slabs (packed device-resident weight tensors); inert unless a
+    /// load scope is open with `HIPFIRE_WEIGHT_SLAB` on.
+    slabs: weight_slab::WeightSlabs,
     /// Per-device cache of `hipDeviceAttributeCanUseStreamWaitValue`.
     stream_wait_caps: [AtomicU8; STREAM_WAIT_CAP_SLOTS],
     /// Plan-mode tape (railgun design A authoring); idle unless a plan is active.
@@ -1696,6 +1704,7 @@ impl HipRuntime {
             launch_grid_yz_limit: AtomicU32::new(u32::MAX),
             own_device_bytes: AtomicUsize::new(0),
             own_vmm_handles: Default::default(),
+            slabs: Default::default(),
             stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(STREAM_WAIT_CAP_UNKNOWN)),
             plan: PlanGate::default(),
             #[cfg(feature = "kernel-timing")]
@@ -2125,7 +2134,8 @@ impl HipRuntime {
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
         crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Malloc);
-        self.own_device_bytes.fetch_add(size, Ordering::Relaxed);
+        self.own_device_bytes
+            .fetch_add(weight_slab::device_alloc_charge(size), Ordering::Relaxed);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -2192,7 +2202,8 @@ impl HipRuntime {
             size,
             crate::registry::AllocationKind::FineGrained,
         );
-        self.own_device_bytes.fetch_add(size, Ordering::Relaxed);
+        self.own_device_bytes
+            .fetch_add(weight_slab::device_alloc_charge(size), Ordering::Relaxed);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -2227,6 +2238,11 @@ impl HipRuntime {
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, mut buf: DeviceBuffer) -> HipResult<()> {
         self.plan_deny("hipFree")?;
+        if buf.is_slab_view() {
+            // A weight-slab view: release the range; the slab's hipFree runs
+            // when its last view is gone.
+            return self.slab_release(buf, false);
+        }
         if !buf.is_hip_allocation() {
             return Err(HipError::new(
                 0,
@@ -2245,7 +2261,7 @@ impl HipRuntime {
             crate::registry::forget(buf.ptr as usize);
             self.own_device_bytes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(size))
+                    Some(v.saturating_sub(weight_slab::device_alloc_charge(size)))
                 })
                 .ok();
             Ok(())
@@ -3667,6 +3683,41 @@ impl HipRuntime {
         };
         memory_effects::htod();
         self.check(code, "hipMemcpyAsync H2D")
+    }
+
+    /// [`Self::memcpy_htod_async`] into `dst[offset..offset + src.len()]`.
+    pub fn memcpy_htod_async_at(
+        &self,
+        dst: &DeviceBuffer,
+        offset: usize,
+        src: &[u8],
+        stream: &Stream,
+    ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync H2D offset")?;
+        if hip_fault_consume(0, "upload") {
+            return Err(hip_fault_err("upload"));
+        }
+        assert!(
+            offset + src.len() <= dst.size,
+            "offset ({}) + source ({}) exceeds device buffer ({})",
+            offset,
+            src.len(),
+            dst.size
+        );
+        // SAFETY: the byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation. Same-device/stream and
+        // host-buffer lifetime across the async copy are the caller's contract.
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                (dst.ptr as *mut u8).add(offset) as *mut c_void,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                MemcpyKind::HostToDevice as c_uint,
+                stream.0,
+            )
+        };
+        memory_effects::htod();
+        self.check(code, "hipMemcpyAsync H2D offset")
     }
 
     /// Host-asynchronous H→D copy ordered on `stream` (`None` = the legacy

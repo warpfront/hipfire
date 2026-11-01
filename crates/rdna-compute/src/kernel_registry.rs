@@ -2726,6 +2726,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["hyper_read_up_fused_f32_sx"]
         );
         add!(
+            "hyper_read_up_fused_twin_t1",
+            crate::tensor_ops::HYPER_READ_UP_FUSED_TWIN_T1_SRC,
+            ["hyper_read_up_fused_f32_sx_t1"]
+        );
+        add!(
             "moe_down_combine_grouped_top10",
             kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC,
             [
@@ -4335,6 +4340,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemm_q8_0_wmma"]
         );
         add!(
+            "gemm_q8_0_wmma_bf16",
+            kernels::GEMM_Q8_0_WMMA_BF16_SRC,
+            ["gemm_q8_0_wmma_bf16"]
+        );
+        add!(
             "gemm_qkv_hfq6g256_wmma",
             kernels::GEMM_QKV_HFQ6G256_WMMA_SRC,
             ["gemm_qkv_hfq6g256_wmma"]
@@ -5293,6 +5303,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_q8_0_mmq_i8_gfx11_t64x64",
                 "gemm_q8_0_mmq_i8_gfx11_t64x128",
                 "gemm_q8_0_mmq_i8_gfx11_t128x128",
+                "gemm_q8_0_mmq_i8_gfx11_t64x64_bf16",
+                "gemm_q8_0_mmq_i8_gfx11_t64x128_bf16",
+                "gemm_q8_0_mmq_i8_gfx11_t128x128_bf16",
             ]
         );
     }
@@ -10796,10 +10809,10 @@ mod tests {
         // gathers, the 27B AR route's plain q8 attention and slab sigmoid
         // producer, plus the opt-in twins, decode twins, QSA modules, slab
         // planner, pruned router, Q8 wide module, the fast narrow Q8 GEMV
-        // module and DFlash-draft overwrite twins. Those 159 are the pre-S1 inventory; the S1 slow-link kernels
+        // module and DFlash-draft overwrite twins and the one-token-per-wave HC read-up twin. Those 160 are the pre-S1 inventory; the S1 slow-link kernels
         // add exactly the modules in `S1_ADDED_MODULES` (not P0 modules, not
         // in the provenance fixture), each its own isolated source.
-        const PRE_S1_ADDED_SINCE_P0: usize = 159;
+        const PRE_S1_ADDED_SINCE_P0: usize = 160;
         const S1_ADDED_MODULES: [&str; 1] = ["slowlink_prefill"];
         for module in S1_ADDED_MODULES {
             assert!(by_name.contains_key(module), "missing S1 module {module}");
