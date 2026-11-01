@@ -8,7 +8,7 @@
 //! `families::work_for`).
 //!
 //! ```text
-//! hip_loop --node contract:generic_gemm.f32_tiled_rows.mpw16 --vs contract:generic_gemm.f32_batched.wave_per_output \
+//! hip_loop --node contract:generic_gemm.bf16_xf32_tiled_rows.mpw16 --vs contract:generic_gemm.bf16_xf32_batched.wave_per_output \
 //!          --shape M=128,K=2560,N=512 [--rowclasses [1,2,4,..]] [--pool] [--arch gfx1201|gfx1100] ...
 //! hip_loop --node contract:gemm_q8_0_wmma_gfx12 --shape M=2048,K=2560,N=512 --null-control aa
 //! hip_loop --node contract:moe_grouped_qt44_a8_sym_gfx1201_nt1r1 --shape M=2176,K=2560,n_experts=128,topk=8,tokens=512 \
@@ -17,13 +17,13 @@
 //!
 //! # Contract resolution
 //!
-//! The spec after `contract:` is an ABI id (`generic_gemm.f32_batched.wave_per_output`; it must have exactly
+//! The spec after `contract:` is an ABI id (`generic_gemm.bf16_xf32_batched.wave_per_output`; it must have exactly
 //! one export on the arch) or an export symbol (`gemm_f32_batched`, `gemm_q8_0_wmma_gfx12`,
 //! `moe_grouped_qt44_a8_sym_gfx1201_nt1r1`). `--arch gfx1201|gfx1100` (default gfx1201) picks the export of
-//! that arch. The symbol `gemm_f32_tiled_rows` is the LAUNCHER entry of the tiled family: at `M <= 32` the
-//! launcher (`Gpu::gemm_f32_tiled_rows`, `gemm.rs`) launches `gemm_f32_tiled_rows_mp4`, so that symbol resolves
+//! that arch. The symbol `gemm_bf16_xf32_tiled_rows` is the LAUNCHER entry of the tiled family: at `M <= 32` the
+//! launcher (`Gpu::gemm_bf16_xf32_tiled_rows`, `gemm.rs`) launches `gemm_bf16_xf32_tiled_rows_mp4`, so that symbol resolves
 //! to the mp4 export there (recorded in `contract.resolved_from`); the ABI id
-//! `generic_gemm.f32_tiled_rows.mpw16` is exact and never switches.
+//! `generic_gemm.bf16_xf32_tiled_rows.mpw16` is exact and never switches.
 //!
 //! # Shape (`--shape k=v,...`)
 //!
@@ -228,7 +228,15 @@ pub fn signature_compat(base: &KernelAbiV1, cand: &KernelAbiV1) -> Result<()> {
     if ops(base) != ops(cand) {
         why.push("operand formats/access differ".to_owned());
     }
-    if base.fields != cand.fields {
+    // The metadata `.name` is a label (BF16 batched names its pointers `W`/`X`, the tiled entries `A`/`B`);
+    // the kernarg image is determined by offset, width and kind.
+    let fl = |a: &KernelAbiV1| -> Vec<(u32, u32, FieldKind)> {
+        a.fields
+            .iter()
+            .map(|f| (f.offset, f.width, f.kind))
+            .collect()
+    };
+    if fl(base) != fl(cand) {
         why.push("explicit kernarg fields differ".to_owned());
     }
     if why.is_empty() {
@@ -852,13 +860,15 @@ impl ContractNode {
         }
         let params: Vec<u64> = vals.into_iter().map(|v| v.unwrap()).collect();
 
-        // Launcher rule: `gemm_f32_tiled_rows` at M <= 32 launches the mp4 entry.
+        // Launcher rule: `gemm_bf16_xf32_tiled_rows` at M <= 32 launches the mp4 entry.
         let mut resolved_from = None;
-        if node_arm.export.symbol == "gemm_f32_tiled_rows" && spec == "gemm_f32_tiled_rows" {
+        if node_arm.export.symbol == "gemm_bf16_xf32_tiled_rows"
+            && spec == "gemm_bf16_xf32_tiled_rows"
+        {
             if let Some(m) = param_value(abi, &params, "M").filter(|m| *m <= 32) {
-                node_arm = resolve("gemm_f32_tiled_rows_mp4", arch)?;
+                node_arm = resolve("gemm_bf16_xf32_tiled_rows_mp4", arch)?;
                 resolved_from = Some(format!(
-                    "gemm_f32_tiled_rows -> gemm_f32_tiled_rows_mp4 (Gpu::gemm_f32_tiled_rows launches the MPW=4 \
+                    "gemm_bf16_xf32_tiled_rows -> gemm_bf16_xf32_tiled_rows_mp4 (Gpu::gemm_bf16_xf32_tiled_rows launches the MPW=4 \
                      entry at M = {m} <= 32)"
                 ));
             }
@@ -867,11 +877,11 @@ impl ContractNode {
             None => (node_arm, None),
             Some(v) => {
                 let mut b = resolve(v, arch)?;
-                if b.export.symbol == "gemm_f32_tiled_rows"
-                    && v == "gemm_f32_tiled_rows"
+                if b.export.symbol == "gemm_bf16_xf32_tiled_rows"
+                    && v == "gemm_bf16_xf32_tiled_rows"
                     && param_value(b.abi, &params, "M").is_some_and(|m| m <= 32)
                 {
-                    b = resolve("gemm_f32_tiled_rows_mp4", arch)?;
+                    b = resolve("gemm_bf16_xf32_tiled_rows_mp4", arch)?;
                 }
                 signature_compat(b.abi, node_arm.abi)?;
                 if b.export.symbol == node_arm.export.symbol
@@ -961,9 +971,17 @@ impl ContractNode {
         let stack = param_value(base.abi, &params, "n_experts").unwrap_or(1);
         env.insert("stack".into(), stack);
         if let Some(w) = base.work {
-            if let Some(r) = w.work.rows {
-                if base.abi.param_index(r).is_none() {
-                    env.insert(r.to_owned(), tokens * topk);
+            // Routed contracts: `RoutedRows` binds the useful slots (tokens x topk, what MACs count),
+            // `RoutedTokens` the token row class (what admission and the sweep use).
+            for b in w.work.bind {
+                match b.source {
+                    hipfire_kernel_abi::work::BindSource::RoutedRows { .. } => {
+                        env.insert(b.param.to_owned(), tokens * topk);
+                    }
+                    hipfire_kernel_abi::work::BindSource::RoutedTokens { .. } => {
+                        env.insert(b.param.to_owned(), tokens);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1718,8 +1736,8 @@ mod tests {
         build(name, shape).unwrap_or_else(|e| panic!("{name} {shape}: {e}"))
     }
 
-    const F32_TILED: &str = "contract:generic_gemm.f32_tiled_rows.mpw16";
-    const F32_BATCHED: &str = "contract:generic_gemm.f32_batched.wave_per_output";
+    const BF16_TILED: &str = "contract:generic_gemm.bf16_xf32_tiled_rows.mpw16";
+    const BF16_BATCHED: &str = "contract:generic_gemm.bf16_xf32_batched.wave_per_output";
     const Q8: &str = "contract:gemm_q8_0_wmma_gfx12";
     const QT44: &str = "contract:moe_grouped_qt44_a8_sym_gfx1201_nt1r1";
     const QT44_SHAPE: &str = "M=128,K=512,n_experts=8,topk=2,tokens=70";
@@ -1733,13 +1751,13 @@ mod tests {
 
     #[test]
     fn the_three_acceptance_contracts_construct() {
-        let f = node(F32_TILED, "M=128,K=2560,N=512");
-        assert_eq!(f.incumbent().unwrap().symbol, "gemm_f32_tiled_rows");
-        assert_eq!(f.incumbent().unwrap().module, "gemm_f32_tiled_rows");
+        let f = node(BF16_TILED, "M=128,K=2560,N=512");
+        assert_eq!(f.incumbent().unwrap().symbol, "gemm_bf16_xf32_tiled_rows");
+        assert_eq!(f.incumbent().unwrap().module, "gemm_bf16_xf32_tiled_rows");
         assert_eq!(f.arch(), "gfx1201");
         assert_eq!(
             f.incumbent().unwrap().selection,
-            "generic_gemm.f32_tiled_rows.mpw16"
+            "generic_gemm.bf16_xf32_tiled_rows.mpw16"
         );
         let q = node(Q8, "M=2048,K=2560,N=512");
         assert_eq!(q.incumbent().unwrap().symbol, "gemm_q8_0_wmma_gfx12");
@@ -1780,10 +1798,10 @@ mod tests {
 
     #[test]
     fn geometry_evaluates_the_contract_grids() {
-        let t = node(F32_TILED, "M=128,K=2560,N=512");
+        let t = node(BF16_TILED, "M=128,K=2560,N=512");
         let g = t.geometry();
         assert_eq!((g.grid, g.block, g.lds), ([1, 128, 1], [256, 1, 1], 0));
-        let b = node(F32_BATCHED, "M=128,K=2560,N=512");
+        let b = node(BF16_BATCHED, "M=128,K=2560,N=512");
         assert_eq!(b.geometry().grid, [128, 512, 1]);
         assert_eq!(b.geometry().block, [32, 1, 1]);
         let q = node(Q8, "M=2048,K=2560,N=512");
@@ -1793,12 +1811,15 @@ mod tests {
         assert_eq!(t.geometry().grid, [2, (mt / 16) as u32, 1]);
         assert_eq!(t.geometry().block, [128, 1, 1]);
         // M = 40 is two tiled-mpw16 128-row blocks' worth: ceil(M/128) = 1; N = 5 -> ceil(5/4) = 2
-        assert_eq!(node(F32_TILED, "M=300,K=64,N=5").geometry().grid, [3, 2, 1]);
+        assert_eq!(
+            node(BF16_TILED, "M=300,K=64,N=5").geometry().grid,
+            [3, 2, 1]
+        );
     }
 
     #[test]
     fn candidate_header_overrides_and_refuses() {
-        let n = node(F32_BATCHED, "M=128,K=2560,N=512");
+        let n = node(BF16_BATCHED, "M=128,K=2560,N=512");
         let mut h = Header::parse("// hip_loop: grid=8,4,2 block=64,2 lds_dynamic=512").unwrap();
         let g = n.geometry_with(&mut h).unwrap();
         assert_eq!((g.grid, g.block, g.lds), ([8, 4, 2], [64, 2, 1], 512));
@@ -1824,12 +1845,12 @@ mod tests {
 
     #[test]
     fn missing_params_and_unknown_keys_are_listed() {
-        let e = build(F32_BATCHED, "M=128,K=2560")
+        let e = build(BF16_BATCHED, "M=128,K=2560")
             .err()
             .unwrap()
             .to_string();
         assert!(e.contains("missing params") && e.contains('N'), "{e}");
-        let e = build(F32_BATCHED, "M=128,K=2560,N=1,Q=3")
+        let e = build(BF16_BATCHED, "M=128,K=2560,N=1,Q=3")
             .err()
             .unwrap()
             .to_string();
@@ -1847,9 +1868,9 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("tokens"), "{e}");
-        assert!(build(F32_BATCHED, "M=128,K=2560,N=1,topk=2").is_err());
+        assert!(build(BF16_BATCHED, "M=128,K=2560,N=1,topk=2").is_err());
         // rows= is the alias of the row key
-        assert_eq!(node(F32_BATCHED, "M=8,K=64,rows=9").rows(), Some(("N", 9)));
+        assert_eq!(node(BF16_BATCHED, "M=8,K=64,rows=9").rows(), Some(("N", 9)));
         assert_eq!(
             node(QT44, "M=128,K=512,n_experts=8,topk=2,rows=140").rows(),
             Some(("tokens", 70))
@@ -1861,11 +1882,14 @@ mod tests {
     fn domain_violations_are_clippable_and_usage_errors_are_not() {
         // N = 0, M = 33 on the mp4 entry, M not a multiple of 64 on the qt44 entry
         assert!(matches!(
-            build(F32_BATCHED, "M=8,K=64,N=0"),
+            build(BF16_BATCHED, "M=8,K=64,N=0"),
             Err(BuildError::Domain(_))
         ));
         assert!(matches!(
-            build("contract:generic_gemm.f32_tiled_rows.mpw4", "M=33,K=64,N=4"),
+            build(
+                "contract:generic_gemm.bf16_xf32_tiled_rows.mpw4",
+                "M=33,K=64,N=4"
+            ),
             Err(BuildError::Domain(_))
         ));
         assert!(matches!(
@@ -1877,47 +1901,50 @@ mod tests {
             Err(BuildError::Domain(_))
         ));
         assert!(matches!(
-            build(F32_BATCHED, "M=8,K=64"),
+            build(BF16_BATCHED, "M=8,K=64"),
             Err(BuildError::Other(_))
         ));
     }
 
     #[test]
     fn launcher_rule_resolves_the_mp4_export_at_small_m() {
-        let a = node("contract:gemm_f32_tiled_rows", "M=17,K=10240,N=64");
-        assert_eq!(a.incumbent().unwrap().symbol, "gemm_f32_tiled_rows_mp4");
-        assert_eq!(a.base.abi.id, "generic_gemm.f32_tiled_rows.mpw4");
+        let a = node("contract:gemm_bf16_xf32_tiled_rows", "M=17,K=10240,N=64");
+        assert_eq!(
+            a.incumbent().unwrap().symbol,
+            "gemm_bf16_xf32_tiled_rows_mp4"
+        );
+        assert_eq!(a.base.abi.id, "generic_gemm.bf16_xf32_tiled_rows.mpw4");
         assert_eq!(a.geometry().grid, [1, 16, 1]);
         assert!(a.record_extra()["contract"]["resolved_from"].is_string());
-        let b = node("contract:gemm_f32_tiled_rows", "M=128,K=2560,N=64");
-        assert_eq!(b.incumbent().unwrap().symbol, "gemm_f32_tiled_rows");
+        let b = node("contract:gemm_bf16_xf32_tiled_rows", "M=128,K=2560,N=64");
+        assert_eq!(b.incumbent().unwrap().symbol, "gemm_bf16_xf32_tiled_rows");
         assert!(b.record_extra()["contract"]["resolved_from"].is_null());
         // the ABI id is exact
-        let c = node(F32_TILED, "M=17,K=10240,N=64");
-        assert_eq!(c.incumbent().unwrap().symbol, "gemm_f32_tiled_rows");
+        let c = node(BF16_TILED, "M=17,K=10240,N=64");
+        assert_eq!(c.incumbent().unwrap().symbol, "gemm_bf16_xf32_tiled_rows");
         // under --vs the symbol form resolves the same way on both sides
         let v = node(
-            "contract:gemm_f32_tiled_rows",
-            "M=17,K=10240,N=64,vs=contract:gemm_f32_batched",
+            "contract:gemm_bf16_xf32_tiled_rows",
+            "M=17,K=10240,N=64,vs=contract:gemm_bf16_xf32_batched",
         );
         assert_eq!(
             v.export_symbols(),
-            ("gemm_f32_batched", "gemm_f32_tiled_rows_mp4")
+            ("gemm_bf16_xf32_batched", "gemm_bf16_xf32_tiled_rows_mp4")
         );
     }
 
     #[test]
     fn vs_makes_the_node_the_candidate_arm() {
         let n = node(
-            F32_TILED,
-            "M=128,K=2560,N=512,vs=contract:generic_gemm.f32_batched.wave_per_output",
+            BF16_TILED,
+            "M=128,K=2560,N=512,vs=contract:generic_gemm.bf16_xf32_batched.wave_per_output",
         );
-        assert_eq!(n.incumbent().unwrap().symbol, "gemm_f32_batched");
-        assert_eq!(n.incumbent().unwrap().module, "gemm_f32_batched");
+        assert_eq!(n.incumbent().unwrap().symbol, "gemm_bf16_xf32_batched");
+        assert_eq!(n.incumbent().unwrap().module, "gemm_bf16_xf32_batched");
         let c = n.candidate_incumbent().unwrap().unwrap();
         assert_eq!(
             (c.symbol.as_str(), c.module.as_str()),
-            ("gemm_f32_tiled_rows", "gemm_f32_tiled_rows")
+            ("gemm_bf16_xf32_tiled_rows", "gemm_bf16_xf32_tiled_rows")
         );
         // baseline geometry = the vs contract's, candidate (no header) = the node contract's
         assert_eq!(n.geometry().grid, [128, 512, 1]);
@@ -1927,18 +1954,18 @@ mod tests {
         );
         assert_eq!(
             n.export_symbols(),
-            ("gemm_f32_batched", "gemm_f32_tiled_rows")
+            ("gemm_bf16_xf32_batched", "gemm_bf16_xf32_tiled_rows")
         );
         let r = n.record_extra();
-        assert_eq!(r["contract"]["symbol"], "gemm_f32_tiled_rows");
-        assert_eq!(r["contract_vs"]["symbol"], "gemm_f32_batched");
+        assert_eq!(r["contract"]["symbol"], "gemm_bf16_xf32_tiled_rows");
+        assert_eq!(r["contract_vs"]["symbol"], "gemm_bf16_xf32_batched");
         // both arms get the same explicit image
         let addrs = fake_addrs(&n);
         let a = n.kernarg_image(&n.base, &addrs).unwrap();
         let b = n.kernarg_image(n.cand.as_ref().unwrap(), &addrs).unwrap();
         assert_eq!(a, b);
         // a null node without vs has no candidate incumbent
-        assert!(node(F32_BATCHED, "M=8,K=64,N=4")
+        assert!(node(BF16_BATCHED, "M=8,K=64,N=4")
             .candidate_incumbent()
             .unwrap()
             .is_none());
@@ -1947,9 +1974,9 @@ mod tests {
     #[test]
     fn signature_compat_refuses_a_different_layout() {
         for (a, b) in [
-            (Q8, F32_BATCHED),
-            (F32_BATCHED, Q8),
-            (QT44, F32_BATCHED),
+            (Q8, BF16_BATCHED),
+            (BF16_BATCHED, Q8),
+            (QT44, BF16_BATCHED),
             ("contract:gemv_q8_0", Q8),
         ] {
             let e = build(
@@ -1966,22 +1993,25 @@ mod tests {
         }
         let e = build(
             Q8,
-            "M=128,K=512,N=8,vs=contract:generic_gemm.f32_batched.wave_per_output",
+            "M=128,K=512,N=8,vs=contract:generic_gemm.bf16_xf32_batched.wave_per_output",
         )
         .err()
         .unwrap()
         .to_string();
         assert!(e.contains("not signature compatible"), "{e}");
         // the same export is not a vs
-        let e = build(F32_BATCHED, "M=8,K=64,N=4,vs=contract:gemm_f32_batched")
-            .err()
-            .unwrap()
-            .to_string();
+        let e = build(
+            BF16_BATCHED,
+            "M=8,K=64,N=4,vs=contract:gemm_bf16_xf32_batched",
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(e.contains("A/A"), "{e}");
         // tiled vs mpw4 (identical fields, different domain/geometry) is compatible
         assert!(signature_compat(
-            &hipfire_kernel_abi::families::generic_gemm::GEMM_F32_BATCHED,
-            &hipfire_kernel_abi::families::generic_gemm::GEMM_F32_TILED_ROWS_MP4
+            &hipfire_kernel_abi::families::generic_gemm::GEMM_BF16_XF32_BATCHED,
+            &hipfire_kernel_abi::families::generic_gemm::GEMM_BF16_XF32_TILED_ROWS_MP4
         )
         .is_ok());
     }
@@ -1989,8 +2019,8 @@ mod tests {
     #[test]
     fn kernarg_image_equals_encode_into() {
         for (name, shape) in [
-            (F32_TILED, "M=128,K=2560,N=512"),
-            (F32_BATCHED, "M=128,K=2560,N=512"),
+            (BF16_TILED, "M=128,K=2560,N=512"),
+            (BF16_BATCHED, "M=128,K=2560,N=512"),
             (Q8, "M=2048,K=2560,N=512"),
             (QT44, QT44_SHAPE),
         ] {
@@ -2034,11 +2064,11 @@ mod tests {
             }
         }
         // tiled: 13 hidden words, segment 296, explicit 36 -> the explicit image alone (48 B padded)
-        let t = node(F32_TILED, "M=128,K=2560,N=512");
+        let t = node(BF16_TILED, "M=128,K=2560,N=512");
         assert_eq!(t.base.abi.segment_bytes, 296);
         assert_eq!(t.kernarg_image(&t.base, &fake_addrs(&t)).unwrap().len(), 48);
         // a wrong extent is refused by validate_invocation (a short operand binding)
-        let mut short = node(F32_BATCHED, "M=8,K=64,N=4");
+        let mut short = node(BF16_BATCHED, "M=8,K=64,N=4");
         short.operands[1].bytes -= 4;
         let e = short
             .kernarg_image(&short.base, &fake_addrs(&short))
@@ -2067,7 +2097,7 @@ mod tests {
         assert!(y
             .chunks_exact(4)
             .all(|w| f32::from_le_bytes(w.try_into().unwrap()) == SENTINEL));
-        let f = node(F32_BATCHED, "M=8,K=64,N=4");
+        let f = node(BF16_BATCHED, "M=8,K=64,N=4");
         assert!(f
             .host_operand(0, 1, 0)
             .chunks_exact(4)
@@ -2185,13 +2215,16 @@ mod tests {
 
     #[test]
     fn work_counts_follow_the_work_spec() {
-        let n = node(F32_TILED, "M=128,K=2560,N=512");
+        let n = node(BF16_TILED, "M=128,K=2560,N=512");
         let w = n.work();
         assert_eq!(w.flops, 2.0 * 128.0 * 512.0 * 2560.0);
-        assert_eq!(w.bytes, ((128 * 2560 + 512 * 2560 + 512 * 128) * 4) as f64);
+        assert_eq!(
+            w.bytes,
+            ((128 * 2560 * 2 + (512 * 2560 + 512 * 128) * 4) as f64)
+        );
         assert_eq!(
             n.bytes_per_call(),
-            (128 * 2560 + 512 * 2560 + 512 * 128) * 4
+            128 * 2560 * 2 + (512 * 2560 + 512 * 128) * 4
         );
         let t = node(QT44, QT44_SHAPE);
         // MACs = routed rows * M * K; bytes = the work spec's lower bound
@@ -2205,16 +2238,25 @@ mod tests {
     }
 
     #[test]
+    fn qt44_nt2r1_routed_work_evaluates() {
+        let n = node(
+            "contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1",
+            "M=2176,K=2560,n_experts=128,topk=6,tokens=512",
+        );
+        assert_eq!(n.work().flops, 2.0 * (512.0 * 6.0) * 2176.0 * 2560.0);
+    }
+
+    #[test]
     fn regime_is_hot_unless_pool_and_above_the_llc() {
-        let small = node(F32_BATCHED, "M=128,K=2560,N=512,pool=1");
+        let small = node(BF16_BATCHED, "M=128,K=2560,N=512,pool=1");
         assert!(small.bytes_per_call() < 64 << 20);
         assert_eq!((small.regime(), small.pool_sets()), ("hot", 1));
-        let big = node(F32_BATCHED, "M=128,K=2560,N=16384,pool=1");
+        let big = node(BF16_BATCHED, "M=128,K=2560,N=16384,pool=1");
         assert!(big.bytes_per_call() > 64 << 20);
         assert_eq!(big.regime(), "pool");
         assert!(big.pool_sets() >= 1);
         // the same shape without --pool stays hot (the promotion side refuses it above the LLC)
-        let hot = node(F32_BATCHED, "M=128,K=2560,N=16384");
+        let hot = node(BF16_BATCHED, "M=128,K=2560,N=16384");
         assert_eq!((hot.regime(), hot.pool_sets()), ("hot", 1));
         assert_eq!(
             hot.record_extra()["bytes_per_call"],
@@ -2237,7 +2279,7 @@ mod tests {
 
     #[test]
     fn row_plan_and_class_helpers() {
-        let p = row_plan(F32_TILED, Some("contract:gemm_f32_batched"), None).unwrap();
+        let p = row_plan(BF16_TILED, Some("contract:gemm_bf16_xf32_batched"), None).unwrap();
         assert_eq!(p.rows_param, "N");
         assert_eq!((p.admit_cand.min_rows, p.admit_base.min_rows), (512, 1));
         assert!(
@@ -2261,16 +2303,16 @@ mod tests {
         assert!(DEFAULT_ROWCLASSES.windows(2).all(|w| w[0] < w[1]));
         // clipping: a class past the batched kernel's grid-y limit is a Domain error, not a fatal one
         assert!(matches!(
-            build(F32_BATCHED, "M=8,K=64,N=70000"),
+            build(BF16_BATCHED, "M=8,K=64,N=70000"),
             Err(BuildError::Domain(_))
         ));
-        assert!(build(F32_TILED, "M=8,K=64,N=70000").is_ok());
+        assert!(build(BF16_TILED, "M=8,K=64,N=70000").is_ok());
     }
 
     #[test]
     fn emu_case_has_the_contract_shape() {
         // f32: 3 pointers + M K N, output last, every operand its own exact-size region
-        let n = node(F32_BATCHED, "M=40,K=96,N=10");
+        let n = node(BF16_BATCHED, "M=40,K=96,N=10");
         let c = n.emu_case(1).unwrap();
         assert_eq!(c.args.len(), 6);
         assert_eq!(
@@ -2282,16 +2324,19 @@ mod tests {
             [EmuArg::I32(40), EmuArg::I32(96), EmuArg::I32(10)]
         );
         assert_eq!(c.out, 2);
-        assert_eq!(c.bufs[0].bytes.len(), 40 * 96 * 4);
+        assert_eq!(c.bufs[0].bytes.len(), 40 * 96 * 2);
         assert_eq!(c.bufs[1].bytes.len(), 10 * 96 * 4);
         assert_eq!(c.bufs[2].bytes.len(), 10 * 40 * 4);
         assert_eq!(c.bufs[2].bytes, n.host_operand(2, 1, 0));
         let c2 = n.emu_case(1).unwrap();
         assert_eq!(c.bufs[0].bytes, c2.bufs[0].bytes);
         // the `emu` preset: ragged defaults, M the smallest the domain admits
-        let e = node("contract:gemm_f32_tiled_rows", "emu");
+        let e = node("contract:gemm_bf16_xf32_tiled_rows", "emu");
         assert_eq!(e.params, vec![32, 256, 37]);
-        assert_eq!(e.incumbent().unwrap().symbol, "gemm_f32_tiled_rows_mp4");
+        assert_eq!(
+            e.incumbent().unwrap().symbol,
+            "gemm_bf16_xf32_tiled_rows_mp4"
+        );
         let q = node(Q8, "emu");
         assert_eq!(q.params, vec![32, 256, 37]);
         // qt44: the pointer table holds the emulator's addresses of the slab regions
