@@ -18,7 +18,7 @@
 //! | [`EMBEDDING_Q8_BATCHED`] | `embedding_q8_batched` (gfx1201, gfx1100) | `Gpu::embedding_lookup_q8_batched` (`crates/rdna-compute/src/embedding.rs`) |
 //! | [`MOE_GROUPED_QT44_A8_SYM`] | `moe_grouped_qt44_a8_sym_gfx1201_nt{1,2}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` (`crates/rdna-compute/src/moe_grouped_qt44_iu4.rs`) |
 //! | [`MOE_GROUPED_QT44_IU4_SYM`] | `moe_grouped_qt44_iu4_sym_gfx1201_nt{1,2,4}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_iu4_sym` (same file) |
-//! | [`MOE_GROUPED_QT44_A8_SYM_XLDS`] | `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` (gfx1201, `HIPFIRE_MOE_A8_XLDS`, default off) | same launcher, X-in-LDS body (own module) |
+//! | [`MOE_GROUPED_QT44_A8_SYM_XLDS`] | `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` (gfx1201, `HIPFIRE_MOE_A8_XLDS`, default on) | same launcher, X-in-LDS body (own module) |
 //!
 //! Evidence for every layout: the JIT-cached objects in `~/.hipfire_kernels/<arch>/` (clang offload
 //! bundles; unbundled with `clang-offload-bundler --type=o --targets=hipv4-amdgcn-amd-amdhsa--<arch>`,
@@ -1971,7 +1971,7 @@ const A8_XLDS_SRC: &str = "kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip";
 const A8_XLDS_MODULE: &str = "moe_grouped_qt44_a8_sym_xlds_gfx12";
 
 /// W4A8 grouped routed experts, X-in-LDS body (`Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` behind
-/// `HIPFIRE_MOE_A8_XLDS`, default OFF, gfx1201 only): ONE export in its own module
+/// `HIPFIRE_MOE_A8_XLDS`, default ON, gfx1201 only): ONE export in its own module
 /// (`kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip`; the `nt{1,2}r{1,2}` module is untouched). Kernarg layout,
 /// operands, fields, numerics and domain are those of [`MOE_GROUPED_QT44_A8_SYM`] (72 B, `n_experts@68`, no hidden
 /// words): the arithmetic is identical (bit-identical output, card-proven at every row class), only the data movement
@@ -2017,12 +2017,12 @@ const ADMIT_QT44_A8_XLDS: RowDomainV1 = RowDomainV1 {
     kill_env: Some("HIPFIRE_MOE_A8_XLDS"),
 };
 
-/// The A8 work, admitted behind `HIPFIRE_MOE_A8_XLDS` (default off) from `MOE_A8_XLDS_MIN_ROWS` grouped rows.
+/// The A8 work, admitted behind `HIPFIRE_MOE_A8_XLDS` (default on; `0` kills) from `MOE_A8_XLDS_MIN_ROWS` grouped rows.
 pub static WORK_MOE_GROUPED_QT44_A8_SYM_XLDS: WorkSpecV1 = WorkSpecV1 {
     abi: &MOE_GROUPED_QT44_A8_SYM_XLDS,
     work: WorkV1 {
         admit: ADMIT_QT44_A8_XLDS,
-        note: "X-in-LDS body of the W4A8 route (default OFF, gfx1201): same work, bindings (routed `rows`/`tokens` \
+        note: "X-in-LDS body of the W4A8 route (default ON, gfx1201): same work, bindings (routed `rows`/`tokens` \
                from `m_total`, expert K match) and lower-bound byte model as the A8 contract; bit-identical output. \
                Replaces the `select_entry_a8` entry when `HIPFIRE_MOE_A8_XLDS=1`, `M % 128 == 0` and `m_total >= \
                MOE_A8_XLDS_MIN_ROWS`; block 256, dynamic LDS 17920, grid (M/128, m_total/16).",
