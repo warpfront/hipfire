@@ -2513,8 +2513,20 @@ impl Gpu {
         block_m: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const FUNC: &str = "moe_scatter_fused_top10";
-        self.ensure_kernel(FUNC, kernels::MOE_SCATTER_FUSED_TOP10_SRC, FUNC)?;
+        // `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` (exact gfx1201): the serial thread-0
+        // prefix walk symbol of the same module; the default symbol scans
+        // block-wide (bytewise the same counts, offsets, tile ids, sorted slots
+        // and inverse).
+        let func: &str = if self.flags.qwen4_moe_scatter_serial_walk() {
+            "moe_scatter_fused_top10_serial"
+        } else {
+            "moe_scatter_fused_top10"
+        };
+        self.ensure_kernel(
+            "moe_scatter_fused_top10",
+            kernels::MOE_SCATTER_FUSED_TOP10_SRC,
+            func,
+        )?;
         let ip = topk_indices.buf.as_ptr();
         let cp = expert_token_counts.buf.as_ptr();
         let op = expert_offsets.buf.as_ptr();
@@ -2539,9 +2551,9 @@ impl Gpu {
         ];
         let lds_bytes = (num_experts * 4) as u32;
         let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
         let result =
-            self.launch_maybe_blob(FUNC, [1, 1, 1], [256, 1, 1], lds_bytes, &mut params, || {
+            self.launch_maybe_blob(func, [1, 1, 1], [256, 1, 1], lds_bytes, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ip);
                 b.push_ptr(cp);

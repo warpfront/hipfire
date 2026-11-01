@@ -2777,7 +2777,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "moe_scatter_fused_top10",
             kernels::MOE_SCATTER_FUSED_TOP10_SRC,
-            ["moe_scatter_fused_top10"]
+            ["moe_scatter_fused_top10", "moe_scatter_fused_top10_serial"]
         );
         add!(
             "mq_rotate_x_128_v2",

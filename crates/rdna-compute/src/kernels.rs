@@ -4450,9 +4450,16 @@ pub const GEMV_Q8_0_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
 pub const GEMM_Q8_0_MOE_GROUPED_TOP10_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_moe_grouped_top10.hip");
 /// Qwen4 alias of the existing bounds-safe scatter body with an independent
-/// entry point.  The old k=8 symbol and launcher are not widened.
+/// entry point.  The old k=8 symbol and launcher are not widened.  The module
+/// also exports `moe_scatter_fused_top10_serial`: the same launch ABI with the
+/// serial thread-0 prefix walk on every arch (the gfx1201
+/// `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` kill switch and the incumbent arm of
+/// `moe_scatter_scan_oracle`); the default symbol scans block-wide on gfx1151
+/// and gfx1201 and walks serially elsewhere.
 pub const MOE_SCATTER_FUSED_TOP10_SRC: &str = concat!(
+    "#define QWEN4_SCATTER_SERIAL_ENTRY 1\n",
     "#define moe_scatter_fused_k8 moe_scatter_fused_top10\n",
+    "#define moe_scatter_fused_k8_serial moe_scatter_fused_top10_serial\n",
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip")
 );
 /// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 and gfx1201),

@@ -133,6 +133,10 @@ name = "qwen4_moe_f16_lds_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "moe_scatter_scan_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_mq6_rows"
 required-features = ["lab"]
 
