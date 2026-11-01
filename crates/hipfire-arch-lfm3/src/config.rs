@@ -48,7 +48,14 @@ pub struct RopeParams {
 }
 
 impl RopeParams {
-    /// n_rot = partial_rotary_factor * head_dim (dims actually rotated).
+    /// n_rot = partial_rotary_factor * head_dim — the SIZE of the rotated
+    /// region, not a contiguous slice. On the zero-tail partial path
+    /// (ROPE-1, `rope_zero_tail_f32` for `partial_rotary_factor < 1.0`) the
+    /// rotated dims are the first `n_rot/2` pairs (d, d + head_dim/2) at
+    /// frequencies base^(-2d/head_dim); dims d ≥ head_dim/2 outside those
+    /// pairs and the trailing tail pass through unrotated. Only on the
+    /// full-rotary halfsplit path (partial = 1.0) is the rotated region the
+    /// contiguous prefix [0, n_rot).
     pub fn n_rot(&self, head_dim: usize) -> usize {
         (self.partial_rotary_factor * head_dim as f32) as usize
     }

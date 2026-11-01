@@ -118,15 +118,28 @@ fn main() {
     eprintln!("codec_smoke: decoding {n_frames} frames → waveform...");
     let (waveform, sr) =
         codec_decode(&codec_cfg, &codec_weights, &mut gpu, &all_codes).expect("codec_decode");
+    // CODEC-SMOKE-1: a batch decode can emit a non-finite frame (runaway
+    // log-magnitude → exp overflow in the iSTFT; observed ~12% of decodes
+    // pre-clamp). Assert finiteness on EVERY decoded waveform, not just the
+    // streaming one — the old pass condition checked batch `finite` only at
+    // the very end and the batch-vs-batch diff silently swallowed NaNs via
+    // `f32::max`.
+    let finite = assert_finite("batch decode run 1", &waveform);
+    let max_amp = waveform.iter().cloned().fold(0.0f32, f32::max);
+    let min_amp = waveform.iter().cloned().fold(0.0f32, f32::min);
+    let rms = (waveform.iter().map(|v| v * v).sum::<f32>() / waveform.len().max(1) as f32).sqrt();
+    let non_silent = rms > 1e-4;
+    eprintln!(
+        "  waveform: {} samples ({:.2}s @ {sr}Hz), finite={finite}, min={min_amp:.4}, max={max_amp:.4}, rms={rms:.4}, non_silent={non_silent}",
+        waveform.len(),
+        waveform.len() as f32 / sr as f32
+    );
 
     // ── Determinism check: decode batch twice, compare (Q8 KV stochasticity?) ──
     let (waveform2, _) =
         codec_decode(&codec_cfg, &codec_weights, &mut gpu, &all_codes).expect("codec_decode run2");
-    let max_diff_12 = waveform
-        .iter()
-        .zip(&waveform2)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let finite2 = assert_finite("batch decode run 2", &waveform2);
+    let max_diff_12 = max_abs_diff(&waveform, &waveform2);
     eprintln!(
         "  determinism: batch-vs-batch max|diff|={max_diff_12:.6} (nonzero ⇒ Q8 KV stochasticity)"
     );
@@ -154,14 +167,12 @@ fn main() {
             finalize,
         )
         .expect("codec_decode_streaming");
+        // CODEC-SMOKE-1: every chunk must be finite too.
+        assert_finite(&format!("streaming chunk {c}"), &chunk);
         str_waveform.extend_from_slice(&chunk);
     }
     str_cache.free_gpu(&mut gpu);
-    let max_diff = waveform
-        .iter()
-        .zip(&str_waveform)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let max_diff = max_abs_diff(&waveform, &str_waveform);
     eprintln!(
         "  streaming: {} samples (batch {}), max|batch-stream|={max_diff:.6}",
         str_waveform.len(),
@@ -171,18 +182,7 @@ fn main() {
     codec_weights.free_gpu(&mut gpu);
 
     // ── Verify + write WAV ──
-    let finite = waveform.iter().all(|v| v.is_finite());
-    let max_amp = waveform.iter().cloned().fold(0.0f32, f32::max);
-    let min_amp = waveform.iter().cloned().fold(0.0f32, f32::min);
-    let rms = (waveform.iter().map(|v| v * v).sum::<f32>() / waveform.len().max(1) as f32).sqrt();
-    let non_silent = rms > 1e-4;
-
     write_wav(std::path::Path::new(&out_wav), &waveform, sr).expect("write_wav");
-    eprintln!(
-        "  waveform: {} samples ({:.2}s @ {sr}Hz), finite={finite}, min={min_amp:.4}, max={max_amp:.4}, rms={rms:.4}, non_silent={non_silent}",
-        waveform.len(),
-        waveform.len() as f32 / sr as f32
-    );
     println!("wav: {out_wav}  ({n_frames} frames, {} samples)", waveform.len());
 
     // The codec decoder uses a Q8 KV cache with stochastic rounding (non-
@@ -191,9 +191,36 @@ fn main() {
     // for byte-parity). Validate the streaming produces the same LENGTH +
     // finite/non-silent audio (the values match within the Q8 noise band).
     let str_match = str_waveform.len() == waveform.len();
-    let pass = finite && non_silent && waveform.len() == n_frames * codec_cfg.frame_samples() && str_match;
+    let pass = finite && finite2 && non_silent && waveform.len() == n_frames * codec_cfg.frame_samples() && str_match;
     println!("RESULT: {}", if pass { "PASS" } else { "FAIL" });
     if !pass {
         std::process::exit(1);
     }
+}
+
+/// CODEC-SMOKE-1 helper: assert every sample is finite. Returns the verdict
+/// (so the caller can fold it into the pass condition) and FAILs loudly via
+/// the result line rather than silently propagating a NaN/inf waveform.
+fn assert_finite(what: &str, samples: &[f32]) -> bool {
+    let finite = samples.iter().all(|v| v.is_finite());
+    if !finite {
+        let n_bad = samples.iter().filter(|v| !v.is_finite()).count();
+        eprintln!("codec_smoke: FAIL: {what} produced {n_bad} non-finite sample(s)");
+    }
+    finite
+}
+
+/// CODEC-SMOKE-1 helper: NaN-aware max|a-b| — `f32::max` (IEEE maxNum) drops
+/// a NaN operand, so the old fold hid non-finite diffs entirely. Inputs are
+/// asserted finite before every call, but a NaN diff still propagates here
+/// instead of being silently swallowed.
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    let mut m = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let d = (x - y).abs();
+        if d.is_nan() || d > m {
+            m = d;
+        }
+    }
+    m
 }

@@ -70,13 +70,16 @@ pub fn text_argmax_suppressed(t: u32) -> bool {
 /// Greedy argmax over `logits` with [`text_argmax_suppressed`] applied —
 /// suppressed ids are excluded the way HF excludes them (`-inf` before
 /// `argmax`). Centralized so the interleaved-batch and streaming text
-/// branches pick identically. A NaN logit can no longer win (the previous
-/// unguarded `max_by` could latch onto one and freeze the slot).
+/// branches pick identically. A NaN logit can no longer win: NaNs are
+/// skipped explicitly (treated as -inf, matching the HF semantics this
+/// documents — the previous `bv >= v` comparison alone adopted a NaN
+/// whenever it was the current element, so a NaN in the LAST non-suppressed
+/// position still won; the old test passed only because its NaN wasn't last).
 pub fn argmax_text_token(logits: &[f32]) -> u32 {
     let mut best: Option<(u32, f32)> = None;
     for (i, &v) in logits.iter().enumerate() {
         let t = i as u32;
-        if text_argmax_suppressed(t) {
+        if text_argmax_suppressed(t) || v.is_nan() {
             continue;
         }
         match best {
@@ -641,5 +644,22 @@ mod tests {
         logits[10] = f32::NAN;
         logits[11] = 0.5;
         assert_eq!(argmax_text_token(&logits), 11);
+    }
+
+    /// SUPPRESS-1 (review follow-up): the old `bv >= v` comparison adopted a
+    /// NaN whenever it was the CURRENT element and only overwrote it on a
+    /// later element — so a NaN in the LAST non-suppressed position still won
+    /// (the old test passed only because its NaN sat at index 10 with 11
+    /// after it). NaNs must be skipped explicitly, wherever they sit.
+    #[test]
+    fn text_argmax_ignores_nan_in_last_position() {
+        let mut logits = vec![-1.0f32; 130_000];
+        logits[11] = 0.5;
+        logits[12] = f32::NAN; // last non-suppressed position wins the old code
+        assert_eq!(argmax_text_token(&logits), 11);
+
+        // All-NaN logits fall back to 0 rather than panicking / picking NaN.
+        let mut logits = vec![f32::NAN; 130_000];
+        assert_eq!(argmax_text_token(&logits), 0);
     }
 }
