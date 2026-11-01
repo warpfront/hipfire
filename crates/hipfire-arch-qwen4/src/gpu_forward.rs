@@ -56,7 +56,7 @@ use hipfire_dispatch::pipeline::gated_mlp::{
 };
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
-    SealedMoeCall,
+    SealedMoeCall, SpecializedRouteAdmission,
 };
 use hipfire_dispatch::pipeline::{
     execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
@@ -17605,17 +17605,29 @@ impl Qwen4GpuForward {
                 None
             };
             if shadow_route.is_none() {
-                match retained_body_action(
-                    eligible,
-                    gpu.replay.state(),
-                    specialized_sealed_moe_retained_admission(),
-                ) {
+                // The GDN conv carries a position kernarg and the MQ6 decode
+                // GEMVs (gemv_mq6g256v2_*) use scratch.
+                let needs = rdna_compute::replay::RetainedTapeNeeds {
+                    position_kernargs: true,
+                    scratch_kernels: true,
+                };
+                let admission = match gpu.replay.transport_refusal(&gpu.arch, needs) {
+                    Some(reason) => SpecializedRouteAdmission::Refused { reason },
+                    None => specialized_sealed_moe_retained_admission(),
+                };
+                match retained_body_action(eligible, gpu.replay.state(), admission) {
                     RetainedBodyAction::Ineligible => {}
                     RetainedBodyAction::Refuse { reason } => {
                         // The route cannot be retained: poison before the body so this
                         // and every later forward runs on HIP.
                         gpu.replay.poison(reason);
-                        eprintln!("[redline] qwen4 retained body unavailable: {reason}");
+                        eprintln!(
+                            "[redline] qwen4: retained body not armed on {} ({} transport): \
+                             {reason}; running plain HIP, output is byte-identical to \
+                             HIPFIRE_REPLAY_BACKEND=hip",
+                            gpu.arch,
+                            gpu.replay.transport_name()
+                        );
                     }
                     RetainedBodyAction::Arm { diagnostic } => {
                         diagnostic_capture = diagnostic;
@@ -18203,7 +18215,11 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
         Err(reason) => {
             let reason = format!("Redline prepare after warmup failed: {reason}");
             gpu.replay.poison(reason.clone());
-            eprintln!("[redline] falling back to HIP: {reason}");
+            eprintln!(
+                "[redline] falling back to HIP: {reason}; the forward that recorded the tape ran \
+                 on the recorded route, so its output (and the state it wrote) is not \
+                 byte-identical to plain HIP; later forwards are plain HIP"
+            );
         }
     }
 }

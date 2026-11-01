@@ -73,6 +73,16 @@ enum Pm4Architecture {
     Gfx12,
 }
 
+/// What a model's retained tape is known to need from the transport, declared
+/// up front so [`ReplayController::transport_refusal`] can refuse before recording.
+#[derive(Clone, Copy, Debug)]
+pub struct RetainedTapeNeeds {
+    /// Kernargs derived from the decode position (rebinding needs PM4).
+    pub position_kernargs: bool,
+    /// Kernels with a private (scratch) segment.
+    pub scratch_kernels: bool,
+}
+
 /// Per-stream producer/consumer visibility for legacy (gfx10/gfx11) PM4 IBs.
 ///
 /// `CsPartialFlush` retains the historical EVENT_WRITE path. `ReleaseWait` is
@@ -8458,6 +8468,29 @@ impl ReplayController {
         self.transport == ReplayTransport::Pm4Ib
     }
 
+    /// Why this transport cannot prepare a retained tape with `needs` on `arch`,
+    /// known before anything records. A model refuses at arm time on `Some` so
+    /// the arming forward runs on plain HIP instead of on the recorded route
+    /// (a prepare that fails after recording leaves that forward's output).
+    pub fn transport_refusal(&self, arch: &str, needs: RetainedTapeNeeds) -> Option<&'static str> {
+        match self.transport {
+            ReplayTransport::AqlPackets if needs.position_kernargs => Some(
+                "linear AQL cannot rebind the position-derived kernargs of this tape (it needs PM4)",
+            ),
+            // ponytail: lift when GFX10/GFX11 PM4 scratch lands (HIPF-253).
+            ReplayTransport::Pm4Ib
+                if needs.scratch_kernels
+                    && matches!(
+                        Pm4Architecture::from_name(arch),
+                        Ok(Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11)
+                    ) =>
+            {
+                Some("GFX10/GFX11 PM4 dispatch does not support the scratch kernels of this tape")
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the *current forward* is inside the retained body: the controller
     /// would record this forward into the tape, or route it through a prepared
     /// plan.
@@ -9132,6 +9165,28 @@ mod tests {
         // The Legacy arch gate is untouched: the gfx11 flag path still
         // reports false on gfx12 even when configured.
         assert!(!pm4_vmem_acquire_arch_enabled(Pm4Architecture::Gfx12, true));
+    }
+
+    #[test]
+    fn transport_refusal_is_known_before_recording() {
+        let qwen4 = RetainedTapeNeeds {
+            position_kernargs: true,
+            scratch_kernels: true,
+        };
+        let plain = RetainedTapeNeeds {
+            position_kernargs: false,
+            scratch_kernels: false,
+        };
+        let mut c = ReplayController::new(ReplayBackendRequest::Auto);
+        c.transport = ReplayTransport::AqlPackets;
+        assert!(c.transport_refusal("gfx1201", qwen4).is_some());
+        assert!(c.transport_refusal("gfx1151", plain).is_none());
+        c.transport = ReplayTransport::Pm4Ib;
+        for arch in ["gfx1151", "gfx1100", "gfx1030"] {
+            assert!(c.transport_refusal(arch, qwen4).is_some(), "{arch}");
+            assert!(c.transport_refusal(arch, plain).is_none(), "{arch}");
+        }
+        assert!(c.transport_refusal("gfx1201", qwen4).is_none());
     }
 
     #[test]

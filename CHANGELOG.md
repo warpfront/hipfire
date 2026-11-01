@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- **Fix (HIPF-225): Qwen4 Redline refuses a known-unpreparable transport before recording, so plain AR and native MTP stay byte-identical to plain HIP.** `ReplayController::transport_refusal` (`RetainedTapeNeeds`) answers before arming: linear AQL cannot rebind the Qwen4 tape's position-derived kernargs (`gated_delta_conv_params_bf16_f32`); GFX10/GFX11 PM4 replay of the tape is unvalidated (the gfx1151 MQ6 LM-head GEMV `gemv_mq6g256v2_k2560_u2` uses scratch, HIPF-253; Qwen4 PM4 decode parity on gfx11, HIPF-254); an arch with no PM4 register map is refused too. The Qwen4 retained-body boundary and its AR launch reference (`ar_launch_reference`, which steers MTP verify and the draft-length planner) read one `qwen4_retained_refusal`. Before, gfx1151 recorded prompt 0's first decode step on the recorded route, refused the prepare, and that prompt's logits differed from plain HIP on 32/32 steps; a native-MTP session kept a `Recorded` AR reference and differed in 10/29 window records. Now one `[redline] qwen4: retained body not armed on <arch> (<transport> transport): ...` line is printed on the first AR step, and halo `fn_ep_oracle` AQL and PM4 arms equal `HIPFIRE_REPLAY_BACKEND=hip`. The measurement-only `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1` still records (it never prepares). A failure after recording (sync, close or prepare) now says the recording forward's output may not be byte-identical to plain HIP.
+
 ## v0.4.5 — 2026-11-11 (re-cut)
 
 The v0.4.5 tag first pointed at `b30b46c1e2` (2026-10-30); that GitHub release was never published. v0.4.5 was re-cut at `7f7cf7f50f` and now includes everything below. If you fetched the October tag, run `git fetch --tags --force`.
