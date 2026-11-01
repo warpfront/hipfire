@@ -778,7 +778,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "memcpy-htod-auto",
         predicates: &[CaptureMode],
-        condition: "Gpu::memcpy_htod_auto: async H2D on the active stream while capturing, else synchronous (dispatch.rs:2336-2347)",
+        condition: "Gpu::memcpy_htod_auto: async H2D on the active stream while capturing, else synchronous (dispatch.rs:2336-2347); Gpu::htod_stream_ordered: async H2D on the active stream while capturing, else async H2D on the active stream plus one wait on it (blocking copy with no active stream)",
         effect: LaunchMechanism,
         switches: "hipMemcpyHtoDAsync vs hipMemcpyHtoD; same bytes",
         kernels: &[],
@@ -2893,6 +2893,12 @@ pub const SITES: &[Site] = &[
         function: "iu4_producer_sidecar_active",
         occurrences: 2,
         decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "htod_stream_ordered",
+        occurrences: 1,
+        decisions: &["memcpy-htod-auto"],
     },
     Site {
         file: "rdna-compute/src/dispatch.rs",

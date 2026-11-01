@@ -1268,7 +1268,8 @@ fn stage_tokens(
         }
         bytes.extend_from_slice(&t.to_le_bytes());
     }
-    gpu.memcpy_htod_auto(&scratch.token_ids.buf, &bytes)
+    // Ordered on the decode stream when there is one (no null-stream hop); blocking otherwise.
+    gpu.htod_stream_ordered(&scratch.token_ids.buf, 0, &bytes)
         .map_err(|e| format!("raon1_mini: upload token ids: {e:?}"))
 }
 

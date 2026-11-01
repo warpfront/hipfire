@@ -547,11 +547,15 @@ impl RaonBundle {
             let Some(k) = layers.iter().position(|&id| id == l) else {
                 return Ok(());
             };
-            gpu.hip
-                .device_synchronize()
-                .map_err(|e| format!("raon1_mini: feature tap synchronize L{l}: {e:?}"))?;
+            // With a decode stream every layer's copy is enqueued on it, so one wait on that
+            // stream covers it; the device-wide drain is only for the no-stream route.
+            if gpu.active_stream.is_none() {
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|e| format!("raon1_mini: feature tap synchronize L{l}: {e:?}"))?;
+            }
             let host = gpu
-                .download_f32(&streams.sub_offset(skip * width, count * width))
+                .download_f32_stream_ordered(&streams.sub_offset(skip * width, count * width))
                 .map_err(|e| format!("raon1_mini: feature tap download L{l}: {e:?}"))?;
             for (r, row) in host.chunks_exact(width).enumerate() {
                 let at = r * row_width + k * width;
@@ -951,7 +955,18 @@ impl SpecTarget for RaonBundle {
     /// The raw embedding row of `token_id` (no scaling), the drafter's noise
     /// input: the very lookup the forward's embedding stage runs.
     fn embed_row(&mut self, gpu: &mut Gpu, token_id: u32) -> Result<Vec<f32>, String> {
-        stage_decode_token(&self.config, &self.scratch, gpu, token_id)?;
+        // On the decode stream when there is one: the id is the immediate of a stream memset
+        // and the row is read back with a wait on that stream alone (no null-stream hop).
+        if gpu.active_stream.is_some() {
+            crate::forward::stage_decode_token_on_stream(
+                &self.config,
+                &self.scratch,
+                gpu,
+                token_id,
+            )?;
+        } else {
+            stage_decode_token(&self.config, &self.scratch, gpu, token_id)?;
+        }
         embed_lookup(
             &self.config,
             &self.weights,
@@ -960,7 +975,7 @@ impl SpecTarget for RaonBundle {
             1,
             &self.scratch.branch_out,
         )?;
-        gpu.download_f32(&self.scratch.branch_out.sub_offset(0, self.config.hidden))
+        gpu.download_f32_stream_ordered(&self.scratch.branch_out.sub_offset(0, self.config.hidden))
             .map_err(|e| format!("raon1_mini embed_row download: {e:?}"))
     }
 

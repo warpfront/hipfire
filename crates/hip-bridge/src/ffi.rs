@@ -3669,6 +3669,41 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync H2D")
     }
 
+    /// [`Self::memcpy_htod_async`] into `dst[offset..offset + src.len()]`.
+    pub fn memcpy_htod_async_at(
+        &self,
+        dst: &DeviceBuffer,
+        offset: usize,
+        src: &[u8],
+        stream: &Stream,
+    ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync H2D offset")?;
+        if hip_fault_consume(0, "upload") {
+            return Err(hip_fault_err("upload"));
+        }
+        assert!(
+            offset + src.len() <= dst.size,
+            "offset ({}) + source ({}) exceeds device buffer ({})",
+            offset,
+            src.len(),
+            dst.size
+        );
+        // SAFETY: the byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation. Same-device/stream and
+        // host-buffer lifetime across the async copy are the caller's contract.
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                (dst.ptr as *mut u8).add(offset) as *mut c_void,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                MemcpyKind::HostToDevice as c_uint,
+                stream.0,
+            )
+        };
+        memory_effects::htod();
+        self.check(code, "hipMemcpyAsync H2D offset")
+    }
+
     /// Host-asynchronous H→D copy ordered on `stream` (`None` = the legacy
     /// stream, only when the caller has no stream). `src` must stay unchanged
     /// until the stream reaches the copy; a pinned `src` makes this a plain

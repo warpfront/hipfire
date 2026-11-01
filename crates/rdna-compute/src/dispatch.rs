@@ -8595,6 +8595,58 @@ impl Gpu {
         self.take_device_wait_error()
     }
 
+    /// H→D copy of `src` into `dst[dst_offset..]` ordered on [`Self::active_stream`]: with a
+    /// stream (the decode stream of a graph route) the copy is enqueued there and the call
+    /// returns once that stream has executed it, so `src` is free on return and no legacy
+    /// (null) stream hop is paid, which is what the plain blocking copy costs whenever the
+    /// runtime synchronizes the null queue with the decode queue. While a graph is being
+    /// captured the copy is enqueued on the capturing stream without a wait (the caller
+    /// keeps `src` alive and rewrites it in place, as with [`Self::memcpy_htod_auto`]).
+    /// With no active stream this is the blocking `hipMemcpy` as before.
+    pub fn htod_stream_ordered(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        src: &[u8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.active_stream.as_ref() {
+            Some(stream) if self.graphs.capture_mode => {
+                self.hip.memcpy_htod_async_at(dst, dst_offset, src, stream)
+            }
+            Some(stream) => {
+                self.hip
+                    .memcpy_htod_async_at(dst, dst_offset, src, stream)?;
+                self.hip.stream_synchronize(stream)?;
+                self.take_device_wait_error()
+            }
+            None => self.hip.memcpy_htod_offset(dst, dst_offset, src),
+        }
+    }
+
+    /// D→H copies of every `(source, destination)` pair, all enqueued on
+    /// [`Self::active_stream`] and read with ONE wait on that stream (the readbacks of one
+    /// step's selector, say): no legacy stream hop and one host round trip. Each source must
+    /// have been written by work on the active stream. With no active stream each part is a
+    /// blocking copy.
+    pub fn dtoh_stream_ordered_batch(
+        &self,
+        parts: &mut [(&hip_bridge::DeviceBuffer, &mut [u8])],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self.active_stream.as_ref();
+        for (src, dst) in parts.iter_mut() {
+            match stream {
+                Some(stream) => self.hip.memcpy_dtoh_async(dst, src, Some(stream))?,
+                None => self.hip.memcpy_dtoh(dst, src)?,
+            }
+        }
+        if let Some(stream) = stream {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.take_device_wait_error()
+    }
+
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
     /// reinterpretation, so a caller can compare code blobs bit-for-bit.
     ///
