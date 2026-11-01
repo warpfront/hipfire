@@ -71,7 +71,11 @@
 //!   MTP lanes check it when a batched window is drafted, before an
 //!   `ArSynced` head append, before each prefill tile, and at the end of
 //!   every verify (`mtp_lanes`).
-//! - I2 (one snapshot ticket, only in a verify): AR lanes snapshot nothing.
+//! - I2 (one snapshot ticket, only in a verify): AR lanes snapshot nothing,
+//!   and an AR lane's state is built without the snapshot arena
+//!   (`StateMirror::Absent`; a snapshot of one is `StateError::MirrorAbsent`):
+//!   every slot of an AR store, and the AR-only slots of a mixed EP store
+//!   (past `LaneSpecConfig::spec_lanes`); the MTP slots keep the mirror.
 //!   An MTP lane holds one head ticket (taken at `draft_step`) and one target
 //!   ticket (taken at `forward_step`) only inside a `Batched` window; both
 //!   are committed by the window's finish, or dropped with the lane by

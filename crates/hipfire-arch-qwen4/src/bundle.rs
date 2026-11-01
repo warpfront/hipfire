@@ -22,7 +22,7 @@ use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpS
 use crate::ple::PleHashMetadata;
 use crate::state::decode_map_ahead_tokens;
 use crate::state::Qwen4StateFormat;
-use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
+use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError, StateMirror};
 use crate::weights::{
     ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, Qwen4Weights,
     WeightError, PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
@@ -5003,7 +5003,10 @@ impl Qwen4Bundle {
     /// store, the resident head state and draft request state) into the
     /// prepared lane `epoch`, then reset the resident owners for the next
     /// singleton request ([`Self::reset`]: session live record and turn
-    /// dropped). Every refusal comes before the swap and leaves both sides
+    /// dropped). The trunk states swap through [`Qwen4State::swap_requests`]:
+    /// an AR lane has no snapshot mirror, so the resident state keeps its own
+    /// mirror and the lane takes the request alone. Every refusal comes
+    /// before the swap and leaves both sides
     /// untouched; once the lane holds the moved states only the reset can
     /// fail, and its error is returned with the lane already live.
     pub fn commit_promotion(
@@ -5045,7 +5048,7 @@ impl Qwen4Bundle {
             }
             bundle.state.clamp_f16_valid();
             lane.state.clamp_f16_valid();
-            std::mem::swap(&mut bundle.state, &mut lane.state);
+            bundle.state.swap_requests(&mut lane.state);
             if let (Some(spec), Some(mtp)) = (lane.spec.as_mut(), bundle.mtp.as_mut()) {
                 std::mem::swap(&mut mtp.state, &mut spec.head);
                 spec.draft = mtp.draft.request_state();
@@ -5059,20 +5062,26 @@ impl Qwen4Bundle {
     /// A fresh lane trunk state: the resident state's formats, QSA backend
     /// and context bound, allocated through the same constructor over this
     /// bundle's band (the whole model under the single scope; a PP band's
-    /// layers and endpoint state otherwise).
-    pub(crate) fn new_lane_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
+    /// layers and endpoint state otherwise), with the lane store's snapshot
+    /// `mirror` ([`crate::lane::Qwen4LaneStore::state_mirror`]).
+    pub(crate) fn new_lane_state(
+        &self,
+        gpu: &mut Gpu,
+        mirror: StateMirror,
+    ) -> Result<Qwen4State, BundleError> {
         // Attached roots need the mesh owner; detached band/rank calls
         // allocate the state local to their weight scope.
         if self.pp.is_some() {
             return Err(pp_owner_required());
         }
-        Qwen4State::new_with_backend_scoped(
+        Qwen4State::new_with_mirror(
             gpu,
             &self.config,
             self.state.max_seq_len,
             self.state_format,
             self.state.qsa_backend(),
             self.weights.band_scope(),
+            mirror,
         )
         .map_err(BundleError::State)
     }
@@ -5229,9 +5238,9 @@ impl Qwen4Bundle {
 
     /// A fresh prefill-wave lane state: the same constructor as a lane
     /// store's states (the resident state's formats, QSA backend and context
-    /// bound).
+    /// bound), snapshot-capable like the resident state.
     pub fn new_wave_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
-        self.new_lane_state(gpu)
+        self.new_lane_state(gpu, StateMirror::Snapshot)
     }
 
     /// One prefill wave: every lane's rows forwarded together

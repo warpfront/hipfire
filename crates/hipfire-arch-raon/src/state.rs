@@ -140,9 +140,10 @@ pub struct RaonStateDims {
     /// Expanded K/V mirror stored as INT8 codes + one F16 scale per (row, head,
     /// plane) instead of BF16 ([`crate::mla::MlaPolicy::mirror_q8`]).
     pub mirror_q8: bool,
-    /// Keep Q8 even when a BF16 mirror would cover the reserved context
-    /// ([`crate::mla::MlaPolicy::mirror_q8_forced`]).
-    pub mirror_q8_forced: bool,
+    /// Keep the BF16 mirror while it covers the whole reserved context (Q8
+    /// otherwise). Set at load for a speculative slot whose Q8 mirror is not forced:
+    /// its verify rows run the tiled kernel, which is faster on BF16 operands.
+    pub mirror_bf16_if_covered: bool,
 }
 
 impl RaonStateDims {
@@ -176,7 +177,7 @@ impl RaonStateDims {
             mhc_controls: 17,
             decay_bottleneck: 128,
             mirror_q8: true,
-            mirror_q8_forced: false,
+            mirror_bf16_if_covered: false,
         }
     }
 
@@ -626,6 +627,21 @@ pub fn expanded_mirror_bytes(d: &RaonStateDims, rows: usize) -> Result<usize, St
 /// Rows of mirror that `budget_bytes` backs (floor).
 pub fn mirror_rows_for_budget(d: &RaonStateDims, budget_bytes: usize) -> usize {
     budget_bytes / mirror_row_bytes(d).max(1)
+}
+
+/// The mirror format rule, decided once per slot before any mirror memory exists:
+/// Q8 whenever it is allowed ([`RaonStateDims::mirror_q8`]); a slot with
+/// [`RaonStateDims::mirror_bf16_if_covered`] keeps BF16 while `usable` bytes back a
+/// BF16 mirror for all `max_seq` rows. An already backed mirror keeps its format.
+pub fn mirror_is_q8(d: &RaonStateDims, max_seq: usize, usable: usize, backed: bool) -> bool {
+    if !d.mirror_q8 || backed || !d.mirror_bf16_if_covered {
+        return d.mirror_q8;
+    }
+    let bf16 = RaonStateDims {
+        mirror_q8: false,
+        ..d.clone()
+    };
+    mirror_rows_for_budget(&bf16, usable) < max_seq
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1233,11 +1249,11 @@ impl RaonState {
     /// latent growth to `max_seq`, [`ADMISSION_HEADROOM_BYTES`] and
     /// [`MIRROR_POST_ASSEMBLY_RESERVE_BYTES`]. Returns the new budget in rows.
     ///
-    /// Format selection (capacity-based): while no mirror is backed yet and the Q8
-    /// mirror is allowed ([`RaonStateDims::mirror_q8`]), the BF16 mirror is kept
-    /// whenever its budget covers the whole reserved context (`max_seq`; it is
-    /// 1-2% faster), and Q8 is chosen otherwise (it backs about twice the rows).
-    /// The choice is made here, once, before any mirror memory exists.
+    /// Format selection ([`mirror_is_q8`]): Q8 whenever it is allowed
+    /// ([`RaonStateDims::mirror_q8`]), except that a speculative slot
+    /// ([`RaonStateDims::mirror_bf16_if_covered`]) keeps BF16 while its budget covers
+    /// the whole reserved context. The choice is made here, once, before any mirror
+    /// memory exists.
     pub fn fit_mirror_budget(&mut self, gpu: &Gpu) -> Result<usize, String> {
         let planned = self.mirror_available_bytes(gpu)?;
         // Everything non-lazy is allocated by now. The planned figure ignores a
@@ -1301,16 +1317,7 @@ impl RaonState {
 
     /// `(mirror is Q8, budget rows)` for `usable` bytes.
     fn plan_mirror(&self, usable: usize) -> (bool, usize) {
-        let mut q8 = self.dims.mirror_q8;
-        if q8 && !self.dims.mirror_q8_forced && self.mirror.is_none() {
-            let bf16 = RaonStateDims {
-                mirror_q8: false,
-                ..self.dims.clone()
-            };
-            if mirror_rows_for_budget(&bf16, usable) >= self.max_seq {
-                q8 = false;
-            }
-        }
+        let q8 = mirror_is_q8(&self.dims, self.max_seq, usable, self.mirror.is_some());
         let dims = RaonStateDims {
             mirror_q8: q8,
             ..self.dims.clone()
@@ -2061,6 +2068,28 @@ mod tests {
         assert_eq!(mirror_plane_row_bytes(&d), [5200, 5200]);
         assert_eq!(expanded_mirror_bytes(&d, 8192).unwrap(), 8192 * 72_800);
         assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn mirror_format_rule() {
+        let max_seq = 32_832;
+        let covers = 143_360 * max_seq; // BF16 backs exactly max_seq rows
+        let short = covers - 1;
+        let mut d = RaonStateDims::raon();
+        // Non-speculative slot: Q8 even when BF16 would cover the context.
+        assert!(mirror_is_q8(&d, max_seq, covers * 2, false));
+        assert!(mirror_is_q8(&d, max_seq, short, false));
+        // Speculative slot: BF16 while it covers, Q8 once it cannot.
+        d.mirror_bf16_if_covered = true;
+        assert!(!mirror_is_q8(&d, max_seq, covers, false));
+        assert!(mirror_is_q8(&d, max_seq, short, false));
+        // A backed mirror keeps its format.
+        assert!(mirror_is_q8(&d, max_seq, covers, true));
+        // Q8 disallowed (HIPFIRE_RAON_MIRROR_Q8=0): BF16 regardless.
+        d.mirror_q8 = false;
+        assert!(!mirror_is_q8(&d, max_seq, short, false));
+        d.mirror_bf16_if_covered = false;
+        assert!(!mirror_is_q8(&d, max_seq, short, false));
     }
 
     #[test]

@@ -319,13 +319,16 @@ fn out_dir(opts: &Opts, required: bool) -> Result<Option<PathBuf>, String> {
     }
 }
 
-/// Production carrier load at an explicit `max_seq`, PP=1, no drafter/vision
-/// (the drafter is built by the modes that need it).
+/// Production carrier load at an explicit `max_seq`, PP=1, no vision. With a
+/// `draft` the load is a DFlash2 load (`speculation.dflash = on`), so the slot
+/// takes the speculative mirror rule; the drafter itself is built by the modes
+/// that need it.
 fn load_bundle(
     gpu: &mut Gpu,
     src: ModelSource,
     path: &str,
     max_seq: usize,
+    draft: Option<&str>,
 ) -> Result<RaonBundle, String> {
     let cask = CaskConfig::default();
     let mut ctx = LoadCtx {
@@ -334,7 +337,7 @@ fn load_bundle(
         sequence: None,
         deepseek4_compute_placement: Default::default(),
         deepseek4_experts_per_token: None,
-        draft_path: None,
+        draft_path: draft,
         vision_path: None,
         mtp_path: None,
         vision_mode: "off".to_string(),
@@ -350,7 +353,10 @@ fn load_bundle(
         pp_layer_counts: None,
         admitted_mesh: None,
         band_placement: None,
-        spec: SpecLoadCfg::default(),
+        spec: SpecLoadCfg {
+            dflash: draft.map(|_| true),
+            ..SpecLoadCfg::default()
+        },
         gpu,
         gemma4_drafter_path: None,
         gemma4_draft_len: 3,
@@ -3824,7 +3830,13 @@ fn run() -> Result<bool, String> {
     let out = out_dir(&opts, mode == "emit")?;
 
     let mut gpu = Gpu::init().map_err(|e| format!("gpu init: {e:?}"))?;
-    let mut bundle = load_bundle(&mut gpu, ModelSource::Hfq(hfq), &model, max_seq)?;
+    let mut bundle = load_bundle(
+        &mut gpu,
+        ModelSource::Hfq(hfq),
+        &model,
+        max_seq,
+        opts.get("draft").map(String::as_str),
+    )?;
     bundle.set_prefill_mode(PrefillMode::Batched);
     let r = (|| -> Result<bool, String> {
         let vocab = bundle.config.vocab;

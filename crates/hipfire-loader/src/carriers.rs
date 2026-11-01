@@ -2782,7 +2782,7 @@ fn qwen4_settled_charges(
 }
 
 /// Planned capacity of every device in `devices` (HIP logical ids), in order, as
-/// [`rdna_compute::Gpu::planned_capacity_for`] reports it before any rank of
+/// [`rdna_compute::Gpu::planned_capacity_for`] reports it (`before_reserve`) before any rank of
 /// the load allocates. Run on the thread that owns `gpu` (the daemon thread):
 /// other devices are queried by `device_mem_info_for`, which switches the
 /// thread's current device with raw HIP setters and restores the previous
@@ -2805,14 +2805,25 @@ pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Ve
     let mut free = Vec::with_capacity(devices.len());
     for &device in devices {
         // Planned capacity (device total minus this process's own live
-        // allocations minus the fixed reserve), not the instantaneous free
-        // figure: a foreign process's transient allocation must not move the
-        // agreed split. UMA parts keep the free figure.
+        // allocations), not the instantaneous free figure: a foreign
+        // process's transient allocation must not move the agreed split. The
+        // fixed planned reserve is NOT deducted here: the EP reserve census
+        // keeps the historical floor (`runtime_overhead_bytes` is `None` for
+        // ranks > 1), which stands in for the HIP runtime residency
+        // (`QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES`, 929-1,383 MiB measured on
+        // an R9700 beyond live allocations), so deducting the planned
+        // reserve as well would count it twice: one resident layer per rank
+        // lost, measured on both the default and the chunk-512 placement.
+        // UMA parts keep the free figure.
         let capacity = gpu
             .planned_capacity_for(device)
             .map_err(|error| format!("qwen4: device {device} memory query: {error}"))?;
-        eprintln!("  qwen4 EP device {device}: {capacity}");
-        free.push(capacity.bytes as u64);
+        let plan_bytes = capacity.before_reserve();
+        eprintln!(
+            "  qwen4 EP device {device}: {capacity}; EP plans against {} MiB (before the fixed reserve: its census carries the runtime reserve)",
+            plan_bytes >> 20
+        );
+        free.push(plan_bytes as u64);
     }
     Ok(qwen4_ep_alias_free(devices, &free))
 }
@@ -2882,10 +2893,11 @@ pub fn qwen4_ep_vram_layers(
         .map_err(|error| error.to_string())?;
     let recipe = receipt.recipe().clone();
     let config = receipt.config;
-    let manifest = receipt
+    let mut manifest = receipt
         .manifest
         .with_expert_parallel(hipfire_arch_qwen4::weights::Qwen4EpPlacement { rank: 0, ranks })
         .map_err(|error| format!("qwen4: {error}"))?;
+    qwen4_apply_ep_embed_host(&mut manifest.weights, ranks, &gpu.arch);
     let state_format = hipfire_arch_qwen4::resolve_state_format(
         &shared.kv_mode,
         shared.state_quant.as_deref().unwrap_or(""),
@@ -3229,6 +3241,46 @@ fn qwen4_ep_chunk_autofit(
         chunk_rows: Some(rows),
         fit_note: Some(fit_note),
     })
+}
+
+/// Developer kill switch of the EP embedding-table host placement
+/// ([`qwen4_ep_embed_host`]): the exact value `0` keeps the table on every
+/// card; unset or any other value leaves the placement on.
+const QWEN4_EP_EMBED_HOST_ENV: &str = "HIPFIRE_EP_EMBED_HOST";
+
+/// The one predicate of the EP embedding-table host placement: an
+/// expert-parallel load (`ranks >= 2`) on exact gfx1201 cards, unless `env`
+/// (the value of [`QWEN4_EP_EMBED_HOST_ENV`]) is exactly `0`. The embedding
+/// kernels read the table through the device alias of the pinned host copy, so
+/// the output is byte-identical; each rank pins its own copy.
+fn qwen4_ep_embed_host(ranks: usize, arch: &str, env: Option<&str>) -> bool {
+    ranks >= 2 && arch == "gfx1201" && env != Some("0")
+}
+
+/// Apply [`qwen4_ep_embed_host`] to an EP manifest with the kill switch's
+/// value `env`. A refusing predicate leaves `weights` untouched. Returns
+/// whether the table was placed in host RAM.
+fn qwen4_place_ep_embed_host(
+    weights: &mut [hipfire_runtime::weight_manifest::WeightEntry],
+    ranks: usize,
+    arch: &str,
+    env: Option<&str>,
+) -> bool {
+    qwen4_ep_embed_host(ranks, arch, env)
+        && hipfire_arch_qwen4::expert_residency::place_embedding_host(weights) > 0
+}
+
+/// [`qwen4_place_ep_embed_host`] with the process environment. Both places that
+/// size an EP load's placement from the manifest ([`qwen4_ep_vram_layers`] for
+/// the agreed split and [`load_qwen4_rank`] for each rank) call this, so the
+/// plan, every rank's census, its fit check and its host RAM/GTT checks agree.
+fn qwen4_apply_ep_embed_host(
+    weights: &mut [hipfire_runtime::weight_manifest::WeightEntry],
+    ranks: usize,
+    arch: &str,
+) -> bool {
+    let env = hipfire_config::developer_var(QWEN4_EP_EMBED_HOST_ENV).ok();
+    qwen4_place_ep_embed_host(weights, ranks, arch, env.as_deref())
 }
 
 /// The AR-lane reservation a load's [`BatchLoadRequest`] asks of an
@@ -5288,11 +5340,15 @@ fn load_qwen4_rank_scoped(
     // Expert parallelism: the routed expert stacks (trunk and MTP head)
     // are declared expert-sharded; rank `r` uploads experts `e % N == r`
     // compactly. The single-device manifest is not touched.
-    if let Some(placement) = ep {
-        manifest = manifest
-            .with_expert_parallel(placement)
-            .map_err(|error| format!("qwen4: {error}"))?;
-    }
+    let embed_host = match ep {
+        Some(placement) => {
+            manifest = manifest
+                .with_expert_parallel(placement)
+                .map_err(|error| format!("qwen4: {error}"))?;
+            qwen4_apply_ep_embed_host(&mut manifest.weights, placement.ranks, &ctx.gpu.arch)
+        }
+        None => false,
+    };
     let metadata = receipt.ple;
     // A dense FFN has no routed experts: its gate/up/down are ordinary
     // resident weights and the host-expert placement does not apply.
@@ -5437,6 +5493,28 @@ fn load_qwen4_rank_scoped(
             }
         })
     };
+    // Expert parallelism with the embedding table in pinned host RAM
+    // ([`qwen4_apply_ep_embed_host`], applied to the manifest above): the
+    // placement census below leaves it out of the non-expert device bytes and
+    // the host RAM/GTT checks count it in every rank's pinned bytes.
+    // Only the embedding table is host-mapped in this manifest so far (the
+    // routed experts are placed below), so its pinned bytes are the whole sum.
+    let embed_pinned_bytes = if embed_host {
+        residency::host_mapped_bytes(&manifest.weights, bytes_of)
+            .map_err(|error| format!("qwen4: {error}"))?
+    } else {
+        0
+    };
+    if let (true, Some(placement)) = (embed_host, ep) {
+        eprintln!(
+            "  qwen4 EP rank {}/{}: embedding table host-mapped ({:.2} GiB pinned host RAM, \
+             {} MiB device bytes freed)",
+            placement.rank,
+            placement.ranks,
+            embed_pinned_bytes as f64 / (1u64 << 30) as f64,
+            (embed_pinned_bytes - residency::HOST_MAPPED_PAD_BYTES) / MIB,
+        );
+    }
     // `native_mtp` as the placement sees it: the later host-spill decline
     // must not move the reserve the placement was sized with.
     let placement_native_mtp = native_mtp;
@@ -6502,6 +6580,9 @@ fn load_qwen4_rank_scoped(
                 .map_err(|error| format!("qwen4: {error}"))?;
         let own_rank = ep.map_or(0, |placement| placement.rank);
         let host_bytes = rank_host_bytes[own_rank];
+        // The experts' share of it: the embedding table (when host-mapped) is
+        // reported on its own load line.
+        let expert_host_bytes = host_bytes.saturating_sub(embed_pinned_bytes);
         let host_check_bytes =
             qwen4_ep_host_check_bytes(&rank_host_bytes, own_rank, ep_reserve_mirror_bytes);
         let mem_available = preallocation_mem_available;
@@ -6521,7 +6602,7 @@ fn load_qwen4_rank_scoped(
             eprintln!(
                 "  qwen4 routed experts: layers {resident:?} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
                  (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
-                gib(host_bytes),
+                gib(expert_host_bytes),
                 gib(mem_available.unwrap_or(0)),
                 gib(ttm_pool)
             );
@@ -6530,7 +6611,7 @@ fn load_qwen4_rank_scoped(
                 "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
                  (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
                 vram_layers.min(config.num_hidden_layers),
-                gib(host_bytes),
+                gib(expert_host_bytes),
                 gib(mem_available.unwrap_or(0)),
                 gib(ttm_pool)
             );
@@ -6541,12 +6622,12 @@ fn load_qwen4_rank_scoped(
                 Some(resident) => format!(
                     "experts: {} layers in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
                     resident.len(),
-                    gib(host_bytes)
+                    gib(expert_host_bytes)
                 ),
                 None => format!(
                     "experts: layers 0..{} in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
                     vram_layers.min(config.num_hidden_layers),
-                    gib(host_bytes)
+                    gib(expert_host_bytes)
                 ),
             },
         );
@@ -6564,7 +6645,7 @@ fn load_qwen4_rank_scoped(
                 hipfire_config::mtp_host_spill_decline_line(
                     "qwen4 native",
                     moved,
-                    host_bytes,
+                    expert_host_bytes,
                     &format!("on {}", ctx.gpu.arch),
                 )
             );
@@ -6577,6 +6658,29 @@ fn load_qwen4_rank_scoped(
                 ),
             );
         }
+    } else if embed_host {
+        // A fully resident EP split pins only the embedding table, one copy per
+        // rank that has not pinned yet: the same host RAM/GTT checks the
+        // spilled placement above makes.
+        let rank_host_bytes =
+            residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
+                .map_err(|error| format!("qwen4: {error}"))?;
+        let host_check_bytes = qwen4_ep_host_check_bytes(
+            &rank_host_bytes,
+            ep.map_or(0, |placement| placement.rank),
+            ep_reserve_mirror_bytes,
+        );
+        residency::check_host_ram(
+            host_check_bytes,
+            preallocation_mem_available,
+            preallocation_ttm_pool,
+        )
+        .map_err(|error| format!("qwen4: {error}"))?;
+        residency::check_gtt_cap(host_check_bytes, preallocation_gtt)
+            .map_err(|error| format!("qwen4: {error}"))?;
+        ctx.gpu
+            .emu_check_host_allocation(host_check_bytes, true)
+            .map_err(|error| format!("qwen4: {error}"))?;
     }
     if placement.is_none() && moe_layers > 0 {
         hipfire_config::load_summary::note(
@@ -7776,12 +7880,14 @@ fn load_qwen4_rank_scoped(
     // started) covers the part already resident; no residency census runs
     // against the still-reading fill.
     // An uncapped `auto` prewarm is for a discrete GPU whose routed experts
-    // actually sit in host RAM (host-mapped bytes, a hot set's host tier, or
-    // an armed CPU splice/tier split); unified memory and a fully resident
-    // discrete card keep the cap.
+    // actually sit in host RAM (host-mapped bytes beyond the embedding table,
+    // a hot set's host tier, or an armed CPU splice/tier split); unified
+    // memory and a fully resident discrete card keep the cap, whatever
+    // pinned copy of the embedding table an expert-parallel rank holds.
     let mut ple_prewarm = ple_prewarm_budget(
         use_ranges,
-        host_expert_bytes > 0 || bundle.has_cpu_deferred_experts(),
+        host_expert_bytes.saturating_sub(embed_pinned_bytes) > 0
+            || bundle.has_cpu_deferred_experts(),
     );
     let mut ple_hot_prewarm = ple_hot_prewarm_budget();
     let ple_resident = if let Some(worker) = &ple_table_worker {
@@ -14253,6 +14359,111 @@ mod ep_lane_reservation_tests {
             })
             .unwrap();
         assert!(lane.bytes.unwrap_err().contains("not VMM"));
+    }
+}
+
+#[cfg(test)]
+mod qwen4_ep_embed_host_tests {
+    use super::{qwen4_ep_embed_host, qwen4_place_ep_embed_host};
+    use hipfire_arch_qwen4::expert_residency as residency;
+    use hipfire_arch_qwen4::weights::QWEN4_EMBED;
+    use hipfire_runtime::weight_manifest::{PinTarget, ShardPolicy, WeightEntry, WeightResidency};
+    use rdna_compute::DType;
+
+    /// The Flash-Next Q8_0 embedding table, its tied MTP alias and one routed
+    /// expert stack: what the placement may or may not move.
+    fn manifest() -> Vec<WeightEntry> {
+        vec![
+            WeightEntry::model(
+                QWEN4_EMBED,
+                vec![248_320, 2_560],
+                DType::Q8_0,
+                ShardPolicy::Pin(PinTarget::Embed),
+            ),
+            WeightEntry::model(
+                "mtp.embed_tokens.weight",
+                vec![248_320, 2_560],
+                DType::Q8_0,
+                ShardPolicy::Tied {
+                    source: QWEN4_EMBED.to_string(),
+                },
+            ),
+            WeightEntry::layer(
+                "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                0,
+                vec![512, 1_024, 2_560],
+                DType::Raw,
+                ShardPolicy::Replicate,
+            ),
+        ]
+    }
+
+    #[test]
+    fn qwen4_ep_embed_host_predicate_is_ep_gfx1201_and_exact_zero_kill_switch() {
+        for ranks in [2usize, 3, 4, 8] {
+            assert!(qwen4_ep_embed_host(ranks, "gfx1201", None), "ranks={ranks}");
+            assert!(qwen4_ep_embed_host(ranks, "gfx1201", Some("1")));
+            assert!(qwen4_ep_embed_host(ranks, "gfx1201", Some("")));
+            assert!(!qwen4_ep_embed_host(ranks, "gfx1201", Some("0")));
+        }
+        // A single device keeps the table on the card; so does every other arch.
+        assert!(!qwen4_ep_embed_host(1, "gfx1201", None));
+        assert!(!qwen4_ep_embed_host(0, "gfx1201", None));
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", ""] {
+            assert!(!qwen4_ep_embed_host(2, arch, None), "{arch}");
+        }
+    }
+
+    #[test]
+    fn qwen4_ep_embed_host_moves_only_the_embed_entry() {
+        let mut weights = manifest();
+        assert!(qwen4_place_ep_embed_host(&mut weights, 2, "gfx1201", None));
+        assert_eq!(weights[0].residency, WeightResidency::HostMapped);
+        assert_eq!(weights[1], manifest()[1], "the tied MTP alias is untouched");
+        assert_eq!(weights[2], manifest()[2], "routed experts are untouched");
+        // Placed once: a second application finds nothing to move.
+        assert!(!qwen4_place_ep_embed_host(&mut weights, 2, "gfx1201", None));
+    }
+
+    #[test]
+    fn qwen4_ep_embed_host_kill_switch_and_single_device_leave_the_manifest_unchanged() {
+        for (ranks, arch, env) in [
+            (2usize, "gfx1201", Some("0")),
+            (1, "gfx1201", None),
+            (2, "gfx1100", None),
+        ] {
+            let mut weights = manifest();
+            assert!(!qwen4_place_ep_embed_host(&mut weights, ranks, arch, env));
+            assert_eq!(weights, manifest(), "{ranks} {arch} {env:?}");
+        }
+    }
+
+    #[test]
+    fn qwen4_ep_embed_host_census_drops_the_table_from_the_device_and_adds_it_to_the_host() {
+        const EMBED: u64 = 675_430_400;
+        let bytes_of = |entry: &WeightEntry| {
+            Some(if entry.name == QWEN4_EMBED {
+                EMBED
+            } else {
+                1 << 20
+            })
+        };
+        let mut weights = manifest();
+        let (resident, _) = residency::resident_split_ranks(&weights, bytes_of, 2).unwrap();
+        assert_eq!(
+            residency::host_mapped_bytes_ranks(&weights, bytes_of, 2),
+            Ok(vec![0, 0])
+        );
+        assert!(qwen4_place_ep_embed_host(&mut weights, 2, "gfx1201", None));
+        let (host, _) = residency::resident_split_ranks(&weights, bytes_of, 2).unwrap();
+        assert_eq!(host, resident - EMBED);
+        // Every rank pins its own copy of the table plus one pad.
+        let pinned = EMBED + residency::HOST_MAPPED_PAD_BYTES;
+        assert_eq!(
+            residency::host_mapped_bytes_ranks(&weights, bytes_of, 2),
+            Ok(vec![pinned; 2])
+        );
+        assert_eq!(residency::host_mapped_bytes(&weights, bytes_of), Ok(pinned));
     }
 }
 

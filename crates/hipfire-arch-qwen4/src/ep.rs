@@ -1915,7 +1915,10 @@ pub fn ep_default_copy_config(gpu_arch: &str) -> Option<crate::lane::LaneCopyCon
 /// Device bytes one rank's lane store commits, for `lanes` lanes at
 /// `row_budget` rows (`spec_k` = native-MTP lanes; EP stages AR lanes only).
 /// `max_seq`, `chunk_rows` and `granularity` are the context commit the QSA
-/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). The single
+/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). An AR
+/// store's lane states hold no snapshot mirror
+/// ([`Qwen4LaneStore::state_mirror`]): the figure excludes it, exactly as
+/// `stage_lanes` allocates. The single
 /// source of the byte count: the loader's EP load reservation and
 /// `stage_rank_lanes` (and the single-device staging check) all call it, so
 /// planned and staged bytes cannot differ. `None` on overflow.
@@ -1949,12 +1952,13 @@ pub fn ep_lane_store_device_bytes(
 }
 
 /// [`ep_lane_store_device_bytes`] of a mixed store: with `spec_lanes =
-/// Some(n)` (and `spec_k`) only the first `n` lanes carry MTP state (target
-/// ring, head); the other `lanes - n` are AR-only lanes. Each AR-only lane
-/// saves the per-lane difference between the MTP and the AR store, measured
-/// from the one census as the byte cost of one more lane in each. `None` on
-/// overflow, or when the MTP store is not larger than the AR store (a census
-/// inconsistency refuses rather than under-reserves).
+/// Some(n)` (and `spec_k`) only the first `n` slots carry MTP state (a
+/// snapshot-mirrored target state, capture ring, head, pending hidden); the
+/// other `lanes - n` slots are AR-only lanes holding a mirror-less target state
+/// alone ([`Qwen4LaneStore::state_mirror`] keyed per SLOT, as `new_payload`
+/// allocates). The store-level buffers stay those of the MTP store of `lanes`
+/// lanes. One census ([`Qwen4LaneStore::device_bytes_mixed`]), so planned bytes
+/// are the allocated bytes. `None` on overflow.
 #[allow(clippy::too_many_arguments)]
 pub fn ep_lane_store_device_bytes_mixed(
     config: &crate::Qwen4Config,
@@ -1969,33 +1973,45 @@ pub fn ep_lane_store_device_bytes_mixed(
     copy: Option<&crate::lane::LaneCopyConfig>,
     spec_lanes: Option<usize>,
 ) -> Option<u64> {
-    let full = |n: usize, k: Option<usize>, c: Option<&crate::lane::LaneCopyConfig>| {
-        ep_lane_store_device_bytes(
+    let (Some(k), Some(n)) = (spec_k, spec_lanes) else {
+        return ep_lane_store_device_bytes(
             config,
             format,
             backend,
             max_seq,
             chunk_rows,
             granularity,
-            n,
+            lanes,
             row_budget,
-            k,
-            c,
-        )
+            spec_k,
+            copy,
+        );
     };
-    let total = full(lanes, spec_k, copy)?;
-    let (Some(k), Some(n)) = (spec_k, spec_lanes) else {
-        return Some(total);
-    };
-    if n >= lanes || lanes < 2 {
-        return Some(total);
+    if n >= lanes {
+        return ep_lane_store_device_bytes(
+            config,
+            format,
+            backend,
+            max_seq,
+            chunk_rows,
+            granularity,
+            lanes,
+            row_budget,
+            spec_k,
+            copy,
+        );
     }
-    let spec_lane = total.checked_sub(full(lanes - 1, Some(k), copy)?)?;
-    let ar_lane = full(lanes, None, None)?.checked_sub(full(lanes - 1, None, None)?)?;
-    let saved = spec_lane
-        .checked_sub(ar_lane)?
-        .checked_mul((lanes - n) as u64)?;
-    total.checked_sub(saved)
+    let context =
+        crate::kv_backend::Qwen4ContextCommit::new(backend, max_seq, chunk_rows, granularity);
+    Qwen4LaneStore::device_bytes_mixed(
+        config,
+        format,
+        &context,
+        lanes,
+        n,
+        k,
+        copy.map(|copy| (crate::gpu_forward_lanes::LANE_MAX_ROWS, copy)),
+    )
 }
 
 /// A lane-entry error as the plain text every rank compares.
@@ -2863,6 +2879,180 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A mixed store's planned bytes are its allocated bytes: only the first
+    /// `spec_lanes` slots hold the snapshot mirror, capture ring, head and
+    /// pending hidden (`new_payload`), each AR-only slot a mirror-less target
+    /// state alone, and the store-level step buffers stay the MTP store's.
+    #[test]
+    fn ep_mixed_store_bytes_key_the_mirror_per_slot() {
+        use crate::lane::census::{
+            ar_lane_census, lane_spec_census, CensusComponent, CensusInputs, LaneSpecBudget,
+        };
+        use crate::weights::Qwen4BandScope;
+        use crate::{Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let (max_seq, chunk, granularity) = (16384usize, 256usize, 2usize << 20);
+        let context = crate::kv_backend::Qwen4ContextCommit::new(
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        let format = Qwen4StateFormat {
+            qsa: crate::QsaKvFormat::Fp8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        // The production census inputs (`device_bytes`): the prompt-fill append
+        // scratch is charged when the store allocates it.
+        let append_scratch = (crate::mtp_spec::mtp_fill_scratch_requested()
+            && crate::mtp_gpu::MtpAppendScratch::allocation_sizes(
+                &config,
+                crate::mtp_gpu::MTP_FILL_ROWS,
+                crate::mtp_gpu::MTP_FILL_ROWS,
+            )
+            .is_some())
+        .then_some((crate::mtp_gpu::MTP_FILL_ROWS, crate::mtp_gpu::MTP_FILL_ROWS));
+        let inputs = CensusInputs {
+            config: &config,
+            format,
+            scope: &single,
+            rank: 0,
+            append_scratch,
+        };
+        let k = 2usize;
+        let lanes = 8usize;
+        let bytes = |lanes: usize, n: Option<usize>| {
+            ep_lane_store_device_bytes_mixed(
+                &config,
+                format,
+                Qwen4KvBackend::Vmm,
+                max_seq,
+                chunk,
+                granularity,
+                lanes,
+                lanes,
+                Some(k),
+                None,
+                n,
+            )
+            .unwrap()
+        };
+        let mtp = lane_spec_census(
+            &LaneSpecBudget::new(lanes, k, 0, 0, context, 1).unwrap(),
+            &inputs,
+        )
+        .unwrap();
+        let line = |component| mtp.bytes_of(component).unwrap();
+        // Per MTP slot: mirrored state + ring + head + pending (no owed rows).
+        let per_slot = |component| line(component) / lanes as u64;
+        let ar = ar_lane_census(1, &context, &inputs).unwrap();
+        let ar_state = ar.bytes_of(CensusComponent::TargetState).unwrap();
+        let mirrored_state = per_slot(CensusComponent::TargetState);
+        assert!(mirrored_state > ar_state, "the MTP slot keeps the mirror");
+        let mtp_only = per_slot(CensusComponent::CaptureRing)
+            + per_slot(CensusComponent::HeadState)
+            + per_slot(CensusComponent::PendingHidden);
+        // All slots MTP, or `spec_lanes` covering the store: the MTP store.
+        let full = bytes(lanes, None);
+        assert_eq!(full, mtp.total().unwrap());
+        assert_eq!(bytes(lanes, Some(lanes)), full);
+        for n in 0..lanes {
+            let ar_slots = (lanes - n) as u64;
+            assert_eq!(
+                bytes(lanes, Some(n)),
+                full - ar_slots * (mirrored_state - ar_state + mtp_only),
+                "spec_lanes={n}"
+            );
+        }
+        // Monotone: every extra AR-only slot saves bytes.
+        let sizes: Vec<u64> = (0..=lanes).map(|n| bytes(lanes, Some(n))).collect();
+        assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// The AR lane store a rank stages carries no snapshot mirror: the one
+    /// byte source the loader reserves and `stage_rank_lanes` checks shrinks
+    /// by exactly the mirror bytes of every lane, and an MTP store (never
+    /// staged by EP, but sized by the same call) keeps them.
+    #[test]
+    fn ep_lane_store_bytes_exclude_the_snapshot_mirror_of_ar_lanes() {
+        use crate::state::{Qwen4State, StateMirror};
+        use crate::weights::Qwen4BandScope;
+        use crate::{Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let (max_seq, chunk, granularity) = (16384usize, 256usize, 2usize << 20);
+        let context = crate::kv_backend::Qwen4ContextCommit::new(
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        assert_eq!(Qwen4LaneStore::state_mirror(None), StateMirror::Absent);
+        for gdn in [
+            crate::GdnStateFormat::F32,
+            crate::GdnStateFormat::Q8,
+            crate::GdnStateFormat::Q8Ef,
+        ] {
+            let format = Qwen4StateFormat {
+                qsa: crate::QsaKvFormat::Fp8,
+                gdn,
+                qsa_f16_arena: false,
+                qsa_pooled_bf16: false,
+            };
+            let with = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &context,
+                &single,
+                StateMirror::Snapshot,
+            )
+            .unwrap() as u64;
+            let without = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &context,
+                &single,
+                StateMirror::Absent,
+            )
+            .unwrap() as u64;
+            let mirror = with - without;
+            assert!(mirror > 0, "{gdn:?}");
+            let mut previous = 0u64;
+            for lanes in [1usize, 2, 4, 8] {
+                let budget = ep_lane_row_budget(4096, lanes);
+                let planned = ep_lane_store_device_bytes(
+                    &config,
+                    format,
+                    Qwen4KvBackend::Vmm,
+                    max_seq,
+                    chunk,
+                    granularity,
+                    lanes,
+                    budget,
+                    None,
+                    None,
+                )
+                .unwrap();
+                // Every lane charges its live state alone; the step buffers
+                // are the store's only other bytes.
+                let rows = 2 * lanes as u64;
+                let step = rows * (config.vocab_size as u64 * 4 + 4);
+                assert_eq!(planned, lanes as u64 * without + step, "{gdn:?} {lanes}");
+                // Lane by lane the saving over a snapshot-capable state.
+                assert_eq!(
+                    lanes as u64 * with + step - planned,
+                    lanes as u64 * mirror,
+                    "{gdn:?} {lanes}"
+                );
+                assert!(planned > previous);
+                previous = planned;
+            }
+        }
     }
 }
 

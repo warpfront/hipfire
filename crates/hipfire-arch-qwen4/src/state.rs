@@ -1024,11 +1024,35 @@ pub struct Qwen4StateSnapshot {
     dimensions: SnapshotDimensions,
 }
 
+/// Whether a [`Qwen4State`] owns the snapshot arena's device mirror of the
+/// state a forward overwrites in place (GDN recurrent and conv, the QSA fixed
+/// arenas, the PLE convolution history and the hyper feedback): the copy
+/// [`Qwen4State::snapshot`] captures into and [`Qwen4State::restore`] copies
+/// back from. One choice per state, made at construction; the byte
+/// accounting ([`Qwen4State::device_bytes_with_mirror`],
+/// [`Qwen4State::device_allocation_sizes_with_mirror`]) takes the same value,
+/// so planned bytes follow what is allocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateMirror {
+    /// The mirror exists: the state can be snapshotted, restored and rolled
+    /// back (prompt windows, verify windows, turn transactions). The resident
+    /// request state, every MTP lane state and the MTP head's own state.
+    Snapshot,
+    /// No mirror: the state is only stepped and reset (an AR lane, whose
+    /// window is one committed row). Every mirror byte is absent from its
+    /// accounting, and [`Qwen4State::snapshot`] refuses with
+    /// [`StateError::MirrorAbsent`] instead of allocating one.
+    Absent,
+}
+
 /// Reusable model-owned GPU snapshot storage.  The append-only QSA full K/V
 /// arenas are deliberately absent: a ticket records their active marks and
 /// restore only rewinds those marks.  Only state that a forward may overwrite
 /// in place is copied into this bounded arena.
 pub(crate) struct Qwen4StateSnapshotArena {
+    /// [`StateMirror::Absent`]: every tensor below is empty and no ticket can
+    /// ever be active.
+    mirror: StateMirror,
     recurrent: Vec<GpuTensor>,
     conv: Vec<GpuTensor>,
     qsa_partial_keys: Vec<GpuTensor>,
@@ -1148,6 +1172,7 @@ impl Qwen4StateSnapshotArena {
             return Err(StateError::AllocationBookkeeping);
         }
         Ok(Self {
+            mirror: StateMirror::Snapshot,
             recurrent,
             conv,
             qsa_partial_keys,
@@ -1165,6 +1190,39 @@ impl Qwen4StateSnapshotArena {
             retained: false,
             generation: 0,
         })
+    }
+
+    /// The arena of a [`StateMirror::Absent`] state: nothing is allocated and
+    /// no ticket can ever be issued against it.
+    fn absent(model_id: u64, ple_history: PleHistory) -> Self {
+        Self {
+            mirror: StateMirror::Absent,
+            recurrent: Vec::new(),
+            conv: Vec::new(),
+            qsa_partial_keys: Vec::new(),
+            qsa_partial_values: Vec::new(),
+            qsa_raw_circular: Vec::new(),
+            qsa_selected: Vec::new(),
+            ple_conv: None,
+            hyper_feedback: None,
+            qsa_marks: Vec::new(),
+            ple_history,
+            position: 0,
+            gdn_live: None,
+            model_id,
+            active: false,
+            retained: false,
+            generation: 0,
+        }
+    }
+
+    /// The typed refusal of every snapshot, restore and rollback on a state
+    /// without a mirror.
+    fn require_mirror(&self) -> Result<(), StateError> {
+        match self.mirror {
+            StateMirror::Snapshot => Ok(()),
+            StateMirror::Absent => Err(StateError::MirrorAbsent),
+        }
     }
 
     fn dimensions(state: &Qwen4State) -> SnapshotDimensions {
@@ -1283,6 +1341,7 @@ impl Qwen4StateSnapshotArena {
         state: &Qwen4State,
         ticket: &Qwen4StateSnapshot,
     ) -> Result<(), StateError> {
+        self.require_mirror()?;
         if !self.active {
             return Err(StateError::SnapshotInactive);
         }
@@ -1305,9 +1364,20 @@ impl Qwen4StateSnapshotArena {
     }
 
     fn invalidate(&mut self) {
+        if self.mirror == StateMirror::Absent {
+            return;
+        }
         self.active = false;
         self.retained = false;
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Hand this arena to the state `model_id` now owns it for: tickets of the
+    /// previous owner stop validating and the next snapshot is the new
+    /// owner's.
+    fn rebind(&mut self, model_id: u64) {
+        self.invalidate();
+        self.model_id = model_id;
     }
 
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
@@ -2165,7 +2235,9 @@ impl Qwen4State {
     /// for the band's layers only (compact local vectors, absolute layer ids
     /// in [`Self::scope_map`]); the PLE convolution history and
     /// `hyper_feedback` only on the input scope. Under the single scope the
-    /// allocations, their order and their bytes are the historical ones.
+    /// allocations, their order and their bytes are the historical ones. A
+    /// snapshot-capable state ([`StateMirror::Snapshot`]): the resident
+    /// request state and every state that rolls a window back.
     pub(crate) fn new_with_backend_scoped(
         gpu: &mut Gpu,
         config: &Qwen4Config,
@@ -2173,6 +2245,31 @@ impl Qwen4State {
         format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
         scope: &Qwen4BandScope,
+    ) -> Result<Self, StateError> {
+        Self::new_with_mirror(
+            gpu,
+            config,
+            max_seq_len,
+            format,
+            backend,
+            scope,
+            StateMirror::Snapshot,
+        )
+    }
+
+    /// [`Self::new_with_backend_scoped`] with an explicit snapshot `mirror`.
+    /// [`StateMirror::Absent`] allocates the live state alone: no mirror of
+    /// the in-place parts is made, now or lazily, and a snapshot of the
+    /// state is the typed [`StateError::MirrorAbsent`]. For states that are
+    /// only stepped and reset (AR lanes).
+    pub(crate) fn new_with_mirror(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_seq_len: usize,
+        format: Qwen4StateFormat,
+        backend: Qwen4KvBackend,
+        scope: &Qwen4BandScope,
+        mirror: StateMirror,
     ) -> Result<Self, StateError> {
         config.validate().map_err(StateError::Config)?;
         let map = Qwen4StateMap::new(config, scope).map_err(StateError::Config)?;
@@ -2347,16 +2444,19 @@ impl Qwen4State {
                     gdn_q8ef_residual_zero(gpu, residual).map_err(StateError::Hip)?;
                 }
             }
-            Qwen4StateSnapshotArena::new(
-                gpu,
-                &gdn,
-                &qsa,
-                ple_conv.as_ref(),
-                hyper_feedback.as_ref(),
-                model_id,
-                ple_history,
-                0,
-            )
+            match mirror {
+                StateMirror::Snapshot => Qwen4StateSnapshotArena::new(
+                    gpu,
+                    &gdn,
+                    &qsa,
+                    ple_conv.as_ref(),
+                    hyper_feedback.as_ref(),
+                    model_id,
+                    ple_history,
+                    0,
+                ),
+                StateMirror::Absent => Ok(Qwen4StateSnapshotArena::absent(model_id, ple_history)),
+            }
         })() {
             Ok(arena) => arena,
             Err(error) => {
@@ -2433,7 +2533,8 @@ impl Qwen4State {
         })
     }
 
-    /// Device bytes one request state commits: every allocation
+    /// Device bytes one snapshot-capable request state commits
+    /// ([`StateMirror::Snapshot`]): every allocation
     /// [`Self::new_with_backend`] makes (GDN recurrent, live-only EF and conv, the QSA
     /// fixed arenas and, as `context` commits them, the context arenas, PLE
     /// conv, hyper feedback) plus the snapshot arena's mirror of the state
@@ -2456,6 +2557,21 @@ impl Qwen4State {
         format: Qwen4StateFormat,
         context: &Qwen4ContextCommit,
         scope: &Qwen4BandScope,
+    ) -> Option<usize> {
+        Self::device_bytes_with_mirror(config, format, context, scope, StateMirror::Snapshot)
+    }
+
+    /// [`Self::device_bytes_scoped`] of a state built with `mirror`
+    /// ([`Self::new_with_mirror`]): under [`StateMirror::Absent`] the GDN
+    /// recurrent and conv mirrors, the QSA fixed-arena and raw-index circular
+    /// mirrors and the PLE/feedback mirrors are all zero; nothing else
+    /// (live state, EF residual, context arenas) changes.
+    pub(crate) fn device_bytes_with_mirror(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+        scope: &Qwen4BandScope,
+        mirror: StateMirror,
     ) -> Option<usize> {
         let f32_bytes = std::mem::size_of::<f32>();
         let recurrent = format
@@ -2511,20 +2627,29 @@ impl Qwen4State {
             .checked_mul(config.hidden_size)?
             .checked_mul(f32_bytes)?;
         let context_arenas = context.committed_layer_bytes(config, format.layout())?;
-        // Live state plus the snapshot arena's mirror of each in-place part.
-        let gdn_layer = recurrent
-            .checked_add(conv)?
-            .checked_mul(2)?
+        // The snapshot arena copies exactly the parts a forward overwrites in
+        // place; an absent mirror holds none of them.
+        let mirrored = |in_place: usize| match mirror {
+            StateMirror::Snapshot => in_place,
+            StateMirror::Absent => 0,
+        };
+        let gdn_in_place = recurrent.checked_add(conv)?;
+        let gdn_layer = gdn_in_place
+            .checked_add(mirrored(gdn_in_place))?
             .checked_add(residual)?;
-        let qsa_fixed = partial_keys
+        let qsa_in_place = partial_keys
             .checked_add(partial_values)?
-            .checked_add(selected)?
-            .checked_mul(2)?;
+            .checked_add(selected)?;
+        // The mirror also holds the raw-index circular block (`compress` rows
+        // of the context arena's live `raw_index_keys`, counted in
+        // `context_arenas`).
         let qsa_layer = context_arenas
-            .checked_add(qsa_fixed)?
-            .checked_add(circular)?;
+            .checked_add(qsa_in_place)?
+            .checked_add(mirrored(qsa_in_place))?
+            .checked_add(mirrored(circular))?;
         let per_request = if scope.input {
-            ple.checked_add(feedback)?.checked_mul(2)?
+            let in_place = ple.checked_add(feedback)?;
+            in_place.checked_add(mirrored(in_place))?
         } else {
             0
         };
@@ -2550,6 +2675,19 @@ impl Qwen4State {
         format: Qwen4StateFormat,
         context: &Qwen4ContextCommit,
     ) -> Option<Vec<u64>> {
+        Self::device_allocation_sizes_with_mirror(config, format, context, StateMirror::Snapshot)
+    }
+
+    /// [`Self::device_allocation_sizes`] of a state built with `mirror`:
+    /// under [`StateMirror::Absent`] no mirror allocation is listed, and the
+    /// entries sum to [`Self::device_bytes_with_mirror`] over the whole-model
+    /// scope.
+    pub(crate) fn device_allocation_sizes_with_mirror(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+        mirror: StateMirror,
+    ) -> Option<Vec<u64>> {
         let ratio = config.indexer_compress_ratio;
         if ratio == 0 || context.max_seq == 0 {
             return None;
@@ -2571,8 +2709,10 @@ impl Qwen4State {
                 spec.elements.checked_mul(spec.dtype.size())?
             };
             push(live)?;
-            if let Some((elements, dtype)) = snapshot_mirror(spec, &geometry, ratio) {
-                push(elements.checked_mul(dtype.size())?)?;
+            if mirror == StateMirror::Snapshot {
+                if let Some((elements, dtype)) = snapshot_mirror(spec, &geometry, ratio) {
+                    push(elements.checked_mul(dtype.size())?)?;
+                }
             }
         }
         Some(sizes)
@@ -2718,6 +2858,23 @@ impl Qwen4State {
     /// A snapshot ticket of this state's arena is outstanding.
     pub(crate) fn snapshot_active(&self) -> bool {
         self.snapshot_arena.active && !self.snapshot_arena.retained
+    }
+
+    /// Exchange the requests two states hold: a promotion moves the resident
+    /// request into its lane and takes the lane's fresh state back. The
+    /// states swap whole, except that a snapshot mirror belongs to the slot
+    /// it was provisioned for, not to the request: when exactly one side has
+    /// none, the arenas are swapped back and rebound, so the resident state
+    /// keeps the mirror it snapshots prompt and verify windows with, and an
+    /// AR lane stays within the bytes its census charged (none for the
+    /// mirror). Two snapshot-capable states swap whole, as before.
+    pub(crate) fn swap_requests(&mut self, other: &mut Self) {
+        std::mem::swap(self, other);
+        if self.snapshot_arena.mirror != other.snapshot_arena.mirror {
+            std::mem::swap(&mut self.snapshot_arena, &mut other.snapshot_arena);
+            self.snapshot_arena.rebind(self.model_id);
+            other.snapshot_arena.rebind(other.model_id);
+        }
     }
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
@@ -3350,7 +3507,10 @@ impl Qwen4State {
 
     /// Capture the fixed-size rollback state into the model-owned arena.
     /// Full-capacity append-only QSA K/V and raw arenas are never copied.
+    /// A state built [`StateMirror::Absent`] has no arena to capture into:
+    /// [`StateError::MirrorAbsent`].
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, StateError> {
+        self.snapshot_arena.require_mirror()?;
         // A retained entry belongs to a window already committed: the next
         // snapshot supersedes it (its tickets stop validating).
         self.release_retained();
@@ -3680,6 +3840,8 @@ impl Qwen4State {
         if rows <= self.row_capture_rows || rows < 2 {
             return Ok(());
         }
+        // A verify ring exists to roll a window back from a snapshot ticket.
+        self.snapshot_arena.require_mirror()?;
         if self.snapshot_arena.active || self.row_capture_armed {
             return Err(StateError::SnapshotBusy);
         }
@@ -4277,6 +4439,10 @@ pub enum StateError {
     SnapshotBusy,
     SnapshotInactive,
     SnapshotTicket,
+    /// The state was built without a snapshot mirror ([`StateMirror::Absent`],
+    /// an AR lane): it can be stepped and reset, never snapshotted, restored
+    /// or armed for a verify rollback.
+    MirrorAbsent,
     /// A QSA context request above the tokens the state can cover.
     ContextCapacity {
         required: usize,
@@ -4315,6 +4481,7 @@ impl fmt::Display for StateError {
             Self::SnapshotTicket => {
                 write!(f, "Qwen4 snapshot ticket does not belong to this state")
             }
+            Self::MirrorAbsent => write!(f, "Qwen4 state has no snapshot mirror"),
             Self::ContextCapacity { required, admitted } => write!(
                 f,
                 "Qwen4 QSA context needs {required} tokens but the state covers {admitted}"
@@ -4827,24 +4994,58 @@ mod tests {
 
     /// The per-allocation inventory sums to the closed-form byte query for
     /// every state format and legacy/VMM context commit (including the F16
-    /// and pooled BF16 arenas and the live-only EF residual).
+    /// and pooled BF16 arenas and the live-only EF residual), under both
+    /// snapshot-mirror choices; the unsuffixed queries are the
+    /// snapshot-capable state.
     #[test]
     fn allocation_sizes_sum_to_device_bytes() {
         let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
         for (name, format) in allocation_formats() {
             for context in allocation_contexts() {
-                let sizes = Qwen4State::device_allocation_sizes(&config, format, &context)
-                    .unwrap_or_else(|| panic!("{name} {context:?} admits"));
-                let total = sizes
-                    .iter()
-                    .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
-                    .expect("inventory sum fits");
+                for mirror in [StateMirror::Snapshot, StateMirror::Absent] {
+                    let sizes = Qwen4State::device_allocation_sizes_with_mirror(
+                        &config, format, &context, mirror,
+                    )
+                    .unwrap_or_else(|| panic!("{name} {context:?} {mirror:?} admits"));
+                    let total = sizes
+                        .iter()
+                        .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
+                        .expect("inventory sum fits");
+                    assert_eq!(
+                        Some(total),
+                        Qwen4State::device_bytes_with_mirror(
+                            &config, format, &context, &single, mirror
+                        )
+                        .map(|bytes| bytes as u64),
+                        "{name} {context:?} {mirror:?}"
+                    );
+                    assert!(
+                        sizes.iter().all(|&bytes| bytes > 0),
+                        "{name} {context:?} {mirror:?}"
+                    );
+                }
                 assert_eq!(
-                    Some(total),
-                    Qwen4State::device_bytes(&config, format, &context).map(|bytes| bytes as u64),
+                    Qwen4State::device_allocation_sizes(&config, format, &context),
+                    Qwen4State::device_allocation_sizes_with_mirror(
+                        &config,
+                        format,
+                        &context,
+                        StateMirror::Snapshot
+                    ),
                     "{name} {context:?}"
                 );
-                assert!(sizes.iter().all(|&bytes| bytes > 0), "{name} {context:?}");
+                assert_eq!(
+                    Qwen4State::device_bytes(&config, format, &context),
+                    Qwen4State::device_bytes_with_mirror(
+                        &config,
+                        format,
+                        &context,
+                        &single,
+                        StateMirror::Snapshot
+                    ),
+                    "{name} {context:?}"
+                );
             }
         }
     }
@@ -4866,9 +5067,11 @@ mod tests {
                 let geometry = StateGeometry::new(&config, &format, max_seq).unwrap();
                 let plan = state_tensor_plan(&config, &format, max_seq, &geometry, &map).unwrap();
                 let mut expected = Vec::new();
+                let mut live_only = Vec::new();
                 for spec in &plan {
                     let bytes = (spec.elements * spec.dtype.size()) as u64;
                     expected.push(bytes);
+                    live_only.push(bytes);
                     match spec.key.rsplit('.').next().unwrap() {
                         "recurrent" | "conv" | "partial_keys" | "partial_values"
                         | "selected_indices" | "ple_conv" | "hyper_feedback" => {
@@ -4882,14 +5085,23 @@ mod tests {
                 }
                 expected.retain(|&bytes| bytes > 0);
                 expected.sort_unstable();
-                let mut sizes = Qwen4State::device_allocation_sizes(
-                    &config,
-                    format,
-                    &Qwen4ContextCommit::legacy(max_seq),
-                )
-                .unwrap();
+                live_only.retain(|&bytes| bytes > 0);
+                live_only.sort_unstable();
+                let context = Qwen4ContextCommit::legacy(max_seq);
+                let mut sizes =
+                    Qwen4State::device_allocation_sizes(&config, format, &context).unwrap();
                 sizes.sort_unstable();
                 assert_eq!(sizes, expected, "{name} {max_seq}");
+                // Without the mirror: each planned tensor once, nothing else.
+                let mut absent = Qwen4State::device_allocation_sizes_with_mirror(
+                    &config,
+                    format,
+                    &context,
+                    StateMirror::Absent,
+                )
+                .unwrap();
+                absent.sort_unstable();
+                assert_eq!(absent, live_only, "{name} {max_seq} absent");
             }
         }
     }
@@ -5485,6 +5697,120 @@ mod tests {
         );
     }
 
+    /// An AR lane's state has no snapshot mirror: the hand computation of
+    /// [`device_bytes_matches_the_constructors_allocations`] without the
+    /// mirror terms (GDN recurrent + conv, QSA partial K/V + selection + the
+    /// raw-index circular block, PLE conv + feedback), exactly. Flash-Next
+    /// geometry, F32 state, 36 GDN + 12 QSA layers; the mirror is context
+    /// independent, so it is the per-lane saving at every `max_seq`.
+    #[test]
+    fn device_bytes_without_the_mirror_is_the_live_state_alone() {
+        let config = crate::config::compact_test_config();
+        let context = Qwen4ContextCommit::legacy(1024);
+        let single = Qwen4BandScope::single(&config);
+        let gdn = 48 * 128 * 128 * 4 + 10_240 * 3 * 4;
+        let arena = 1024 * (2 * 2048 + 512) + 256 * 512;
+        let fixed = 4 * 128 * 4 + 4 * 512 * 4 + (2048 + 3) * 4;
+        let circular = 4 * 128 * 4;
+        let ple = 9 * 2560 * 4 * 4;
+        let feedback = 4 * 2560 * 4;
+        let live = 36 * gdn + 12 * (arena + fixed) + ple + feedback;
+        let mirror = 36 * gdn + 12 * (fixed + circular) + ple + feedback;
+        assert_eq!((live, mirror), (176_496_784, 118_325_392));
+        assert_eq!(8 * mirror, 946_603_136);
+        let bytes = |mirror| {
+            Qwen4State::device_bytes_with_mirror(
+                &config,
+                Qwen4StateFormat::F32,
+                &context,
+                &single,
+                mirror,
+            )
+        };
+        assert_eq!(bytes(StateMirror::Absent), Some(live));
+        assert_eq!(bytes(StateMirror::Snapshot), Some(live + mirror));
+        assert_eq!(
+            Qwen4State::device_bytes(&config, Qwen4StateFormat::F32, &context),
+            bytes(StateMirror::Snapshot)
+        );
+        // The mirror does not depend on the committed context.
+        for context in allocation_contexts() {
+            let with = |mirror| {
+                Qwen4State::device_bytes_with_mirror(
+                    &config,
+                    Qwen4StateFormat::F32,
+                    &context,
+                    &single,
+                    mirror,
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                with(StateMirror::Snapshot) - with(StateMirror::Absent),
+                118_325_392,
+                "{context:?}"
+            );
+        }
+    }
+
+    /// Bands charge their own layers' mirrors and nothing twice: the band
+    /// mirror bytes sum to the whole-model mirror, only the input band holds
+    /// the PLE/feedback mirror, and the live EF residual is the same under
+    /// both choices.
+    #[test]
+    fn band_mirror_bytes_sum_to_the_single_mirror() {
+        let config = crate::config::compact_test_config();
+        let context = Qwen4ContextCommit::legacy(1024);
+        let single = Qwen4BandScope::single(&config);
+        let format = |gdn| Qwen4StateFormat {
+            qsa: QsaKvFormat::Fp8,
+            gdn,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        let bytes = |gdn, scope: &Qwen4BandScope, mirror| {
+            Qwen4State::device_bytes_with_mirror(&config, format(gdn), &context, scope, mirror)
+                .unwrap()
+        };
+        for gdn in [
+            GdnStateFormat::F32,
+            GdnStateFormat::Q8,
+            GdnStateFormat::Q8Ef,
+        ] {
+            let mirror_of = |scope: &Qwen4BandScope| {
+                bytes(gdn, scope, StateMirror::Snapshot) - bytes(gdn, scope, StateMirror::Absent)
+            };
+            let whole = mirror_of(&single);
+            assert!(whole > 0, "{gdn:?}");
+            for counts in PP_LAYOUTS {
+                let scopes = pp_scopes(counts);
+                assert_eq!(
+                    scopes.iter().map(mirror_of).sum::<usize>(),
+                    whole,
+                    "{gdn:?} {counts:?}"
+                );
+                // The input band's surplus over a same-shaped tail band is
+                // the PLE conv + feedback mirror alone.
+                let per_request = 9 * 2560 * 4 * 4 + 4 * 2560 * 4;
+                let (head, tail) = (&scopes[0], scopes.last().unwrap());
+                let (head_gdn, head_qsa) = scope_layer_counts(&config, head);
+                let (tail_gdn, tail_qsa) = scope_layer_counts(&config, tail);
+                if (head_gdn, head_qsa) == (tail_gdn, tail_qsa) {
+                    assert_eq!(mirror_of(head) - mirror_of(tail), per_request);
+                }
+            }
+        }
+        // The Q8Ef residual is live-only: 54 MiB over Q8 under either choice.
+        for mirror in [StateMirror::Snapshot, StateMirror::Absent] {
+            assert_eq!(
+                bytes(GdnStateFormat::Q8Ef, &single, mirror)
+                    - bytes(GdnStateFormat::Q8, &single, mirror),
+                54 * 1024 * 1024,
+                "{mirror:?}"
+            );
+        }
+    }
+
     #[test]
     fn device_bytes_without_ple_budgets_no_conv_history() {
         use crate::config::{synthetic_test_config, Qwen4FfnConfig};
@@ -5509,6 +5835,197 @@ mod tests {
         let ple = with.ple_conv_history_rows() * with.hidden_size * with.hc_count * 4;
         assert!(ple > 0 && without.ple_conv_history_rows() == 0);
         assert_eq!(bytes(&with) - bytes(&without), 2 * ple);
+    }
+
+    /// The host-side bookkeeping of a state with no device memory (no GDN,
+    /// QSA, PLE or feedback tensor): what the snapshot-mirror ownership rules
+    /// act on, built without a device. A `Snapshot` arena here stands for a
+    /// mirror whose tensor lists are empty.
+    fn host_only_state(mirror: StateMirror, model_id: u64, position: usize) -> Qwen4State {
+        let config = crate::config::compact_test_config();
+        let ple_history = PleHistory::new(config.eos_token_id);
+        let mut arena = Qwen4StateSnapshotArena::absent(model_id, ple_history);
+        arena.mirror = mirror;
+        Qwen4State {
+            gdn: Vec::new(),
+            qsa: Vec::new(),
+            ple_conv: None,
+            hyper_feedback: None,
+            ple_history,
+            position,
+            max_seq_len: 8,
+            qsa_selected_capacity: 0,
+            snapshot_arena: arena,
+            row_capture: Vec::new(),
+            row_capture_output: None,
+            row_capture_rows: 0,
+            gdn_live: 0,
+            gdn_format: GdnStateFormat::F32,
+            gdn_value_heads: config.linear_num_value_heads,
+            gdn_residual_resets: 0,
+            row_capture_armed: false,
+            #[cfg(feature = "lab")]
+            lab: crate::lab_window::LabStateTap::default(),
+            qsa_backend: Qwen4KvBackend::Legacy,
+            qsa_mapped_tokens: 8,
+            qsa_compress: config.indexer_compress_ratio,
+            model_id,
+            reset_epoch: 0,
+            map: Qwen4StateMap::new(&config, &Qwen4BandScope::single(&config)).unwrap(),
+            transaction_generation: 0,
+        }
+    }
+
+    /// A ticket shaped as `state`'s own snapshot would be.
+    fn host_ticket(state: &Qwen4State) -> Qwen4StateSnapshot {
+        Qwen4StateSnapshot {
+            model_id: state.model_id,
+            reset_epoch: state.reset_epoch,
+            transaction_generation: state.transaction_generation,
+            arena_generation: state.snapshot_arena.generation,
+            dimensions: Qwen4StateSnapshotArena::dimensions(state),
+        }
+    }
+
+    /// A state without a mirror can never hold a ticket: every ticket
+    /// operation is the typed `MirrorAbsent` (not a lazy allocation, not
+    /// "inactive"), it reports no outstanding snapshot, and invalidation is a
+    /// no-op. A snapshot-capable state with no ticket answers differently.
+    #[test]
+    fn an_absent_mirror_has_no_tickets_and_ignores_invalidation() {
+        let mut state = host_only_state(StateMirror::Absent, 7, 3);
+        assert!(matches!(
+            state.snapshot_arena.require_mirror(),
+            Err(StateError::MirrorAbsent)
+        ));
+        assert!(!state.snapshot_active());
+        let generation = state.snapshot_arena.generation;
+        state.snapshot_arena.invalidate();
+        state.release_retained();
+        assert_eq!(state.snapshot_arena.generation, generation);
+        assert!(!state.snapshot_arena.active && !state.snapshot_arena.retained);
+        assert!(matches!(
+            state.validate_commit(host_ticket(&state)),
+            Err(StateError::MirrorAbsent)
+        ));
+        let capable = host_only_state(StateMirror::Snapshot, 8, 3);
+        assert!(capable.snapshot_arena.require_mirror().is_ok());
+        assert!(matches!(
+            capable.validate_commit(host_ticket(&capable)),
+            Err(StateError::SnapshotInactive)
+        ));
+        assert_eq!(
+            StateError::MirrorAbsent.to_string(),
+            "Qwen4 state has no snapshot mirror"
+        );
+    }
+
+    /// A promotion moves the resident request into its lane: the request
+    /// (position, model id) changes slot while each slot keeps its mirror
+    /// kind, so the resident state still snapshots and an AR lane stays
+    /// mirrorless. The mirror that changes hands is rebound to the state it
+    /// now sits in and its previous owner's tickets stop validating; two
+    /// snapshot-capable states swap whole.
+    #[test]
+    fn swap_requests_keeps_each_slots_mirror() {
+        let mut resident = host_only_state(StateMirror::Snapshot, 11, 5);
+        let mut lane = host_only_state(StateMirror::Absent, 12, 0);
+        resident.snapshot_arena.generation = 3;
+        resident.snapshot_arena.active = true;
+        resident.snapshot_arena.retained = true;
+        resident.swap_requests(&mut lane);
+        assert_eq!((resident.position, lane.position), (0, 5));
+        assert_eq!((resident.model_id, lane.model_id), (12, 11));
+        assert_eq!(resident.snapshot_arena.mirror, StateMirror::Snapshot);
+        assert_eq!(lane.snapshot_arena.mirror, StateMirror::Absent);
+        assert_eq!(resident.snapshot_arena.model_id, resident.model_id);
+        assert_eq!(lane.snapshot_arena.model_id, lane.model_id);
+        assert!(resident.snapshot_arena.generation > 3);
+        assert!(!resident.snapshot_arena.active && !resident.snapshot_arena.retained);
+        assert!(!lane.snapshot_active());
+        assert!(matches!(
+            lane.snapshot_arena.require_mirror(),
+            Err(StateError::MirrorAbsent)
+        ));
+        assert!(resident.snapshot_arena.require_mirror().is_ok());
+        // The same swap, from the other side.
+        let mut lane = host_only_state(StateMirror::Absent, 21, 9);
+        let mut resident = host_only_state(StateMirror::Snapshot, 22, 0);
+        lane.swap_requests(&mut resident);
+        assert_eq!(lane.snapshot_arena.mirror, StateMirror::Absent);
+        assert_eq!(resident.snapshot_arena.mirror, StateMirror::Snapshot);
+        assert_eq!(resident.snapshot_arena.model_id, resident.model_id);
+        assert_eq!((lane.position, resident.position), (0, 9));
+
+        // Two snapshot-capable states (an MTP lane): the whole state swaps,
+        // arena and generation included.
+        let mut a = host_only_state(StateMirror::Snapshot, 31, 1);
+        let mut b = host_only_state(StateMirror::Snapshot, 32, 2);
+        a.snapshot_arena.generation = 4;
+        b.snapshot_arena.generation = 6;
+        a.swap_requests(&mut b);
+        assert_eq!((a.model_id, b.model_id), (32, 31));
+        assert_eq!(
+            (a.snapshot_arena.model_id, b.snapshot_arena.model_id),
+            (32, 31)
+        );
+        assert_eq!(
+            (a.snapshot_arena.generation, b.snapshot_arena.generation),
+            (6, 4)
+        );
+        // Two mirrorless states likewise.
+        let mut c = host_only_state(StateMirror::Absent, 41, 1);
+        let mut d = host_only_state(StateMirror::Absent, 42, 2);
+        c.swap_requests(&mut d);
+        assert_eq!((c.position, d.position), (2, 1));
+        assert!(
+            c.snapshot_arena.mirror == StateMirror::Absent
+                && d.snapshot_arena.mirror == StateMirror::Absent
+        );
+    }
+
+    /// A real mirrorless state (needs a device; skipped without one):
+    /// allocates no mirror, steps and resets like any state, and refuses
+    /// every snapshot, restore and verify-ring request with the typed error.
+    #[test]
+    fn a_mirrorless_state_refuses_snapshot_restore_and_the_verify_ring() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        let config = crate::config::compact_test_config();
+        let scope = Qwen4BandScope::single(&config);
+        let mut state = Qwen4State::new_with_mirror(
+            &mut gpu,
+            &config,
+            8,
+            Qwen4StateFormat::F32,
+            Qwen4KvBackend::Legacy,
+            &scope,
+            StateMirror::Absent,
+        )
+        .expect("mirrorless state");
+        assert!(state.snapshot_arena.recurrent.is_empty());
+        assert!(state.snapshot_arena.qsa_partial_keys.is_empty());
+        assert!(state.snapshot_arena.ple_conv.is_none());
+        assert!(state.snapshot_arena.hyper_feedback.is_none());
+        assert!(matches!(
+            state.snapshot(&mut gpu),
+            Err(StateError::MirrorAbsent)
+        ));
+        let ticket = host_ticket(&state);
+        assert!(matches!(
+            state.restore(&mut gpu, ticket),
+            Err(StateError::MirrorAbsent)
+        ));
+        assert!(matches!(
+            state.ensure_row_capture(&mut gpu, 4, config.linear_conv_kernel_dim - 1),
+            Err(StateError::MirrorAbsent)
+        ));
+        state.position = 2;
+        state.reset(&mut gpu).expect("reset in place");
+        assert_eq!(state.position, 0);
+        assert!(!state.snapshot_active());
+        state.free_gpu(&mut gpu).expect("free state");
     }
 
     #[test]

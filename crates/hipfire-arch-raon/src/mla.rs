@@ -140,15 +140,17 @@ pub struct MlaPolicy {
     pub absorb: bool,
     /// `HIPFIRE_RAON_MIRROR_Q8` (default 1): allow the Q8 expanded K_nope/V mirror
     /// (INT8 codes with one F16 scale per (row, head, plane); about half the BF16
-    /// bytes per token, so twice the rows fit the mirror budget). Capacity-based:
-    /// `RaonState::fit_mirror_budget` keeps the BF16 mirror when its budget covers
-    /// the whole reserved context (it is 1-2% faster) and picks Q8 otherwise.
+    /// bytes per token, so twice the rows fit the mirror budget). Default rule
+    /// (`state::mirror_is_q8`): Q8, except that a speculative (DFlash2) slot keeps
+    /// BF16 while its budget covers the whole reserved context, because its verify
+    /// rows run the tiled kernel, faster on BF16. Q8 decodes faster at every context
+    /// (R9700: +4% at 4K, +11.5% at 16K/32K) and prefills 2-6% slower above 16K.
     /// Needs the tiled kernels (the reference route reads BF16 mirrors only), so
     /// this is forced off when `tiled` is off. `0` always keeps the BF16 mirror;
-    /// `force` always takes Q8 (measurement control for the 8-bit storage arm).
+    /// `force` always takes Q8, speculative slots included.
     pub mirror_q8: bool,
-    /// `HIPFIRE_RAON_MIRROR_Q8=force`: Q8 even when a BF16 mirror would cover the
-    /// whole reserved context. Implies [`Self::mirror_q8`].
+    /// `HIPFIRE_RAON_MIRROR_Q8=force`: Q8 even for a speculative slot whose BF16
+    /// mirror would cover the reserved context. Implies [`Self::mirror_q8`].
     pub mirror_q8_forced: bool,
 }
 

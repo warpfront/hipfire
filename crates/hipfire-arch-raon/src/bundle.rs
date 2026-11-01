@@ -204,7 +204,11 @@ impl RaonBundle {
                          ({} B/token, {}); contexts beyond it use the absorbed route (HIPFIRE_RAON_MLA_ABSORB)",
                         state.max_seq(),
                         crate::state::mirror_row_bytes(state.dims()),
-                        if state.dims().mirror_q8 { "Q8 (HIPFIRE_RAON_MIRROR_Q8)" } else { "BF16" }
+                        match (state.dims().mirror_q8, state.dims().mirror_bf16_if_covered) {
+                            (true, _) => "Q8 (HIPFIRE_RAON_MIRROR_Q8)",
+                            (false, true) => "BF16: speculative slot, covers the reserved context",
+                            (false, false) => "BF16: Q8 mirror off (HIPFIRE_RAON_MIRROR_Q8=0 or HIPFIRE_RAON_ATTN_TILED=0)",
+                        }
                     ),
                     Err(e) => eprintln!("raon1_mini: mirror budget refit failed ({e}); keeping the admission estimate"),
                 }
