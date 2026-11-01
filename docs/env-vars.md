@@ -3246,12 +3246,16 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TP_PEER_PUSH` | crates/hipfire-runtime/src/multi_gpu.rs, crates/hipfire-runtime/src/multi_gpu/tp_peer_push.rs | developer |
 | `HIPFIRE_TP_PEER_PUSH_FAULT` | crates/hipfire-runtime/src/multi_gpu/tp_peer_push.rs, crates/rdna-compute/src/tp_peer_push.rs | developer |
 | `HIPFIRE_TP_USE_RCCL` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
+| `HIPFIRE_T0_DEVICE` | crates/rdna-compute/examples/tmp_lloyd_i8_twin_t0.rs | harness |
 | `HIPFIRE_T0_ONLY_SMALL` | crates/rdna-compute/examples/tmp_lloyd_gfx11_t0.rs | harness |
 | `HIPFIRE_TQ2G128_XBATCH` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_TQ2G128_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_TQ2G128_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_TQ2_MODEL` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_TRANSFORMERS_CHECKOUT` | crates/hipfire-arch-qwen4/reference_oracle/upstream.py | harness |
+| `HIPFIRE_TWIN_C16ZERO` | crates/rdna-compute/examples/tmp_lloyd_i8_twin_t0.rs | harness |
+| `HIPFIRE_TWIN_DUMP` | crates/rdna-compute/examples/tmp_lloyd_i8_twin_t0.rs | harness |
+| `HIPFIRE_TWIN_N` | crates/rdna-compute/examples/tmp_lloyd_i8_twin_t0.rs | harness |
 | `HIPFIRE_TUI_BIN` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_UNIFORM_GATE_UP` | crates/hipfire-runtime/examples/hfq_splice_attn.rs | harness |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | crates/hipfire-cli/src/serve/complete.rs, crates/hipfire-config/src/lib.rs | stable |
