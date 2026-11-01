@@ -1513,6 +1513,29 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
+        // AWQ twins of the silu+FWHT producer. The single-scale form
+        // (gate, up, awq_scale, signs1, signs2, x_rot, K) is the shared/F1
+        // expert-down producer; the indexed form selects the scale per routed
+        // slot from a device pointer table (gate, up, ptrs, topk, signs1,
+        // signs2, x_rot, K, n_exp). Both run on the AWQ single-row program and
+        // the indexed one also on the multi-slot cohort.
+        "fused_silu_mul_mq_rotate_awq" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
+        "fused_silu_mul_mq_rotate_awq_indexed" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            write(48),
+        ]),
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
         | "gemv_mq4g256v2_xbatch_residual_sigmoid"
@@ -2106,6 +2129,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
+        // 6 pointers + K = 52 explicit bytes, padded to 16 B.
+        "fused_silu_mul_mq_rotate_awq" => Some(64),
+        // 7 pointers + K + n_exp = 64 explicit bytes (already 16 B aligned).
+        "fused_silu_mul_mq_rotate_awq_indexed" => Some(64),
         // 10 pointers + eps + freq_base = 88 explicit bytes, padded to 16 B.
         "qwen35_fa_prep_kvwrite_gfx1100" => Some(96),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
@@ -9904,6 +9931,73 @@ mod tests {
         assert_eq!(
             modes,
             vec![(0, Read), (8, Write), (16, Read), (24, Read), (32, Read)]
+        );
+    }
+
+    #[test]
+    fn awq_silu_launches_keep_typed_replay_contracts() {
+        use RecordedAccessMode::{Read, Write};
+        // The two AWQ expert-down silu+FWHT producers: the single-scale form
+        // (`fused_silu_mul_rotate_mq_awq` / `_batched`) and the per-expert
+        // indexed form the multi-slot cohort and the single-row AWQ program
+        // launch. Neither is in the `_f16`/wavegrid table, so without these
+        // entries a cold kernel pack records them as no-effects launches.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..6 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        assert_eq!(blob.len(), 52);
+        blob.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("fused_silu_mul_mq_rotate_awq"),
+            Some(blob.len())
+        );
+        let modes: Vec<_> = pointer_effects("fused_silu_mul_mq_rotate_awq")
+            .expect("AWQ silu contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, Read),
+                (8, Read),
+                (16, Read),
+                (24, Read),
+                (32, Read),
+                (40, Write)
+            ]
+        );
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..7 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        blob.push_i32(256);
+        assert_eq!(blob.len(), 64);
+        blob.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("fused_silu_mul_mq_rotate_awq_indexed"),
+            Some(blob.len())
+        );
+        let modes: Vec<_> = pointer_effects("fused_silu_mul_mq_rotate_awq_indexed")
+            .expect("AWQ indexed silu contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, Read),
+                (8, Read),
+                (16, Read),
+                (24, Read),
+                (32, Read),
+                (40, Read),
+                (48, Write)
+            ]
         );
     }
 

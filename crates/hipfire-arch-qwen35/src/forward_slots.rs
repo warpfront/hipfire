@@ -1283,6 +1283,206 @@ where
     Ok(())
 }
 
+/// One MoE projection as the multi-slot cohort admission sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CohortProj {
+    pub dtype: DType,
+    pub m: usize,
+    pub k: usize,
+    /// The weight ships a per-input-channel AWQ scale sidecar.
+    pub awq: bool,
+}
+
+/// Per-expert `down_proj` AWQ scale coverage across the layer's routed experts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CohortDownScales {
+    /// No routed expert carries a down scale: the plain silu+rotate producer.
+    None,
+    /// Every routed expert carries one and the device pointer table exists:
+    /// the per-expert AWQ silu+rotate producer.
+    PerExpert,
+    /// Some but not all (or all without the pointer table). Never admitted:
+    /// a missing scale would silently change the layer's math.
+    Partial,
+}
+
+/// Everything [`cohort_admit`] reads. Pure so the admission matrix is
+/// unit-testable without a GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CohortFacts {
+    pub n: usize,
+    pub gfx1100: bool,
+    pub dim: usize,
+    pub mi: usize,
+    pub smi: usize,
+    pub k_top: usize,
+    pub n_exp: usize,
+    pub cpu_deferred: bool,
+    pub expert_tags: bool,
+    pub ep_global_tiers: bool,
+    pub router: CohortProj,
+    pub shared_expert_gate: CohortProj,
+    pub shared_gate: CohortProj,
+    pub shared_up: CohortProj,
+    pub shared_down: CohortProj,
+    /// Every routed expert shares the representative dtype/shape.
+    pub routed_uniform: bool,
+    /// `None` when the layer has no resident expert list (paged experts; the
+    /// `_slots` kernels only ever read `expert_*_ptrs` for that route).
+    pub routed_gate_up: Option<CohortProj>,
+    pub routed_down: Option<CohortProj>,
+    /// Any routed expert's `gate_up` carries an AWQ scale (the x_norm basis).
+    pub routed_gate_up_awq: bool,
+    pub routed_down_scales: CohortDownScales,
+}
+
+/// Resolved cohort route for one layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CohortPlan {
+    /// Route the expert-down silu+rotate through the per-expert AWQ table.
+    pub down_awq: bool,
+}
+
+/// Why the cohort declined a layer. The reasons are fixed strings so a served
+/// model that misses the merged program says exactly what to change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CohortDecline {
+    Rows,
+    Arch,
+    Shape,
+    CpuDeferred,
+    ExpertTags,
+    ExpertParallel,
+    PagedExperts,
+    RoutedMixed,
+    RouterProj,
+    SharedProj,
+    SharedDownScale,
+    RoutedGateUpProj,
+    RoutedDownProj,
+    XnormScale,
+    RoutedDownScale,
+}
+
+impl CohortDecline {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Rows => "live rows outside 2..=4",
+            Self::Arch => "not exact gfx1100",
+            Self::Shape => "not the K=2048 / mi=512 / smi=512 / k8 / exp256 shape",
+            Self::CpuDeferred => "routed experts are CPU-deferred",
+            Self::ExpertTags => "per-expert dtype tags present",
+            Self::ExpertParallel => "expert-parallel global tier table present",
+            Self::PagedExperts => "routed experts are paged (no resident list)",
+            Self::RoutedMixed => "routed experts are not uniform",
+            Self::RouterProj => "router is not MQ4G256V2 [256,2048]",
+            Self::SharedProj => "shared expert is not MQ4G256V2 at its shape",
+            Self::SharedDownScale => "shared down_proj carries an AWQ scale",
+            Self::RoutedGateUpProj => "routed gate_up is not MQ4G256V2 [1024,2048]",
+            Self::RoutedDownProj => "routed down is not MQ4G256V2 [2048,512]",
+            Self::XnormScale => "an x_norm reader (router/shared/gate_up) carries an AWQ scale",
+            Self::RoutedDownScale => "routed down AWQ scales are partial or missing their table",
+        }
+    }
+}
+
+/// Admit or refuse the merged multi-slot MoE for one layer.
+///
+/// The merged program runs one rotate per row and one `_slots` GEMV pair for
+/// all live rows, so every projection that reads the row's `x_norm` must share
+/// one activation basis: same dtype/shape, and either no AWQ scale or a scale
+/// the single rotate already applies. AWQ scales are per *input* channel, so
+/// the routed `gate_up` shares its scale with the router and the shared expert;
+/// a per-expert `down_proj` scale rides its own table and is applied by the
+/// indexed silu+rotate *before* the FWHT, which is why it is the one scale this
+/// program can carry today.
+pub(crate) fn cohort_admit(f: &CohortFacts) -> Result<CohortPlan, CohortDecline> {
+    if !(2..=4).contains(&f.n) {
+        return Err(CohortDecline::Rows);
+    }
+    if !f.gfx1100 {
+        return Err(CohortDecline::Arch);
+    }
+    if f.dim != 2048 || f.mi != 512 || f.smi != 512 || f.k_top != 8 || f.n_exp != 256 {
+        return Err(CohortDecline::Shape);
+    }
+    if f.cpu_deferred {
+        return Err(CohortDecline::CpuDeferred);
+    }
+    if f.expert_tags {
+        return Err(CohortDecline::ExpertTags);
+    }
+    if f.ep_global_tiers {
+        return Err(CohortDecline::ExpertParallel);
+    }
+    let v2 =
+        |p: CohortProj, m: usize, k: usize| p.dtype == DType::MQ4G256V2 && p.m == m && p.k == k;
+    if !v2(f.router, 256, 2048) {
+        return Err(CohortDecline::RouterProj);
+    }
+    if !v2(f.shared_expert_gate, 1, 2048)
+        || !v2(f.shared_gate, 512, 2048)
+        || !v2(f.shared_up, 512, 2048)
+        || !v2(f.shared_down, 2048, 512)
+    {
+        return Err(CohortDecline::SharedProj);
+    }
+    if f.shared_down.awq {
+        return Err(CohortDecline::SharedDownScale);
+    }
+    if !f.routed_uniform {
+        return Err(CohortDecline::RoutedMixed);
+    }
+    let (Some(gate_up), Some(down)) = (f.routed_gate_up, f.routed_down) else {
+        return Err(CohortDecline::PagedExperts);
+    };
+    if !v2(gate_up, 1024, 2048) {
+        return Err(CohortDecline::RoutedGateUpProj);
+    }
+    if !v2(down, 2048, 512) {
+        return Err(CohortDecline::RoutedDownProj);
+    }
+    // The one rotated activation feeds the router, the shared gate/up and the
+    // routed gate_up, so those must stay scale-free for this program. A trunk
+    // that scales them needs two activation bases (or an AWQ-aware fused
+    // router/shared kernel) and stays on the per-slot program.
+    if f.router.awq || f.shared_expert_gate.awq || f.shared_gate.awq || f.shared_up.awq {
+        return Err(CohortDecline::XnormScale);
+    }
+    if f.routed_gate_up_awq {
+        return Err(CohortDecline::XnormScale);
+    }
+    // down_proj reads a per-expert hidden, so its scale is per expert and is
+    // applied by the indexed silu+rotate. Partial coverage never rides the
+    // plain producer: that would drop a scale.
+    match (f.routed_down_scales, down.awq) {
+        (CohortDownScales::None, false) => Ok(CohortPlan { down_awq: false }),
+        (CohortDownScales::PerExpert, true) => Ok(CohortPlan { down_awq: true }),
+        _ => Err(CohortDecline::RoutedDownScale),
+    }
+}
+
+/// `HIPFIRE_MOE_SLOTS_COHORT=0` forces the per-slot MoE. Read once per process;
+/// a deliberate opt-out is silent (no decline line).
+fn slots_cohort_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_MOE_SLOTS_COHORT").as_deref() != Ok("0")
+    });
+    *ENABLED
+}
+
+/// One line per process for the first declined layer: a model that misses the
+/// merged program must be diagnosable from its own serve log.
+fn log_cohort_decline_once(layer: u16, decline: CohortDecline) {
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if LOGGED.set(()).is_ok() {
+        eprintln!(
+            "[slots-moe] multi-slot cohort declined (layer {layer}): {} — running the per-slot MoE",
+            decline.reason()
+        );
+    }
+}
+
 /// Ornith-shaped multi-slot MoE. The sealed single-row program is exact, and
 /// calling it once per live slot reloads every routed expert. For two to four
 /// decode rows on the gfx1100 K=2048 / intermediate-512 MQ4V2 shape, the
@@ -1304,45 +1504,78 @@ fn slots_moe_cohort(
     let smi = config.shared_expert_intermediate_size;
     let n_exp = config.num_experts;
     let k_top = config.num_experts_per_tok;
-    if n < 2
-        || n > 4
-        || !gpu.arch_caps.is_gfx1100()
-        || dim != 2048
-        || mi != 512
-        || smi != 512
-        || k_top != 8
-        || n_exp != 256
-        || ffn.cpu_deferred_experts
-        || ffn.expert_down_awq_ptrs.is_some()
-    {
+    if !slots_cohort_enabled() {
         return Ok(false);
     }
-    let v2 = |w: &WeightTensor, m: usize, k: usize| {
-        w.gpu_dtype == DType::MQ4G256V2 && w.m == m && w.k == k && w.awq_scale.is_none()
+    let proj = |w: &WeightTensor| CohortProj {
+        dtype: w.gpu_dtype,
+        m: w.m,
+        k: w.k,
+        awq: w.awq_scale.is_some(),
     };
-    if !v2(&ffn.router, 256, 2048)
-        || !v2(&ffn.shared_expert_gate, 1, 2048)
-        || !v2(&ffn.shared_expert.gate, 512, 2048)
-        || !v2(&ffn.shared_expert.up, 512, 2048)
-        || !v2(&ffn.shared_expert.down, 2048, 512)
-    {
-        return Ok(false);
-    }
-    let routed_v2 = match ffn.global_expert_dtypes.as_deref() {
-        Some(table) if !table.is_empty() => table
+    // Per-expert down scales: the loader builds the device pointer table only
+    // when every expert carries a sidecar, so `PerExpert` requires both.
+    let routed_down_scales = if ffn.experts.is_empty() {
+        CohortDownScales::None
+    } else {
+        let scaled = ffn
+            .experts
             .iter()
-            .all(|(gate_up, down)| *gate_up == DType::MQ4G256V2 && *down == DType::MQ4G256V2),
-        _ => {
-            !ffn.experts.is_empty()
-                && ffn
-                    .experts
-                    .iter()
-                    .all(|expert| v2(&expert.gate_up, 1024, 2048) && v2(&expert.down, 2048, 512))
+            .filter(|expert| expert.down.awq_scale.is_some())
+            .count();
+        match (scaled, ffn.expert_down_awq_ptrs.is_some()) {
+            (0, _) => CohortDownScales::None,
+            (scaled, true) if scaled == ffn.experts.len() => CohortDownScales::PerExpert,
+            _ => CohortDownScales::Partial,
         }
     };
-    if !routed_v2 {
-        return Ok(false);
-    }
+    let first = ffn.experts.first();
+    let routed_uniform = first.is_some_and(|lead| {
+        ffn.experts.iter().all(|expert| {
+            expert.gate_up.gpu_dtype == lead.gate_up.gpu_dtype
+                && (expert.gate_up.m, expert.gate_up.k) == (lead.gate_up.m, lead.gate_up.k)
+                && expert.down.gpu_dtype == lead.down.gpu_dtype
+                && (expert.down.m, expert.down.k) == (lead.down.m, lead.down.k)
+        })
+    });
+    let facts = CohortFacts {
+        n,
+        gfx1100: gpu.arch_caps.is_gfx1100(),
+        dim,
+        mi,
+        smi,
+        k_top,
+        n_exp,
+        cpu_deferred: ffn.cpu_deferred_experts,
+        expert_tags: ffn.expert_dtype_tags.is_some(),
+        ep_global_tiers: ffn.global_expert_dtypes.is_some(),
+        router: proj(&ffn.router),
+        shared_expert_gate: proj(&ffn.shared_expert_gate),
+        shared_gate: proj(&ffn.shared_expert.gate),
+        shared_up: proj(&ffn.shared_expert.up),
+        shared_down: proj(&ffn.shared_expert.down),
+        routed_uniform,
+        routed_gate_up: first.map(|expert| proj(&expert.gate_up)),
+        routed_down: first.map(|expert| proj(&expert.down)),
+        routed_gate_up_awq: ffn
+            .experts
+            .iter()
+            .any(|expert| expert.gate_up.awq_scale.is_some()),
+        routed_down_scales,
+    };
+    let plan = match cohort_admit(&facts) {
+        Ok(plan) => plan,
+        Err(decline) => {
+            // `Rows` (one live row — the ordinary single-slot step) and `Arch`
+            // (this program is gfx1100-only) mean the program does not apply,
+            // not that a model missed it: stay silent so the one line per
+            // process is reserved for a real model/route refusal.
+            if !matches!(decline, CohortDecline::Rows | CohortDecline::Arch) {
+                log_cohort_decline_once(ffn.layer_idx, decline);
+            }
+            return Ok(false);
+        }
+    };
     let Some(logits) = pbs.moe_router_logits_batch.as_ref() else {
         return Ok(false);
     };
@@ -1444,7 +1677,28 @@ fn slots_moe_cohort(
         dim,
         n,
     )?;
-    gpu.fused_silu_mul_rotate_mq_batched(gate, up, rot, mi, n * k_top)?;
+    // AWQ: `down_proj` is pre-scaled by a per-expert `s`, so its input must be
+    // divided by that same table before the FWHT — the indexed producer does
+    // exactly that, at the same flat slot order (`tok * 8 + rank`) the slots
+    // gate/up GEMV wrote. Without scales this is the byte-identical plain
+    // producer.
+    if plan.down_awq {
+        let ptrs = ffn
+            .expert_down_awq_ptrs
+            .as_ref()
+            .expect("cohort admitted per-expert down AWQ without its pointer table");
+        gpu.fused_silu_mul_rotate_mq_awq_indexed_batched(
+            gate,
+            up,
+            ptrs,
+            topk_i,
+            rot,
+            mi,
+            n * k_top,
+        )?;
+    } else {
+        gpu.fused_silu_mul_rotate_mq_batched(gate, up, rot, mi, n * k_top)?;
+    }
     gpu.gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100(
         &ffn.expert_down_ptrs,
         topk_i,
@@ -5828,6 +6082,251 @@ mod tests {
     use super::*;
     use hipfire_dispatch::types::KernelKey;
     use rdna_compute::DType;
+
+    fn proj(dtype: DType, m: usize, k: usize) -> CohortProj {
+        CohortProj {
+            dtype,
+            m,
+            k,
+            awq: false,
+        }
+    }
+
+    /// A layer the cohort must admit with the plain expert-down producer.
+    fn cohort_base() -> CohortFacts {
+        let v2 = DType::MQ4G256V2;
+        CohortFacts {
+            n: 4,
+            gfx1100: true,
+            dim: 2048,
+            mi: 512,
+            smi: 512,
+            k_top: 8,
+            n_exp: 256,
+            cpu_deferred: false,
+            expert_tags: false,
+            ep_global_tiers: false,
+            router: proj(v2, 256, 2048),
+            shared_expert_gate: proj(v2, 1, 2048),
+            shared_gate: proj(v2, 512, 2048),
+            shared_up: proj(v2, 512, 2048),
+            shared_down: proj(v2, 2048, 512),
+            routed_uniform: true,
+            routed_gate_up: Some(proj(v2, 1024, 2048)),
+            routed_down: Some(proj(v2, 2048, 512)),
+            routed_gate_up_awq: false,
+            routed_down_scales: CohortDownScales::None,
+        }
+    }
+
+    #[test]
+    fn cohort_admits_plain_v2_layer_without_down_awq() {
+        assert_eq!(
+            cohort_admit(&cohort_base()),
+            Ok(CohortPlan { down_awq: false })
+        );
+    }
+
+    #[test]
+    fn cohort_admits_per_expert_down_awq() {
+        let facts = CohortFacts {
+            routed_down: Some(CohortProj {
+                awq: true,
+                ..proj(DType::MQ4G256V2, 2048, 512)
+            }),
+            routed_down_scales: CohortDownScales::PerExpert,
+            ..cohort_base()
+        };
+        assert_eq!(cohort_admit(&facts), Ok(CohortPlan { down_awq: true }));
+    }
+
+    #[test]
+    fn cohort_refuses_partial_or_tableless_down_awq() {
+        // Some experts scaled: never ride the plain producer.
+        let partial = CohortFacts {
+            routed_down: Some(CohortProj {
+                awq: true,
+                ..proj(DType::MQ4G256V2, 2048, 512)
+            }),
+            routed_down_scales: CohortDownScales::Partial,
+            ..cohort_base()
+        };
+        assert_eq!(cohort_admit(&partial), Err(CohortDecline::RoutedDownScale));
+        // Every expert scaled but the device table is missing (loader declined
+        // it): the scales would be dropped, so refuse.
+        let no_table = CohortFacts {
+            routed_down: Some(CohortProj {
+                awq: true,
+                ..proj(DType::MQ4G256V2, 2048, 512)
+            }),
+            ..cohort_base()
+        };
+        assert_eq!(cohort_admit(&no_table), Err(CohortDecline::RoutedDownScale));
+        // Coverage claims the table but the representative weight is unscaled:
+        // an inconsistent snapshot still refuses.
+        let inconsistent = CohortFacts {
+            routed_down_scales: CohortDownScales::PerExpert,
+            ..cohort_base()
+        };
+        assert_eq!(
+            cohort_admit(&inconsistent),
+            Err(CohortDecline::RoutedDownScale)
+        );
+    }
+
+    #[test]
+    fn cohort_refuses_x_norm_reader_scales() {
+        // Every projection reading x_norm must share this program's one
+        // activation basis, and that basis is unscaled here.
+        for facts in [
+            CohortFacts {
+                router: CohortProj {
+                    awq: true,
+                    ..proj(DType::MQ4G256V2, 256, 2048)
+                },
+                ..cohort_base()
+            },
+            CohortFacts {
+                shared_gate: CohortProj {
+                    awq: true,
+                    ..proj(DType::MQ4G256V2, 512, 2048)
+                },
+                ..cohort_base()
+            },
+            CohortFacts {
+                routed_gate_up_awq: true,
+                ..cohort_base()
+            },
+        ] {
+            assert_eq!(cohort_admit(&facts), Err(CohortDecline::XnormScale));
+        }
+    }
+
+    #[test]
+    fn cohort_refuses_shared_down_scale() {
+        let facts = CohortFacts {
+            shared_down: CohortProj {
+                awq: true,
+                ..proj(DType::MQ4G256V2, 2048, 512)
+            },
+            ..cohort_base()
+        };
+        assert_eq!(cohort_admit(&facts), Err(CohortDecline::SharedDownScale));
+    }
+
+    #[test]
+    fn cohort_refuses_rows_arch_and_shape() {
+        for n in [1usize, 5] {
+            assert_eq!(
+                cohort_admit(&CohortFacts { n, ..cohort_base() }),
+                Err(CohortDecline::Rows)
+            );
+        }
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                gfx1100: false,
+                ..cohort_base()
+            }),
+            Err(CohortDecline::Arch)
+        );
+        for facts in [
+            CohortFacts {
+                dim: 2560,
+                ..cohort_base()
+            },
+            CohortFacts {
+                mi: 1024,
+                ..cohort_base()
+            },
+            CohortFacts {
+                smi: 1024,
+                ..cohort_base()
+            },
+            CohortFacts {
+                k_top: 4,
+                ..cohort_base()
+            },
+            CohortFacts {
+                n_exp: 128,
+                ..cohort_base()
+            },
+        ] {
+            assert_eq!(cohort_admit(&facts), Err(CohortDecline::Shape));
+        }
+    }
+
+    #[test]
+    fn cohort_refuses_displaced_routed_experts() {
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                cpu_deferred: true,
+                ..cohort_base()
+            }),
+            Err(CohortDecline::CpuDeferred)
+        );
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                expert_tags: true,
+                ..cohort_base()
+            }),
+            Err(CohortDecline::ExpertTags)
+        );
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                ep_global_tiers: true,
+                ..cohort_base()
+            }),
+            Err(CohortDecline::ExpertParallel)
+        );
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                routed_gate_up: None,
+                ..cohort_base()
+            }),
+            Err(CohortDecline::PagedExperts)
+        );
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                routed_uniform: false,
+                ..cohort_base()
+            }),
+            Err(CohortDecline::RoutedMixed)
+        );
+    }
+
+    #[test]
+    fn cohort_refuses_non_v2_projections() {
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                router: proj(DType::MQ4G256, 256, 2048),
+                ..cohort_base()
+            }),
+            Err(CohortDecline::RouterProj)
+        );
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                shared_up: proj(DType::MQ4G256V2, 512, 2048),
+                shared_down: proj(DType::MQ4G256V2, 2048, 512),
+                shared_gate: proj(DType::MQ6G256V2, 512, 2048),
+                ..cohort_base()
+            }),
+            Err(CohortDecline::SharedProj)
+        );
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                routed_gate_up: Some(proj(DType::MQ4G256, 1024, 2048)),
+                ..cohort_base()
+            }),
+            Err(CohortDecline::RoutedGateUpProj)
+        );
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                routed_down: Some(proj(DType::MQ4G128V2, 2048, 512)),
+                ..cohort_base()
+            }),
+            Err(CohortDecline::RoutedDownProj)
+        );
+    }
 
     #[test]
     fn paged_decode_pos_allows_ragged_positions_without_a_position_binding() {
