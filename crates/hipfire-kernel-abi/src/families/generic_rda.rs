@@ -6,7 +6,8 @@
 //! (`gated_delta_vector_chunk_prep_gfx12`, `gated_delta_vector_chunk_scan_gfx12`), the fused
 //! conv + prepare producer (`raon_rda_conv_prepare_w128_f32`) and the one-wave-per-(row, head) gated
 //! RMSNorm (`gated_rmsnorm_sigmoid_rows_w128_f32`). gfx1201 only (every launcher refuses other archs:
-//! `chunked_supported` / `rda_wave_kernels_arch_supported`).
+//! `chunked_supported` / `rda_wave_kernels_arch_supported`); the conv + prepare producer is also admitted on exact
+//! gfx1100 (`rda_conv_prepare_arch_supported`).
 //!
 //! Evidence.
 //!
@@ -844,20 +845,37 @@ mod conv_prepare {
         rule(Rule::MultipleOf(p!("hist_tap_stride"), 4), "16-byte accesses (launcher check)"),
     ];
 
-    const EXPORTS: &[ExportV1] = &[ExportV1 {
-        symbol: "raon_rda_conv_prepare_w128_f32",
-        arch: Arch::Gfx1201,
-        object: ObjectRefV1::HipccSource {
-            module: "raon_rda_conv_prepare",
-            source: "kernels/src/raon_rda_conv_prepare.hip",
+    const EXPORTS: &[ExportV1] = &[
+        ExportV1 {
+            symbol: "raon_rda_conv_prepare_w128_f32",
+            arch: Arch::Gfx1201,
+            object: ObjectRefV1::HipccSource {
+                module: "raon_rda_conv_prepare",
+                source: "kernels/src/raon_rda_conv_prepare.hip",
+            },
+            block: [256, 1, 1],
+            dynamic_lds: 0,
+            group_segment_fixed: 0,
+            // WAVES_PER_BLOCK = 8 (one (head, row tile) per wave32).
+            grid: [Expr::DivCeil(&p!("waves"), 8), c!(1), c!(1)],
+            consts: &[],
         },
-        block: [256, 1, 1],
-        dynamic_lds: 0,
-        group_segment_fixed: 0,
-        // WAVES_PER_BLOCK = 8 (one (head, row tile) per wave32).
-        grid: [Expr::DivCeil(&p!("waves"), 8), c!(1), c!(1)],
-        consts: &[],
-    }];
+        // gfx1100 (7900 XTX): same layout from a local hipcc build (`--offload-arch=gfx1100`: kernarg 208,
+        // 0 LDS, 175 VGPRs, max flat workgroup 256, wave32).
+        ExportV1 {
+            symbol: "raon_rda_conv_prepare_w128_f32",
+            arch: Arch::Gfx1100,
+            object: ObjectRefV1::HipccSource {
+                module: "raon_rda_conv_prepare",
+                source: "kernels/src/raon_rda_conv_prepare.hip",
+            },
+            block: [256, 1, 1],
+            dynamic_lds: 0,
+            group_segment_fixed: 0,
+            grid: [Expr::DivCeil(&p!("waves"), 8), c!(1), c!(1)],
+            consts: &[],
+        },
+    ];
 
     /// `raon_rda_conv_prepare_w128_f32`: the three depthwise width-4 SiLU convs (q, k, v) fused with
     /// `raon_rda_prepare_f32` in one launch; one wave32 per (head, `rows_per_wave` rows), 8 waves per block.
