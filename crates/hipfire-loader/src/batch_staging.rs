@@ -535,23 +535,23 @@ fn leave_planned_route(gpu: &mut Gpu, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Developer opt-in of EP native-MTP lanes: exact `1` stages them; unset (the
-/// default) or any other value keeps the AR lane store, as before the mesh
-/// lane protocol.
+/// Kill switch of EP native-MTP lanes: exact `0` keeps the AR lane store (as
+/// before the mesh lane protocol); unset (the default) or any other value
+/// stages native-MTP lanes.
 pub const EP_MTP_LANES_ENV: &str = "HIPFIRE_EP_MTP_LANES";
 
-/// [`EP_MTP_LANES_ENV`] from the process configuration (default off).
+/// [`EP_MTP_LANES_ENV`] from the process configuration (default on).
 pub fn ep_mtp_lanes_enabled() -> bool {
-    hipfire_config::developer_bool(EP_MTP_LANES_ENV, false)
+    hipfire_config::developer_bool(EP_MTP_LANES_ENV, true)
 }
 
-/// Why an EP load that carries the MTP head still stages AR lanes: native-MTP
-/// lanes are opt-in (`HIPFIRE_EP_MTP_LANES=1`; EP lanes are AR lanes, as
-/// before the mesh lane protocol). Sampled requests (`serve.batch_sampled`)
-/// take the mesh native-MTP lanes too (root-drawn Leviathan acceptance) once
-/// opted in. `None` = stage MTP lanes.
-pub fn ep_spec_off_reason(opted_in: bool) -> Option<&'static str> {
-    (!opted_in).then_some("HIPFIRE_EP_MTP_LANES is not 1 (opt-in)")
+/// Why an EP load that carries the MTP head still stages AR lanes: the
+/// `HIPFIRE_EP_MTP_LANES=0` kill switch (EP lanes are AR lanes, as before the
+/// mesh lane protocol). Sampled requests (`serve.batch_sampled`) take the mesh
+/// native-MTP lanes too (root-drawn Leviathan acceptance). `None` = stage MTP
+/// lanes.
+pub fn ep_spec_off_reason(enabled: bool) -> Option<&'static str> {
+    (!enabled).then_some("HIPFIRE_EP_MTP_LANES=0")
 }
 
 /// What an EP load reserves for the lane store its batch staging will make:
@@ -559,7 +559,7 @@ pub fn ep_spec_off_reason(opted_in: bool) -> Option<&'static str> {
 /// (`(None, false)` = AR lanes). The same predicate and K the staging applies
 /// (`stage_qwen4_lanes`), so the resident-expert split reserves the bytes the
 /// spec store will commit: `serve.batch_spec` on, native MTP explicitly on
-/// (EP attaches heads only then), `HIPFIRE_EP_MTP_LANES=1` opted in,
+/// (EP attaches heads only then), the kill switch off,
 /// K = the load's resolved draft depth clamped to the lane ring.
 pub fn ep_spec_lane_reservation(
     batch_spec: bool,
@@ -569,14 +569,14 @@ pub fn ep_spec_lane_reservation(
     ep_spec_lane_reservation_with(ep_mtp_lanes_enabled(), batch_spec, spec, gpu_arch)
 }
 
-/// [`ep_spec_lane_reservation`] with the opt-in passed in (pure; the tests).
+/// [`ep_spec_lane_reservation`] with the kill switch's state passed in (pure; the tests).
 fn ep_spec_lane_reservation_with(
-    opted_in: bool,
+    enabled: bool,
     batch_spec: bool,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
     gpu_arch: &str,
 ) -> (Option<usize>, bool) {
-    let admitted = batch_spec && spec.mtp == Some(true) && ep_spec_off_reason(opted_in).is_none();
+    let admitted = batch_spec && spec.mtp == Some(true) && ep_spec_off_reason(enabled).is_none();
     if !admitted {
         return (None, false);
     }
@@ -600,7 +600,7 @@ fn ep_spec_lane_reservation_with(
 /// - `single`: one-device budget check here, then `stage_lanes`.
 /// - `ep`: replicated rank stores (the arch fans staging out and budgets
 ///   every rank against its own free memory). With `serve.batch_spec`, the MTP
-///   head loaded and `HIPFIRE_EP_MTP_LANES=1` set, native-MTP
+///   head loaded and no kill switch (`HIPFIRE_EP_MTP_LANES=0`) set, native-MTP
 ///   lanes are staged with the default
 ///   copy lane ([`hipfire_arch_qwen4::ep::ep_default_copy_config`]) and the
 ///   mesh lane transaction is armed
@@ -1123,17 +1123,22 @@ mod tests {
     use hipfire_runtime::loader_api::SpecLoadCfg;
 
     #[test]
-    fn ep_native_mtp_lanes_stage_only_when_opted_in() {
+    fn ep_native_mtp_lanes_stage_unless_killed() {
         assert_eq!(ep_spec_off_reason(true), None);
-        assert!(ep_spec_off_reason(false).is_some());
-        // Default (variable unset) is the AR lane store of beta: no spec K, no copy lane.
-        assert!(!super::ep_mtp_lanes_enabled());
+        assert_eq!(ep_spec_off_reason(false), Some("HIPFIRE_EP_MTP_LANES=0"));
+        // Default (variable unset) stages native-MTP lanes.
+        assert!(super::ep_mtp_lanes_enabled());
         let on = SpecLoadCfg {
             mtp: Some(true),
             mtp_k: Some(3),
             ..SpecLoadCfg::default()
         };
-        assert_eq!(ep_spec_lane_reservation(true, on, "gfx1201"), (None, false));
+        assert_eq!(
+            ep_spec_lane_reservation(true, on, "gfx1201").0,
+            Some(2),
+            "the default reserves the native-MTP lane store"
+        );
+        // `HIPFIRE_EP_MTP_LANES=0`: the AR lane store, no spec K, no copy lane.
         assert_eq!(
             ep_spec_lane_reservation_with(false, true, on, "gfx1201"),
             (None, false)

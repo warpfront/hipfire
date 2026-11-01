@@ -52,7 +52,7 @@ pub fn spec_store_blocks_reserve(
     share_override: bool,
 ) -> Option<&'static str> {
     (spec_k.is_some() && spec_slots > 0 && !share_override).then_some(
-        "native-MTP EP lanes are staged (`--spec mtp`): the decoupled reserve admits AR lanes only; leave HIPFIRE_EP_MTP_LANES unset (or pass no `--spec mtp`) for 32-layer AR lanes, or HIPFIRE_EP_MTP_RESERVE_SHARE=1 (lab) to run MTP lanes on it",
+        "native-MTP EP lanes are staged (`--spec mtp`): the decoupled reserve admits AR lanes only; pass no `--spec mtp` (or HIPFIRE_EP_MTP_LANES=0) for 32-layer AR lanes, or HIPFIRE_EP_MTP_RESERVE_SHARE=1 (lab) to run MTP lanes on it",
     )
 }
 
@@ -74,8 +74,8 @@ pub fn spec_store_reserve_verdict(
         return Err(
             "native-MTP lanes are refused on an EP reserve-sharing load: the mesh lane \
              protocol's draft/verify windows and head fill are not proven on the borrowed \
-             reserve bank (AR lanes are admitted; load without `--spec mtp`, leave \
-             HIPFIRE_EP_MTP_LANES unset, or HIPFIRE_EP_MTP_RESERVE_SHARE=1 for the lab route)"
+             reserve bank (AR lanes are admitted; load without `--spec mtp`, set \
+             HIPFIRE_EP_MTP_LANES=0, or HIPFIRE_EP_MTP_RESERVE_SHARE=1 for the lab route)"
                 .to_string(),
         );
     }

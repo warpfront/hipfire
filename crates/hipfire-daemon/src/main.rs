@@ -2379,8 +2379,8 @@ fn main() {
                 // Qwen4 expert-parallel load reserves the lane store's bytes
                 // before it splits the experts: the native-MTP lane store
                 // (default copy lane included) when the staging will stage it
-                // (`serve.batch_spec`, explicit `--spec mtp`, opted in
-                // with `HIPFIRE_EP_MTP_LANES=1`), else the AR
+                // (`serve.batch_spec`, explicit `--spec mtp`, no
+                // `HIPFIRE_EP_MTP_LANES=0`), else the AR
                 // store. Only the exact VMM route stages Qwen4 lanes;
                 // `vmm_batch` is false for the non-exact route and without
                 // `serve_vmm_batch`.
