@@ -1,7 +1,14 @@
 # LFM3 port — pre-PR review follow-ups (actionable task list)
 
 > **Source:** pre-PR review of branch `lfm3-port` (27 commits, base `beta`, HEAD `dd6286e`).
-> **Status:** all tasks open. Each task is self-contained and independently pickable.
+> **Status (2026-11-02):** all 23 tasks resolved across four commits on
+> `lfm3-port` — `d1d1fc0` (batch 1: quick wins + omni/streaming contract,
+> 14 IDs), `3f1834f` (ROPE-1), `7c95d23` (batch 2: numerics + hardening),
+> `e9498cb` (batch 3: cleanup). GPU verify (gfx1151, LFM3-1.7B q8 via
+> `serve_harness.py` battery) ran coherent through the new zero-tail RoPE
+> kernel; `finish_reason=length` surfaces through the CLI. The merge gate
+> (ROPE-1, PROMPT-1, STREAM-1) is satisfied. Each task is self-contained and
+> independently pickable.
 > **Line numbers** are as of `dd6286e` and will drift — re-grep the named symbol if a
 > reference is stale.
 > **Convention:** `P0` = must fix before merge (correctness/blocking), `P1` = correctness or
