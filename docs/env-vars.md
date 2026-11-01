@@ -696,6 +696,7 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_HOST_TIMING=1` | Host timing JSON |
 | `HIPFIRE_PROFILE` / `HIPFIRE_PROFILE_DECODE` / `HIPFIRE_PROFILE_CYCLES` | Profiling |
 | `HIPFIRE_DETERMINISTIC` | Determinism toggles in dispatch |
+| `HIPFIRE_WEIGHT_SLAB` | `off` \| `2m` \| `16m` (developer, also `[developer] weight_slab`). Packs device-resident weight tensors of at most 2 MiB / 16 MiB into shared slabs (zero-filled, 2 MiB-multiple `hipMalloc`s, 32 / 64 MiB) at their exact size on a 4 KiB boundary, instead of one `hipMalloc` each. ROCr rounds every allocation above 1 MiB up to a multiple of 2 MiB, so a model of thousands of 1-8 MiB tensors loses gigabytes (Raon on a 7900 XTX: 4,758 MiB of 21,624 MiB). Takes effect inside a weight-load scope: single-device carriers (`load_admitted`), Flash-Next ranks (single, EP rank thread, PP band), the Raon weight loader. Not packed: host-mapped/offloaded tensors, VMM/arena paths (KV, Raon mirror, S1 arenas, Flash-Next per-layer expert arenas), DFlash drafter weights, tensors above the threshold, EP/TP/PP loaders outside the Flash-Next rank funnel, and anything under `HIPFIRE_RAILGUN_CHECK`/`HIPFIRE_RAILGUN_DIGEST` recording. A freed weight view is released, never pooled; a slab is returned when its last view is gone (`drain_pool` at unload; `unload_model` reports a slab still held). Output is byte-identical to `off` (same bytes, different addresses). Default `16m`; `off` restores one allocation per tensor. The planned-capacity ledger charges every `hipMalloc` at its ROCr-rounded size (4 KiB up to 1 MiB, 2 MiB above, a slab at its slab bytes) plus a 140 MiB HIP-ring constant, so `own + ring + unledgered` equals the process's fdinfo `drm-memory-vram`. |
 | `HIPFIRE_DS4_DENSE_ACT_DIR` | DeepSeek4 calibration-only dump of P1 projection inputs in `collect_e8_hessian` format; direct evaluator flag `--dump-dense-acts` is preferred. |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | Compatibility alias for `diagnostic.compiler.hipcc_extra_flags` |
 | `HIPFIRE_KERNEL_CACHE` | Kernel cache dir (`var_os`) |
@@ -2830,6 +2831,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_WEIGHT_HOST` | crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs, crates/hipfire-arch-qwen35/src/carrier.rs | developer |
 | `HIPFIRE_WEIGHT_HOST_SOCKET` | crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs, crates/hipfire-arch-qwen35/src/carrier.rs | developer |
 | `HIPFIRE_WEIGHT_LOAD_SPLIT_U32` | crates/rdna-compute/src/residual_lanes.rs | developer |
+| `HIPFIRE_WEIGHT_SLAB` | crates/hip-bridge/src/ffi.rs, crates/hip-bridge/src/ffi/weight_slab.rs | developer |
 | `HIPFIRE_WH_FD_ISOLATED_CHILD` | crates/hipfire-runtime/src/weight_host.rs | developer |
 | `HIPFIRE_WIDENED_PBS_GROW_ONLY` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_WMMA_BATCH_TILES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |

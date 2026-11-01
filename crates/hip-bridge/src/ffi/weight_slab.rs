@@ -69,7 +69,7 @@ pub enum SlabMode {
 }
 
 /// Mode when `HIPFIRE_WEIGHT_SLAB` is unset.
-pub const DEFAULT_SLAB_MODE: SlabMode = SlabMode::Off;
+pub const DEFAULT_SLAB_MODE: SlabMode = SlabMode::Up16M;
 
 impl SlabMode {
     /// Parse `off|2m|16m` (case-insensitive; `0`/`none` mean off).
