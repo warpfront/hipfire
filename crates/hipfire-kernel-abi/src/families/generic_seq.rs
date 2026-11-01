@@ -1028,12 +1028,12 @@ mod flash_fa2 {
         kill_env: Some("HIPFIRE_ATTN_FA2_GENERIC"),
     };
 
-    /// The incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default off).
+    /// The incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default on; `0` kills).
     pub static WORK: WorkSpecV1 = WorkSpecV1 {
         abi: &ABI,
         work: WorkV1 {
             admit: FA2_ADMIT,
-            note: "FA2 route (default OFF, gfx1201): same work as the incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
+            note: "FA2 route (default ON, gfx1201): same work as the incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
             ..flash::WORK.work
         },
     };
@@ -1281,12 +1281,12 @@ mod flash_fa2_q8 {
         kill_env: Some("HIPFIRE_ATTN_FA2_GENERIC"),
     };
 
-    /// The Q8 incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default off).
+    /// The Q8 incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default on; `0` kills).
     pub static WORK: WorkSpecV1 = WorkSpecV1 {
         abi: &ABI,
         work: WorkV1 {
             admit: FA2_ADMIT,
-            note: "FA2 Q8 route (default OFF, gfx1201): same work as the Q8 incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
+            note: "FA2 Q8 route (default ON, gfx1201): same work as the Q8 incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
             ..flash_q8::WORK.work
         },
     };

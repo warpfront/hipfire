@@ -517,7 +517,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | `HIPFIRE_GFX12_FA2_PREFILL` | GQA-fused FA2 prefill on exact gfx1201 (same Qwen NH24/NKV4/HD256 envelope) — default ON (`kernel.gfx12_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
 | `HIPFIRE_GFX12_FA_PACKET` | Packet-minimal Q128 FA2 body on exact gfx1201 (same Qwen envelope as `HIPFIRE_GFX12_FA2_PREFILL`) — default ON (`kernel.gfx12_fa_packet`); `=0` opts out to the byte-identical route-N body |
 | `HIPFIRE_ATTN_QRESIDENT_V2` | Bit-exact v2 schedule of the gfx1201 register-resident-Q FA2 prefill kernel (same Qwen envelope; only where `kernel.attn_qresident` selects the Q-resident route) — default ON (`kernel.attn_qresident_v2`); `=0` restores the byte-identical v1 Q-resident kernel |
-| `HIPFIRE_ATTN_FA2_GENERIC` | GEN-FA2 F2a flash-prefill body (`kernels/src/latent_attention_flash_fa2.hip`, symbol `latent_attention_flash_prefill_fa2_q128w8`) inside the generic `Gpu::latent_attention_flash_prefill` (BF16 non-wide path) and `Gpu::latent_attention_flash_prefill_q8` (Q8 mirror path, symbol `latent_attention_flash_prefill_fa2_q8_q128w8`, `kernels/src/latent_attention_flash_fa2_q8.hip`); the wide path is unchanged — default **OFF** (developer); `1` opts in, `0` kills. Taken only on exact gfx1201 with `n_rows >= 17` (`FA2_MIN_ROWS`, receipt `receipts/selectors/fa2_min_rows.json`) and the judged geometry `wa 128 / wb 64 / dv 128`; everything else runs the incumbent. Block 256, dynamic LDS 44032, grid `[ceil(n_rows/128), n_heads, 1]`, same 21 kernargs; bit-identical to the incumbent on both the BF16 and Q8 mirror paths |
+| `HIPFIRE_ATTN_FA2_GENERIC` | GEN-FA2 F2a flash-prefill body (`kernels/src/latent_attention_flash_fa2.hip`, symbol `latent_attention_flash_prefill_fa2_q128w8`) inside the generic `Gpu::latent_attention_flash_prefill` (BF16 non-wide path) and `Gpu::latent_attention_flash_prefill_q8` (Q8 mirror path, symbol `latent_attention_flash_prefill_fa2_q8_q128w8`, `kernels/src/latent_attention_flash_fa2_q8.hip`); the wide path is unchanged — default **ON** (developer); `0` kills and restores the incumbent. Taken only on exact gfx1201 with `n_rows >= 17` (`FA2_MIN_ROWS`, receipt `receipts/selectors/fa2_min_rows.json`) and the judged geometry `wa 128 / wb 64 / dv 128`; everything else runs the incumbent. Block 256, dynamic LDS 44032, grid `[ceil(n_rows/128), n_heads, 1]`, same 21 kernargs; bit-identical to the incumbent on both the BF16 and Q8 mirror paths |
 | `HIPFIRE_GFX12_FA_PREP_FUSED` | Exact gfx1201 FA Q/K norm and RoPE fusion (`kernel.gfx12_fa_prep_fused`); default ON only on gfx1201, `=0` restores separate launches |
 | `HIPFIRE_GFX12_FA_PREP_FP8Q` | Preconvert Q to E4M3 codes for gfx1201 Q-resident v2 attention (`kernel.gfx12_fa_prep_fp8q`); default ON only on gfx1201, `=0` retains F32 Q; requires fused prep and Q-resident v2 |
 | `HIPFIRE_FA_RAGGED_PACKET` | Developer kill switch (default ON, read through `developer_bool`). Exact gfx1201 native-fp8 KV, Qwen NH24/NKV4/HD256, full fp8q eligibility (fused prep, `HIPFIRE_GFX12_FA_PREP_FP8Q`, Q-resident and Q-resident v2 attention, no tree/independent/verify scope), ordinary widened prefill (`commit_stride` exactly 512) with `512 < n <= 32768` whose tail `n % 512` is 64..=511 and whose context ends exactly at the chunk end (`start_pos + n == max_ctx_len <= physical_cap`): the chunk's fp8q prep output is attended through the whole-`n` Raw Q (code plane then scale plane) as a whole-512-row prefix launch plus a tail launch, with one whole-`n` K/V write; the A4 attention epilogue is not used for such chunks and the existing whole-`n` sigmoid output producer still runs. `=0` restores the incumbent admission exactly (F32 prep and segmented attention for ragged chunks). Aligned chunks, tails below 64 rows and every other architecture, tier or mode are unchanged. |
@@ -971,7 +971,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1863
+**Count:** 1865
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1016,7 +1016,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_AR_GRAPH_TRACE` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL` | crates/rdna-compute/src/attention.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
-| `HIPFIRE_ATTN_FA2_GENERIC` | crates/rdna-compute/src/latent_attention_flash.rs | developer |
+| `HIPFIRE_ATTN_FA2_GENERIC` | crates/hipfire-kernel-abi/src/families/generic_seq.rs, crates/rdna-compute/src/latent_attention_flash.rs | developer |
 | `HIPFIRE_ATTN_FLASH` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_ATTN_QRESIDENT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_ATTN_QRESIDENT_V2` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
@@ -1471,7 +1471,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FA_PREFILL_PM` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/families/attention.rs | developer |
 | `HIPFIRE_FA_PREFILL_PM_QPREP` | crates/hipfire-config/src/lib.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_FA_RAGGED_PACKET` | crates/hipfire-dispatch/src/pipeline/batched_attention.rs | developer |
-| `HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/tests/kernel_abi_drift.rs | developer |
 | `HIPFIRE_FIXED_TIER` | crates/hipfire-quantize/src/model_filter.rs, crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_FLASH_ATTN_CK_LIB` | crates/hipfire-config/src/lib.rs, crates/railgun-cert/src/recording.rs | experimental |
 | `HIPFIRE_FLASH_ATTN_CK_TEST_LIB` | crates/rdna-compute/src/flash_attn_ck.rs | developer |
@@ -2246,7 +2246,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PROMPT_HEAT_JSON` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
-| `HIPFIRE_Q8A8_PS` | crates/rdna-compute/src/gemm_q8_a8.rs | developer |
+| `HIPFIRE_Q8A8_PS` | crates/hipfire-kernel-abi/src/families/generic_mmq.rs, crates/rdna-compute/src/gemm_q8_a8.rs | developer |
 | `HIPFIRE_Q8_BATCHED_LEGACY` | crates/hipfire-config/src/lib.rs, crates/hipfire-kernel-abi/src/families/generic_gemm.rs | experimental |
 | `HIPFIRE_Q8_CLASSES` | crates/hipfire-quantize/src/diagnostics.rs, crates/hipfire-quantize/src/model_filter.rs | developer |
 | `HIPFIRE_Q8_FLASH_TILE` | crates/hipfire-arch-maple/src/maple.rs, crates/rdna-compute/src/attention.rs | developer |
@@ -2470,7 +2470,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAON_RDA_SEGMENT` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
 | `HIPFIRE_RAON_SHARED_FFN` | crates/hipfire-quantize/src/raon.rs | developer |
 | `HIPFIRE_RAON_TOKENIZER` | crates/hipfire-runtime/src/tokenizer.rs, scripts/check-env-docs.py | developer |
-| `HIPFIRE_RAON_VERIFY_ROWEXACT` | crates/hipfire-arch-raon/src/projection.rs | developer |
+| `HIPFIRE_RAON_VERIFY_ROWEXACT` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-arch-raon/src/projection.rs | developer |
 | `HIPFIRE_RCCL_LIB` | crates/hip-bridge/src/rccl.rs | developer |
 | `HIPFIRE_RDNA2_VARIANT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_RDNA3` | crates/hipfire-runtime/examples/tmp_halo_iu4_calibrate.rs | harness |
@@ -2708,7 +2708,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | stable |
 | `HIPFIRE_SPEC_LOOKUP_TAIL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
-| `HIPFIRE_SPEC_RETIRE` | crates/hipfire-generate/src/qwen.rs, crates/hipfire-runtime/src/spec.rs | developer |
+| `HIPFIRE_SPEC_RETIRE` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-generate/src/qwen.rs | developer |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |

@@ -52,7 +52,7 @@ const FLASH_FA2_MODULE: &str = "latent_attention_flash_fa2";
 const FLASH_FA2_FUNC: &str = "latent_attention_flash_prefill_fa2_q128w8";
 const FLASH_FA2_Q8_MODULE: &str = "latent_attention_flash_fa2_q8";
 const FLASH_FA2_Q8_FUNC: &str = "latent_attention_flash_prefill_fa2_q8_q128w8";
-/// Developer switch of the FA2 route (default OFF; `0` kills).
+/// Developer switch of the FA2 route (default ON; `0` kills and restores the incumbent).
 pub const FA2_FLAG: &str = "HIPFIRE_ATTN_FA2_GENERIC";
 /// Smallest row count the FA2 body is routed at (below it the incumbent wins: j6115, 1 row prefix 0 is 1.105x).
 // selector-receipt: receipts/selectors/fa2_min_rows.json
@@ -288,7 +288,7 @@ impl Gpu {
             && !wide
             && fa2_route_admits(
                 &self.arch,
-                hipfire_config::developer_bool(FA2_FLAG, false),
+                hipfire_config::developer_bool(FA2_FLAG, true),
                 a.n_rows,
                 if q8 { FA2_Q8_MIN_ROWS } else { FA2_MIN_ROWS },
                 wa,
