@@ -1103,9 +1103,17 @@ pub trait Speculator {
     /// Whether the drafter can continue a target restored or continued live
     /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The
     /// session planner falls back to the deepest reuse point it can resume
-    /// ([`crate::arch_model::ArchModel::session_plan_resumable`]).
+    /// ([`crate::session_cache::plan_resumable`]).
     fn can_resume_at(&self, _prompt: &[u32], _start: usize) -> bool {
         true
+    }
+
+    /// The target session route this drafter resumes on a session-cache hit
+    /// (`Ar` for a target-only draft context, `Mtp` when the target's
+    /// session state carries the drafter's head). `None` (default): the
+    /// drafter does not resume from the target's session cache.
+    fn session_route(&self) -> Option<crate::session_cache::SessionRoute> {
+        None
     }
 
     /// Release all GPU buffers the drafter owns. Called from `unload_model`,
@@ -1509,6 +1517,11 @@ pub trait MtpDrafter {
         "mtp"
     }
 
+    /// [`Speculator::session_route`] for an MTP drafter. Default `None`.
+    fn session_route(&self) -> Option<crate::session_cache::SessionRoute> {
+        None
+    }
+
     /// Install the per-request sampling contract. [`MtpSpeculator`] forwards
     /// [`Speculator::configure_request`] here exactly once per request so a
     /// temp>0-capable drafter (DSpark) can drive a sampled verify. Default
@@ -1684,6 +1697,10 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.arch.mtp_checkpoint_positions()
+    }
+
+    fn session_route(&self) -> Option<crate::session_cache::SessionRoute> {
+        self.arch.session_route()
     }
 
     fn rewind_to(
