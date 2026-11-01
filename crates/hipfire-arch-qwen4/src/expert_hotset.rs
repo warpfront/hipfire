@@ -1242,6 +1242,52 @@ mod tests {
         }
     }
 
+    /// A K0-shaped ranking (48 layers x 512 experts, top_k 10, as written by
+    /// `scripts/k0rank.py`) loads bound from a file for the EP2 tier: the
+    /// parser needs no EP-specific input, the rank is a permutation, and the
+    /// static parity ownership (`expert % 2`) splits it into two disjoint
+    /// halves of 12,288 units each. The default environment decision still
+    /// skips expert-parallel placement; that gate belongs to the caller.
+    #[test]
+    fn k0_shaped_ranking_loads_bound_and_splits_by_parity_for_ep2() {
+        const L: usize = 48;
+        const E: usize = 512;
+        let counts: Vec<u64> = (0..L * E)
+            .map(|id| ((id * 2_654_435_761) % 997) as u64)
+            .collect();
+        let mut value = sidecar();
+        let o = value.as_object_mut().unwrap();
+        o.insert("layers".into(), json!(L));
+        o.insert("experts_per_layer".into(), json!(E));
+        o.insert("top_k".into(), json!(10));
+        o.insert("rank".into(), json!(ranked(&counts)));
+        o.insert("counts".into(), json!(counts));
+        let dir = temp_dir("k0-shaped");
+        let path = dir.join("k0.expert-hotset");
+        std::fs::write(&path, value.to_string()).unwrap();
+
+        let parsed = HotsetSidecar::load_bound(&path, L, E, 10, &base()).unwrap();
+        assert_eq!(parsed.rank().len(), L * E);
+        let mut halves = [Vec::new(), Vec::new()];
+        for &id in parsed.rank() {
+            let (_, expert) = parsed.split_id(id);
+            halves[expert % 2].push(id);
+        }
+        assert_eq!((halves[0].len(), halves[1].len()), (L * E / 2, L * E / 2));
+        for half in &halves {
+            assert!(half
+                .windows(2)
+                .all(|w| parsed.count(w[0]) >= parsed.count(w[1])));
+        }
+
+        let mut env = good_env();
+        env.expert_parallel = true;
+        assert_eq!(
+            decide(&HotsetPolicy::Default, true, &env),
+            Err(HotsetSkip::ExpertParallel)
+        );
+    }
+
     #[test]
     fn policy_parses_the_documented_values() {
         assert_eq!(HotsetPolicy::parse(None), Ok(HotsetPolicy::Default));
