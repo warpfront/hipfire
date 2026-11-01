@@ -32,7 +32,10 @@
 //! to the draft rows on the device ([`SpecTarget::lm_head_logits_device`]).
 //! Chain only: there is no tree arm (the selector is the proposal).
 
-use crate::dflash::{draft_forward_based, propose_candidates_device, DflashConfig, DflashScratch};
+use crate::dflash::{
+    draft_forward_based, propose_candidates_device_penalized, DflashConfig, DflashScratch,
+    SelectorPenalty,
+};
 use crate::dflash::{DflashWeights, DFLASH_BLOCK_MAX};
 use crate::hfq::HfqFile;
 use crate::llama::argmax;
@@ -69,6 +72,8 @@ pub struct DraftWindowTrace {
 static WINDOW_TRACE: std::sync::Mutex<Option<Vec<DraftWindowTrace>>> = std::sync::Mutex::new(None);
 /// 0 = follow `HIPFIRE_DFLASH_DRAFT_GRAPH`, 1 = force off, 2 = force on.
 static DRAFT_GRAPH_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 0 = follow `HIPFIRE_DFLASH_DRAFT_PENALTY`, 1 = force off, 2 = force on.
+static DRAFT_PENALTY_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Developer oracle hook: from now on every speculator window records a
 /// [`DraftWindowTrace`] (and device-syncs around the draft forward to time
@@ -96,6 +101,30 @@ pub fn set_draft_graph_override(on: Option<bool>) {
         Some(true) => 2,
     };
     DRAFT_GRAPH_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Developer oracle hook: force the draft-side penalty on (`Some(true)`), off
+/// (`Some(false)`), or back to `HIPFIRE_DFLASH_DRAFT_PENALTY` (`None`) for every
+/// speculator built after this call.
+pub fn set_draft_penalty_override(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    DRAFT_PENALTY_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the selector penalizes its candidate scores like the target
+/// ([`SelectorPenalty`]): default on, `HIPFIRE_DFLASH_DRAFT_PENALTY=0` kills it,
+/// [`set_draft_penalty_override`] wins.
+fn draft_penalty_enabled() -> bool {
+    match DRAFT_PENALTY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT_PENALTY")
+            .map_or(true, |v| v.trim() != "0"),
+    }
 }
 
 fn fnv1a_f32_bits(v: &[f32]) -> u64 {
@@ -150,6 +179,9 @@ pub struct Dflash2Speculator {
     /// The request's penalty policy for [`apply_logit_policy_cpu`], the same
     /// arithmetic AR's `sample_cpu` runs before its temperature stage.
     penalty_cfg: SamplerConfig,
+    /// The selector scores its candidates after the request's penalties
+    /// ([`SelectorPenalty`]); set at build from [`draft_penalty_enabled`].
+    draft_penalty: bool,
     /// The target's measured break-even line for this draft
     /// ([`SpecTarget::dflash_retire_break_even`]); `Some` arms the AR step.
     retire: Option<crate::spec_retire::BreakEven>,
@@ -517,7 +549,14 @@ impl Speculator for Dflash2Speculator {
         } else {
             Vec::new()
         };
-        let proposal = propose_candidates_device(
+        // The selector walks the rows with the verify rows' penalty history
+        // (base ‖ earlier selected drafts), so q follows the penalized p; a
+        // neutral request (or the kill switch) walks the raw scores.
+        let mut selector_penalty = (penalized && self.draft_penalty).then(|| SelectorPenalty {
+            cfg: &self.penalty_cfg,
+            history: &mut self.history,
+        });
+        let proposal = propose_candidates_device_penalized(
             gpu,
             &self.weights,
             &self.scratch,
@@ -527,6 +566,7 @@ impl Speculator for Dflash2Speculator {
             seed,
             if sampled { temp } else { 0.0 },
             sampled.then_some(uniforms.as_slice()),
+            selector_penalty.as_mut(),
         )
         .map_err(|e| format!("Dflash2Speculator selector: {e}"))?;
         if let (Some(draft_ms), Some(t_selector)) = (draft_ms, t_selector) {
@@ -1060,6 +1100,7 @@ pub fn build_dflash2_speculator(
         mask_row: Vec::new(),
         request: SpecRequestConfig::default(),
         rng: SpecRng::new(0),
+        draft_penalty: draft_penalty_enabled(),
         history: PenaltyHistory::default(),
         penalty_cfg: SamplerConfig::greedy(),
         retire,
@@ -1615,5 +1656,125 @@ mod tests {
             without > 0.01,
             "a base-only history must show its bias, deviation {without}"
         );
+    }
+
+    /// The draft-side penalty: with a presence penalty a token already in the
+    /// history loses rank in the selector's `q` (and the greedy walk), and row
+    /// `r + 1` is penalized against the token row `r` selected; `q` stays a
+    /// proper distribution over the row's candidates, the history is left at
+    /// its base, and no penalty is the old walk bit for bit.
+    #[test]
+    fn draft_side_penalty_demotes_history_tokens_in_q() {
+        use crate::dflash::{propose_inner_capture, SelectorCodebook, SelectorPenalty};
+        let (vocab, rank, k, rows) = (8usize, 2usize, 4usize, 2usize);
+        // Zero codebooks: a row's score is its unary, so the walk isolates the penalty.
+        let book = || SelectorCodebook {
+            vocab,
+            rank,
+            f16_data: None,
+            f32_data: Some(vec![0.0; vocab * rank]),
+        };
+        let (pred, succ) = (book(), book());
+        let proj = vec![0.0f32; rows * rank];
+        // Row 0: token 1 is the raw favourite (2.0) over 2 (1.9); row 1: 5 over
+        // 2 and 1 (raw 1.0 / 0.97 / 0.96 / 0.5).
+        let ids = [1u32, 2, 3, 4, 5, 2, 1, 6];
+        let vals = [2.0f32, 1.9, 1.0, 0.5, 1.0, 0.97, 0.96, 0.5];
+        // 0.3 lands on token 1 raw (q 0.40) and on token 2 penalized (q 0.13 / 0.53).
+        let uniforms = [0.3f32; 2];
+        let cfg = SamplerConfig {
+            presence_penalty: 1.5,
+            repeat_window: 16,
+            ..SamplerConfig::greedy()
+        };
+        let walk = |temp: f32, penalty: Option<&mut SelectorPenalty<'_>>| {
+            propose_inner_capture(
+                vocab,
+                &pred,
+                &succ,
+                &proj,
+                &ids,
+                &vals,
+                rows,
+                k,
+                rank,
+                0,
+                temp,
+                (temp > 0.0).then_some(&uniforms[..]),
+                None,
+                penalty,
+            )
+            .unwrap()
+        };
+        let raw_greedy = walk(0.0, None);
+        assert_eq!(raw_greedy.tokens, vec![1, 5], "unpenalized walk");
+        let mut history = PenaltyHistory::new(16);
+        history.set_prompt(&[]);
+        history.begin_window(&[7, 1]); // emitted: ... 1 (the pending seed)
+        let penalized_greedy = walk(
+            0.0,
+            Some(&mut SelectorPenalty {
+                cfg: &cfg,
+                history: &mut history,
+            }),
+        );
+        // Row 0: token 1 is in the history, 2 takes over; row 1 then sees 2
+        // too, so 5 stays on top over the penalized 2 and 1.
+        assert_eq!(penalized_greedy.tokens, vec![2, 5]);
+        assert_eq!(
+            history.tokens(),
+            &[7, 1],
+            "walk leaves the history at its base"
+        );
+        assert_eq!(raw_greedy.candidates, penalized_greedy.candidates);
+
+        // Sampled q at temperature 1: token 1 ranks above 2 raw, below it penalized.
+        let q_of = |p: &crate::dflash::DflashCandidateProposal, row: usize, token: u32| -> f32 {
+            let probs = p.probabilities.as_ref().unwrap();
+            let at = (0..k)
+                .find(|&j| p.candidates[row * k + j] == token)
+                .unwrap();
+            probs[row * k + at]
+        };
+        let raw_q = walk(1.0, None);
+        let pen_q = walk(
+            1.0,
+            Some(&mut SelectorPenalty {
+                cfg: &cfg,
+                history: &mut history,
+            }),
+        );
+        assert!(q_of(&raw_q, 0, 1) > q_of(&raw_q, 0, 2));
+        assert!(
+            q_of(&pen_q, 0, 1) < q_of(&pen_q, 0, 2),
+            "a history token loses rank in q"
+        );
+        // The selector's q mass of token 1 drops by the penalty's softmax factor.
+        assert!(q_of(&pen_q, 0, 1) < 0.5 * q_of(&raw_q, 0, 1));
+        for p in [&raw_q, &pen_q] {
+            let probs = p.probabilities.as_ref().unwrap();
+            for row in probs.chunks_exact(k) {
+                assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5, "{row:?}");
+            }
+        }
+        // Row 1 follows the token row 0 SELECTED: with uniform 0 that is the
+        // penalized walk's first candidate (token 1 raw, token 2 penalized).
+        assert_eq!(raw_q.tokens[0], 1);
+        assert_eq!(pen_q.tokens[0], 2);
+        assert!(q_of(&pen_q, 1, 2) < q_of(&raw_q, 1, 2));
+        assert!(q_of(&pen_q, 1, 5) > q_of(&raw_q, 1, 5));
+        assert_eq!(history.tokens(), &[7, 1]);
+
+        // Inactive penalties leave the walk untouched.
+        let off = SamplerConfig::greedy();
+        let same = walk(
+            0.0,
+            Some(&mut SelectorPenalty {
+                cfg: &off,
+                history: &mut history,
+            }),
+        );
+        assert_eq!(same.tokens, raw_greedy.tokens);
+        assert_eq!(same.confidence, raw_greedy.confidence);
     }
 }
