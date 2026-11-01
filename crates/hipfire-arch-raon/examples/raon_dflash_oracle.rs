@@ -11,8 +11,8 @@
 //! raon_dflash_oracle greedy   --model M.hfq --draft D.hfq --prompt-file P.txt [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off]
 //! raon_dflash_oracle rollback  --model M.hfq [--draft D.hfq] --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
 //! raon_dflash_oracle verifygraph --model M.hfq --prompt-file P.txt [--out DIR] [--chat on] [--max-seq N]
-//! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off] [--out DIR]
-//! raon_dflash_oracle costs    --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
+//! raon_dflash_oracle sampled  --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off] [--retire-after W] [--out DIR]
+//! raon_dflash_oracle costs    --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--sampled-ar on [--sar-tokens N] [--temp T] [--top-p P] [--top-k K] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W]] [--out DIR]
 //! raon_dflash_oracle draftgraph --model M.hfq --draft D.hfq --prompt-file P.txt [--chat on] [--block B] [--tokens N] [--out DIR] [--max-seq N]
 //! ```
 //!
@@ -113,6 +113,11 @@
 //!   earlier drafts of that window` = the emitted prefix of that position, so the gate is the
 //!   same per-position chi-square against the penalized law of the prefix actually emitted.
 //!   Example: `raon_dflash_oracle sampled --model M.hfq --draft D.hfq --prompt-file P.txt --presence 1.5`.
+//!   `--retire-after W` runs the request's windows `0..W` speculatively and every later token through
+//!   the speculator's retired AR step (`ar_step`; `W = 0`: all of them), the production path of a
+//!   request the spec-retire policy retired: those tokens are judged against the same per-position laws,
+//!   so the retired step's sampler is validated as AR's (see the fixed-seed pin
+//!   `one_token_pick_is_the_ar_sampler_stream`). `HIPFIRE_SPEC_RETIRE` is not read by this oracle.
 //! * penalty flags (`sampled`, `greedy`): `--presence P` (default 0), `--frequency F` (0),
 //!   `--repeat-penalty R` (1.0), `--repeat-window W`. The default window is
 //!   `max(128, --tokens)`: 128 is the request default the AR producers use, and
@@ -135,6 +140,15 @@
 //!   speculator's own greedy windows over `--tokens` (64) tokens, each priced in
 //!   decode steps by its verified rows, with their least-squares break-even line
 //!   (the `spec_retire` line a target states). Writes `costs.json`.
+//!   `--sampled-ar on` (with `--temp` 1.0, `--top-p` 0.95, `--top-k` 20, `--sar-tokens` 128 and the
+//!   `--presence` / `--frequency` / `--repeat-penalty` / `--repeat-window` flags) adds the sampled,
+//!   penalized step of a retired request, device-synced with the host work included: (A) the AR
+//!   step as Raon AR runs it (`decode_step` + logits download + `sampler::sample_cpu`, generated-only
+//!   history), total and per stage, against (B) the speculator's `ar_step` with the same request,
+//!   total and per stage (`commit_row_logits` = forward + feature capture + logits readback, the
+//!   argmax-route `commit_row` for the readback difference, penalty, the host draw).
+//!   Example: `raon_dflash_oracle costs --model M.hfq --draft D.hfq --prompt-file P.txt --chat on
+//!   --sampled-ar on --presence 1.5`.
 //!
 //! * `draftgraph` (draft-graph gate): the same DFlash2 greedy run twice from a fresh target
 //!   state, once with the draft window eager and once with the graph-captured draft window
@@ -192,8 +206,8 @@ const USAGE: &str = "usage:
   raon_dflash_oracle greedy   --model M --draft D --prompt-file P [--out DIR] [--block N] [--tokens N] [--profile on|off] [--max-seq N] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off]
   raon_dflash_oracle rollback --model M [--draft D] --prompt-file P [--out DIR] [--max-seq N]
   raon_dflash_oracle verifygraph --model M --prompt-file P [--out DIR] [--chat on] [--max-seq N]
-  raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off] [--out DIR]
-  raon_dflash_oracle costs    --model M --draft D --prompt-file P [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--out DIR]
+  raon_dflash_oracle sampled  --model M --draft D --prompt-file P [--chat on] [--think on|off] [--trials N] [--tokens L] [--block B] [--temp T] [--top-p P] [--top-k K] [--alpha A] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W] [--draft-penalty on|off] [--retire-after W] [--out DIR]
+  raon_dflash_oracle costs    --model M --draft D --prompt-file P [--chat on] [--reps R] [--max-rows K] [--block B] [--tokens N] [--sampled-ar on [--sar-tokens N] [--temp T] [--top-p P] [--top-k K] [--presence P] [--frequency F] [--repeat-penalty R] [--repeat-window W]] [--out DIR]
   raon_dflash_oracle draftgraph --model M --draft D --prompt-file P [--chat on] [--block B] [--tokens N] [--fc-compare on|off] [--out DIR] [--max-seq N]
 common: [--chat on|off] [--think on|off]   (raw text tokens by default)";
 
@@ -1457,6 +1471,42 @@ impl SpecTarget for TimedTarget<'_> {
             }
         }
         Ok(pick)
+    }
+
+    /// Forwarded so the oracle also checks the target's own one-pass logits
+    /// readback; records the row exactly as [`Self::commit_row`] does.
+    fn commit_row_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        logits: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        {
+            let mut p = self.prof.borrow_mut();
+            *p.verify_rows.entry(1).or_default() += 1;
+            p.verifies.push((position, vec![token]));
+        }
+        let r: Result<(), String> = timed!(
+            self,
+            gpu,
+            "commit_row",
+            self.inner
+                .commit_row_logits(gpu, token, position, scratch, hidden_out, logits)
+        );
+        r?;
+        let (law, raw) = {
+            let p = self.prof.borrow();
+            (p.row_law, p.raw_rows)
+        };
+        if raw {
+            self.prof.borrow_mut().last_rows = logits.clone();
+        } else if let Some(spec) = law {
+            self.prof.borrow_mut().last_laws = vec![row_law(logits, spec)?];
+        }
+        Ok(())
     }
 
     fn commit_prefix(
@@ -3239,6 +3289,14 @@ fn tv_distance(a: &[(u32, f32)], b: &[(u32, f32)]) -> f64 {
     0.5 * m.values().map(|(x, y)| (x - y).abs()).sum::<f64>()
 }
 
+/// One window of the `sampled` DFlash arm: a speculative window or one retired AR step.
+struct OneStep {
+    emit: Vec<u32>,
+    proposed: usize,
+    accepted: usize,
+    next_seed: u32,
+}
+
 /// Sampled-decoding distribution oracle: every emitted token of the AR host
 /// sampler and of DFlash2 sampled speculation against the truncated law of the
 /// target row it was drawn or verified against.
@@ -3258,6 +3316,10 @@ fn run_sampled(
     let alpha = opt_f64(opts, "alpha", 1e-3)?;
     let pen = PenaltyOpts::parse(opts, l)?;
     let penalized = pen.active();
+    let retire_after = match opts.get("retire-after") {
+        Some(_) => Some(opt_usize(opts, "retire-after", 0)?),
+        None => None,
+    };
     if trials == 0 || l == 0 {
         return Err("--trials and --tokens must be >= 1".into());
     }
@@ -3363,17 +3425,37 @@ fn run_sampled(
                 let mut stream = vec![first];
                 let mut laws = vec![p0];
                 let (mut position, mut seed) = (prompt.len(), first);
+                let mut trial_windows = 0usize;
                 while stream.len() < l {
-                    let step = spec.step(
-                        gpu,
-                        &mut target,
-                        position,
-                        seed,
-                        &stream,
-                        None,
-                        temp,
-                        usize::MAX,
-                    )?;
+                    // `--retire-after W`: from window W on the request runs the speculator's
+                    // retired AR step (`ar_step`), as a retired production request does.
+                    let step = if retire_after.is_some_and(|w| trial_windows >= w) {
+                        let token = spec.ar_step(gpu, &mut target, position, seed, &stream)?;
+                        OneStep {
+                            emit: vec![token],
+                            proposed: 0,
+                            accepted: 0,
+                            next_seed: token,
+                        }
+                    } else {
+                        let s = spec.step(
+                            gpu,
+                            &mut target,
+                            position,
+                            seed,
+                            &stream,
+                            None,
+                            temp,
+                            usize::MAX,
+                        )?;
+                        OneStep {
+                            emit: s.emit.to_vec(),
+                            proposed: s.proposed,
+                            accepted: s.accepted,
+                            next_seed: s.next_seed,
+                        }
+                    };
+                    trial_windows += 1;
                     let window_laws: Vec<Vec<(u32, f32)>> = if penalized {
                         // Row j of the window predicts emitted token j; its history is the
                         // emitted stream (pending seed last) plus the window's earlier
@@ -3675,6 +3757,253 @@ fn draft_cost(
     Ok((whole, head))
 }
 
+/// Median and mean of `v` in ms, three decimals.
+fn med_mean_json(v: &[f64]) -> Value {
+    let (med, mean) = median_mean(v);
+    json!({"median": med, "mean": mean})
+}
+
+/// `costs --sampled-ar on`: the per-token cost of a SAMPLED, penalized decode
+/// step two ways, device-synced and host included, over `--sar-tokens` tokens
+/// (default 128, after 2 warm-up steps):
+///
+/// * A: the AR step exactly as Raon AR runs it: `decode_step`, the logits
+///   download, `sampler::sample_cpu` (= `apply_logit_policy_cpu` then
+///   `llama::sample_top_k_p`) with the generated-only history. Run whole
+///   (A total), then again with a sync after the device work and a timer per
+///   stage (A stages).
+/// * B: the speculator's retired `ar_step` with the same request config
+///   (B total); then its pieces: `commit_row_logits` (forward + feature
+///   capture + logits readback), `commit_row` with the argmax route (forward +
+///   feature capture; the difference is the logits readback), the penalty and
+///   the host draw (`llama::sample_top_k_p_with_state`, the AR sampler) on the row it returned.
+///
+/// Flags: `--temp` (1.0), `--top-p` (0.95), `--top-k` (20), the penalty flags
+/// of `greedy` / `sampled` (`--presence`, ...). The speculator's draft is not
+/// run.
+fn sampled_ar_cost(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    spec: &mut dyn Speculator,
+    scratch: &mut dyn SpecScratch,
+    prompt: &[u32],
+    opts: &Opts,
+) -> Result<Value, String> {
+    const WARM: usize = 2;
+    let n = opt_usize(opts, "sar-tokens", 128)?;
+    let temp = opt_f32(opts, "temp", 1.0)?;
+    let top_p = opt_f32(opts, "top-p", 0.95)?;
+    let top_k = opt_usize(opts, "top-k", 20)? as u32;
+    let pen = PenaltyOpts::parse(opts, n + WARM)?;
+    if n == 0 || temp <= 0.0 {
+        return Err("--sar-tokens must be >= 1 and --temp > 0".into());
+    }
+    let position = prompt.len();
+    if position + n + WARM + 1 > bundle.max_seq() {
+        return Err(format!(
+            "context {position} + {} tokens exceeds max_seq {}",
+            n + WARM,
+            bundle.max_seq()
+        ));
+    }
+    let mut request = SpecRequestConfig {
+        temp,
+        top_p,
+        top_k: Some(top_k),
+        min_p: 0.0,
+        rng_seed: 0x5a17_0b5e,
+        ..SpecRequestConfig::default()
+    };
+    pen.configure(&mut request);
+    spec.configure_request(request);
+    if !spec.supports_ar_step() {
+        return Err("this speculator has no AR step (no break-even line for this target)".into());
+    }
+    let cfg = SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty: pen.repeat_penalty,
+        repeat_window: pen.window,
+        presence_penalty: pen.presence,
+        frequency_penalty: pen.frequency,
+        blocked_tokens: Vec::new(),
+        top_k: Some(top_k),
+        min_p: None,
+    };
+    println!(
+        "sampled AR step: temp {temp} top_p {top_p} top_k {top_k}, penalties {} (window {}), {n} tokens",
+        if pen.active() { "active" } else { "neutral" },
+        pen.window
+    );
+    let fresh = |gpu: &mut Gpu,
+                 bundle: &mut RaonBundle,
+                 spec: &mut dyn Speculator|
+     -> Result<u32, String> {
+        spec.prefill(gpu, bundle, prompt, prompt, 0, false, None, &|| false)?
+            .into_first_token()
+    };
+
+    // A total: decode_step + download + sample_cpu, generated-only history.
+    let mut tok = fresh(gpu, bundle, spec)?;
+    let mut gen = vec![tok];
+    let mut a_total = Vec::with_capacity(n);
+    for i in 0..n + WARM {
+        let (next, ms) = timed_ms(gpu, |gpu| {
+            bundle.decode_step(gpu, tok)?;
+            let mut logits = bundle.download_logits(gpu)?;
+            Ok(hipfire_runtime::sampler::sample_cpu(
+                &mut logits,
+                &gen,
+                &cfg,
+            ))
+        })?;
+        tok = next;
+        gen.push(tok);
+        if i >= WARM {
+            a_total.push(ms);
+        }
+    }
+    // A stages.
+    let mut tok = fresh(gpu, bundle, spec)?;
+    let mut gen = vec![tok];
+    let (mut a_dev, mut a_dl, mut a_pen, mut a_smp) = (vec![], vec![], vec![], vec![]);
+    for i in 0..n + WARM {
+        sync(gpu)?;
+        let t0 = Instant::now();
+        bundle.decode_step(gpu, tok)?;
+        sync(gpu)?;
+        let t1 = Instant::now();
+        let mut logits = bundle.download_logits(gpu)?;
+        let t2 = Instant::now();
+        apply_logit_policy_cpu(&mut logits, &gen, &cfg);
+        let t3 = Instant::now();
+        tok = hipfire_runtime::llama::sample_top_k_p(&logits, temp, top_p, Some(top_k), None);
+        let t4 = Instant::now();
+        gen.push(tok);
+        if i >= WARM {
+            let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1e3;
+            a_dev.push(ms(t0, t1));
+            a_dl.push(ms(t1, t2));
+            a_pen.push(ms(t2, t3));
+            a_smp.push(ms(t3, t4));
+        }
+    }
+
+    // B total: the speculator's retired AR step.
+    let mut tok = fresh(gpu, bundle, spec)?;
+    let mut emitted = vec![tok];
+    let mut b_total = Vec::with_capacity(n);
+    for i in 0..n + WARM {
+        let (next, ms) = timed_ms(gpu, |gpu| {
+            spec.ar_step(gpu, bundle, position + i, tok, &emitted)
+        })?;
+        tok = next;
+        emitted.push(tok);
+        if i >= WARM {
+            b_total.push(ms);
+        }
+    }
+    // B stages: commit_row_logits (+ the host work on its row).
+    let mut tok = fresh(gpu, bundle, spec)?;
+    let mut emitted = vec![tok];
+    let mut host_rows: Vec<f32> = Vec::new();
+    let mut logits: Vec<f32> = Vec::new();
+    let (mut b_commit, mut b_pen, mut b_dist) = (vec![], vec![], vec![]);
+    let mut ar_state = 0x5a17_0b5eu32;
+    for i in 0..n + WARM {
+        host_rows.clear();
+        let (_, ms) = timed_ms(gpu, |gpu| {
+            SpecTarget::commit_row_logits(
+                bundle,
+                gpu,
+                tok,
+                position + i,
+                scratch,
+                Some(&mut host_rows),
+                &mut logits,
+            )
+        })?;
+        let t0 = Instant::now();
+        apply_logit_policy_cpu(&mut logits, &emitted, &cfg);
+        let t1 = Instant::now();
+        tok = hipfire_runtime::llama::sample_top_k_p_with_state(
+            &logits,
+            temp,
+            top_p,
+            Some(top_k),
+            None,
+            &mut ar_state,
+        );
+        let t2 = Instant::now();
+        emitted.push(tok);
+        if i >= WARM {
+            b_commit.push(ms);
+            b_pen.push(t1.duration_since(t0).as_secs_f64() * 1e3);
+            b_dist.push(t2.duration_since(t1).as_secs_f64() * 1e3);
+        }
+    }
+    // B argmax commit: the same forward and feature capture, a 4-byte readback.
+    let mut tok = fresh(gpu, bundle, spec)?;
+    let mut b_arg = Vec::with_capacity(n);
+    for i in 0..n + WARM {
+        host_rows.clear();
+        let (pick, ms) = timed_ms(gpu, |gpu| {
+            SpecTarget::commit_row(
+                bundle,
+                gpu,
+                tok,
+                position + i,
+                scratch,
+                Some(&mut host_rows),
+                false,
+            )
+        })?;
+        tok = match pick {
+            RowPick::Argmax(t) => t,
+            RowPick::Logits(_) => return Err("commit_row returned logits".into()),
+        };
+        if i >= WARM {
+            b_arg.push(ms);
+        }
+    }
+
+    let med = |v: &[f64]| median_mean(v).0;
+    let (a_t, b_t) = (med(&a_total), med(&b_total));
+    let a_sum = med(&a_dev) + med(&a_dl) + med(&a_pen) + med(&a_smp);
+    println!("  A  AR step (decode_step + download + sample_cpu)   median {a_t:.3} ms");
+    println!(
+        "     stages: decode (device) {:.3}  logits download {:.3}  penalty {:.3}  sample {:.3}  (sum {a_sum:.3})",
+        med(&a_dev),
+        med(&a_dl),
+        med(&a_pen),
+        med(&a_smp)
+    );
+    println!(
+        "  B  retired ar_step (Dflash2Speculator)               median {b_t:.3} ms  = {:.4}x A",
+        b_t / a_t
+    );
+    println!(
+        "     stages: commit_row_logits (forward + capture + logits readback) {:.3}  [commit_row argmax route {:.3} => logits readback ~{:.3}]  penalty {:.3}  draw {:.3}",
+        med(&b_commit),
+        med(&b_arg),
+        med(&b_commit) - med(&b_arg),
+        med(&b_pen),
+        med(&b_dist)
+    );
+    Ok(json!({
+        "tokens": n, "temp": temp, "top_p": top_p, "top_k": top_k,
+        "penalties": pen.json(),
+        "a_total_ms": med_mean_json(&a_total),
+        "a_decode_ms": med_mean_json(&a_dev), "a_download_ms": med_mean_json(&a_dl),
+        "a_penalty_ms": med_mean_json(&a_pen), "a_sample_ms": med_mean_json(&a_smp),
+        "b_total_ms": med_mean_json(&b_total),
+        "b_commit_row_logits_ms": med_mean_json(&b_commit),
+        "b_commit_row_argmax_ms": med_mean_json(&b_arg),
+        "b_penalty_ms": med_mean_json(&b_pen), "b_draw_ms": med_mean_json(&b_dist),
+        "b_over_a": b_t / a_t,
+    }))
+}
+
 /// Per-call cost measurements for the spec-retire policy: AR decode, verify
 /// (argmax and logits routes) per row count, partial commit, draft sequence.
 fn run_costs(
@@ -3877,6 +4206,20 @@ fn run_costs(
         let (ar_med, ar_mean) = median_mean(&ar_ms);
         println!("commit_row (AR step): median {ar_med:.3} ms, mean {ar_mean:.3} ms");
 
+        // 2b. `--sampled-ar on`: the sampled, penalized AR step against the
+        // speculator's retired step. Runs on its own prefilled state and
+        // leaves the greedy request config back on the speculator.
+        let sampled_ar = if on_off(opts, "sampled-ar", false)? {
+            let s = spec
+                .as_mut()
+                .expect("speculator lives until the draft cost");
+            let v = sampled_ar_cost(gpu, bundle, s.as_mut(), scratch.as_mut(), prompt, opts)?;
+            s.configure_request(SpecRequestConfig::default());
+            Value::from(v)
+        } else {
+            Value::Null
+        };
+
         // Production cycles: the speculator's own greedy windows (draft,
         // selector, verify, commit, feature append and every host round trip
         // in between) over `--tokens` generated tokens, each device-synced
@@ -4033,6 +4376,7 @@ fn run_costs(
             "ar_step_units": ar_step_units,
             "production_cycles": cycle_line.map(|(base, per_row, units)| json!({"timed": cycles.len(), "emit_mean": emit_mean, "units_mean": units, "base": base, "per_row": per_row})),
             "commit_row_ms": {"median": ar_med, "mean": ar_mean},
+            "sampled_ar": sampled_ar,
         }))
     })();
     scratch.free(gpu);
