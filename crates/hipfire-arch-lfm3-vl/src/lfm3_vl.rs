@@ -49,7 +49,6 @@ pub enum VisionLayerKind {
 pub struct ProjectorConfig {
     pub hidden_size: usize,        // projector_hidden_size (4096)
     pub hidden_act: String,        // "gelu" (erf)
-    pub bias: bool,                // projector_bias (true)
     pub layer_norm_eps: f32,       // 1e-6
     pub downsample_factor: usize,  // == vision spatial_merge_size (2)
     pub text_hidden_size: usize,   // text_config.hidden_size (2048) — projector output
@@ -67,7 +66,6 @@ pub struct VisionConfig {
     pub temporal_patch_size: usize,// 2
     pub in_channels: usize,        // 3
     pub spatial_merge_size: usize, // 2
-    pub conv_kernel_size: usize,   // 3
     pub norm_eps: f32,             // 1e-5
     pub rope_theta: f32,           // 1e6 (axial)
     pub layer_types: Vec<VisionLayerKind>,
@@ -77,7 +75,6 @@ pub struct VisionConfig {
     // placeholder token (``) is a 9-byte special string that is awkward to
     // look up by name.
     pub image_token_id: u32,        // 125030
-    pub video_token_id: u32,        // 125029
     pub vision_start_token_id: u32, // 125009
     pub vision_end_token_id: u32,   // 125010
 }
@@ -153,10 +150,6 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
             .and_then(|v| v.as_str())
             .unwrap_or("gelu")
             .to_string(),
-        bias: config
-            .get("projector_bias")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
         layer_norm_eps: config
             .get("projector_layer_norm_eps")
             .and_then(|v| v.as_f64())
@@ -179,13 +172,11 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
         temporal_patch_size: vc.get("temporal_patch_size").and_then(|v| v.as_u64()).unwrap_or(2) as usize,
         in_channels: vc.get("in_channels").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
         spatial_merge_size: vc.get("spatial_merge_size").and_then(|v| v.as_u64()).unwrap_or(2) as usize,
-        conv_kernel_size: vc.get("conv_kernel_size").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
         norm_eps: vc.get("norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32,
         rope_theta,
         layer_types,
         projector,
         image_token_id: config.get("image_token_id").and_then(|v| v.as_u64()).unwrap_or(125_030) as u32,
-        video_token_id: config.get("video_token_id").and_then(|v| v.as_u64()).unwrap_or(125_029) as u32,
         vision_start_token_id: config.get("vision_start_token_id").and_then(|v| v.as_u64()).unwrap_or(125_009) as u32,
         vision_end_token_id: config.get("vision_end_token_id").and_then(|v| v.as_u64()).unwrap_or(125_010) as u32,
     })
@@ -652,26 +643,17 @@ pub fn vision_forward(
     gpu.layernorm_batched(&x, &pw.layer_norm_w, &pw.layer_norm_b, &normed, n, h, pcfg.layer_norm_eps)?;
     gpu.free_tensor(x)?;
 
-    // Download → CPU 2x2 merge rearrange (4 consecutive patches per block).
-    let normed_data = gpu.download_f32(&normed)?;
+    // 2x2 merge: patches arrive in (gy, gx, sy, sx) merge-grouped order (see
+    // extract_patches / conv2d_gated_f32), so each 2x2 block's four patches
+    // are already contiguous in raster order. The old "rearrange" copied
+    // block i's patches to output row i unchanged — an identity — and paid a
+    // download → CPU copy → upload round-trip for it (NITS-1). HF's pixel
+    // merger is a plain reshape of the same buffer; feed `normed` to the
+    // gemm directly.
+    debug_assert_eq!(n, n_merged * sms * sms);
+    debug_assert_eq!(merge_dim, h * sms * sms);
+    let m1 = linear_f16_bias(gpu, &pw.linear_1_w, &normed, &pw.linear_1_b, pcfg.hidden_size, merge_dim, n_merged)?;
     gpu.free_tensor(normed)?;
-
-    let mut merged = vec![0.0f32; n_merged * merge_dim];
-    for my in 0..merged_h {
-        for mx in 0..merged_w {
-            let out_idx = my * merged_w + mx;
-            for sub in 0..(sms * sms) {
-                let src = out_idx * (sms * sms) + sub;
-                merged[out_idx * merge_dim + sub * h..out_idx * merge_dim + sub * h + h]
-                    .copy_from_slice(&normed_data[src * h..src * h + h]);
-            }
-        }
-    }
-
-    // linear_1 (4096->4096, bias) → GELU(erf) → linear_2 (4096->2048, bias).
-    let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
-    let m1 = linear_f16_bias(gpu, &pw.linear_1_w, &merged_gpu, &pw.linear_1_b, pcfg.hidden_size, merge_dim, n_merged)?;
-    gpu.free_tensor(merged_gpu)?;
     gpu.gelu_erf_f32(&m1, &m1, n_merged * pcfg.hidden_size)?;
 
     let m2 = linear_f16_bias(gpu, &pw.linear_2_w, &m1, &pw.linear_2_b, pcfg.text_hidden_size, pcfg.hidden_size, n_merged)?;
@@ -686,4 +668,86 @@ pub fn vision_forward(
         t0.elapsed().as_secs_f32()
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LFM3-VL vision shape constants (HF `Lfm3VlConfig.vision_config` for
+    /// LiquidAI/LFM3-VL-2B). Pin the derived helpers + the projector merge
+    /// dim so a config-shape regression (e.g. a wrong head_dim default) is
+    /// caught without a GPU/HFQ round-trip.
+    fn lfm3_vl_vision_config() -> VisionConfig {
+        // 14 layers, alternating conv/full_attention per the HF default
+        // (i < 2 or i % 2 != 0 → conv).
+        let layer_types = (0..14)
+            .map(|i| {
+                if i < 2 || i % 2 != 0 {
+                    VisionLayerKind::Conv
+                } else {
+                    VisionLayerKind::FullAttention
+                }
+            })
+            .collect();
+        VisionConfig {
+            hidden_size: 1024,
+            intermediate_size: 2560,
+            num_hidden_layers: 14,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            head_dim: 64,
+            patch_size: 16,
+            temporal_patch_size: 2,
+            in_channels: 3,
+            spatial_merge_size: 2,
+            norm_eps: 1e-5,
+            rope_theta: 1_000_000.0,
+            layer_types,
+            projector: ProjectorConfig {
+                hidden_size: 4096,
+                hidden_act: "gelu".to_string(),
+                layer_norm_eps: 1e-6,
+                downsample_factor: 2,
+                text_hidden_size: 2048,
+            },
+            image_token_id: 125_030,
+            vision_start_token_id: 125_009,
+            vision_end_token_id: 125_010,
+        }
+    }
+
+    #[test]
+    fn lfm3_vl_derived_dims_match_hf() {
+        let vc = lfm3_vl_vision_config();
+        // GQA: 16Q / 8KV, head_dim 64 → q_dim 1024, kv_dim 512.
+        assert_eq!(vc.q_dim(), 1024);
+        assert_eq!(vc.kv_dim(), 512);
+        assert_eq!(vc.num_attention_heads / vc.num_key_value_heads, 2); // groups = 2
+    }
+
+    #[test]
+    fn lfm3_vl_layer_pattern_is_conv_first_two_then_alternating() {
+        let vc = lfm3_vl_vision_config();
+        // HF default: layers 0,1 conv; then full_attention on even indices ≥2.
+        assert!(!vc.is_attention(0));
+        assert!(!vc.is_attention(1));
+        assert!(vc.is_attention(2));
+        assert!(!vc.is_attention(3));
+        assert!(vc.is_attention(4));
+        // 14 layers → 6 full_attention (2,4,6,8,10,12) + 8 conv.
+        let n_attn = (0..14).filter(|&i| vc.is_attention(i)).count();
+        assert_eq!(n_attn, 6);
+    }
+
+    #[test]
+    fn lfm3_vl_projector_merge_dim_is_4x_hidden() {
+        let vc = lfm3_vl_vision_config();
+        let sms = vc.spatial_merge_size;
+        let merge_dim = vc.hidden_size * sms * sms;
+        // 1024 * 2 * 2 = 4096 → matches projector.hidden_size (the 2x2 merge
+        // feeds linear_1(4096→4096)). VL-RESIZE-1 / GRID-1 depend on this.
+        assert_eq!(merge_dim, 4096);
+        assert_eq!(merge_dim, vc.projector.hidden_size);
+    }
 }

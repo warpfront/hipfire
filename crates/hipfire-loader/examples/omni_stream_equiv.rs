@@ -138,6 +138,21 @@ fn main() {
     }
     eprintln!("  streaming: {} text tokens {text_ids_s:?} + {} audio frames ({} codes)", text_ids_s.len(), audio_codes_s.len()/12, audio_codes_s.len());
 
+    // TEST-1: bound the generated frame/text counts by the step budget
+    // (STREAM-1's max_steps cap + EOS-1's post-eos TEXT continuation must
+    // never exceed it). The batch path is bounded by the same max_steps=40.
+    const MAX_STEPS: usize = 40;
+    assert!(
+        audio_codes_s.len() / 12 <= MAX_STEPS,
+        "streaming emitted {} audio frames > max_steps {MAX_STEPS}",
+        audio_codes_s.len() / 12
+    );
+    assert!(
+        text_ids_s.len() <= MAX_STEPS,
+        "streaming emitted {} text tokens > max_steps {MAX_STEPS}",
+        text_ids_s.len()
+    );
+
     // ── Compare text tokens ──
     let n_common = text_ids_b.len().min(text_ids_s.len());
     let mut div = None;

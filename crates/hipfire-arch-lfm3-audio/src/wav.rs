@@ -5,12 +5,18 @@
 //! Minimal PCM WAV decoder for LFM3-Audio input.
 //!
 //! Decodes a RIFF/WAVE file to a mono F32 waveform at the model's expected
-//! sample rate (16 kHz). Supports 16-bit signed PCM (mono or stereo→mean),
-//! the common ASR test-audio format. Multi-channel clips are mixed to mono by
-//! averaging channels (matching the HF `channel_reduction: "mean"`). The HF
-//! `load_audio` backend (librosa/torchcodec) resamples to 16 kHz; this decoder
-//! requires the file to already be 16 kHz (resampling is a follow-up — the
-//! feature extractor checks `sampling_rate` and refuses a mismatch).
+//! sample rate (16 kHz). Supports 16/24/32-bit signed-integer and 32-bit
+//! float PCM (mono or multi-channel→mean) — the common ASR test-audio
+//! formats. Multi-channel clips are mixed to mono by averaging channels
+//! (matching the HF `channel_reduction: "mean"`). The HF `load_audio` backend
+//! (librosa/torchcodec) resamples to 16 kHz; this decoder requires the file to
+//! already be 16 kHz (resampling is a follow-up — the feature extractor checks
+//! `sampling_rate` and refuses a mismatch).
+//!
+//! Limitations (NITS-1): `WAVE_FORMAT_EXTENSIBLE` and 8-bit PCM are rejected
+//! (not in the LFM3-Audio test set); a trailing partial frame shorter than one
+//! interleave is dropped by `chunks_exact` (sub-millisecond at 16 kHz — below
+//! the encoder's 8-frame / 80 ms token granularity).
 
 /// A decoded mono waveform + its sample rate.
 pub struct Waveform {

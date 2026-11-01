@@ -1299,7 +1299,7 @@ fn emit_qwen_ar_info(stdout: &mut impl std::io::Write, id: &str, message: &str) 
 
 /// Emit the Qwen AR cancellation transcript (`aborted` then `done`) with
 /// attempt_id on every event after gen_start.
-fn emit_qwen_ar_cancelled(stdout: &mut impl std::io::Write, id: &str, completion_tokens: usize) {
+fn emit_ar_cancelled(stdout: &mut impl std::io::Write, id: &str, completion_tokens: usize) {
     let attempt_id = active_attempt_id();
     let aborted = hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id);
     let _ = writeln!(stdout, "{}", aborted);
@@ -1321,7 +1321,7 @@ fn emit_spec_cancel_after_rollback(
     epilogue: &RollbackEpilogue,
 ) {
     if epilogue.rolled_back {
-        emit_qwen_ar_cancelled(stdout, id, completion_tokens);
+        emit_ar_cancelled(stdout, id, completion_tokens);
         return;
     }
     emit_fail_closed_error(
@@ -18748,7 +18748,7 @@ fn generate_lfm2moe(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => emit_qwen_ar_cancelled(stdout, id, generated_count),
+        ClientTerminalDecision::Abort => emit_ar_cancelled(stdout, id, generated_count),
     }
 }
 
@@ -19072,7 +19072,7 @@ fn generate_lfm3(
         // correlated cancellation transcript so the CLI serve's
         // abort_and_drain terminates instead of waiting forever while holding
         // the serve admission slot (queue-wide stall).
-        ClientTerminalDecision::Abort => emit_qwen_ar_cancelled(stdout, id, generated_count),
+        ClientTerminalDecision::Abort => emit_ar_cancelled(stdout, id, generated_count),
     }
 }
 
@@ -19474,7 +19474,7 @@ fn generate_lfm3_vl(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => emit_qwen_ar_cancelled(stdout, id, generated_count),
+        ClientTerminalDecision::Abort => emit_ar_cancelled(stdout, id, generated_count),
     }
 }
 
@@ -19797,7 +19797,7 @@ fn generate_lfm3_audio(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => emit_qwen_ar_cancelled(stdout, id, generated_count),
+        ClientTerminalDecision::Abort => emit_ar_cancelled(stdout, id, generated_count),
     }
 }
 /// LFM3-Omni TTS (audio output) path — Phase 4c. Generates audio OUTPUT: a
@@ -22985,7 +22985,7 @@ fn run_dots_ocr_ngram_loop(
         Ok(PrefillOutcome::Aborted) => {
             // Client cancel during n-gram prefill: cancel lifecycle only
             // (no success done / commit_ready).
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            emit_ar_cancelled(stdout, id, 0);
             return;
         }
         Err(e) => {
@@ -23530,7 +23530,7 @@ mod vl_adaptive_admission_tests {
 #[cfg(test)]
 mod qwen_ar_semantic_route_tests {
     use super::{
-        emit_gen_start, emit_qwen_ar_cancelled, emit_qwen_ar_done, emit_qwen_ar_info,
+        emit_gen_start, emit_ar_cancelled, emit_qwen_ar_done, emit_qwen_ar_info,
         emit_qwen_ar_open_think_terminal, emit_spec_cancel_after_rollback,
         emit_staged_terminal_done, emit_tool_calls_event, emit_visible_token,
         qwen_ar_apply_cache_action, qwen_ar_cache_action, qwen_ar_done_value,
@@ -23976,7 +23976,7 @@ mod qwen_ar_semantic_route_tests {
     fn cancellation_transcript_carries_attempt_id() {
         set_active_attempt_id(42);
         let mut sink = Vec::new();
-        emit_qwen_ar_cancelled(&mut sink, "req-1", 3);
+        emit_ar_cancelled(&mut sink, "req-1", 3);
         let events = parse_jsonl(&String::from_utf8(sink).unwrap());
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["type"], "aborted");
@@ -24366,7 +24366,7 @@ mod qwen_ar_semantic_route_tests {
             Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
         );
         emit_visible_token(&mut sink, "c1", "partial ");
-        emit_qwen_ar_cancelled(&mut sink, "c1", 1);
+        emit_ar_cancelled(&mut sink, "c1", 1);
         let events = parse_jsonl(&String::from_utf8(sink).unwrap());
         assert_eq!(events[0]["type"], "gen_start");
         assert_eq!(events[0]["contract_version"], 2);
@@ -24662,7 +24662,7 @@ mod qwen_ar_semantic_route_tests {
             false,
             Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
         );
-        emit_qwen_ar_cancelled(&mut sink, "c1", 1);
+        emit_ar_cancelled(&mut sink, "c1", 1);
         let events = parse_jsonl(&String::from_utf8(sink).unwrap());
         assert_eq!(
             events[0],
@@ -26788,7 +26788,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // Production cancel writer (same path as generate_spec abort sites).
         set_active_attempt_id(11);
         let mut sink = Vec::new();
-        emit_qwen_ar_cancelled(&mut sink, "c", 3);
+        emit_ar_cancelled(&mut sink, "c", 3);
         let out = String::from_utf8(sink).unwrap();
         let lines = parse_jsonl(&out);
         assert_eq!(lines.len(), 2);
@@ -26896,7 +26896,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // Production cancel writer carries attempt_id on aborted + done.
         set_active_attempt_id(3);
         let mut sink = Vec::new();
-        emit_qwen_ar_cancelled(&mut sink, "c1", 5);
+        emit_ar_cancelled(&mut sink, "c1", 5);
         let lines = parse_jsonl(&String::from_utf8(sink).unwrap());
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["type"], "aborted");
@@ -27069,7 +27069,7 @@ mod qwen_dflash_semantic_terminal_tests {
         let mut sink = Vec::new();
         match classify_forced_gpu_advance(true) {
             ForcedGpuAdvanceKind::Cancelled => {
-                emit_qwen_ar_cancelled(&mut sink, "c-force", 4);
+                emit_ar_cancelled(&mut sink, "c-force", 4);
             }
             ForcedGpuAdvanceKind::Committed => panic!("abort must classify Cancelled"),
         }

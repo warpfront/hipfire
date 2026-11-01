@@ -240,11 +240,8 @@ pub fn load_codec_weights(
     gpu: &mut Gpu,
 ) -> Result<CodecWeights, String> {
     let h = cfg.hidden_size;
-    let q_dim = cfg.q_dim();
-    let kv_dim = cfg.kv_dim();
     let inter = cfg.intermediate_size;
     let k_conv = cfg.conv_kernel_size;
-    let cb_dim = cfg.fsq_levels.len(); // 4
 
     eprintln!("  loading Liquid Codec weights (F16)...");
     let project_out_w = load_f16_source(source, gpu, "quantizer.project_out.weight")?;
@@ -305,7 +302,6 @@ pub fn load_codec_weights(
             w3,
         });
     }
-    let _ = (q_dim, kv_dim, cb_dim);
 
     let lin_w = load_f16_source(source, gpu, "decoder.lin.weight")?;
     let lin_b = load_f32_source_gpu(
@@ -378,7 +374,6 @@ pub struct CodecState {
     pub kv: KvCache,
     pub conv_states: Vec<GpuTensor>,
     pub pos_buf: hip_bridge::DeviceBuffer,
-    pub max_seq: usize,
     /// Absolute position counter (carries across chunks for streaming decode).
     pub n_tokens: usize,
     pub h: GpuTensor,
@@ -445,7 +440,6 @@ impl CodecState {
             kv,
             conv_states,
             pos_buf,
-            max_seq,
             n_tokens: 0,
             h: alloc(gpu, h, "h")?,
             tmp: alloc(gpu, h, "tmp")?,
@@ -700,26 +694,42 @@ pub fn fsq_decode(cfg: &CodecConfig, codes: &[u32]) -> Result<Vec<f32>, String> 
 
 // ─── iSTFT (CPU) ─────────────────────────────────────────────────────────────
 
+/// Precomputed irfft twiddle tables, built once per decode (NITS-1: the old
+/// code rebuilt a (n/2+1)×n table — ~820K trig evaluations for the 1280-point
+/// STFT — for EVERY codec frame; hoisted here so a decode builds it once).
+struct IrfftTwiddles {
+    n: usize,
+    cos_t: Vec<f32>, // [(n/2 + 1) * n]
+    sin_t: Vec<f32>,
+}
+
+impl IrfftTwiddles {
+    fn new(n: usize) -> Self {
+        let half = n / 2;
+        let mut cos_t = vec![0.0f32; (half + 1) * n];
+        let mut sin_t = vec![0.0f32; (half + 1) * n];
+        for k in 0..=half {
+            for j in 0..n {
+                let ang = 2.0 * PI * k as f32 * j as f32 / n as f32;
+                cos_t[k * n + j] = ang.cos();
+                sin_t[k * n + j] = ang.sin();
+            }
+        }
+        Self { n, cos_t, sin_t }
+    }
+}
+
 /// Inverse real FFT (naive O(N²)): half-spectrum `[N/2+1]` (re, im) → `[N]` real.
 /// norm="backward" (1/N scaling), matching `torch.fft.irfft(..., norm="backward")`.
-fn irfft(re: &[f32], im: &[f32], n: usize) -> Vec<f32> {
+fn irfft_with(tw: &IrfftTwiddles, re: &[f32], im: &[f32]) -> Vec<f32> {
+    let n = tw.n;
     let half = n / 2;
     let inv_n = 1.0 / n as f32;
     let mut out = vec![0.0f32; n];
-    // Precompute twiddles.
-    let mut cos_t = vec![0.0f32; (half + 1) * n];
-    let mut sin_t = vec![0.0f32; (half + 1) * n];
-    for k in 0..=half {
-        for j in 0..n {
-            let ang = 2.0 * PI * k as f32 * j as f32 / n as f32;
-            cos_t[k * n + j] = ang.cos();
-            sin_t[k * n + j] = ang.sin();
-        }
-    }
     for k in 0..=half {
         let scale = if k == 0 || k == half { inv_n } else { 2.0 * inv_n };
-        let c = cos_t[k * n..k * n + n].as_ptr();
-        let s = sin_t[k * n..k * n + n].as_ptr();
+        let c = tw.cos_t[k * n..k * n + n].as_ptr();
+        let s = tw.sin_t[k * n..k * n + n].as_ptr();
         let rk = re[k];
         let ik = im[k];
         for j in 0..n {
@@ -738,6 +748,7 @@ fn irfft(re: &[f32], im: &[f32], n: usize) -> Vec<f32> {
 /// `(num_frames-1)*hop + win` (NOT trimmed). The caller divides + trims.
 fn istft_overlap_add_raw(
     cfg: &CodecConfig,
+    tw: &IrfftTwiddles,
     window: &[f32],
     log_mag: &[f32], // [num_frames, n_bins]
     angle: &[f32],   // [num_frames, n_bins]
@@ -772,7 +783,7 @@ fn istft_overlap_add_raw(
                 mag * angle[t * n_bins + k].sin()
             })
             .collect();
-        let frame = irfft(&re, &im, n_fft);
+        let frame = irfft_with(tw, &re, &im);
         let off = t * hop;
         for j in 0..win {
             let idx = off + j;
@@ -796,7 +807,8 @@ fn istft_overlap_add(
     let win = cfg.stft_win;
     let hop = cfg.stft_hop;
     let trim = (win - hop) / 2;
-    let (audio, envelope) = istft_overlap_add_raw(cfg, window, log_mag, angle, num_frames);
+    let tw = IrfftTwiddles::new(cfg.stft_n_fft);
+    let (audio, envelope) = istft_overlap_add_raw(cfg, &tw, window, log_mag, angle, num_frames);
     let output_size = audio.len();
     let lo = trim;
     let hi = output_size.saturating_sub(trim);
@@ -990,7 +1002,9 @@ pub fn codec_decode_streaming(
                 angle[t * n_bins + k] = lin_host[t * (2 * n_bins) + n_bins + k];
             }
         }
-        istft_overlap_add_raw(cfg, &weights.istft_window, &log_mag, &angle, n_up)
+        // NITS-1: twiddles built once per streaming decode, not per frame.
+        let tw = IrfftTwiddles::new(cfg.stft_n_fft);
+        istft_overlap_add_raw(cfg, &tw, &weights.istft_window, &log_mag, &angle, n_up)
     } else {
         // Finalize flush with no new frames: zeros of the tail length.
         (vec![0.0f32; tail], vec![0.0f32; tail])

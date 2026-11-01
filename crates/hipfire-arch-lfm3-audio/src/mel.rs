@@ -56,8 +56,6 @@ impl MelConfig {
     pub fn num_freq_bins(&self) -> usize {
         self.n_fft / 2 + 1
     }
-    /// 8 spectrogram frames → 1 encoder token (LFM3-Audio `encoder_stride`).
-    pub const ENCODER_STRIDE: usize = 8;
 
     /// Right-pad length for a clip of `num_samples` (HF `pad_length`): pad so
     /// the last STFT window is full (aligned to `hop_length`), minimum `n_fft`.
@@ -68,11 +66,6 @@ impl MelConfig {
             let rem = (num_samples - self.n_fft) % self.hop_length;
             num_samples + ((self.hop_length - rem) % self.hop_length)
         }
-    }
-    /// Number of STFT frames for a clip of `num_samples` (after padding).
-    pub fn num_frames(&self, num_samples: usize) -> usize {
-        let padded = self.pad_length(num_samples);
-        1 + (padded.saturating_sub(self.n_fft)) / self.hop_length
     }
 }
 
