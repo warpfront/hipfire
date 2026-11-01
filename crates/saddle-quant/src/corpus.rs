@@ -383,6 +383,33 @@ mod tests {
     }
 
     #[test]
+    fn missing_or_empty_tools_bind_none() {
+        // Llama-3.x renders its tool preamble on `tools is not none`.
+        let tmpl = "{% if tools is not none %}PRE{% endif %}{% for m in messages %}{{ m.content }}{% endfor %}";
+        let conv = |tools: Option<serde_json::Value>| {
+            let mut c = serde_json::json!({
+                "kept_index": 0,
+                "scenario_category": "chat",
+                "source": "unit",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(t) = tools {
+                c["tools"] = t;
+            }
+            c
+        };
+        let tool = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        let json = serde_json::json!({
+            "recipe": "v6",
+            "n_conversations": 3,
+            "conversations": [conv(None), conv(Some(serde_json::json!([]))), conv(Some(tool))]
+        })
+        .to_string();
+        let rendered = render_conversations(&json, tmpl).expect("render");
+        assert_eq!(rendered, vec!["hi", "hi", "PREhi"]);
+    }
+
+    #[test]
     fn render_reasoning_content_and_tool_role() {
         let tmpl = qwen_chatml_template();
         let json = serde_json::json!({
