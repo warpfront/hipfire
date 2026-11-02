@@ -3559,3 +3559,31 @@ fn arch_has_hfq6_gemv_is_mmq_union_wave32() {
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_gfx906()));
     assert!(!ArchPredicate::HasHfq6Gemv.eval_arch(&DispatchCtx::for_test("gfx942")));
 }
+
+/// HIPF-241: `GemvHfq3G256` was gated on sdot4 + gfx110x, so gfx1151/gfx12
+/// resolved MissingImpl and LLaMA hfq3g256 files failed at the first prefill.
+/// The generic kernel is wave32 scalar: every wave32 arch resolves, CDNA wave64
+/// stays excluded.
+#[test]
+fn hfq3g256_gemv_resolves_on_wave32_only() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    for (arch, ok) in [
+        ("gfx1010", true),
+        ("gfx1030", true),
+        ("gfx1100", true),
+        ("gfx1151", true),
+        ("gfx1201", true),
+        ("gfx906", false),
+        ("gfx942", false),
+    ] {
+        let r = fam.resolve(
+            DType::HFQ3G256,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert_eq!(r.is_ok(), ok, "HFQ3G256 on {arch}: {r:?}");
+    }
+}
