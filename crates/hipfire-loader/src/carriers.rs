@@ -3506,6 +3506,14 @@ fn qwen4_ep_unit_stage_borrow_on() -> bool {
     hipfire_config::developer_var(QWEN4_EP_UNIT_STAGE_BORROW_ENV).as_deref() == Ok("1")
 }
 
+/// `HIPFIRE_EP_UNIT_DONORS=tail` (lab, default off = hottest ranked layers): the decoupled
+/// reserve's scratch donors under a unit plan are the last whole layers of the model instead.
+const QWEN4_EP_UNIT_DONORS_ENV: &str = "HIPFIRE_EP_UNIT_DONORS";
+
+fn qwen4_ep_unit_donors_tail() -> bool {
+    hipfire_config::developer_var(QWEN4_EP_UNIT_DONORS_ENV).as_deref() == Ok("tail")
+}
+
 /// Pinned host bytes of the restore copies a borrowed unit stage keeps for `rank`: both
 /// tensors (gate/up, down) of each of the two lent layers plus the four allocation pads
 /// (`expert_stage_mirror_bytes(layer_bytes, 1)`'s formula); `0` without a borrowed stage.
@@ -3817,8 +3825,16 @@ fn qwen4_ep_units_donor_plan(
     } else {
         Vec::new()
     };
-    let candidates =
-        units::ep_unit_donor_layers_excluding(&unforced.plan, geometry.trunk_layers, &lent);
+    let candidates = if qwen4_ep_unit_donors_tail() {
+        // Lab: the scratch donors are the LAST whole layers (a contiguous late suffix like the
+        // release default's donors), not the hottest ones.
+        (0..geometry.trunk_layers)
+            .rev()
+            .filter(|layer| !lent.contains(layer))
+            .collect::<Vec<_>>()
+    } else {
+        units::ep_unit_donor_layers_excluding(&unforced.plan, geometry.trunk_layers, &lent)
+    };
     let probe_capacity = ep::EpReserveCapacity {
         free_per_rank: input.free_per_rank.to_vec(),
         non_expert_bytes: input.non_expert,
