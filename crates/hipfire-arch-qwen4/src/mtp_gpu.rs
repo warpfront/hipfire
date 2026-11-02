@@ -352,6 +352,9 @@ const MTP_SCRATCH_TENSORS: usize = 36;
 impl MtpGpuScratch {
     /// Element count and dtype of each scratch tensor, in field order.
     fn shapes(config: &Qwen4Config) -> Result<[(usize, DType); MTP_SCRATCH_TENSORS], MtpGpuError> {
+        // The replicated head is sized under the GLOBAL geometry (a trunk-shard rank's local
+        // config halves the q heads and the shared expert for the trunk only).
+        let config = config.mtp_geometry();
         let hidden = config.hidden_size;
         let wide = config
             .hc_count
@@ -2672,6 +2675,7 @@ impl Qwen4MtpGpu {
         head_dtype: DType,
         head_d2: bool,
     ) -> Option<(usize, usize)> {
+        let config = config.mtp_geometry();
         let (policy, layout) = draft_head_config(config);
         let (draft, scratch) = DraftHead::device_bytes(head_dtype, layout, policy)?;
         let resident = MtpGpuScratch::device_bytes(config)
@@ -2696,6 +2700,7 @@ impl Qwen4MtpGpu {
         head_dtype: DType,
         head_d2: bool,
     ) -> Option<(Vec<u64>, Vec<u64>)> {
+        let config = config.mtp_geometry();
         let (policy, layout) = draft_head_config(config);
         let (draft, draft_scratch) = DraftHead::allocation_sizes(head_dtype, layout, policy)?;
         let widen = |sizes: Vec<usize>| -> Option<Vec<u64>> {
@@ -2733,6 +2738,7 @@ impl Qwen4MtpGpu {
         )>,
         head_d2: bool,
     ) -> Result<Self, MtpGpuError> {
+        let config = config.mtp_geometry();
         admit_mtp(weights, config)?;
         if weights.ep_placement() != ep.map(|(placement, _, _)| placement) {
             return Err(invalid(
@@ -3326,6 +3332,7 @@ impl Qwen4MtpGpu {
         step: MtpStep,
         ep: Option<MtpEpGather<'_>>,
     ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
+        let config = config.mtp_geometry();
         self.head_prologue(gpu, config, token, backbone_hidden, position)?;
         let mtp = bound_mtp(weights)?;
         let lengths = {
@@ -3485,6 +3492,7 @@ impl Qwen4MtpGpu {
         weights: &Qwen4Weights,
         config: &Qwen4Config,
     ) -> bool {
+        let config = config.mtp_geometry();
         (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
             && AppendWidths::new(config)
                 .is_some_and(|w| AppendWeights::resolve(weights, config, &w).is_ok())
@@ -3534,6 +3542,7 @@ impl Qwen4MtpGpu {
         device_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), MtpGpuError> {
+        let config = config.mtp_geometry();
         let rows = tokens.len();
         let w = AppendWidths::new(config).ok_or_else(|| invalid("MTP append width overflow"))?;
         let det = append_rows_det(context, mtp_append_det_enabled(gpu));
@@ -4560,6 +4569,146 @@ mod tests {
             MtpGpuScratch::device_bytes(&config).unwrap(),
             flash_next_mtp_plan_bytes(&config)
         );
+    }
+
+    /// A trunk-shard rank that KEEPS the head (lab): the replicated head is sized under the
+    /// GLOBAL geometry (24 q heads, shared expert 640) although the rank's own config is the
+    /// local one (12 q heads, 384 / 256). Every sizing entry the loader, census, lanes and
+    /// `native_mtp_device_bytes` reach is byte-identical to the unsharded config's, and a config
+    /// that lost its geometry view would size different (smaller) q/shared buffers.
+    #[test]
+    fn head_sizing_under_a_trunk_shard_rank_is_the_global_geometry() {
+        let global = compact_test_config();
+        let context = Qwen4ContextCommit::legacy(4096);
+        let global_q = global.num_attention_heads * global.head_dim;
+        let global_shapes = MtpGpuScratch::shapes(&global).unwrap();
+        // pin the two shard-dependent tensors of the scratch plan: q-and-gate rows, shared
+        assert_eq!(global_shapes[17], (2 * global_q, DType::F32));
+        assert_eq!(
+            global_shapes[35],
+            (global.shared_expert_intermediate_size, DType::F32)
+        );
+        assert_eq!(global.shared_expert_intermediate_size, 640);
+        for rank in 0..2 {
+            let local = global.trunk_shard_local(rank, 2).unwrap();
+            assert_eq!(local.num_attention_heads * 2, global.num_attention_heads);
+            assert_eq!(MtpGpuScratch::shapes(&local).unwrap(), global_shapes);
+            assert_eq!(
+                MtpGpuScratch::allocation_sizes(&local),
+                MtpGpuScratch::allocation_sizes(&global)
+            );
+            assert_eq!(
+                MtpGpuScratch::device_bytes(&local).unwrap(),
+                flash_next_mtp_plan_bytes(&global)
+            );
+            assert_eq!(
+                MtpRowsScratch::device_bytes(&local),
+                MtpRowsScratch::device_bytes(&global)
+            );
+            assert_eq!(
+                MtpRowsScratch::allocation_sizes(&local),
+                MtpRowsScratch::allocation_sizes(&global)
+            );
+            for head in [DType::BF16, DType::MQ6G256V2] {
+                for head_d2 in [false, true] {
+                    assert_eq!(
+                        Qwen4MtpGpu::device_bytes(&local, &context, head, head_d2),
+                        Qwen4MtpGpu::device_bytes(&global, &context, head, head_d2)
+                    );
+                    assert_eq!(
+                        Qwen4MtpGpu::allocation_sizes(&local, &context, head, head_d2),
+                        Qwen4MtpGpu::allocation_sizes(&global, &context, head, head_d2)
+                    );
+                }
+                assert_eq!(
+                    crate::mtp_spec::native_mtp_device_bytes(
+                        &local, &context, 1536, 3, head, None, false
+                    ),
+                    crate::mtp_spec::native_mtp_device_bytes(
+                        &global, &context, 1536, 3, head, None, false
+                    )
+                );
+            }
+            // without the view the rank-local geometry WOULD have been sized: smaller buffers
+            let mut naive = local.clone();
+            naive.mtp_head = None;
+            assert_ne!(
+                MtpGpuScratch::allocation_sizes(&naive),
+                MtpGpuScratch::allocation_sizes(&global)
+            );
+            assert_eq!(MtpGpuScratch::shapes(&naive).unwrap()[17].0, global_q);
+            assert_eq!(
+                MtpGpuScratch::shapes(&naive).unwrap()[35].0,
+                [384, 256][rank]
+            );
+        }
+        // a head-free shard has no head to size: the view is the plain config (identity)
+        let headless = global
+            .clone()
+            .into_headless()
+            .unwrap()
+            .trunk_shard_local(1, 2)
+            .unwrap();
+        assert!(std::ptr::eq(headless.mtp_geometry(), &headless));
+    }
+
+    /// The hidden stream the head reads after the sharded trunk is the FULL replicated HC
+    /// stream: the trunk-output taps (wide hidden capture, spec hidden rows, MTP wide hidden
+    /// carry, lane pending hidden) size from `hc_count * hidden`, which the shard never cuts.
+    #[test]
+    fn trunk_output_taps_are_full_width_under_the_shard() {
+        let global = compact_test_config();
+        let dims = crate::gpu_forward::program_dims(&global);
+        for rank in 0..2 {
+            let local = global.trunk_shard_local(rank, 2).unwrap();
+            let local_dims = crate::gpu_forward::program_dims(&local);
+            assert_eq!(local_dims.wide(), dims.wide());
+            assert_eq!(local_dims.wide(), global.hc_count * global.hidden_size);
+            assert_eq!(local.hc_count * local.hidden_size, dims.wide());
+            assert_eq!(local_dims.hidden, dims.hidden);
+            assert_eq!(local_dims.hc_lowrank, dims.hc_lowrank);
+            assert_eq!(
+                crate::gpu_forward::router_columns(local_dims),
+                crate::gpu_forward::router_columns(dims)
+            );
+            // what does shrink is the mixer / shared width, never the stream
+            assert_eq!(local_dims.q_width() * 2, dims.q_width());
+            assert_eq!(local_dims.gdn_value() * 2, dims.gdn_value());
+            let head = crate::gpu_forward::program_dims(local.mtp_geometry());
+            assert_eq!(head.wide(), local_dims.wide());
+            assert_eq!(head.q_width(), dims.q_width());
+        }
+    }
+
+    /// The head runs replicated on every rank: its HC writes are local, never the trunk shard's
+    /// fused all-reduce (the trunk route's writers are built only for trunk layers, in
+    /// `gpu_forward.rs` / `gpu_forward_lanes.rs`). Source guard: every HC write op the head
+    /// builds names `ar: None`, and the head code never reads the trunk route.
+    #[test]
+    fn head_hc_writes_carry_no_all_reduce() {
+        let ctor = ["HyperWrite", "Op {"].concat();
+        let route = ["trunk", "_route"].concat();
+        let mut seen = 0;
+        for (name, source) in [
+            ("mtp_gpu.rs", include_str!("mtp_gpu.rs")),
+            ("mtp_gpu/rows.rs", include_str!("mtp_gpu/rows.rs")),
+            ("mtp_gpu/lab.rs", include_str!("mtp_gpu/lab.rs")),
+        ] {
+            let production = source.split("mod tests {").next().unwrap();
+            for (at, _) in production.match_indices(&ctor) {
+                seen += 1;
+                let next = production[at..].lines().nth(1).unwrap_or("").trim();
+                assert_eq!(
+                    next, "ar: None,",
+                    "{name}: a head HC write must not all-reduce"
+                );
+            }
+            assert!(
+                !production.contains(&route),
+                "{name}: the head never reads the trunk route"
+            );
+        }
+        assert!(seen >= 1, "the head builds its HC writes in `hc_write`");
     }
 
     fn tiny_dense() -> Qwen4Config {

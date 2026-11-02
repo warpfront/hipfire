@@ -3916,6 +3916,61 @@ mod tests {
         );
     }
 
+    /// Under the head-keeping shard policy (lab shard switch AND the MTP switch) the shipped
+    /// packed artifact admits UNCHANGED: checkpoint profile, native MTP config, the manifest
+    /// with every `mtp.*` tensor, all head records counted; any other policy outcome admits
+    /// it headless. The kept config then shards into rank-local configs that run the head on
+    /// the global geometry.
+    #[test]
+    fn head_keeping_shard_policy_admits_the_artifact_with_its_head() {
+        use crate::weights::trunk_shard::{drops_head_for, keeps_mtp_given};
+        let headers = flash_next_headers();
+        let json = flash_next_json();
+        let unsharded = admit_with_head_policy(&json, &headers, false).unwrap();
+        for (lab, mtp_env) in [(false, false), (true, false), (false, true)] {
+            let drop = drops_head_for(true, keeps_mtp_given(lab, mtp_env));
+            assert!(drop, "lab={lab} mtp={mtp_env} drops the head");
+            let admitted = admit_with_head_policy(&json, &headers, drop).unwrap();
+            assert_eq!(
+                admitted.config.profile,
+                crate::config::Qwen4Profile::FlashNextHeadless
+            );
+            assert!(admitted.config.mtp.is_none());
+        }
+        let drop = drops_head_for(true, keeps_mtp_given(true, true));
+        assert!(!drop);
+        let kept = admit_with_head_policy(&json, &headers, drop).unwrap();
+        assert_eq!(kept.config, unsharded.config);
+        assert_eq!(kept.config.profile, crate::config::Qwen4Profile::FlashNext);
+        assert!(kept.config.mtp.is_some() && kept.config.mtp_num_hidden_layers == 1);
+        assert_eq!(kept.manifest, unsharded.manifest);
+        assert_eq!(kept.source_tensor_count, headers.len());
+        assert!(
+            kept.manifest
+                .weights
+                .iter()
+                .filter(|entry| entry.name.starts_with("mtp."))
+                .count()
+                > 0
+        );
+        // every head record of the file is still held to the exact inventory
+        let mut reshaped = headers.clone();
+        let at = reshaped
+            .iter()
+            .position(|header| header.name.starts_with("mtp.") && header.shape.len() > 1)
+            .unwrap();
+        reshaped[at].shape[0] += 1;
+        assert!(admit_with_head_policy(&json, &reshaped, drop).is_err());
+        // the admitted global config shards; each rank's head geometry is the global config
+        for rank in 0..2 {
+            let local = kept.config.trunk_shard_local(rank, 2).unwrap();
+            local.validate().unwrap();
+            assert_eq!(local.mtp_geometry(), &kept.config);
+            assert_eq!(local.replica_geometry(), kept.config);
+            assert!(local.num_attention_heads < kept.config.num_attention_heads);
+        }
+    }
+
     fn stock_fp8_json(id: &str) -> String {
         let mut value: serde_json::Value = serde_json::from_str(&flash_next_json()).unwrap();
         value[RECIPE_METADATA_KEY] = json!({"version": 3, "id": id});

@@ -738,6 +738,13 @@ pub struct Qwen4Config {
     /// the q heads and the shared-expert intermediate are this rank's share; `None` on every
     /// parsed (global) config.
     pub trunk_shard: Option<(usize, usize)>,
+    /// On the rank-local config of a trunk shard that KEEPS the native MTP head
+    /// ([`crate::weights::trunk_shard::trunk_shard_keeps_mtp`]): the GLOBAL config the head
+    /// runs under (24 q heads, shared expert 640; the head weights are not cut). The
+    /// head's sizing and launch code reads its geometry through [`Self::mtp_geometry`]; every
+    /// trunk consumer keeps reading the rank-local fields above. `None` on every parsed
+    /// config and on a head-free shard.
+    pub mtp_head: Option<Box<Qwen4Config>>,
 }
 
 impl Qwen4Config {
@@ -1077,6 +1084,7 @@ impl Qwen4Config {
             mtp,
             trunk_iu4_default,
             trunk_shard: None,
+            mtp_head: None,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1100,6 +1108,11 @@ impl Qwen4Config {
                 ));
             }
             return self.validate_typed_agreement();
+        }
+        if self.mtp_head.is_some() {
+            return Err(
+                "qwen4: a head geometry view is only carried by a trunk-shard config".into(),
+            );
         }
         expect(self.architecture_id, ARCH_ID, "architecture_id")?;
         expect_str(&self.model_type, MODEL_TYPE, "model_type")?;
@@ -1162,19 +1175,23 @@ impl Qwen4Config {
     /// The rank-local config of `rank` of `parts` of a TP trunk shard: GDN key/value heads and
     /// q heads divided by `parts` (KV heads stay: the q heads of a rank are an equal share of
     /// every KV group), the shared-expert intermediate this rank's share. Defined only for a
-    /// validated global head-free Flash-Next config ([`Qwen4Profile::is_headless`]; the
-    /// native MTP head reads the global geometry and is not sharded yet). Whether a load
-    /// drops the head for the shard is ONE decision,
-    /// [`crate::weights::trunk_shard::trunk_shard_keeps_mtp`]; the slice that keeps the
-    /// head replicated on the global config relaxes the head refusal below.
+    /// validated global Flash-Next config that is either head-free
+    /// ([`Qwen4Profile::is_headless`]) or the checkpoint profile WITH its native MTP head. The
+    /// head is replicated, never cut: it keeps reading the GLOBAL geometry, which the local
+    /// config carries as [`Self::mtp_head`] ([`Self::mtp_geometry`]). Whether a load keeps
+    /// or drops the head for the shard is ONE decision,
+    /// [`crate::weights::trunk_shard::trunk_shard_keeps_mtp`] (enforced by
+    /// [`crate::weights::trunk_shard::load_local_config`], not here: this is the geometry).
     pub fn trunk_shard_local(&self, rank: usize, parts: usize) -> Result<Self, String> {
-        if self.trunk_shard.is_some() {
+        if self.trunk_shard.is_some() || self.mtp_head.is_some() {
             return Err("qwen4: the config is already a trunk-shard config".into());
         }
-        if !self.profile.is_headless() || self.mtp.is_some() {
+        let head_free = self.profile.is_headless() && self.mtp.is_none();
+        let headed = self.profile == Qwen4Profile::FlashNext && self.mtp.is_some();
+        if !head_free && !headed {
             return Err(
-                "qwen4: the trunk shard needs a head-free Flash-Next profile (no native MTP head; \
-                 the artifact is admitted headless under HIPFIRE_QWEN4_EP_TRUNK_SHARD)"
+                "qwen4: the trunk shard needs a Flash-Next profile that is head-free (no native \
+                 MTP head) or the checkpoint profile with its head"
                     .into(),
             );
         }
@@ -1211,6 +1228,9 @@ impl Qwen4Config {
             *shared_intermediate_size = Some(shared);
         }
         local.trunk_shard = Some((rank, parts));
+        if headed {
+            local.mtp_head = Some(Box::new(self.clone()));
+        }
         Ok(local)
     }
 
@@ -1227,6 +1247,7 @@ impl Qwen4Config {
         }
         let mut global = self.clone();
         global.trunk_shard = None;
+        global.mtp_head = None;
         global.linear_num_key_heads *= parts;
         global.linear_num_value_heads *= parts;
         global.num_attention_heads *= parts;
@@ -1238,6 +1259,16 @@ impl Qwen4Config {
     /// The geometry ranks must agree on (`check_replica`): the global config.
     pub fn replica_geometry(&self) -> Self {
         self.trunk_shard_global().unwrap_or_else(|_| self.clone())
+    }
+
+    /// The config the native MTP head sizes and launches under: the GLOBAL geometry (all q
+    /// heads, the whole shared expert) the replicated head weights were built for, while the
+    /// 48-layer trunk of a trunk-shard rank runs the rank-local fields of `self`. `self` for
+    /// every config that is not a head-keeping shard rank (identity: unsharded loads and the
+    /// head-free shard are untouched). Only the head's sizing/launch code
+    /// (`mtp_gpu.rs`) reads this; trunk consumers (state, scratch, GDN/QSA shapes) never do.
+    pub fn mtp_geometry(&self) -> &Self {
+        self.mtp_head.as_deref().unwrap_or(self)
     }
 
     /// Why a peer loaded as rank `rank` of `ranks` is not the same model as `rank0` (the
@@ -3026,13 +3057,14 @@ mod tests {
 
     /// The rank-local config of a TP trunk shard: half the GDN/q heads, KV heads kept, the
     /// shared expert split 384 + 256, validated through its reconstructed global config,
-    /// round-tripping, and refused on a profile that carries the MTP head.
+    /// round-tripping (the head-bearing profile is covered by
+    /// `head_keeping_shard_runs_the_head_on_the_global_geometry`).
     #[test]
     fn trunk_shard_local_config_is_the_shard_of_its_global_config() {
         let flash = compact_test_config();
         let ar = flash.clone().into_ar_only().unwrap();
-        // MTP-bearing Flash-Next is refused: the head reads the global geometry.
-        assert!(flash.trunk_shard_local(0, 2).is_err());
+        // MTP-bearing Flash-Next shards too (replicated head on the global geometry).
+        assert!(flash.trunk_shard_local(0, 2).is_ok());
         let locals: Vec<Qwen4Config> = (0..2)
             .map(|r| ar.trunk_shard_local(r, 2).expect("local"))
             .collect();
@@ -3194,17 +3226,21 @@ mod tests {
     /// the global one, keep the head-free profile, and are mutually consistent replicas.
     #[test]
     fn headless_global_config_shards_into_replica_consistent_local_configs() {
-        use crate::weights::trunk_shard::{drops_head_for, load_local_config_for};
+        use crate::weights::trunk_shard::{drops_head_for, keeps_mtp_given, load_local_config_for};
         let flash = compact_test_config();
         let headless = flash.clone().into_headless().unwrap();
-        // the packed head-bearing config is refused until the head policy flips
-        assert!(flash.trunk_shard_local(0, 2).is_err());
+        // the packed head-bearing config shards too; the policy decides whether the load drops
+        // the head, and a drop-policy load refuses a config that still carries it
         let placement = |rank| Some(crate::weights::Qwen4EpPlacement { rank, ranks: 2 });
-        assert!(!crate::weights::trunk_shard::trunk_shard_keeps_mtp());
-        assert!(drops_head_for(true) && !drops_head_for(false));
+        assert!(flash.trunk_shard_local(0, 2).is_ok());
+        // default: the head is dropped (keeps needs the lab value AND the MTP switch)
+        assert!(!keeps_mtp_given(true, false) && !keeps_mtp_given(false, true));
+        assert!(keeps_mtp_given(true, true));
+        assert!(drops_head_for(true, false) && !drops_head_for(false, false));
+        assert!(!drops_head_for(true, true));
         let locals: Vec<Qwen4Config> = (0..2)
             .map(|r| {
-                load_local_config_for(true, &headless, placement(r))
+                load_local_config_for(true, false, &headless, placement(r))
                     .expect("local config")
                     .expect("the switch is on")
             })
@@ -3219,11 +3255,15 @@ mod tests {
         }
         assert_ne!(locals[0], locals[1]);
         // switch off: no local config; a head-bearing config or a non-EP2 load refuses
-        assert_eq!(load_local_config_for(false, &flash, None).unwrap(), None);
-        assert!(load_local_config_for(true, &flash, placement(0)).is_err());
-        assert!(load_local_config_for(true, &headless, None).is_err());
+        assert_eq!(
+            load_local_config_for(false, false, &flash, None).unwrap(),
+            None
+        );
+        assert!(load_local_config_for(true, false, &flash, placement(0)).is_err());
+        assert!(load_local_config_for(true, false, &headless, None).is_err());
         assert!(load_local_config_for(
             true,
+            false,
             &headless,
             Some(crate::weights::Qwen4EpPlacement { rank: 0, ranks: 4 })
         )
@@ -3251,6 +3291,91 @@ mod tests {
         // unsharded EP: the plain replica equality is unchanged
         assert_eq!(flash.replica_mismatch(&flash, 1, 2), None);
         assert!(headless.replica_mismatch(&flash, 1, 2).is_some());
+    }
+
+    /// The shard that KEEPS the native MTP head (lab policy): each rank's local config keeps
+    /// the checkpoint profile and `mtp`, runs the trunk at half the heads / its shared share,
+    /// and carries the GLOBAL geometry the replicated head runs under
+    /// ([`Qwen4Config::mtp_geometry`]). Unsharded and head-free configs are untouched
+    /// (identity), the replica check keeps comparing global geometry, a tampered view is refused.
+    #[test]
+    fn head_keeping_shard_runs_the_head_on_the_global_geometry() {
+        use crate::weights::trunk_shard::load_local_config_for;
+        let flash = compact_test_config();
+        let headless = flash.clone().into_headless().unwrap();
+        let placement = |rank| Some(crate::weights::Qwen4EpPlacement { rank, ranks: 2 });
+        let keep = |rank, config: &Qwen4Config| {
+            load_local_config_for(true, true, config, placement(rank))
+                .expect("local config")
+                .expect("the switch is on")
+        };
+        let locals: Vec<Qwen4Config> = (0..2).map(|r| keep(r, &flash)).collect();
+        for (rank, local) in locals.iter().enumerate() {
+            // the head stays declared: checkpoint profile, MTP config and scalar mirror
+            assert_eq!(local.profile, Qwen4Profile::FlashNext);
+            assert!(local.mtp.is_some() && local.mtp_num_hidden_layers == 1);
+            assert_eq!(local.trunk_shard, Some((rank, 2)));
+            local.validate().expect("the local config validates");
+            // trunk consumers read the rank-local fields
+            assert_eq!(local.num_attention_heads, flash.num_attention_heads / 2);
+            assert_eq!(
+                local.linear_num_value_heads,
+                flash.linear_num_value_heads / 2
+            );
+            assert_eq!(local.shared_expert_intermediate_size, [384, 256][rank]);
+            // the head reads the global geometry: 24 q heads, shared 640, the unsharded config
+            let head = local.mtp_geometry();
+            assert_eq!(head, &flash);
+            assert_eq!(head.trunk_shard, None);
+            assert_eq!(head.num_attention_heads, 24);
+            assert_eq!(head.shared_expert_intermediate_size, 640);
+            assert_eq!(head.ffn.scalar_mirror().3, 640);
+            assert_eq!(head.linear_num_value_heads, 48);
+            assert_eq!(head.mtp_geometry(), head);
+            // the global config and the replica geometry are the unsharded one, view dropped
+            assert_eq!(local.trunk_shard_global().unwrap(), flash);
+            assert_eq!(local.replica_geometry(), flash);
+            assert_eq!(local.replica_geometry().mtp_head, None);
+        }
+        assert_ne!(locals[0], locals[1]);
+        // the two head-keeping ranks are replicas of each other; a headless peer, an unsharded
+        // one and a wrong rank are not
+        assert_eq!(locals[1].replica_mismatch(&locals[0], 1, 2), None);
+        assert_eq!(locals[0].replica_mismatch(&locals[1], 0, 2), None);
+        let headless_peer = keep(1, &headless);
+        assert!(headless_peer.replica_mismatch(&locals[0], 1, 2).is_some());
+        assert!(flash.replica_mismatch(&locals[0], 1, 2).is_some());
+        assert!(locals[0].replica_mismatch(&locals[0], 1, 2).is_some());
+
+        // identity everywhere the head is not kept under the shard
+        assert!(std::ptr::eq(flash.mtp_geometry(), &flash));
+        assert!(std::ptr::eq(headless.mtp_geometry(), &headless));
+        assert_eq!(headless_peer.mtp_head, None);
+        assert!(std::ptr::eq(headless_peer.mtp_geometry(), &headless_peer));
+        assert_eq!(flash.mtp_head, None);
+
+        // the drop policy refuses a config that still carries the head; the keep policy does
+        // not require one
+        assert!(load_local_config_for(true, false, &flash, placement(0)).is_err());
+        assert!(load_local_config_for(false, true, &flash, placement(0))
+            .unwrap()
+            .is_none());
+
+        // a tampered or misplaced view is refused
+        let mut bad = locals[0].clone();
+        bad.mtp_head.as_mut().unwrap().rope_theta *= 2.0;
+        assert!(bad.validate().is_err());
+        let mut bad = locals[0].clone();
+        bad.mtp_head = None;
+        assert!(bad.validate().is_err());
+        let mut bad = flash.clone();
+        bad.mtp_head = Some(Box::new(flash.clone()));
+        assert!(bad.validate().is_err());
+        // sharding a shard (with or without the view) is refused
+        assert!(locals[0].trunk_shard_local(0, 2).is_err());
+        let mut viewed = flash.clone();
+        viewed.mtp_head = Some(Box::new(flash.clone()));
+        assert!(viewed.trunk_shard_local(0, 2).is_err());
     }
     fn fixture() -> Value {
         let layers: Vec<_> = (0..48)

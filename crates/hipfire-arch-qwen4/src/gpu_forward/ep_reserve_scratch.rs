@@ -162,8 +162,23 @@ pub(crate) struct EpRootPlacement {
     pub bytes: u64,
 }
 
+/// How a placement's reserved bytes relate to the root it hosts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacementFit {
+    /// The root has exactly the planned size (every ordinary load: the plan is cut from the
+    /// very config the banks are built from).
+    Exact,
+    /// The planned extent is an upper bound of the root (a trunk-shard rank builds its banks
+    /// from its rank-local config while the ONE shared plan is the root-wise maximum of the
+    /// ranks' own plans: every local root is at most its planned size, proven by
+    /// `EpReserveForwardPlan::covers_local`). The root occupies the first `root.bytes` of its
+    /// extent; the rest of the extent stays reserved and unused.
+    Bounded,
+}
+
 /// Check `placements` against the borrowed plan's non-persistent roots and the
-/// donor `segments`: every such root placed exactly once at its exact size, no
+/// donor `segments`: every such root placed exactly once at its exact size (or, with
+/// [`PlacementFit::Bounded`], inside a planned extent at least that large), no
 /// persistent root placed, every start 256-aligned, no root straddling a
 /// segment, no two roots overlapping, segments 256-aligned and mutually
 /// disjoint in the address space. All arithmetic is checked.
@@ -171,6 +186,7 @@ pub(crate) fn validate_placements(
     roots: &[EpRootSpec],
     segments: &[EpDonorSegment],
     placements: &[EpRootPlacement],
+    fit: PlacementFit,
 ) -> Result<(), Qwen4GpuForwardError> {
     let overflow = || invalid("EP reserve placement arithmetic overflows");
     let align = DECODE_SHARE_ROOT_ALIGN;
@@ -215,7 +231,11 @@ pub(crate) fn validate_placements(
         if std::mem::replace(&mut seen[placement.field as usize], true) {
             return Err(invalid(format!("{:?} is placed twice", placement.field)));
         }
-        if placement.bytes != bytes {
+        let fits = match fit {
+            PlacementFit::Exact => placement.bytes == bytes,
+            PlacementFit::Bounded => placement.bytes >= bytes,
+        };
+        if !fits {
             return Err(invalid(format!(
                 "{:?} is placed with {} bytes, its root has {bytes}",
                 placement.field, placement.bytes
@@ -450,7 +470,14 @@ impl EpReserveBanks {
         }
         let prompt_roots = plan_roots(&prompt_slots)
             .ok_or_else(|| invalid("prompt scratch root sizes overflow"))?;
-        validate_placements(&prompt_roots, segments, placements)?;
+        // The one shared plan bounds every shard rank: a trunk-shard rank's banks (its
+        // rank-local config) fit inside the planned extents instead of matching them.
+        let fit = if config.trunk_shard.is_some() {
+            PlacementFit::Bounded
+        } else {
+            PlacementFit::Exact
+        };
+        validate_placements(&prompt_roots, segments, placements, fit)?;
         let resident_roots = plan_roots(&resident_slots)
             .ok_or_else(|| invalid("resident scratch root sizes overflow"))?;
         let device_bytes = prompt_roots
@@ -597,9 +624,9 @@ impl EpReserveBanks {
                     .ok()
                     .and_then(|offset| segment.address.checked_add(offset))
                     .ok_or_else(|| invalid("borrowed scratch root address overflows"))?;
-                let bytes = usize::try_from(placement.bytes)
-                    .map_err(|_| invalid("borrowed scratch root bytes overflow"))?;
-                // SAFETY: `validate_placements` proved `[offset, offset + bytes)`
+                // The root's own size (== the placement's under `PlacementFit::Exact`).
+                let bytes = slot.bytes()?;
+                // SAFETY: `validate_placements` proved `[offset, offset + root bytes)`
                 // lies inside the donor segment, which the caller guarantees is
                 // live device memory for the bank's life. The tensor is a
                 // non-owning view: both banks are `ScratchBackingKind::Borrowed`
@@ -1141,7 +1168,7 @@ mod tests {
         assert_eq!(six, 3825 * MIB);
         let placements = pack(7).expect("seven layers pack");
         let roots = ep_reserve_scratch(&config(), Mode::Full, PROMPT).unwrap();
-        validate_placements(&roots, &segments(7), &placements).unwrap();
+        validate_placements(&roots, &segments(7), &placements, PlacementFit::Exact).unwrap();
         // No root crosses a segment boundary; ~609 MiB of the 4462.5 MiB is spare.
         let used: u64 = placements.iter().map(|p| p.bytes).sum();
         let capacity: u64 = segments(7).iter().map(|s| s.bytes).sum();
@@ -1155,11 +1182,11 @@ mod tests {
         let roots = ep_reserve_scratch(&config(), Mode::Full, PROMPT).unwrap();
         let segs = segments(7);
         let good = pack(7).unwrap();
-        validate_placements(&roots, &segs, &good).unwrap();
+        validate_placements(&roots, &segs, &good, PlacementFit::Exact).unwrap();
         let broken = |edit: &dyn Fn(&mut Vec<EpRootPlacement>)| {
             let mut placements = good.clone();
             edit(&mut placements);
-            validate_placements(&roots, &segs, &placements)
+            validate_placements(&roots, &segs, &placements, PlacementFit::Exact)
                 .unwrap_err()
                 .to_string()
         };
@@ -1189,14 +1216,166 @@ mod tests {
         // Segments that are unaligned or overlap in the address space.
         let mut unaligned = segs.clone();
         unaligned[0].address += 8;
-        assert!(validate_placements(&roots, &unaligned, &good).is_err());
+        assert!(validate_placements(&roots, &unaligned, &good, PlacementFit::Exact).is_err());
         let mut aliased = segs.clone();
         aliased[1].address = aliased[0].address + 4096;
-        assert!(validate_placements(&roots, &aliased, &good).is_err());
+        assert!(validate_placements(&roots, &aliased, &good, PlacementFit::Exact).is_err());
         // Arithmetic overflow fails closed.
         let mut huge = good.clone();
         huge[0].offset = u64::MAX - 255;
-        assert!(validate_placements(&roots, &segs, &huge).is_err());
+        assert!(validate_placements(&roots, &segs, &huge, PlacementFit::Exact).is_err());
+    }
+
+    /// The headless global config the trunk shard loads and the two rank-local configs cut
+    /// from it.
+    fn shard_configs() -> (Qwen4Config, [Qwen4Config; 2]) {
+        let global = config().into_headless().expect("headless global config");
+        let locals = [0, 1].map(|rank| global.trunk_shard_local(rank, 2).expect("local config"));
+        (global, locals)
+    }
+
+    fn donor_specs(config: &Qwen4Config) -> Vec<EpRootSpec> {
+        ep_reserve_scratch(config, Mode::Full, PROMPT).unwrap()
+    }
+
+    /// The deterministic packing of `config`'s donor-packed roots into the seven segments.
+    fn pack_of(config: &Qwen4Config) -> Vec<EpRootPlacement> {
+        let roots: Vec<(ScratchField, u64)> = donor_specs(config)
+            .into_iter()
+            .filter(|(_, _, persistent)| !persistent)
+            .map(|(field, bytes, _)| (field, bytes))
+            .collect();
+        let caps: Vec<u64> = segments(7).iter().map(|s| s.bytes).collect();
+        crate::ep_reserve::pack_roots(&roots, &caps)
+            .expect("seven donor layers pack")
+            .into_iter()
+            .map(|(field, segment, offset, bytes)| EpRootPlacement {
+                field,
+                segment,
+                offset,
+                bytes,
+            })
+            .collect()
+    }
+
+    /// A shard rank validates its LOCAL roots against the placements of the ONE plan cut from
+    /// the global config: pass under `Bounded`, refused under `Exact` (the sizes differ), and
+    /// every other placement defect stays refused.
+    #[test]
+    fn bounded_fit_places_local_roots_inside_the_global_plan() {
+        let (global, locals) = shard_configs();
+        let planned = pack_of(&global);
+        let segs = segments(7);
+        let global_roots = donor_specs(&global);
+        validate_placements(&global_roots, &segs, &planned, PlacementFit::Exact).unwrap();
+        validate_placements(&global_roots, &segs, &planned, PlacementFit::Bounded).unwrap();
+        for local in &locals {
+            let roots = donor_specs(local);
+            // same root set, every local root no larger than planned, at least one strictly smaller
+            let planned_bytes =
+                |field: F| planned.iter().find(|p| p.field == field).map(|p| p.bytes);
+            let mut smaller = 0;
+            for &(field, bytes, persistent) in &roots {
+                if persistent {
+                    continue;
+                }
+                let plan = planned_bytes(field).expect("a planned extent for every local root");
+                assert!(bytes <= plan, "{field:?}: local {bytes} > planned {plan}");
+                smaller += usize::from(bytes < plan);
+            }
+            assert!(smaller > 0, "the shard shrinks some donor-packed root");
+            validate_placements(&roots, &segs, &planned, PlacementFit::Bounded).unwrap();
+            let exact = validate_placements(&roots, &segs, &planned, PlacementFit::Exact)
+                .unwrap_err()
+                .to_string();
+            assert!(exact.contains("bytes"), "{exact}");
+            // a planned extent SMALLER than its local root is refused under both fits
+            let mut short = planned.clone();
+            let victim = short
+                .iter()
+                .position(|p| roots.iter().any(|r| r.0 == p.field && r.1 > 256))
+                .unwrap();
+            let field = short[victim].field;
+            short[victim].bytes = roots.iter().find(|r| r.0 == field).unwrap().1 - 256;
+            assert!(validate_placements(&roots, &segs, &short, PlacementFit::Bounded).is_err());
+            // a missing / duplicated / persistent placement and a straddling extent still refuse
+            let mut missing = planned.clone();
+            missing.pop();
+            assert!(validate_placements(&roots, &segs, &missing, PlacementFit::Bounded).is_err());
+            let mut twice = planned.clone();
+            twice[1].field = twice[0].field;
+            assert!(validate_placements(&roots, &segs, &twice, PlacementFit::Bounded).is_err());
+            let mut persistent = planned.clone();
+            persistent[0].field = F::MoeYDownGrouped;
+            assert!(
+                validate_placements(&roots, &segs, &persistent, PlacementFit::Bounded).is_err()
+            );
+            let mut straddle = planned.clone();
+            let last = straddle.len() - 1;
+            straddle[last].offset = segs[straddle[last].segment].bytes - 256;
+            assert!(validate_placements(&roots, &segs, &straddle, PlacementFit::Bounded).is_err());
+        }
+    }
+
+    /// The banks of a shard rank are built from its rank-local config over the shared plan's
+    /// segments and placements: every borrowed root is a view of its LOCAL size at its planned
+    /// offset, the device allocations (resident roots + persistent roots) are no larger than
+    /// the plan charges, and nothing leaks on release.
+    #[test]
+    fn shard_banks_build_over_the_global_plan_with_local_sized_roots() {
+        let (global, locals) = shard_configs();
+        let planned = pack_of(&global);
+        let segs = segments(7);
+        let global_device = {
+            let mut device = FakeDevice::new();
+            let (_s, banks) =
+                EpReserveBanks::build(&mut device, &global, Mode::Full, PROMPT, &segs, &planned)
+                    .unwrap();
+            let bytes = live_bank_bytes(&banks);
+            assert!(banks.release(&mut device).is_none());
+            bytes
+        };
+        for local in &locals {
+            let mut device = FakeDevice::new();
+            let (resident, banks) =
+                EpReserveBanks::build(&mut device, local, Mode::Full, PROMPT, &segs, &planned)
+                    .unwrap();
+            assert_eq!(resident.max_chunk, EP_RESERVE_RESIDENT_ROWS);
+            assert!(
+                live_bank_bytes(&banks) <= global_device,
+                "the local banks allocate no more than the plan's dedicated roots"
+            );
+            assert!(live_bank_bytes(&banks) < global_device);
+            let borrowed = banks.borrowed.as_ref().unwrap();
+            for (field, bytes, persistent) in donor_specs(local) {
+                if persistent {
+                    continue;
+                }
+                let placement = planned.iter().find(|p| p.field == field).unwrap();
+                let tensor = borrowed.field_tensor(field);
+                assert_eq!(
+                    tensor.buf.size() as u64,
+                    bytes,
+                    "{field:?} is a local-size view"
+                );
+                assert_eq!(
+                    tensor.buf.as_ptr() as usize,
+                    segs[placement.segment].address + placement.offset as usize,
+                    "{field:?} sits at its planned offset"
+                );
+            }
+            banks.check_stable(&resident).unwrap();
+            assert!(banks.release(&mut device).is_none());
+            assert!(device.live.is_empty() && device.double_frees == 0);
+        }
+        // An unsharded config keeps the exact contract: placements packed for the smaller
+        // local roots are refused before anything is allocated.
+        let mut device = FakeDevice::new();
+        let wrong = pack_of(&shard_configs().1[0]);
+        assert!(
+            EpReserveBanks::build(&mut device, &global, Mode::Full, PROMPT, &segs, &wrong).is_err()
+        );
+        assert_eq!(device.allocs, 0, "nothing allocated before validation");
     }
 
     #[test]

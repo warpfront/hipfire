@@ -10773,7 +10773,10 @@ pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
 /// is larger), the pending, row and retained-pending hidden carries, with `row_capture`
 /// (the GDN state format and ring rows, [`native_mtp_capture`]) the GDN
 /// capture ring in that format, and with `batched_fill`
-/// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch.
+/// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch. The head part and the
+/// request carries are sized under the head's GLOBAL geometry
+/// ([`crate::Qwen4Config::mtp_geometry`]: identity unless a TP trunk shard keeps the head);
+/// the GDN capture ring is the caller's `row_capture` (the trunk's, on its own config).
 pub fn native_mtp_device_bytes(
     config: &crate::Qwen4Config,
     context: &crate::Qwen4ContextCommit,
@@ -10783,6 +10786,7 @@ pub fn native_mtp_device_bytes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
+    let config = config.mtp_geometry();
     let request = native_mtp_request_bytes(
         config,
         context.max_seq,

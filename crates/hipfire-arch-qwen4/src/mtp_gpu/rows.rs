@@ -113,6 +113,7 @@ impl MtpRowsScratch {
     fn shapes(
         config: &Qwen4Config,
     ) -> Result<Option<[(usize, DType); ROWS_SCRATCH_TENSORS]>, MtpGpuError> {
+        let config = config.mtp_geometry();
         let rows = MTP_DRAFT_LANES_MAX;
         let hidden = config.hidden_size;
         let wide = config
@@ -477,6 +478,7 @@ impl Qwen4MtpGpu {
         top1_out: &GpuTensor,
         ep: Option<MtpEpGather<'_>>,
     ) -> Result<(), MtpGpuError> {
+        let config = config.mtp_geometry();
         let n = lanes.len();
         if !draft_rounds_enabled() {
             return Err(invalid(format!(

@@ -6593,12 +6593,14 @@ impl Qwen4Bundle {
         plan: std::sync::Arc<crate::ep_reserve::EpReservePlan>,
     ) -> Result<(), BundleError> {
         let fail = |message: String| BundleError::Forward(format!("EP reserve attach: {message}"));
+        // A trunk-shard rank builds its scratch from its rank-local config while the shared
+        // plan is the root-wise maximum of the ranks' own plans: this rank's roots must fit
+        // inside the planned ones (the banks then place them in the planned extents,
+        // `PlacementFit::Bounded`).
         if self.config.trunk_shard.is_some() {
-            return Err(fail(
-                "a trunk-shard rank sizes its scratch from its rank-local config; the shared \
-                 reserve plan was cut from the global one"
-                    .to_string(),
-            ));
+            plan.forward
+                .covers_local(&self.config)
+                .map_err(|refusal| fail(refusal.to_string()))?;
         }
         if self.execution.is_some() {
             return Err(fail(

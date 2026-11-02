@@ -76,6 +76,11 @@ required-features = ["lab", "reference-parity"]
 name = "qwen4_kld"
 required-features = ["lab"]
 
+# Served-route (EP) twin of `qwen4_kld eval --decode`: same references, estimator and decode route, loaded through the product loader.
+[[example]]
+name = "qwen4_ep_kld"
+required-features = ["lab"]
+
 [[example]]
 name = "qwen4_greedy_ids"
 required-features = ["lab"]

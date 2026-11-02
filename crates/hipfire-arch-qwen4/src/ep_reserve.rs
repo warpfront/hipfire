@@ -16,6 +16,14 @@
 //!
 //! One immutable [`EpReservePlan`] feeds the loader's four reserve readers, the
 //! forward and the mesh receipt ([`EpReserveMeshReceipt`]).
+//!
+//! Under the Flash-Next trunk shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`) the plan is still ONE plan
+//! shared by both ranks, so its digest, the mesh receipt and the census/floor charge are one
+//! figure; each rank sizes its scratch from its own rank-local config, and the plan is the
+//! root-wise maximum of the ranks' own plans ([`EpReserveForwardPlan::from_config_for_shard`]),
+//! so [`EpReserveForwardPlan::covers_local`] holds for every rank (the banks place a smaller
+//! local root at its planned offset). That is a few percent below the plan of the unsharded
+//! global config, which would also bound every rank but reserve (and charge) more.
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
@@ -244,12 +252,6 @@ pub fn admit_ep_reserve(facts: &EpReserveFacts<'_>) -> Result<(), Refusal> {
     if !facts.flash_next {
         return no("not the pinned Flash-Next profile");
     }
-    // The plan is ONE global-config scratch layout placed byte for byte on both ranks
-    // (`validate_placements`); a trunk-shard rank sizes its scratch from its own rank-local
-    // config (half the heads, 384 / 256 shared width), so no shared plan fits either rank.
-    if crate::weights::trunk_shard::trunk_shard_requested() {
-        return no("the trunk shard sizes each rank's scratch from its rank-local config");
-    }
     if facts.expert_qt != Some((44, 53)) {
         return no("expert recipe is not the pinned QT44/QT53 pair");
     }
@@ -405,7 +407,132 @@ impl EpReserveForwardPlan {
     /// The plan of `config` in `Full` mode from the production scratch planner
     /// ([`ep_reserve_scratch`]); `fixed_table_bytes` is every additional
     /// table/metadata charge the integration owner declares.
+    ///
+    /// Under the trunk shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`) the plan is STILL one plan for
+    /// both ranks, but each rank sizes its scratch from its own rank-local config: the plan is
+    /// the root-wise maximum of every rank's own plan ([`Self::from_config_for_shard`]), the
+    /// tightest single plan every rank fits in ([`Self::covers_local`]).
     pub fn from_config(
+        config: &Qwen4Config,
+        mode: Qwen4ForwardScratchMode,
+        fixed_table_bytes: u64,
+    ) -> Result<Self, Refusal> {
+        Self::from_config_for_shard(
+            config,
+            mode,
+            fixed_table_bytes,
+            crate::weights::trunk_shard::trunk_shard_requested(),
+        )
+    }
+
+    /// [`Self::from_config`] with the shard's verdict passed in. `shard` false is exactly the
+    /// plan of `config`, byte for byte what a load without the shard makes. With `shard`, the
+    /// plan is the root-wise maximum of the plans of the rank-local configs of every rank of
+    /// the admitted topology (rank 0 shared width 384, rank 1 shared width 256; the heads
+    /// halved identically): ONE plan, so one digest, one mesh receipt and one census charge,
+    /// no larger than the plan of the global config and every rank's own plan fits inside it.
+    /// A geometry the shard cannot cut, or ranks whose root sets differ, refuses the plan (the
+    /// load keeps the ordinary placement with the reason).
+    pub fn from_config_for_shard(
+        config: &Qwen4Config,
+        mode: Qwen4ForwardScratchMode,
+        fixed_table_bytes: u64,
+        shard: bool,
+    ) -> Result<Self, Refusal> {
+        if config.trunk_shard.is_some() {
+            return Err(Refusal::new(
+                "a trunk-shard rank-local config cannot seed the shared reserve plan: it is cut \
+                 from the global config",
+            ));
+        }
+        if !shard {
+            return Self::from_config_exact(config, mode, fixed_table_bytes);
+        }
+        let mut union: Option<Self> = None;
+        for rank in 0..EP_RESERVE_RANKS {
+            let local = config
+                .trunk_shard_local(rank, EP_RESERVE_RANKS)
+                .map_err(|error| {
+                    Refusal::new(format!("trunk shard rank {rank} local config: {error}"))
+                })?;
+            let own = Self::from_config_exact(&local, mode, fixed_table_bytes)
+                .map_err(|refusal| Refusal::new(format!("rank {rank}: {}", refusal.0)))?;
+            union = Some(match union {
+                None => own,
+                Some(plan) => plan
+                    .union(&own)
+                    .map_err(|refusal| Refusal::new(format!("rank {rank}: {}", refusal.0)))?,
+            });
+        }
+        union.ok_or_else(|| Refusal::new("no rank to plan for"))
+    }
+
+    /// The root-wise maximum of two plans of the same rows, mode and fixed charge (the same
+    /// roots in the same order), speculative bytes included. A plan covers each of its parts
+    /// ([`Self::covers_local`]).
+    fn union(&self, other: &Self) -> Result<Self, Refusal> {
+        if (
+            self.mode,
+            self.prompt_rows,
+            self.resident_rows,
+            self.fixed_table_bytes,
+        ) != (
+            other.mode,
+            other.prompt_rows,
+            other.resident_rows,
+            other.fixed_table_bytes,
+        ) {
+            return Err(Refusal::new(
+                "the plans have other rows, mode or fixed charge",
+            ));
+        }
+        let merge = |what: &str,
+                     a: &[EpReserveRoot],
+                     b: &[EpReserveRoot]|
+         -> Result<Vec<EpReserveRoot>, Refusal> {
+            let fields =
+                |roots: &[EpReserveRoot]| roots.iter().map(|r| r.field).collect::<Vec<_>>();
+            if fields(a) != fields(b) {
+                return Err(Refusal::new(format!(
+                    "the {what} root sets {:?} and {:?} differ",
+                    fields(a),
+                    fields(b)
+                )));
+            }
+            Ok(a.iter()
+                .zip(b)
+                .map(|(a, b)| EpReserveRoot {
+                    field: a.field,
+                    bytes: a.bytes.max(b.bytes),
+                })
+                .collect())
+        };
+        Ok(Self {
+            mode: self.mode,
+            prompt_rows: self.prompt_rows,
+            resident_rows: self.resident_rows,
+            external_roots: merge(
+                "persistent prompt",
+                &self.external_roots,
+                &other.external_roots,
+            )?,
+            resident_persistent: merge(
+                "persistent resident",
+                &self.resident_persistent,
+                &other.resident_persistent,
+            )?,
+            resident_roots: merge("resident", &self.resident_roots, &other.resident_roots)?,
+            remaining_roots: merge(
+                "donor-packed",
+                &self.remaining_roots,
+                &other.remaining_roots,
+            )?,
+            spec_bytes: self.spec_bytes.max(other.spec_bytes),
+            fixed_table_bytes: self.fixed_table_bytes,
+        })
+    }
+
+    fn from_config_exact(
         config: &Qwen4Config,
         mode: Qwen4ForwardScratchMode,
         fixed_table_bytes: u64,
@@ -428,6 +555,63 @@ impl EpReserveForwardPlan {
             spec_bytes,
             fixed_table_bytes,
         )
+    }
+
+    /// Whether a rank built from `local` (the rank-local config of a trunk shard) fits inside
+    /// this plan: the SAME rows, mode and root set (every root present in one is present in
+    /// the other, persistent or not, in the same order), every root of `local`'s own plan no
+    /// larger than the planned one, and no more speculative bytes. The plan then bounds what
+    /// the rank allocates (resident and persistent roots, [`Self::charged_forward_bytes`]) and
+    /// what it borrows from the donor segments (the placements' extents), so the one shared
+    /// plan, its census charge and its digest hold for every rank while each sizes its scratch
+    /// from its own config.
+    pub fn covers_local(&self, local: &Qwen4Config) -> Result<(), Refusal> {
+        let own = Self::from_config_exact(local, self.mode, self.fixed_table_bytes)?;
+        if (own.prompt_rows, own.resident_rows) != (self.prompt_rows, self.resident_rows) {
+            return Err(Refusal::new("the local plan has other row counts"));
+        }
+        let lists: [(&str, &[EpReserveRoot], &[EpReserveRoot]); 4] = [
+            (
+                "persistent prompt",
+                &self.external_roots,
+                &own.external_roots,
+            ),
+            (
+                "persistent resident",
+                &self.resident_persistent,
+                &own.resident_persistent,
+            ),
+            ("resident", &self.resident_roots, &own.resident_roots),
+            ("donor-packed", &self.remaining_roots, &own.remaining_roots),
+        ];
+        for (what, planned, wanted) in lists {
+            let fields =
+                |roots: &[EpReserveRoot]| roots.iter().map(|r| r.field).collect::<Vec<_>>();
+            if fields(planned) != fields(wanted) {
+                return Err(Refusal::new(format!(
+                    "the local {what} root set {:?} is not the plan's {:?}",
+                    fields(wanted),
+                    fields(planned)
+                )));
+            }
+            if let Some((planned, wanted)) = planned
+                .iter()
+                .zip(wanted)
+                .find(|(planned, wanted)| wanted.bytes > planned.bytes)
+            {
+                return Err(Refusal::new(format!(
+                    "the local {what} root {:?} needs {} bytes, the plan reserves {}",
+                    wanted.field, wanted.bytes, planned.bytes
+                )));
+            }
+        }
+        if own.spec_bytes > self.spec_bytes {
+            return Err(Refusal::new(format!(
+                "the local speculative buffers need {} bytes, the plan reserves {}",
+                own.spec_bytes, self.spec_bytes
+            )));
+        }
+        Ok(())
     }
 
     /// The plan from explicit root specs `(field, bytes, persistent)`.
@@ -2012,5 +2196,447 @@ mod tests {
         assert!(mesh_window_epoch_check(epoch.dirty()).is_err());
         epoch.restored();
         assert_eq!(mesh_window_epoch_check(epoch.dirty()), Ok(()));
+    }
+
+    // -- trunk shard: ONE shared plan (the root-wise maximum of the local plans) -------------
+
+    /// The headless global config the shard loads, and the two rank-local configs cut from it
+    /// (rank 0 shared width 384, rank 1 shared width 256; heads halved identically).
+    fn shard_global() -> Qwen4Config {
+        compact_test_config()
+            .into_headless()
+            .expect("headless global config")
+    }
+
+    fn shard_locals() -> [Qwen4Config; 2] {
+        let global = shard_global();
+        [0, 1].map(|rank| global.trunk_shard_local(rank, 2).expect("local config"))
+    }
+
+    /// The forward plan every rank shares under the shard: the root-wise maximum of the two
+    /// ranks' own plans.
+    fn shard_forward() -> EpReserveForwardPlan {
+        EpReserveForwardPlan::from_config_for_shard(
+            &shard_global(),
+            Qwen4ForwardScratchMode::Full,
+            0,
+            true,
+        )
+        .expect("the union plan covers both local configs")
+    }
+
+    /// The reserve plan every rank shares under the shard.
+    fn shard_plan() -> EpReservePlan {
+        let fwd = shard_forward();
+        let cap = capacity_for(33, 0);
+        plan_ep_reserve(&fwd, &geometry(), &cap).expect("the shard plan")
+    }
+
+    /// Every root of `plan`, in a fixed order.
+    fn all_roots(plan: &EpReserveForwardPlan) -> Vec<EpReserveRoot> {
+        plan.external_roots
+            .iter()
+            .chain(&plan.resident_persistent)
+            .chain(&plan.resident_roots)
+            .chain(&plan.remaining_roots)
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn the_shard_plan_is_the_union_of_the_local_plans_inside_the_global_one() {
+        let (global, locals) = (shard_global(), shard_locals());
+        let mode = Qwen4ForwardScratchMode::Full;
+        // The two ranks really have different local configs.
+        assert_ne!(locals[0], locals[1]);
+        assert_ne!(
+            locals[0].shared_expert_intermediate_size,
+            locals[1].shared_expert_intermediate_size
+        );
+        // Without the shard verdict the plan is the ordinary plan of the global config:
+        // flag off is byte-identical.
+        let plain = EpReserveForwardPlan::from_config_for_shard(&global, mode, 0, false).unwrap();
+        assert_eq!(
+            plain,
+            EpReserveForwardPlan::from_config(&global, mode, 0).unwrap()
+        );
+        let shared = shard_forward();
+        assert_ne!(shared, plain);
+        let owns = locals
+            .clone()
+            .map(|local| EpReserveForwardPlan::from_config_exact(&local, mode, 0).unwrap());
+        // The shared plan IS the root-wise maximum of the ranks' own plans, and every rank's
+        // plan fits inside it, root for root.
+        assert_eq!(shared, owns[0].union(&owns[1]).unwrap());
+        for (local, own) in locals.iter().zip(&owns) {
+            shared.covers_local(local).expect("covered");
+            assert!(
+                own.charged_forward_bytes().unwrap() <= shared.charged_forward_bytes().unwrap()
+            );
+            assert!(own.remaining_bytes().unwrap() <= shared.remaining_bytes().unwrap());
+            assert!(own.spec_bytes <= shared.spec_bytes);
+        }
+        // The union is no larger than the plan of the global config, root for root, and
+        // strictly smaller in charge and donor-packed bytes.
+        let (union_roots, global_roots) = (all_roots(&shared), all_roots(&plain));
+        assert_eq!(union_roots.len(), global_roots.len());
+        for (union, global) in union_roots.iter().zip(&global_roots) {
+            assert_eq!(union.field, global.field);
+            assert!(union.bytes <= global.bytes, "{:?}", union.field);
+        }
+        assert!(shared.spec_bytes <= plain.spec_bytes);
+        assert!(shared.charged_forward_bytes().unwrap() < plain.charged_forward_bytes().unwrap());
+        assert!(shared.remaining_bytes().unwrap() < plain.remaining_bytes().unwrap());
+        // One rank's plan alone is NOT enough for the other (the shared widths differ), which
+        // is why the shared plan is the union; the global config's plan does not fit in a
+        // local one.
+        let (larger, smaller) = if owns[0].charged_forward_bytes().unwrap()
+            >= owns[1].charged_forward_bytes().unwrap()
+        {
+            (0, 1)
+        } else {
+            (1, 0)
+        };
+        assert!(
+            owns[smaller].charged_forward_bytes().unwrap()
+                < owns[larger].charged_forward_bytes().unwrap()
+        );
+        let error = owns[smaller].covers_local(&locals[larger]).unwrap_err();
+        assert!(error.0.contains("plan reserves"), "{error}");
+        let error = owns[smaller].covers_local(&global).unwrap_err();
+        assert!(error.0.contains("plan reserves"), "{error}");
+        // A local config can never seed the shared plan.
+        for shard in [false, true] {
+            let error = EpReserveForwardPlan::from_config_for_shard(&locals[0], mode, 0, shard)
+                .unwrap_err();
+            assert!(error.0.contains("cannot seed"), "{error}");
+        }
+        // A fixed table charge is added once on the shared plan.
+        let with_tables =
+            EpReserveForwardPlan::from_config_for_shard(&global, mode, MIB, true).unwrap();
+        assert_eq!(
+            with_tables.charged_forward_bytes().unwrap(),
+            shared.charged_forward_bytes().unwrap() + MIB
+        );
+        // A geometry the shard cannot cut refuses the plan (the load keeps the ordinary
+        // placement) instead of failing later at attach.
+        let mut odd = global.clone();
+        odd.linear_num_value_heads = 47;
+        let error = EpReserveForwardPlan::from_config_for_shard(&odd, mode, 0, true).unwrap_err();
+        assert!(error.0.contains("local config"), "{error}");
+        assert!(EpReserveForwardPlan::from_config_for_shard(&odd, mode, 0, false).is_ok());
+        // Plans of other rows or a different fixed charge never merge.
+        let mut other = owns[0].clone();
+        other.fixed_table_bytes += 1;
+        assert!(owns[0].union(&other).is_err());
+    }
+
+    /// Both ranks hold the same `Arc` of the shared plan: their mesh receipts agree whatever
+    /// their local configs are, and a rank that cut a plan from ITS OWN local config alone
+    /// (the per-rank-plan design) publishes a different digest whenever its roots differ from
+    /// the shared ones, so the mesh refuses it.
+    #[test]
+    fn receipts_agree_across_two_different_local_configs_and_refuse_a_per_rank_plan() {
+        let mode = Qwen4ForwardScratchMode::Full;
+        let (global, locals) = (shard_global(), shard_locals());
+        let plan = shard_plan();
+        let generation = 0x5eed;
+        // what `EpReserveForward::ep_reserve_plan_receipt` returns on each rank: the plan's
+        // receipt with the rank's source generation (the seal's, rank-independent) and the
+        // route bits (tile carrier admitted and the stage built on both ranks)
+        let receipt = |plan: &EpReservePlan| plan.mesh_receipt(generation, true, true);
+        let (rank0, rank1) = (receipt(&plan), receipt(&plan));
+        assert_eq!(rank0.agree(&rank1), Ok(()));
+        assert_eq!(
+            crate::ep::agree_reserve_receipts(&[Some(rank0), Some(rank1)]),
+            Ok(Some(rank0))
+        );
+        // per-rank plans: each from its own local config alone, same capacity
+        let own_plan = |forward: EpReserveForwardPlan| {
+            plan_ep_reserve(&forward, &geometry(), &capacity_for(33, 0)).expect("a plan")
+        };
+        let owns = locals.clone().map(|local| {
+            own_plan(EpReserveForwardPlan::from_config_exact(&local, mode, 0).unwrap())
+        });
+        // the rank whose own plan is smaller than the shared one publishes another digest
+        let smaller = owns
+            .iter()
+            .find(|own| own.digest != plan.digest)
+            .expect("the ranks' own plans differ");
+        let mixed = [Some(receipt(&plan)), Some(receipt(smaller))];
+        let error = crate::ep::agree_reserve_receipts(&mixed).unwrap_err();
+        assert!(
+            error.contains("disagrees") && error.contains("rank 1"),
+            "{error}"
+        );
+        // the capacity-derived boundaries agree and the shared plan never needs fewer donor
+        // layers than a rank's own plan
+        for own in &owns {
+            assert!(own.donor_layers.len() <= plan.donor_layers.len());
+            assert_eq!(own.resident_layers, plan.resident_layers);
+            assert_eq!(own.forward.prompt_rows, plan.forward.prompt_rows);
+            assert!(own.mirror_bytes_per_rank <= plan.mirror_bytes_per_rank);
+        }
+        // ... while the plan of the unsharded global config would take at least as many donors
+        // and restore at least as many bytes per borrowed epoch as the shared one
+        let global_plan =
+            own_plan(EpReserveForwardPlan::from_config_for_shard(&global, mode, 0, false).unwrap());
+        assert!(plan.donor_layers.len() <= global_plan.donor_layers.len());
+        assert!(plan.restore_bytes_per_rank <= global_plan.restore_bytes_per_rank);
+        assert!(plan.mirror_bytes_per_rank <= global_plan.mirror_bytes_per_rank);
+        // every placement of the shared plan is at least as large as its local root (the
+        // banks put the local root at the planned offset)
+        for local in &locals {
+            let own = EpReserveForwardPlan::from_config_exact(local, mode, 0).unwrap();
+            for root in &own.remaining_roots {
+                let placed = plan
+                    .placements
+                    .iter()
+                    .find(|placement| placement.field == root.field)
+                    .expect("the shared plan places every local donor-packed root");
+                assert!(placed.bytes >= root.bytes);
+            }
+        }
+    }
+
+    /// The census charges the shared plan's forward (the union of the ranks' own); every
+    /// rank's real scratch, state and reserve is at most what the loader charged, and a load
+    /// without the shard keeps the census it had.
+    #[test]
+    fn shard_census_charges_are_conservative_per_rank() {
+        let (global, locals) = (shard_global(), shard_locals());
+        let mode = Qwen4ForwardScratchMode::Full;
+        let shared = shard_forward().charged_forward_bytes().unwrap();
+        let context = crate::Qwen4ContextCommit::legacy(16384);
+        let layout = crate::Qwen4StateFormat::F32.layout();
+        let census = |config: &Qwen4Config, forward: u64| {
+            state_census_with_forward(
+                config,
+                crate::Qwen4StateFormat::F32,
+                &context,
+                4096,
+                mode,
+                Some(forward),
+            )
+            .unwrap()
+        };
+        let reserve = |config: &Qwen4Config, forward: u64| {
+            auto_vram_reserve_with_forward(
+                config,
+                &context,
+                4096,
+                mode,
+                layout,
+                None,
+                None,
+                Some(forward),
+            )
+            .unwrap()
+        };
+        let charged = census(&global, shared);
+        let floor = reserve(&global, shared);
+        for local in &locals {
+            let own_forward = EpReserveForwardPlan::from_config_exact(local, mode, 0)
+                .unwrap()
+                .charged_forward_bytes()
+                .unwrap();
+            assert!(own_forward <= shared);
+            // the shared charge is >= what the rank's own config would charge, term by term;
+            // the loader's state/QSA terms come from the GLOBAL config (>= every rank's)
+            let own = census(local, own_forward);
+            assert!(charged.forward >= own.forward);
+            assert!(
+                charged.state >= own.state,
+                "the GDN state halves, never grows"
+            );
+            assert!(charged.qsa_context >= own.qsa_context);
+            // the historical floor is a measured layout of the GLOBAL geometry plus the
+            // forward's difference from that layout: a rank's need is the same floor with its
+            // own (smaller) forward, which the shared plan's charge bounds
+            assert!(floor >= reserve(&global, own_forward));
+        }
+        // flag off: the plan the loader charges is the ordinary global plan, bit for bit,
+        // and the shard's shared charge is below it
+        let plain = EpReserveForwardPlan::from_config_for_shard(&global, mode, 0, false)
+            .unwrap()
+            .charged_forward_bytes()
+            .unwrap();
+        assert!(shared < plain);
+        assert!(floor < reserve(&global, plain));
+    }
+
+    /// The bytes the shard frees on the busiest rank reach the per-rank unit budget
+    /// (`resident_split_ranks_trunk` -> `non_expert` -> `ep_unit_rank_budgets`) one for one,
+    /// and become `freed / unit` more resident experts at the plan's unit size. Real
+    /// Flash-Next trunk shapes at the MQ6 trunk dtype (shared expert BF16).
+    #[test]
+    fn freed_trunk_bytes_reach_the_unit_budget() {
+        use crate::expert_residency::resident_split_ranks_trunk;
+        use crate::weights::trunk_shard::{census_trunk_for, trunk_share_bytes};
+        use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
+        use rdna_compute::DType;
+
+        let global = shard_global();
+        let (dims, qsa) = census_trunk_for(true, &global, 2).expect("the census view");
+        // the census cuts from the GLOBAL geometry even when handed a rank-local config
+        for local in shard_locals() {
+            assert_eq!(census_trunk_for(true, &local, 2).unwrap().0, dims);
+        }
+        let mut weights: Vec<WeightEntry> = Vec::new();
+        let mut add = |layer: usize, tail: &str, shape: &[usize], dtype: DType| {
+            let mut entry = WeightEntry::model(
+                format!("model.language_model.layers.{layer}.{tail}"),
+                shape.to_vec(),
+                dtype,
+                ShardPolicy::Replicate,
+            );
+            entry.layer = Some(layer);
+            weights.push(entry);
+        };
+        for layer in 0..48 {
+            if layer % 4 == 3 {
+                add(
+                    layer,
+                    "self_attn.q_proj.weight",
+                    &[12288, 2560],
+                    DType::MQ6G256V2,
+                );
+                add(
+                    layer,
+                    "self_attn.k_proj.weight",
+                    &[512, 2560],
+                    DType::MQ6G256V2,
+                );
+                add(
+                    layer,
+                    "self_attn.v_proj.weight",
+                    &[512, 2560],
+                    DType::MQ6G256V2,
+                );
+                add(
+                    layer,
+                    "self_attn.o_proj.weight",
+                    &[2560, 6144],
+                    DType::MQ6G256V2,
+                );
+            } else {
+                add(
+                    layer,
+                    "linear_attn.in_proj_qkv.weight",
+                    &[10240, 2560],
+                    DType::MQ6G256V2,
+                );
+                add(
+                    layer,
+                    "linear_attn.in_proj_z.weight",
+                    &[6144, 2560],
+                    DType::MQ6G256V2,
+                );
+                add(
+                    layer,
+                    "linear_attn.out_proj.weight",
+                    &[2560, 6144],
+                    DType::MQ6G256V2,
+                );
+                add(
+                    layer,
+                    "linear_attn.in_proj_a.weight",
+                    &[48, 2560],
+                    DType::BF16,
+                );
+                add(
+                    layer,
+                    "linear_attn.in_proj_b.weight",
+                    &[48, 2560],
+                    DType::BF16,
+                );
+                add(
+                    layer,
+                    "linear_attn.conv1d.weight",
+                    &[10240, 1, 4],
+                    DType::BF16,
+                );
+                add(layer, "linear_attn.A_log", &[48], DType::F32);
+                add(layer, "linear_attn.dt_bias", &[48], DType::BF16);
+            }
+            add(
+                layer,
+                "mlp.shared_expert.gate_proj.weight",
+                &[640, 2560],
+                DType::BF16,
+            );
+            add(
+                layer,
+                "mlp.shared_expert.up_proj.weight",
+                &[640, 2560],
+                DType::BF16,
+            );
+            add(
+                layer,
+                "mlp.shared_expert.down_proj.weight",
+                &[2560, 640],
+                DType::BF16,
+            );
+            add(layer, "mlp.gate.weight", &[512, 2560], DType::BF16);
+            add(layer, "mlp.experts.gate_up_proj", &[512, 1, 1], DType::Raw);
+            add(layer, "mlp.experts.down_proj", &[512, 1, 1], DType::Raw);
+        }
+        let bytes_of = |entry: &WeightEntry| -> Option<u64> {
+            let numel: usize = entry.logical_shape.iter().product();
+            Some(match entry.dtype {
+                DType::MQ6G256V2 => (numel / 256 * 200) as u64,
+                DType::BF16 => (numel * 2) as u64,
+                DType::F32 => (numel * 4) as u64,
+                // a routed-expert tensor: unchanged by the shard (EP owner split, not TP)
+                _ => numel as u64 * 1_740_800,
+            })
+        };
+        let (whole, whole_experts) =
+            resident_split_ranks_trunk(&weights, bytes_of, 2, None).unwrap();
+        let (cut, cut_experts) =
+            resident_split_ranks_trunk(&weights, bytes_of, 2, Some((&dims, qsa))).unwrap();
+        assert_eq!(
+            whole_experts, cut_experts,
+            "routed-expert bytes are never cut"
+        );
+        let freed = whole - cut;
+        // the busiest rank's freed bytes, tensor by tensor
+        let expected: u64 = weights
+            .iter()
+            .filter(|entry| !entry.name.contains(".mlp.experts."))
+            .map(|entry| {
+                let full = bytes_of(entry).unwrap();
+                full - trunk_share_bytes(&dims, qsa, &entry.name, &entry.logical_shape, full, 2)
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(freed, expected);
+        // closed form: 36 GDN layers x 22,814,864 + 12 QSA layers x 18,432,000
+        //              + 48 shared experts x 3,932,160 (the busiest rank keeps 384/640)
+        assert_eq!(freed, 36 * 22_814_864 + 12 * 18_432_000 + 48 * 3_932_160);
+        assert_eq!(freed, 1_231_262_784);
+        // the unit budget: every rank's `free - trunk - reserve` grows by exactly the freed
+        // bytes (the reserve term is the plan's, independent of the trunk)
+        let (free, reserve) = (
+            30 * GIB,
+            6 * GIB + shard_forward().charged_forward_bytes().unwrap(),
+        );
+        let before = crate::expert_ep_units::ep_unit_rank_budgets(&[free, free], whole, reserve);
+        let after = crate::expert_ep_units::ep_unit_rank_budgets(&[free, free], cut, reserve);
+        for rank in 0..2 {
+            assert_eq!(after[rank] - before[rank], freed);
+        }
+        let unit = EP2_GATE_UP_EXPERT_BYTES + EP2_DOWN_EXPERT_BYTES;
+        assert_eq!(unit, 2_611_200);
+        let gained = after[0] / unit - before[0] / unit;
+        assert!(gained == freed / unit || gained == freed / unit + 1);
+        assert_eq!(freed / unit, 471);
+        let planar = EP2_PLANAR_GATE_UP_EXPERT_BYTES + EP2_PLANAR_DOWN_EXPERT_BYTES;
+        assert_eq!(freed / planar, 485);
+        // no shard: the census is the one it always was
+        assert_eq!(
+            resident_split_ranks_trunk(&weights, bytes_of, 2, None).unwrap(),
+            crate::expert_residency::resident_split_ranks(&weights, bytes_of, 2).unwrap()
+        );
     }
 }

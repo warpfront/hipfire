@@ -558,6 +558,14 @@ fn balanced_layer_tables(
     tables.get(layer).and_then(Option::as_ref)
 }
 
+/// Whether the expert-row gather of MoE invocation `layer_idx` is skipped for the trunk shard's
+/// partial FFN route (`ffn_partial`: the thread's route carries the FFN all-reduce). Only
+/// TRUNK layers skip: the replicated native MTP head runs at `layer_idx >= trunk_layers` and
+/// its HC writes are local (no all-reduce), so it keeps the gather.
+fn trunk_partial_skips_gather(layer_idx: u16, trunk_layers: usize, ffn_partial: bool) -> bool {
+    ffn_partial && usize::from(layer_idx) < trunk_layers
+}
+
 impl BalancedOwners {
     fn layer(&self, layer_idx: u16, trunk_layers: usize) -> Option<&Qwen4EpOwnerTables> {
         balanced_layer_tables(&self.tables, layer_idx, trunk_layers)
@@ -704,7 +712,11 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         // reduced by the fused all-reduce of its HC write, not gathered. Non-owned slots ran
         // on the zero dummy tables, so this rank's replicated combine yields its owned-slot
         // partial; the MTP head (layer >= trunk layers) keeps the gather (its write is local).
-        if usize::from(layer_idx) < self.trunk_layers && crate::trunk_route::ffn_partial_active() {
+        if trunk_partial_skips_gather(
+            layer_idx,
+            self.trunk_layers,
+            crate::trunk_route::ffn_partial_active(),
+        ) {
             return Ok(());
         }
         // A balanced layer gathers from the owners its own assignment wrote
@@ -856,6 +868,24 @@ mod gather_hook_tests {
         assert_eq!(balanced_layer_tables(&by_layer, 4, trunk_layers), None);
         assert_eq!(balanced_layer_tables(&by_layer, 5, trunk_layers), None);
         assert_eq!(balanced_layer_tables(&[], 0, trunk_layers), None);
+    }
+
+    /// The trunk shard's partial FFN route skips the expert-row gather of TRUNK layers only;
+    /// the replicated MTP head (layer indices `trunk_layers + parity`, its HC writes local)
+    /// keeps the gather, and nothing skips without the route.
+    #[test]
+    fn the_partial_route_skips_trunk_gathers_never_the_mtp_heads() {
+        let trunk_layers = 48usize;
+        for layer in 0..trunk_layers as u16 {
+            assert!(trunk_partial_skips_gather(layer, trunk_layers, true));
+            assert!(!trunk_partial_skips_gather(layer, trunk_layers, false));
+        }
+        // the head's gather layer is `num_hidden_layers + j % 2`
+        for parity in 0..2u16 {
+            let head = trunk_layers as u16 + parity;
+            assert!(!trunk_partial_skips_gather(head, trunk_layers, true));
+            assert!(!trunk_partial_skips_gather(head, trunk_layers, false));
+        }
     }
 }
 

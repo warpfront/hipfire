@@ -3491,21 +3491,29 @@ fn ep_lever_on(value: Option<&str>) -> bool {
     value != Some("0")
 }
 
-/// Whether the owner-routed chunk MoE is on for an EP load: its lever (default on, exact `0`
-/// off) and NOT the trunk-shard route, whose FFN of every forward is this rank's partial
-/// reduced by the fused all-reduce of its HC write. The owner-routed tile exchange completes
-/// the routed FFN on every rank, so it cannot ride that route (it would double the routed
-/// half in the reduction); with the shard on it is never admitted, installed or lowered.
-fn ep_owner_routed_prefill_on(value: Option<&str>, trunk_shard: bool) -> bool {
-    ep_lever_on(value) && !trunk_shard
+/// Whether an EP load admits the owner-routed tile route object (its buffers, the transport
+/// every rank registers with, the host rendezvous the EP reserve crosses): the lever (default
+/// on, exact `0` off) and, with the trunk shard, only on a reserve-sharing load. The shard's
+/// FFN of every forward is this rank's partial reduced by the fused all-reduce of its HC
+/// write, and the owner-routed tile exchange completes the routed FFN on every rank (it would
+/// double the routed half in the reduction), so under the shard the route is admitted solely as
+/// the reserve's rendezvous carrier: its chunk exchange never runs, the partial chunk route
+/// takes every wide call (`forward_chunk_tile`).
+fn ep_owner_routed_prefill_on(
+    value: Option<&str>,
+    trunk_shard: bool,
+    reserve_sharing: bool,
+) -> bool {
+    ep_lever_on(value) && (!trunk_shard || reserve_sharing)
 }
 
-fn qwen4_ep_owner_routed_prefill_enabled() -> bool {
+fn qwen4_ep_owner_routed_prefill_enabled(reserve_sharing: bool) -> bool {
     ep_owner_routed_prefill_on(
         hipfire_config::developer_var(QWEN4_EP_OWNER_ROUTED_PREFILL_ENV)
             .ok()
             .as_deref(),
         crate::weights::trunk_shard::trunk_shard_requested(),
+        reserve_sharing,
     )
 }
 
@@ -11966,7 +11974,7 @@ impl Qwen4GpuForward {
                 .as_ref()
                 .map(|reserve| reserve.banks.exchange_capacity());
             if let Some(state) = ep.as_mut() {
-                if qwen4_ep_owner_routed_prefill_enabled() {
+                if qwen4_ep_owner_routed_prefill_enabled(reserve.is_some()) {
                     state.tile = Qwen4TileRoute::admit(
                         gpu,
                         &bundle.config,
@@ -15207,17 +15215,16 @@ impl Qwen4GpuForward {
         // by the fused all-reduce of its HC write. A full chunk therefore binds the rank's
         // compact table (non-owned experts are the zero dummy: exactly-zero rows, no peer
         // reads) instead of the full table that would complete the routed FFN on both ranks,
-        // and it cannot take the owner-routed tile exchange (which completes it too).
-        let trunk_chunk_partial =
-            ep.is_some() && !ep_gathered && crate::trunk_route::ffn_partial_active();
-        if trunk_chunk_partial
-            && ep.is_some_and(|ep| ep.tile.as_ref().is_some_and(|route| route.hook.is_some()))
-        {
-            return Err(invalid(
-                "trunk shard: the owner-routed chunk exchange (HIPFIRE_EP_OWNER_ROUTED_PREFILL) \
-                 completes the routed FFN on every rank and cannot ride the partial FFN route",
-            ));
-        }
+        // and it never runs the owner-routed tile exchange (which completes it too). A
+        // reserve-sharing shard load installs the tile route's transport only as the reserve's
+        // rendezvous carrier ([`ep_owner_routed_prefill_on`]): the partial route takes
+        // precedence over it below.
+        let trunk_chunk_partial = ep_reserve_forward::ep_trunk_partial_chunk(
+            ep.is_some(),
+            n,
+            route_n,
+            crate::trunk_route::ffn_partial_active(),
+        );
         let ep_gather: Option<&dyn MoeRowGather> = ep.filter(|_| ep_gathered).and_then(|ep| {
             ep.gather
                 .as_deref()
@@ -15239,8 +15246,9 @@ impl Qwen4GpuForward {
             .filter(|_| route_n > 1 && !ep_few_rows)
             .and_then(|ep| ep.tile.as_ref())
             .filter(|route| route.hook.is_some());
-        let tile_active = ep_reserve_forward::ep_tile_active(ep, gpu, &config, n, route_n);
-        if let Some(route) = tile_route.filter(|_| !tile_active) {
+        let tile_active = !trunk_chunk_partial
+            && ep_reserve_forward::ep_tile_active(ep, gpu, &config, n, route_n);
+        if let Some(route) = tile_route.filter(|_| !tile_active && !trunk_chunk_partial) {
             // A full-table chunk also writes `y_down_grouped`: it may start only after the
             // peer finished pulling this rank's rows of the last exchange.
             if let Some(hook) = route.hook.as_ref() {
@@ -15251,7 +15259,7 @@ impl Qwen4GpuForward {
         let tile_route = tile_route.filter(|_| tile_active);
         // G2 expert stage under EP: a full-table chunk reads another rank's donor VRAM, so every
         // rank drains its stage donors and crosses a host barrier before ANY rank launches it.
-        if ep.is_some() && route_n > 1 && !ep_few_rows && !tile_active {
+        if ep.is_some() && route_n > 1 && !ep_few_rows && !tile_active && !trunk_chunk_partial {
             // A stage is only ever USED (donors overwritten) on forwards that bind the compact
             // route, which needs the installed exchange; without its hook no forward staged, so
             // there is nothing to drain.
@@ -20546,13 +20554,24 @@ mod ep_rank_generic_tests {
     }
 
     /// The owner-routed tile exchange completes the routed FFN on every rank, so the trunk
-    /// shard (whose FFN is each rank's partial) never admits it; without the shard the lever
-    /// is exactly the shared EP lever rule.
+    /// shard (whose FFN is each rank's partial) never runs it; the route object is admitted
+    /// under the shard only as the EP reserve's rendezvous carrier. Without the shard the
+    /// lever is exactly the shared EP lever rule, reserve or not.
     #[test]
-    fn trunk_shard_turns_the_owner_routed_prefill_off() {
+    fn trunk_shard_admits_the_owner_routed_route_only_for_a_reserve_sharing_load() {
         for value in [None, Some("1"), Some(""), Some("true"), Some("0")] {
-            assert_eq!(ep_owner_routed_prefill_on(value, false), ep_lever_on(value));
-            assert!(!ep_owner_routed_prefill_on(value, true), "{value:?}");
+            for reserve in [false, true] {
+                assert_eq!(
+                    ep_owner_routed_prefill_on(value, false, reserve),
+                    ep_lever_on(value)
+                );
+            }
+            assert!(!ep_owner_routed_prefill_on(value, true, false), "{value:?}");
+            assert_eq!(
+                ep_owner_routed_prefill_on(value, true, true),
+                ep_lever_on(value),
+                "{value:?}"
+            );
         }
     }
 

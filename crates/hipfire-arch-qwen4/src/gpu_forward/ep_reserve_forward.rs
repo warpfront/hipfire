@@ -307,6 +307,34 @@ pub(super) fn ep_tile_active(
         }
 }
 
+/// Whether a call of `n` rows (`route_n` routing rows) on an EP forward takes the trunk-shard
+/// PARTIAL chunk route (`partial_active`: the thread's [`crate::trunk_route`] FFN route is
+/// installed): a wide chunk binds this rank's COMPACT table (non-owned experts the zero
+/// dummy) and the all-reduce of its FFN HC write completes the FFN. `forward_chunk_tile` and
+/// the reserve's bank choice share this one predicate.
+pub(super) fn ep_trunk_partial_chunk(
+    ep_present: bool,
+    n: usize,
+    route_n: usize,
+    partial_active: bool,
+) -> bool {
+    let few_rows = (2..=QWEN4_EP_GATHER_MAX_ROWS).contains(&route_n) && route_n == n;
+    ep_present && partial_active && route_n > 1 && !few_rows
+}
+
+/// The bank route of a call wider than the resident bank. The borrowed bank overwrites donor
+/// expert bytes, so it may serve only a route whose peers read no donor entry: the owner-routed
+/// tile exchange (peers read the persistent grouped-down root) or the trunk-shard partial chunk
+/// (this rank's own compact table, no peer expert read at all). Any other wide call is the
+/// full-table route, which the epoch refuses above the resident bank.
+pub(super) fn ep_wide_bank_route(tile_active: bool, trunk_partial_chunk: bool) -> EpBankRoute {
+    if tile_active || trunk_partial_chunk {
+        EpBankRoute::TileExchange
+    } else {
+        EpBankRoute::FullTable
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plan geometry (pure)
 // ---------------------------------------------------------------------------
@@ -1396,12 +1424,14 @@ impl Qwen4GpuForward {
             let (scopes, _) = self.enter_tile_scopes(gpu, n);
             let route_n = gpu.route_rows(n);
             let tile = ep_tile_active(self.ep.as_ref(), gpu, &bundle.config, n, route_n);
+            let partial = ep_trunk_partial_chunk(
+                self.ep.is_some(),
+                n,
+                route_n,
+                crate::trunk_route::ffn_partial_active(),
+            );
             Self::leave_tile_scopes(gpu, scopes);
-            if tile {
-                EpBankRoute::TileExchange
-            } else {
-                EpBankRoute::FullTable
-            }
+            ep_wide_bank_route(tile, partial)
         } else {
             EpBankRoute::TileExchange
         };
@@ -2550,5 +2580,50 @@ mod tests {
             );
             assert!(text.contains("against the plan's 26 / [24, 25]"), "{text}");
         }
+    }
+
+    /// The trunk-shard partial chunk route binds this rank's compact table (no peer expert
+    /// read), so a wide call on it may borrow the donor bank exactly like the tile exchange;
+    /// a wide call on neither route stays the refused Full-table route. Decode, a lone row
+    /// and the few-row (2..=8 row) verify windows are never the partial CHUNK route.
+    #[test]
+    fn the_trunk_shard_partial_chunk_may_borrow_the_donor_bank() {
+        assert_eq!(ep_wide_bank_route(true, false), EpBankRoute::TileExchange);
+        assert_eq!(ep_wide_bank_route(false, true), EpBankRoute::TileExchange);
+        assert_eq!(ep_wide_bank_route(true, true), EpBankRoute::TileExchange);
+        assert_eq!(ep_wide_bank_route(false, false), EpBankRoute::FullTable);
+        let epoch = EpEpoch::default();
+        let wide = RESIDENT + 1;
+        let borrowed = epoch
+            .plan_call(wide, RESIDENT, PROMPT, ep_wide_bank_route(false, true))
+            .expect("the partial chunk route borrows");
+        assert_eq!(borrowed.bank, EpBankKind::Borrowed);
+        assert!(borrowed.acquire && !borrowed.restore_first);
+        let refused = epoch
+            .plan_call(wide, RESIDENT, PROMPT, ep_wide_bank_route(false, false))
+            .unwrap_err();
+        assert!(refused.contains("Full peer tables"), "{refused}");
+        // The predicate: needs an EP forward, the installed route, and a routing row count
+        // that is not a lone row or a few-row window.
+        assert!(ep_trunk_partial_chunk(true, 4096, 4096, true));
+        assert!(ep_trunk_partial_chunk(true, 9, 9, true));
+        assert!(
+            !ep_trunk_partial_chunk(true, 4096, 4096, false),
+            "route not installed"
+        );
+        assert!(
+            !ep_trunk_partial_chunk(false, 4096, 4096, true),
+            "not an EP forward"
+        );
+        assert!(!ep_trunk_partial_chunk(true, 1, 1, true), "decode");
+        for rows in 2..=QWEN4_EP_GATHER_MAX_ROWS {
+            assert!(
+                !ep_trunk_partial_chunk(true, rows, rows, true),
+                "{rows}-row window"
+            );
+        }
+        // a wide launch whose routing rows are a few-row count is not a verify window (its
+        // routing rows differ from its launch rows): it takes the chunk route
+        assert!(ep_trunk_partial_chunk(true, 4096, 8, true));
     }
 }
