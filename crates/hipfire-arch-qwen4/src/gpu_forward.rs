@@ -1074,6 +1074,33 @@ impl From<WeightError> for Qwen4GpuForwardError {
     }
 }
 
+const SYM_IU4_KILL_WARNING: &str =
+    "  qwen4 symmetric IU4 MoE: WARNING: the IU4 route is explicitly \
+disabled (HIPFIRE_QWEN4_MOE_SYM_IU4=0); the F16/SIMT fallback is a developer reference route, \
+~2.9x slower prefill on a single R9700 and ~13x slower on EP2";
+
+const SYM_IU4_KILL_EP_REFUSAL: &str = "HIPFIRE_QWEN4_MOE_SYM_IU4=0 is not supported on an EP \
+topology (topology.ep >= 2): EP reserve sharing and owner-routed prefill need the symmetric IU4 \
+route, and the F16/SIMT fallback is ~13x slower on EP2. Unset HIPFIRE_QWEN4_MOE_SYM_IU4 or run \
+without EP";
+
+#[derive(Debug, PartialEq, Eq)]
+enum Iu4KillVerdict {
+    NotKilled,
+    Warn,
+    RefuseEp,
+}
+
+/// `flag` is the typed `HIPFIRE_QWEN4_MOE_SYM_IU4`; `route_exists` is whether this arch has an
+/// IU4 route to kill.
+fn sym_iu4_kill_verdict(flag: Option<bool>, route_exists: bool, ep: bool) -> Iu4KillVerdict {
+    match (flag, route_exists, ep) {
+        (Some(false), true, true) => Iu4KillVerdict::RefuseEp,
+        (Some(false), true, false) => Iu4KillVerdict::Warn,
+        _ => Iu4KillVerdict::NotKilled,
+    }
+}
+
 pub(crate) fn invalid(message: impl Into<String>) -> Qwen4GpuForwardError {
     Qwen4GpuForwardError::Invalid(message.into())
 }
@@ -10487,6 +10514,15 @@ impl Qwen4GpuForward {
                 } else {
                     d2_resolved
                 };
+            match sym_iu4_kill_verdict(
+                hipfire_config::developer_typed_bool("HIPFIRE_QWEN4_MOE_SYM_IU4"),
+                gpu.qwen4_moe_sym_kernel().is_some(),
+                bundle.weights.ep_placement().is_some(),
+            ) {
+                Iu4KillVerdict::NotKilled => {}
+                Iu4KillVerdict::Warn => eprintln!("{SYM_IU4_KILL_WARNING}"),
+                Iu4KillVerdict::RefuseEp => return Err(invalid(SYM_IU4_KILL_EP_REFUSAL)),
+            }
             if let Some(placement) = bundle.weights.ep_placement() {
                 let seal = bundle.ep_seal().cloned().ok_or_else(|| {
                     invalid("an EP placement needs the load's seal (bind_ep_seal)")
@@ -15869,6 +15905,16 @@ mod d2_split_enabled_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sym_iu4_kill_verdict_cases() {
+        use super::{sym_iu4_kill_verdict as v, Iu4KillVerdict::*};
+        assert_eq!(v(Some(false), true, false), Warn);
+        assert_eq!(v(Some(false), true, true), RefuseEp);
+        assert_eq!(v(Some(false), false, true), NotKilled);
+        assert_eq!(v(None, true, true), NotKilled);
+        assert_eq!(v(Some(true), true, false), NotKilled);
+    }
+
     #[test]
     fn parse_qwen4_cut_layers_accepts_valid_lists() {
         let cuts = super::parse_qwen4_cut_layers("9,17,25,33,41", 48, Some(0)).unwrap();
