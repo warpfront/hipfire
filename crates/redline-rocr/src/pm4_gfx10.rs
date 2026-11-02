@@ -154,7 +154,7 @@ impl Gfx11ScratchRing {
 
     /// Bind the backing allocation; `None` unless non-null and 256-byte aligned.
     pub fn at(self, base: u64) -> Option<Self> {
-        (base != 0 && base % Self::GRANULE == 0).then_some(Self { base, ..self })
+        (base != 0 && base.is_multiple_of(Self::GRANULE)).then_some(Self { base, ..self })
     }
 
     pub fn bytes(&self) -> u64 {
@@ -739,8 +739,9 @@ impl Gfx10Pm4CommandBuffer {
         self.set_sh_regs(COMPUTE_PGM_RSRC3_GFX10, &[image.compute_pgm_rsrc3]);
         // Only scratch dispatches see the ring; scratch-free ones keep TMPRING
         // zero. The ring registers bypass the stateful cache: after a TMPRING=0
-        // dispatch an elided SCRATCH_BASE left later scratch waves faulting
-        // against base 0 on gfx1151 (HIPF-259 B1).
+        // dispatch and a drain (CS_PARTIAL_FLUSH + ACQUIRE_MEM), an elided
+        // SCRATCH_BASE left later scratch waves faulting against base 0 on
+        // gfx1151 (HIPF-259 B1).
         match ring.filter(|_| image.private_segment_size != 0) {
             Some(ring) => {
                 if let Some(register_state) = self.register_state.as_mut() {

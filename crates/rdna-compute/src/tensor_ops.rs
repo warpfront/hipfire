@@ -17077,7 +17077,10 @@ mod tests {
     /// separated by scratch-free ones, default stateful register policy) runs
     /// on the tape's own GFX11 scratch ring and must equal the plain HIP
     /// launches byte for byte; outputs are NaN-poisoned before each run so a
-    /// skipped dispatch fails. A parallel two-queue phase of independent u2
+    /// skipped dispatch fails. The first add writes the second u2's input, so
+    /// the read-after-write keeps a drain between the scratch dispatches even
+    /// once `add_f32` has typed effects (the HIPF-259 B1 fault needs that
+    /// drain). A parallel two-queue phase of independent u2
     /// dispatches must refuse at prepare: its lanes would share one ring.
     #[test]
     fn retained_pm4_scratch_kernel_matches_hip_on_gfx1151() {
@@ -17087,7 +17090,6 @@ mod tests {
         const M: usize = 248_320;
         const K: usize = 2560;
         const GROUP_BYTES: usize = 200;
-        const F: usize = 1 << 20;
         const GEMVS: usize = 6;
 
         let Some(mut gpu) = try_gpu() else {
@@ -17128,20 +17130,19 @@ mod tests {
         let ys: Vec<GpuTensor> = (0..GEMVS)
             .map(|_| gpu.zeros(&[M], DType::F32).expect("y"))
             .collect();
-        let pq: Vec<f32> = (0..F).map(|i| i as f32 * 0.5).collect();
-        let p = gpu.upload_f32(&pq, &[F]).expect("p");
-        let q = gpu.upload_f32(&pq, &[F]).expect("q");
-        let rs: Vec<GpuTensor> = (0..2)
-            .map(|_| gpu.zeros(&[F], DType::F32).expect("r"))
-            .collect();
-        // The interleaved tape: gemv i writes ys[i], add i writes rs[i].
+        let pq: Vec<f32> = (0..K).map(|i| (i % 7) as f32 * 0.25 - 0.75).collect();
+        let p = gpu.upload_f32(&pq, &[K]).expect("p");
+        let q = gpu.upload_f32(&pq, &[K]).expect("q");
+        let r = gpu.zeros(&[K], DType::F32).expect("r");
+        // The interleaved tape: u2(xs[0]) -> ys[0], add -> xs[1] (read by the
+        // next u2), u2(xs[1]) -> ys[1], add -> r.
         let interleaved = |gpu: &mut Gpu| {
-            for i in 0..2 {
+            for (i, sum) in [&xs[1], &r].into_iter().enumerate() {
                 gpu.gemv_mq6g256v2(&a, &xs[i], &ys[i], M, K).expect("gemv");
-                gpu.add_f32(&p, &q, &rs[i]).expect("add");
+                gpu.add_f32(&p, &q, sum).expect("add");
             }
         };
-        let outputs = || ys[..2].iter().chain(&rs);
+        let outputs = || ys[..2].iter().chain([&xs[1], &r]);
 
         let run = |gpu: &mut Gpu, replay: bool| -> Vec<Vec<u8>> {
             for t in outputs() {
