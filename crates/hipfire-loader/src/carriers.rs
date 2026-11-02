@@ -2100,7 +2100,7 @@ fn plan_qwen4_ep(
             .map_err(|error| format!("qwen4: {error}"))?,
         hfq,
         &gpu.arch,
-        hipfire_arch_qwen4::artifact::expert_drop_zero_requested(),
+        hipfire_arch_qwen4::artifact::expert_drop_zero_requested_for(hfq.path()),
     )
     .map_err(|error| error.to_string())?
     .0;
@@ -2986,7 +2986,7 @@ pub fn qwen4_ep_vram_layers(
         manifest,
         hfq,
         &gpu.arch,
-        hipfire_arch_qwen4::artifact::expert_drop_zero_requested(),
+        hipfire_arch_qwen4::artifact::expert_drop_zero_requested_for(hfq.path()),
     )
     .map_err(|error| error.to_string())?
     .0;
@@ -3479,10 +3479,8 @@ pub fn qwen4_ep_vram_layers(
 }
 
 /// `HIPFIRE_EP_UNIT_RESERVE`: with a per-expert plan, keep the decoupled EP reserve (units
-/// budgeted against its census, whole-resident donor layers) instead of forcing it off. `1` forces
-/// it on, exact `0` kills it, anything else follows the units: on under the shipped default
-/// (`hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON`), off while that gate is off (the flag's
-/// historical opt-in).
+/// budgeted against its census, whole-resident donor layers) instead of forcing it off. Opt-in:
+/// only an exact `1` turns it on; the shipped default plans the units under the ordinary reserve.
 const QWEN4_EP_UNIT_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE";
 
 /// `HIPFIRE_EP_UNIT_RESERVE_SHADOWS=1` (lab, default off): under `HIPFIRE_EP_UNIT_RESERVE=1`, host
@@ -3494,7 +3492,6 @@ fn qwen4_ep_unit_reserve_on() -> bool {
         hipfire_config::developer_var(QWEN4_EP_UNIT_RESERVE_ENV)
             .ok()
             .as_deref(),
-        hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
     )
 }
 
@@ -6240,7 +6237,7 @@ fn load_qwen4_rank_unscoped(
                 manifest,
                 &hfq,
                 &ctx.gpu.arch,
-                hipfire_arch_qwen4::artifact::expert_drop_zero_requested(),
+                hipfire_arch_qwen4::artifact::expert_drop_zero_requested_for(hfq.path()),
             )
             .map_err(|error| error.to_string())?;
             manifest = declared;

@@ -874,6 +874,22 @@ fn confirm(prompt: &mut dyn Prompt, question: &str, default: bool) -> Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`plan_items`] without the EP2 ranking sidecar (the shipped gate adds it to every
+    /// Flash-Next plan): the tests that assert exact file lists of the other sidecars.
+    fn plan_items_no_ep(
+        ctx: &PullContext<'_, '_>,
+        choice: &PullChoice<'_>,
+        force: bool,
+    ) -> Vec<PlanItem> {
+        plan_items_with_ep(
+            ctx,
+            choice,
+            force,
+            hipfire_registry::EP_EXPERT_HOTSET_PINS,
+            false,
+        )
+    }
     use crate::{Cli, Commands};
     use clap::Parser;
     use std::io::Cursor;
@@ -1682,7 +1698,7 @@ mod tests {
                     present: &absent,
                 };
                 let choice = PullChoice::defaults(tag, entry, &PullFlags::default());
-                let items = plan_items(&ctx, &choice, false);
+                let items = plan_items_no_ep(&ctx, &choice, false);
                 let files: Vec<&str> = items.iter().map(|item| item.file.as_str()).collect();
                 assert_eq!(files, [STOCK_BASE, sidecar.file.as_str()], "{input} {arch}");
                 assert_eq!(
@@ -1692,7 +1708,7 @@ mod tests {
                 );
             }
             // The exact sums a pull reports.
-            let q4 = plan_items(
+            let q4 = plan_items_no_ep(
                 &PullContext {
                     registry: &registry,
                     host: &host_with_arch("gfx1151"),
@@ -1707,7 +1723,7 @@ mod tests {
             assert_eq!(download_total(&q4), (100_008_416_792, 0));
         }
         let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
-        let rdna4 = plan_items(
+        let rdna4 = plan_items_no_ep(
             &PullContext {
                 registry: &registry,
                 host: &host_with_arch("gfx1201"),
@@ -1742,7 +1758,7 @@ mod tests {
             grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
             present: &absent,
         };
-        let items = plan_items(
+        let items = plan_items_no_ep(
             &ctx,
             &PullChoice::defaults(tag, entry, &PullFlags::default()),
             false,
@@ -1827,7 +1843,7 @@ mod tests {
             grandfather_pins: GF_PINS,
             present,
         };
-        plan_items(
+        plan_items_no_ep(
             &ctx,
             &PullChoice::defaults(tag, entry, &PullFlags::default()),
             force,
@@ -1954,7 +1970,7 @@ mod tests {
                 grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
                 present: &absent,
             };
-            let items = plan_items(
+            let items = plan_items_no_ep(
                 &ctx,
                 &PullChoice::defaults(tag, entry, &PullFlags::default()),
                 false,
@@ -1986,7 +2002,7 @@ mod tests {
             ..host_with_arch("")
         };
         let plan = |present: &dyn Fn(&str, Option<u64>) -> bool| {
-            plan_items(
+            plan_items_no_ep(
                 &PullContext {
                     registry: &registry,
                     host: &hipx,

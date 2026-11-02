@@ -10331,11 +10331,13 @@ pub mod memory {
 
     /// THE gate of the shipped EP expert hot set (D1). `false`: nothing changes unless
     /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=<path>` names a sidecar (the loader never discovers one,
-    /// the unit reserve stays opt-in, `hipfire pull` does not fetch the sidecar). `true`: an EP2
-    /// gfx1201 Flash-Next load discovers `<base>.ep.expert-hotset` when the variable is unset,
-    /// the unit reserve follows the units (`HIPFIRE_EP_UNIT_RESERVE=0` kills it) and `hipfire
-    /// pull` fetches the pinned sidecar. Flipping this one constant is the whole switch.
-    pub const EP_EXPERT_HOTSET_DEFAULT_ON: bool = false;
+    /// `hipfire pull` does not fetch the sidecar). `true` (shipped): an EP2 gfx1201 Flash-Next load
+    /// discovers `<base>.ep.expert-hotset` when the variable is unset, the drop-zero planar expert
+    /// repack (F1, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO`) follows it, and `hipfire pull` fetches the
+    /// pinned sidecar. The decoupled unit reserve stays opt-in (`HIPFIRE_EP_UNIT_RESERVE=1`).
+    /// Kill switches: `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=0`, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO=0`,
+    /// `HIPFIRE_EP_UNIT_PINNED_OWNERS=0`.
+    pub const EP_EXPERT_HOTSET_DEFAULT_ON: bool = true;
 
     /// Optional override of the PLE hot-rank sidecar path
     /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.

@@ -1861,12 +1861,45 @@ pub fn routed_headers_symmetric_verdict(
 /// (`2,611,200 -> 2,534,400` bytes per expert). `=0` keeps the shipped layout.
 pub const EXPERT_DROP_ZERO_ENV: &str = "HIPFIRE_QWEN4_EXPERT_DROP_ZERO";
 
-/// Default of [`EXPERT_DROP_ZERO_ENV`] when it is unset.
-pub const EXPERT_DROP_ZERO_DEFAULT: bool = false;
+/// Whether the drop-zero repack is requested for the load of `model`. An explicit
+/// [`EXPERT_DROP_ZERO_ENV`] wins (`0` off, `1` on). Unset follows the shipped EP expert hot set
+/// (D1): on exactly when the shipped default gate is on
+/// (`hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON`), the model has its
+/// `<model>.ep.expert-hotset` sidecar and `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` is not `0`; so the
+/// repack rides with the per-expert plan on Flash-Next EP2 gfx1201 and nowhere else (the repack
+/// itself still declines every load it does not apply to,
+/// [`apply_expert_drop_zero`]).
+pub fn expert_drop_zero_requested_for(model: &std::path::Path) -> bool {
+    expert_drop_zero_default_requested(
+        hipfire_config::developer_var(EXPERT_DROP_ZERO_ENV)
+            .ok()
+            .as_deref(),
+        hipfire_config::developer_var(crate::expert_ep_units::EP_EXPERT_HOTSET_ENV)
+            .ok()
+            .as_deref(),
+        hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+        || hipfire_config::memory::ep_expert_hotset_sidecar_path(model).is_file(),
+    )
+}
 
-/// Whether the drop-zero repack is requested for this process.
-pub fn expert_drop_zero_requested() -> bool {
-    hipfire_config::developer_bool(EXPERT_DROP_ZERO_ENV, EXPERT_DROP_ZERO_DEFAULT)
+/// The pure decision of [`expert_drop_zero_requested_for`] over the raw values of
+/// [`EXPERT_DROP_ZERO_ENV`] and [`crate::expert_ep_units::EP_EXPERT_HOTSET_ENV`].
+pub fn expert_drop_zero_default_requested(
+    drop_zero_raw: Option<&str>,
+    hotset_raw: Option<&str>,
+    gate: bool,
+    sidecar_exists: impl FnOnce() -> bool,
+) -> bool {
+    // `hipfire_config::developer_bool` semantics: exact `1` on, exact `0` off, anything else unset.
+    match drop_zero_raw {
+        Some("0") => return false,
+        Some("1") => return true,
+        _ => {}
+    }
+    gate && !matches!(
+        crate::expert_ep_units::ep_units_policy(hotset_raw),
+        crate::expert_ep_units::EpUnitsPolicy::Off
+    ) && sidecar_exists()
 }
 
 /// What [`apply_expert_drop_zero`] did.
@@ -4826,5 +4859,44 @@ mod tests {
         assert!(!routed_tensors_symmetric(&hfq, &[]).unwrap());
         assert!(!routed_tensors_symmetric(&hfq, &[SYM_GATE_UP]).unwrap());
         sym_cleanup(path, hfq);
+    }
+}
+
+#[cfg(test)]
+mod drop_zero_default_tests {
+    use super::expert_drop_zero_default_requested as requested;
+
+    #[test]
+    fn the_drop_zero_default_follows_the_shipped_hot_set() {
+        // Unset: on exactly with the gate, an unkilled hot set policy and the sidecar present.
+        assert!(requested(None, None, true, || true));
+        assert!(requested(
+            None,
+            Some("/x/model.ep.expert-hotset"),
+            true,
+            || true
+        ));
+        assert!(!requested(None, None, false, || true), "gate off");
+        assert!(!requested(None, None, true, || false), "no sidecar");
+        assert!(!requested(None, Some("0"), true, || true), "hot set killed");
+        assert!(
+            !requested(None, Some(""), true, || true),
+            "hot set blank = off"
+        );
+        // The explicit switch wins over everything.
+        assert!(requested(Some("1"), Some("0"), false, || false));
+        assert!(!requested(Some("0"), None, true, || true));
+        // Any other spelling is unset.
+        assert!(requested(Some("yes"), None, true, || true));
+        assert!(!requested(Some("yes"), None, false, || true));
+    }
+
+    #[test]
+    fn the_sidecar_probe_is_not_called_when_the_answer_is_settled() {
+        let probe = || -> bool { panic!("probed") };
+        assert!(requested(Some("1"), None, true, probe));
+        assert!(!requested(Some("0"), None, true, probe));
+        assert!(!requested(None, None, false, probe));
+        assert!(!requested(None, Some("0"), true, probe));
     }
 }

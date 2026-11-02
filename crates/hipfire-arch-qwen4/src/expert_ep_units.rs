@@ -1104,16 +1104,12 @@ pub fn ep_units_source(policy: &EpUnitsPolicy, found: &EpUnitsDiscovery<'_>) -> 
     }
 }
 
-/// `HIPFIRE_EP_UNIT_RESERVE` for a load that plans per unit, from its raw
-/// value: exact `0` kills the decoupled reserve, exact `1` forces it, anything
-/// else follows the units (`gate`: on with the shipped default, off while the
-/// gate is off, which is the flag's historical opt-in).
-pub fn ep_unit_reserve_on(raw: Option<&str>, gate: bool) -> bool {
-    match raw {
-        Some("0") => false,
-        Some("1") => true,
-        _ => gate,
-    }
+/// `HIPFIRE_EP_UNIT_RESERVE` for a load that plans per unit, from its raw value: only an exact
+/// `1` keeps the decoupled reserve (units budgeted against its census, whole-resident donor
+/// layers); unset or anything else plans the units under the ordinary reserve, the shipped
+/// default (the explicit-donor reserve costs prefill time, see `docs/env-vars.md`).
+pub fn ep_unit_reserve_on(raw: Option<&str>) -> bool {
+    raw == Some("1")
 }
 
 /// The tier a manifest entry name denotes when it is a mixed layer's arena
@@ -2515,24 +2511,16 @@ mod loader_support_tests {
     }
 
     #[test]
-    fn the_unit_reserve_follows_the_units_and_zero_kills_it() {
-        // Gate off: the historical opt-in (only an exact 1 turns it on).
+    fn the_unit_reserve_is_opt_in_only() {
+        // Only an exact 1 turns the decoupled unit reserve on, under any gate: the shipped
+        // default plans the units under the ordinary reserve.
         for (raw, want) in [
             (None, false),
             (Some("1"), true),
             (Some("0"), false),
             (Some("yes"), false),
         ] {
-            assert_eq!(ep_unit_reserve_on(raw, false), want, "{raw:?} gate off");
-        }
-        // Gate on: on with the units, an exact 0 kills it.
-        for (raw, want) in [
-            (None, true),
-            (Some("1"), true),
-            (Some("0"), false),
-            (Some("yes"), true),
-        ] {
-            assert_eq!(ep_unit_reserve_on(raw, true), want, "{raw:?} gate on");
+            assert_eq!(ep_unit_reserve_on(raw), want, "{raw:?}");
         }
     }
 
