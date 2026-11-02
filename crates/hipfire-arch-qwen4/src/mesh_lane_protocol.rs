@@ -2405,13 +2405,23 @@ impl MeshRoot {
             if by_rank.insert(r.rank, r).is_some() {
                 return Err(self.fail(Some(r.rank), "duplicate draft answer".into()));
             }
-            if r.ops_executed != round.ops.len() || r.head_gathers != round.ops.len() {
+            // One row gather per op, or (a batched head round,
+            // HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS) one for the whole round of two
+            // or more ops; every rank must have taken the same shape.
+            let gathers_ok =
+                r.head_gathers == round.ops.len() || (round.ops.len() >= 2 && r.head_gathers == 1);
+            let peer_gathers = by_rank
+                .values()
+                .map(|p| p.head_gathers)
+                .find(|&g| g != r.head_gathers);
+            if r.ops_executed != round.ops.len() || !gathers_ok || peer_gathers.is_some() {
                 return Err(self.fail(
                     Some(r.rank),
                     format!(
-                        "executed {} ops/{} gathers, scheduled {}",
+                        "executed {} ops/{} gathers (peer {:?}), scheduled {}",
                         r.ops_executed,
                         r.head_gathers,
+                        peer_gathers,
                         round.ops.len()
                     ),
                 ));

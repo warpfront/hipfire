@@ -103,6 +103,8 @@ struct RowsView {
     embedding_norm: GpuTensor,
     hidden_norm: GpuTensor,
     backbone_hidden: GpuTensor,
+    /// `[rows, router_columns]`: the grouped MoE seal checks this shape.
+    router_logits: GpuTensor,
 }
 
 impl MtpRowsScratch {
@@ -333,15 +335,20 @@ impl MtpRowsScratch {
         first
     }
 
-    fn view(&self, rows: usize, config: &Qwen4Config) -> RowsView {
+    fn view(&self, rows: usize, config: &Qwen4Config) -> Result<RowsView, MtpGpuError> {
         let hidden = config.hidden_size;
         let wide = config.hc_count * hidden;
-        RowsView {
+        Ok(RowsView {
+            router_logits: crate::gpu_forward::matrix_view(
+                &self.router_logits,
+                rows,
+                crate::gpu_forward::router_columns(program_dims(config)),
+            )?,
             token_embedding: self.token_embedding.sub_offset(0, rows * hidden),
             embedding_norm: self.embedding_norm.sub_offset(0, rows * hidden),
             hidden_norm: self.hidden_norm.sub_offset(0, rows * wide),
             backbone_hidden: self.backbone_hidden.sub_offset(0, rows * wide),
-        }
+        })
     }
 
     fn tensors<'a>(&'a self, view: &'a RowsView) -> HeadRowTensors<'a> {
@@ -367,7 +374,11 @@ impl MtpRowsScratch {
     /// The MoE seal's scratch description: the rows scratch with
     /// `down_expanded` as the expanded-row buffer (the EP gather buffer under
     /// EP). Fields the MoE never reads alias `wide`.
-    fn layer_scratch<'a>(&'a self, down_expanded: &'a GpuTensor) -> Qwen4LayerScratch<'a> {
+    fn layer_scratch<'a>(
+        &'a self,
+        down_expanded: &'a GpuTensor,
+        router_logits: &'a GpuTensor,
+    ) -> Qwen4LayerScratch<'a> {
         let unused = &self.wide;
         Qwen4LayerScratch {
             streams: unused,
@@ -394,7 +405,7 @@ impl MtpRowsScratch {
             attention_output: unused,
             ffn_output: &self.ffn_output,
             moe_shared_output: &self.moe_shared_output,
-            moe_router_logits: &self.router_logits,
+            moe_router_logits: router_logits,
             moe_x_rot: &self.moe_x_rot,
             moe_gate_up: &self.moe_gate_up,
             moe_scalar: &self.moe_scalar,
@@ -539,7 +550,7 @@ impl Qwen4MtpGpu {
             }
         }
         require_hc_up(&rs.hc_up, n, wide, config.hc_lowrank)?;
-        let view = rs.view(n, config);
+        let view = rs.view(n, config)?;
         for (row, lane) in lanes.iter().enumerate() {
             let source = lane.backbone_hidden.unwrap_or(&lane.state.wide_hidden);
             let target = rs.backbone_hidden.sub_offset(row * wide, wide);
@@ -609,8 +620,10 @@ impl Qwen4MtpGpu {
             } else {
                 None
             };
-            let layer_scratch =
-                rs.layer_scratch(moe_ep.map_or(&rs.moe_down_expanded, |(_, buffer, _)| buffer));
+            let layer_scratch = rs.layer_scratch(
+                moe_ep.map_or(&rs.moe_down_expanded, |(_, buffer, _)| buffer),
+                &view.router_logits,
+            );
             let sealed = seal_moe_rows(
                 &ctx,
                 config,
