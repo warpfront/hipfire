@@ -6696,6 +6696,36 @@ pub fn raon_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, R
             crate::device_counter::DEVICE_COUNTER_ADD_SRC,
             ["device_counter_add_i32"]
         ); // device_counter.rs:39
+           // The MQ8G256 layout-B decode GEMVs (installed mq4-xts, MQ8 attention): the plain rows-exact symbols and the
+           // fused-producer `bx` symbols (gemv_mq8_rows.rs:199,260), one module.
+        add!(
+            "gemv_mq8g256_b",
+            kernels::GEMV_MQ8G256_B_SRC,
+            [
+                "gemv_mq8g256_b_r1_u1_w4_p1",
+                "gemv_mq8g256_b_r2_u1_w4_p1",
+                "gemv_mq8g256_b_r3_u1_w4_p1",
+                "gemv_mq8g256_b_r4_u1_w4_p1",
+                "gemv_mq8g256_b_r5_u1_w4_p1",
+                "gemv_mq8g256_b_r6_u1_w4_p1",
+                "gemv_mq8g256_b_r7_u1_w4_p1",
+                "gemv_mq8g256_b_r8_u1_w4_p1",
+                "gemv_mq8g256_b_r9_u1_w4_p1",
+                "gemv_mq8g256_b_r10_u1_w4_p1",
+                "gemv_mq8g256_b_r11_u1_w4_p1",
+                "gemv_mq8g256_b_r12_u1_w4_p1",
+                "gemv_mq8g256_b_r13_u1_w4_p1",
+                "gemv_mq8g256_b_r14_u1_w4_p1",
+                "gemv_mq8g256_b_r15_u1_w4_p1",
+                "gemv_mq8g256_b_r16_u1_w4_p1",
+                "gemv_mq8g256_bx_r1_u1_w10_p1",
+                "gemv_mq8g256_bx_r1_u5_w24_p1",
+                "gemv_mq8g256_bx_r1_u10_w20_p1",
+                "gemv_mq8g256_bx_r2_u1_w10_p1",
+                "gemv_mq8g256_bx_r2_u5_w24_p1",
+                "gemv_mq8g256_bx_r2_u10_w20_p1"
+            ]
+        );
     }
     Ok(entries)
 }
@@ -11632,6 +11662,7 @@ mod tests {
                 "latent_attention_gate",
                 "latent_attention_decode",
                 "device_counter_add",
+                "gemv_mq8g256_b",
             ]
         );
         let all = corpus_entries("gfx1201", "").unwrap();

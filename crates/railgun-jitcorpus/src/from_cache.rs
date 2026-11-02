@@ -67,11 +67,20 @@ pub struct EmbeddedProgram {
 }
 
 /// The programs `from-cache` knows, by id.
-pub const EMBEDDED_PROGRAMS: &[EmbeddedProgram] = &[EmbeddedProgram {
-    id: "raon-ar-decode-gfx1201",
-    arch: "gfx1201",
-    jsonl: include_str!("../programs/raon-ar-decode-gfx1201.jsonl"),
-}];
+pub const EMBEDDED_PROGRAMS: &[EmbeddedProgram] = &[
+    // The shipped decode body: the installed mq4-xts (MQ8 attention, layout-B GEMVs).
+    EmbeddedProgram {
+        id: "raon-ar-decode-gfx1201",
+        arch: "gfx1201",
+        jsonl: include_str!("../programs/raon-ar-decode-gfx1201.jsonl"),
+    },
+    // The earlier a8attn-s artifact (A8 attention GEMVs).
+    EmbeddedProgram {
+        id: "raon-ar-decode-a8attn-gfx1201",
+        arch: "gfx1201",
+        jsonl: include_str!("../programs/raon-ar-decode-a8attn-gfx1201.jsonl"),
+    },
+];
 
 pub struct FromCacheOptions {
     pub arch: String,
