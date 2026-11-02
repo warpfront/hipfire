@@ -86,11 +86,18 @@ pub struct BinaryLookup<'a> {
     pub path: Option<&'a OsStr>,
 }
 
+#[cfg(unix)]
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// No execute bit off unix: any regular file counts.
+#[cfg(not(unix))]
+fn is_executable(p: &Path) -> bool {
+    fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// First executable `name`: beside the running executable, in the hipfire
@@ -324,5 +331,6 @@ fn run(
     })
 }
 
-#[cfg(test)]
+// The tests drive fake `from-cache` shell scripts, so they are unix-only.
+#[cfg(all(test, unix))]
 mod tests;
