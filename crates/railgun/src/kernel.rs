@@ -112,6 +112,11 @@ pub struct ArgFact {
 /// Witness kind the receipt names for the loaded-index case (§A9.2).
 pub const WITNESS_INDEXED_BIND: &str = "indexed_bind";
 
+/// Witness kind the receipt names for the sealed pointer-table case: the
+/// table argument resolves to a loader-sealed immutable region whose every
+/// entry points into an immutable allocation (`crate::sealed_table`).
+pub const WITNESS_SEALED_TABLE: &str = railgun_corpus::receipt::WITNESS_SEALED_TABLE;
+
 /// `IndexLoad` (§A9.2): an immutable `I32` index loaded from a pointer
 /// argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,12 +157,66 @@ pub struct ArgGuard {
     pub value: String,
 }
 
+/// Where a sealed table's guard bound comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableBound {
+    /// The 4-byte unsigned kernarg scalar at this byte offset.
+    Kernarg(u32),
+    /// A constant.
+    Const(u32),
+}
+
+/// One entry load of a sealed table: a 64-bit load of `table[index]` whose
+/// index is, on every path from the kernel entry, strictly below the bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableEntryLoad {
+    pub pc: u32,
+    pub class: MemClass,
+    pub path: String,
+    pub cache: String,
+    pub width: u32,
+    pub index_expr: String,
+    pub guard_pcs: Vec<u32>,
+}
+
+/// One read whose base derives from sealed-table entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableAccess {
+    pub pc: u32,
+    pub class: MemClass,
+    pub path: String,
+    pub cache: String,
+    pub width: u32,
+    pub entry_pcs: Vec<u32>,
+}
+
+/// One sealed pointer table of a `Conditional` kernel (receipt
+/// `sealed_tables`, kept apart from the indexed effects): the pointer
+/// argument that holds the table, the bound its index is checked against and
+/// what the kernel does with the loaded entries (only reads).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedTableFact {
+    /// Kernarg byte offset of the table's base pointer.
+    pub table_arg_offset: u32,
+    pub bound: TableBound,
+    /// Bytes per entry (a pointer: 8).
+    pub entry_bytes: u32,
+    pub entries: Vec<TableEntryLoad>,
+    pub accesses: Vec<TableAccess>,
+    /// Every read through an entry is reachable only with that entry nonzero
+    /// (the receipt's `null_guarded`): the sealed table may hold null entries.
+    pub null_guarded: bool,
+}
+
 /// The guarded case of a `Conditional` kernel: valid only while every guard
 /// holds and every `witnesses` kind has a matching runtime bind witness.
+/// `indexed` and `tables` are the two independent case families (the
+/// `indexed_bind` and `sealed_table` witnesses); a record has either or both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConditionalFacts {
     pub guards: Vec<ArgGuard>,
     pub indexed: Vec<IndexedArgEffect>,
+    pub tables: Vec<SealedTableFact>,
     pub witnesses: Vec<String>,
     pub case_digest: String,
 }
@@ -243,21 +302,111 @@ pub struct KernelFacts {
     pub guard_flag: Option<u32>,
 }
 
+/// Parse a conditional record with `KernelRecord::validate_case` semantics
+/// (the object-bound digest is verified at admission; this is the fail-closed
+/// structural half): an indexed case needs guards and indexed effects, a
+/// sealed-only case needs sealed tables and **no** guards, and the required
+/// witnesses are exactly the kinds the case implies. An unknown kind is an
+/// error.
 fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, String> {
     let sym = &record.symbol;
-    if record.guards.is_empty()
-        || record.indexed_effects.is_empty()
+    let has_indexed = !record.indexed_effects.is_empty();
+    let has_sealed = !record.sealed_tables.is_empty();
+    if (!has_indexed && !has_sealed)
         || record.required_witnesses.is_empty()
         || record.case_digest.is_empty()
     {
         return Err(format!(
-            "{sym}: conditional record lacks guards, indexed effects, witnesses or case digest"
+            "{sym}: conditional record lacks effects (indexed or sealed tables), witnesses or case digest"
+        ));
+    }
+    if has_indexed && record.guards.is_empty() {
+        return Err(format!("{sym}: indexed conditional record lacks guards"));
+    }
+    if !has_indexed && !record.guards.is_empty() {
+        return Err(format!(
+            "{sym}: sealed-table-only conditional record carries guards"
         ));
     }
     for w in &record.required_witnesses {
-        if w != WITNESS_INDEXED_BIND {
+        if !railgun_corpus::receipt::KNOWN_WITNESSES.contains(&w.as_str()) {
             return Err(format!("{sym}: unknown required witness kind {w:?}"));
         }
+    }
+    if record.required_witnesses != record.implied_witnesses() {
+        return Err(format!(
+            "{sym}: required witnesses {:?} are not the kinds the case implies {:?}",
+            record.required_witnesses,
+            record.implied_witnesses()
+        ));
+    }
+    let mut tables = Vec::with_capacity(record.sealed_tables.len());
+    for (i, t) in record.sealed_tables.iter().enumerate() {
+        t.validate(sym)?;
+        if record.sealed_tables[..i].iter().any(|o| {
+            o.table_arg_offset == t.table_arg_offset
+                && o.bound_kind == t.bound_kind
+                && o.bound_value == t.bound_value
+        }) {
+            return Err(format!("{sym}: duplicate sealed table"));
+        }
+        let table_arg = record.args.iter().find(|a| a.offset == t.table_arg_offset);
+        if !table_arg.is_some_and(|a| a.size == 8 && a.role == "pointer") {
+            return Err(format!(
+                "{sym}: sealed table argument +{} is not an 8-byte pointer argument",
+                t.table_arg_offset
+            ));
+        }
+        let bound = match t.bound_kind.as_str() {
+            railgun_corpus::receipt::SEALED_BOUND_KERNARG => {
+                let at = u32::try_from(t.bound_value)
+                    .ok()
+                    .filter(|at| at.checked_add(4).is_some_and(|end| end <= record.kernarg_size))
+                    .ok_or_else(|| {
+                        format!(
+                            "{sym}: sealed table bound +{} lies outside the {}-byte kernarg segment",
+                            t.bound_value, record.kernarg_size
+                        )
+                    })?;
+                TableBound::Kernarg(at)
+            }
+            railgun_corpus::receipt::SEALED_BOUND_CONST => TableBound::Const(
+                u32::try_from(t.bound_value)
+                    .map_err(|_| format!("{sym}: sealed table constant bound exceeds u32"))?,
+            ),
+            other => return Err(format!("{sym}: unknown sealed table bound kind {other:?}")),
+        };
+        let mut entries = Vec::with_capacity(t.entries.len());
+        for e in &t.entries {
+            entries.push(TableEntryLoad {
+                pc: e.pc,
+                class: MemClass::parse(&e.class).map_err(|m| format!("{sym}: {m}"))?,
+                path: e.path.clone(),
+                cache: e.cache.clone(),
+                width: e.width,
+                index_expr: e.index_expr.clone(),
+                guard_pcs: e.guard_pcs.clone(),
+            });
+        }
+        let mut accesses = Vec::with_capacity(t.accesses.len());
+        for a in &t.accesses {
+            accesses.push(TableAccess {
+                pc: a.pc,
+                class: MemClass::parse(&a.class).map_err(|m| format!("{sym}: {m}"))?,
+                path: a.path.clone(),
+                cache: a.cache.clone(),
+                width: a.width,
+                entry_pcs: a.entry_pcs.clone(),
+            });
+        }
+        tables.push(SealedTableFact {
+            table_arg_offset: t.table_arg_offset,
+            bound,
+            entry_bytes: t.entry_bytes,
+            entries,
+            accesses,
+            null_guarded: t.null_guarded,
+        });
     }
     let mut indexed = Vec::with_capacity(record.indexed_effects.len());
     for e in &record.indexed_effects {
@@ -300,6 +449,7 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
             })
             .collect(),
         indexed,
+        tables,
         witnesses: record.required_witnesses.clone(),
         case_digest: record.case_digest.clone(),
     })
@@ -810,6 +960,11 @@ pub struct KernelNode {
     /// window only while the window holds a matching
     /// [`crate::index_bind::IndexedBindWitness`].
     pub indexed: Option<IndexedNode>,
+    /// The sealed-pointer-table case of a `Conditional` kernel (a copy of the
+    /// receipt's facts; kept apart from `indexed`). A node carrying it is
+    /// admitted to a window only while the window holds a matching
+    /// [`crate::sealed_table::SealedTableWitness`].
+    pub table: Option<TableNode>,
     /// #867: the ControlWord resource whose clear flag makes this launch a
     /// no-op, from the object's guard certificate (`KernelFacts::guard_flag`)
     /// with its pointer bound to the start of that resource.
@@ -823,6 +978,17 @@ pub struct IndexedNode {
     pub args: Vec<ArgFact>,
     pub effects: Vec<IndexedArgEffect>,
     pub guards: Vec<ArgGuard>,
+    pub witnesses: Vec<String>,
+    pub case_digest: String,
+}
+
+/// What a window needs to bind a sealed-table `Conditional` node: the explicit
+/// arguments of the loaded object, the sealed tables and the case's receipt
+/// identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableNode {
+    pub args: Vec<ArgFact>,
+    pub tables: Vec<SealedTableFact>,
     pub witnesses: Vec<String>,
     pub case_digest: String,
 }
@@ -994,6 +1160,22 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                         }
                     }
                 }
+                // A sealed table's own entry loads are reads of the table
+                // argument; the table is immutable, so a write class on it
+                // (from any source) refuses the node.
+                for t in c.tables.iter().filter(|t| t.table_arg_offset == arg.offset) {
+                    for e in &t.entries {
+                        if !classes.contains(&e.class) {
+                            classes.push(e.class);
+                        }
+                    }
+                    if classes.iter().any(|k| k.writes()) {
+                        refusals.push(format!(
+                            "sealed table argument +{} has write effects",
+                            arg.offset
+                        ));
+                    }
+                }
             }
             if arg.size != 8 {
                 refusals.push(format!(
@@ -1079,13 +1261,38 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 declared.len() - used_words
             ));
         }
+        if let Some(c) = conditional {
+            for t in &c.tables {
+                let is_resource = args.iter().any(|(offset, arg)| {
+                    *offset == t.table_arg_offset && matches!(arg, Arg::Resource { .. })
+                });
+                if !is_resource {
+                    refusals.push(format!(
+                        "sealed table argument +{} is not a bound allocation",
+                        t.table_arg_offset
+                    ));
+                }
+                if let TableBound::Kernarg(at) = t.bound {
+                    if at as usize + 4 > explicit {
+                        refusals.push(format!(
+                            "sealed table bound +{at} lies outside the {explicit}-byte explicit kernarg segment"
+                        ));
+                    }
+                }
+            }
+        }
         let lowering = if !refusals.is_empty() {
             Lowering::HipDirect {
                 reason: refusals.join("; "),
             }
-        } else if conditional.is_some() {
+        } else if let Some(c) = conditional {
+            let reason = match (has_indexed_case(c), !c.tables.is_empty()) {
+                (true, false) => "indexed_bind witness not consumed",
+                (false, _) => "sealed_table witness not consumed",
+                (true, true) => "indexed_bind and sealed_table witnesses not consumed",
+            };
             Lowering::Conditional {
-                reason: "indexed_bind witness not consumed".to_owned(),
+                reason: reason.to_owned(),
             }
         } else if non_commutative_atomic {
             Lowering::Graph {
@@ -1116,13 +1323,23 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             effects,
             read_cache: f.read_cache,
             lowering,
-            indexed: conditional.map(|c| IndexedNode {
-                args: f.args.clone(),
-                effects: c.indexed.clone(),
-                guards: c.guards.clone(),
-                witnesses: c.witnesses.clone(),
-                case_digest: c.case_digest.clone(),
-            }),
+            indexed: conditional
+                .filter(|c| has_indexed_case(c))
+                .map(|c| IndexedNode {
+                    args: f.args.clone(),
+                    effects: c.indexed.clone(),
+                    guards: c.guards.clone(),
+                    witnesses: c.witnesses.clone(),
+                    case_digest: c.case_digest.clone(),
+                }),
+            table: conditional
+                .filter(|c| !c.tables.is_empty())
+                .map(|c| TableNode {
+                    args: f.args.clone(),
+                    tables: c.tables.clone(),
+                    witnesses: c.witnesses.clone(),
+                    case_digest: c.case_digest.clone(),
+                }),
             guard,
         });
     }
@@ -1233,6 +1450,7 @@ fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
         read_cache: ReadCache::Unknown,
         lowering: Lowering::HipDirect { reason },
         indexed: None,
+        table: None,
         guard: None,
     }
 }
@@ -1463,7 +1681,9 @@ impl KernelProgram {
     }
 
     /// Indices of the nodes that need an
-    /// [`crate::index_bind::IndexedBindWitness`] (receipt `Conditional`).
+    /// [`crate::index_bind::IndexedBindWitness`] (receipt `Conditional` with
+    /// an `indexed_bind` case). Sealed-table nodes are
+    /// [`Self::sealed_table_nodes`].
     pub fn conditional_nodes(&self) -> Vec<usize> {
         self.nodes
             .iter()
@@ -1473,21 +1693,62 @@ impl KernelProgram {
             .collect()
     }
 
-    /// The program a window plan is laid out against *assuming* its bind
-    /// witness: every `Conditional` node that carries its guarded case is
-    /// lowered as PM4. This is a derived value; the cached node facts and
-    /// this program are never promoted to `Proven`. The resulting plan keeps
-    /// the node's `indexed` case, and `PreparedWindow` refuses to submit
-    /// without a witness for every such node.
-    pub fn assume_indexed_witness(&self) -> KernelProgram {
+    /// Indices of the nodes that need a
+    /// [`crate::sealed_table::SealedTableWitness`] (receipt `Conditional`
+    /// with sealed tables).
+    pub fn sealed_table_nodes(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.table.is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The program a window plan is laid out against *assuming* the bind
+    /// witnesses of `kinds`: every `Conditional` node whose required witness
+    /// kinds (`indexed_bind` for an `indexed` case, `sealed_table` for a
+    /// `table` case) are all in `kinds` is lowered as PM4. A node that still
+    /// needs another kind stays `Conditional`. This is a derived value; the
+    /// cached node facts and this program are never promoted to `Proven`. The
+    /// resulting plan keeps the nodes' cases, and `PreparedWindow` refuses to
+    /// submit without a witness for every such node.
+    pub fn assume_witnesses(&self, kinds: &[&str]) -> KernelProgram {
         let mut p = self.clone();
         for n in &mut p.nodes {
-            if n.indexed.is_some() && matches!(n.lowering, Lowering::Conditional { .. }) {
+            if (n.indexed.is_none() && n.table.is_none())
+                || !matches!(n.lowering, Lowering::Conditional { .. })
+            {
+                continue;
+            }
+            let covered = (n.indexed.is_none() || kinds.contains(&WITNESS_INDEXED_BIND))
+                && (n.table.is_none() || kinds.contains(&WITNESS_SEALED_TABLE));
+            if covered {
                 n.lowering = Lowering::Pm4;
             }
         }
         p
     }
+
+    /// [`Self::assume_witnesses`] for the `indexed_bind` kind: every
+    /// `Conditional` node that carries only its indexed case is lowered as
+    /// PM4. A node that also needs a sealed table stays `Conditional`.
+    pub fn assume_indexed_witness(&self) -> KernelProgram {
+        self.assume_witnesses(&[WITNESS_INDEXED_BIND])
+    }
+
+    /// [`Self::assume_witnesses`] for the `sealed_table` kind: every
+    /// `Conditional` node that carries only its sealed-table case is lowered
+    /// as PM4. A node that also needs an indexed bind stays `Conditional`.
+    pub fn assume_sealed_table_witness(&self) -> KernelProgram {
+        self.assume_witnesses(&[WITNESS_SEALED_TABLE])
+    }
+}
+
+/// Whether `c` carries an `indexed_bind` case. A conditional fact with
+/// neither family is the legacy indexed shape (hand-built facts).
+fn has_indexed_case(c: &ConditionalFacts) -> bool {
+    !c.indexed.is_empty() || c.tables.is_empty()
 }
 
 #[cfg(test)]

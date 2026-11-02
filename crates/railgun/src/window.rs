@@ -38,6 +38,10 @@ use crate::index_bind::{
 };
 use crate::kernel::{Arg, Expr, ExprError, ImageOverrides, KernelProgram, PatchKind, WordRole};
 use crate::plan::Pm4Plan;
+use crate::sealed_table::{
+    SealedTableError, SealedTableRegistry, SealedTableWitness, TableBindInputs, TableContent,
+    TableLease,
+};
 use crate::{Binding, ResourceId, WordId};
 
 /// Prepared topology skeletons retained per owner (§2: "one bounded cache of
@@ -111,6 +115,10 @@ pub enum Refusal {
     Indexed(IndexBindError),
     #[error("node {node} ({symbol}) is conditional: submit needs an indexed bind witness")]
     IndexedWitnessMissing { node: usize, symbol: String },
+    #[error("sealed table: {0}")]
+    SealedTable(SealedTableError),
+    #[error("node {node} ({symbol}) is conditional: submit needs a sealed_table witness")]
+    SealedTableWitnessMissing { node: usize, symbol: String },
 }
 
 /// What is known about the queue after a failure (§2: "failure distinguishes
@@ -860,6 +868,9 @@ pub struct BoundWindow {
     host_delta: WindowHostDelta,
     /// The consumed-at-submit bind witness of a plan with conditional nodes.
     indexed: Option<(IndexedBindWitness, SealedPositions)>,
+    /// The consumed-at-submit sealed-table witness of a plan with
+    /// sealed-table nodes, with the registry it was bound against.
+    tables: Option<(SealedTableWitness, SealedTableRegistry)>,
     /// A certified exact route for **this** window: the manifest admitted the
     /// plan with this bind's witnesses ([`PreparedWindow::certify_exact`]).
     exact: bool,
@@ -877,6 +888,12 @@ impl BoundWindow {
     /// The attached bind witness, when the plan has conditional nodes.
     pub fn indexed_witness(&self) -> Option<&IndexedBindWitness> {
         self.indexed.as_ref().map(|(w, _)| w)
+    }
+
+    /// The attached sealed-table witness, when the plan has sealed-table
+    /// nodes.
+    pub fn sealed_table_witness(&self) -> Option<&SealedTableWitness> {
+        self.tables.as_ref().map(|(w, _)| w)
     }
 }
 
@@ -920,6 +937,7 @@ pub struct Submission {
     receipt_tape: bool,
     host_delta: WindowHostDelta,
     sealed: Option<SealedPositions>,
+    tables: Option<TableLease>,
 }
 
 impl Submission {
@@ -927,13 +945,16 @@ impl Submission {
     /// returns the host delta for its single commit; a failure with
     /// [`Quiescence::Proven`] retires it, [`Quiescence::Unknown`] quarantines
     /// it (§6).
-    pub fn complete(self) -> Result<CompleteWindow, CompletionFailure> {
+    pub fn complete(mut self) -> Result<CompleteWindow, CompletionFailure> {
         let mut shared = lock(&self.shared);
         match shared.queue.wait() {
             Ok(()) => {
                 shared.phase = Phase::Retired;
                 if let Some(s) = &self.sealed {
                     s.finish(Quiescence::Proven);
+                }
+                if let Some(l) = self.tables.take() {
+                    l.release(Quiescence::Proven);
                 }
                 Ok(CompleteWindow {
                     generation: self.generation,
@@ -953,6 +974,9 @@ impl Submission {
                 };
                 if let Some(s) = &self.sealed {
                     s.finish(f.quiescence);
+                }
+                if let Some(l) = self.tables.take() {
+                    l.release(f.quiescence);
                 }
                 Err(CompletionFailure {
                     generation: self.generation,
@@ -1372,6 +1396,7 @@ impl PreparedWindow {
             generation: shape.generation,
             host_delta,
             indexed: None,
+            tables: None,
             exact: false,
         })
     }
@@ -1419,6 +1444,52 @@ impl PreparedWindow {
         Ok(())
     }
 
+    /// Bind the sealed tables to this window's bound state: the per-node and
+    /// full-program proofs of [`SealedTableRegistry::bind_sealed_table`] run
+    /// against the **encoded kernarg images** and the window's allocation
+    /// identities, and the resulting [`SealedTableWitness`] is held by
+    /// `bound` until [`Self::submit`] consumes it. `content` is the owner's
+    /// view of the live table bytes. A stale `bound` is refused before any
+    /// proof runs.
+    pub fn attach_sealed_table_witness(
+        &self,
+        bound: &mut BoundWindow,
+        registry: &SealedTableRegistry,
+        content: &dyn TableContent,
+    ) -> Result<(), Refusal> {
+        {
+            let shared = lock(&self.shared);
+            if bound.prepared != self.id
+                || bound.epoch != shared.epoch
+                || shared.phase != Phase::Bound
+            {
+                return Err(Refusal::StaleBound);
+            }
+        }
+        if self.plan.program.sealed_table_nodes().is_empty() {
+            return Err(Refusal::SealedTable(SealedTableError::Closure(
+                "the plan has no sealed-table node".into(),
+            )));
+        }
+        let witness = registry
+            .bind_sealed_table(
+                &TableBindInputs {
+                    window: self.id,
+                    shape_generation: bound.generation,
+                    program: &self.plan.program,
+                    steps: &self.plan.steps,
+                    bindings: &self.bindings,
+                    allocations: &self.key.allocations,
+                    images: &self.images,
+                    grids: &self.grids,
+                },
+                content,
+            )
+            .map_err(Refusal::SealedTable)?;
+        bound.tables = Some((witness, registry.clone()));
+        Ok(())
+    }
+
     /// Record that the window manifest admitted this plan **together with
     /// this bind's witnesses** (a plan with conditional nodes is not
     /// certified exact by its plan alone). The owner calls it after
@@ -1446,6 +1517,14 @@ impl PreparedWindow {
                 symbol: "certify_exact".into(),
             });
         }
+        if bound.tables.is_none() {
+            if let Some(&node) = self.plan.program.sealed_table_nodes().first() {
+                return Err(Refusal::SealedTableWitnessMissing {
+                    node,
+                    symbol: self.plan.program.nodes[node].symbol.clone(),
+                });
+            }
+        }
         bound.exact = true;
         Ok(())
     }
@@ -1464,6 +1543,33 @@ impl PreparedWindow {
             Phase::Quarantined => return Err(Refusal::Quarantined),
             Phase::Retired => return Err(Refusal::StaleBound),
         }
+        // A plan with sealed-table nodes is PM4-ineligible until every one of
+        // them has this window's matching sealed_table witness; the pure
+        // checks run before anything transitions.
+        let table_nodes = self.plan.program.sealed_table_nodes();
+        let table_witness = if table_nodes.is_empty() {
+            None
+        } else {
+            let Some((witness, registry)) = &bound.tables else {
+                return Err(Refusal::SealedTableWitnessMissing {
+                    node: table_nodes[0],
+                    symbol: self.plan.program.nodes[table_nodes[0]].symbol.clone(),
+                });
+            };
+            witness
+                .matches_window(self.id, bound.generation, &self.images, &self.grids)
+                .map_err(Refusal::SealedTable)?;
+            let covered: Vec<usize> = witness.nodes().iter().map(|n| n.node).collect();
+            if covered != table_nodes {
+                return Err(Refusal::SealedTable(SealedTableError::Stale(format!(
+                    "witness covers nodes {covered:?}, the plan's sealed-table nodes are {table_nodes:?}"
+                ))));
+            }
+            registry
+                .check_witness(witness)
+                .map_err(Refusal::SealedTable)?;
+            Some((witness, registry))
+        };
         // A plan with conditional nodes is PM4-ineligible until every one of
         // them has this window's matching witness (§A9.2).
         let sealed = if self.plan.indexed_positions.is_some() {
@@ -1497,6 +1603,20 @@ impl PreparedWindow {
         } else {
             None
         };
+        // Mark the sealed tables as used by a window in flight; nothing is
+        // queued yet, so a refusal here retires the sealed positions again.
+        let lease = match table_witness {
+            Some((witness, registry)) => match registry.lease(witness) {
+                Ok(lease) => Some(lease),
+                Err(e) => {
+                    if let Some(s) = &sealed {
+                        s.submit_failed(Quiescence::Proven);
+                    }
+                    return Err(Refusal::SealedTable(e));
+                }
+            },
+            None => None,
+        };
         let nodes: Vec<NodeImage<'_>> = self
             .images
             .iter()
@@ -1518,6 +1638,7 @@ impl PreparedWindow {
                     receipt_tape: self.plan.tape_populated,
                     host_delta: bound.host_delta,
                     sealed,
+                    tables: lease,
                 })
             }
             Err(f) => {
@@ -1527,6 +1648,9 @@ impl PreparedWindow {
                 };
                 if let Some(s) = &sealed {
                     s.submit_failed(f.quiescence);
+                }
+                if let Some(l) = lease {
+                    l.release(f.quiescence);
                 }
                 Err(Refusal::SubmitFailed {
                     message: f.message,
@@ -2830,5 +2954,275 @@ mod tests {
         assert!(
             matches!(make_plan(indexed_parts(&fx)), Err(Refusal::Malformed(m)) if m.contains("another conditional node"))
         );
+    }
+
+    // ---- sealed pointer tables through the window ---------------------------
+
+    use crate::kernel::LaunchRecord;
+    use crate::sealed_table::tests as st;
+
+    fn sealed_parts(fx: &st::Fixture) -> WindowPlanParts {
+        WindowPlanParts {
+            program: fx.program.clone(),
+            steps: fx.steps.clone(),
+            patches: Vec::new(),
+            host_delta: HostDeltaSpec::default(),
+            completion_surfaces: vec![fx.out_res],
+            projection_rows: vec![],
+            execution: WindowExecution::Whole16,
+            hip_graph_certified: false,
+            tape_populated: false,
+        }
+    }
+
+    fn sealed_key(fx: &st::Fixture) -> WindowBindingKey {
+        WindowBindingKey {
+            allocations: fx.allocations.clone(),
+            object_digests: vec!["aa".into(); fx.program.nodes.len()],
+            ..key()
+        }
+    }
+
+    fn sealed_window(extra: Vec<LaunchRecord>) -> (st::Fixture, PreparedWindow, Arc<Mutex<Log>>) {
+        sealed_window_of(st::Fixture::new(extra))
+    }
+
+    fn sealed_window_of(fx: st::Fixture) -> (st::Fixture, PreparedWindow, Arc<Mutex<Log>>) {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let plan =
+            make_plan(sealed_parts(&fx)).expect("a sealed-table plan under the assumed witness");
+        let w = PreparedWindow::new(plan, sealed_key(&fx), Box::new(MockQueue(log.clone())))
+            .expect("prepared");
+        (fx, w, log)
+    }
+
+    fn sealed_bind(w: &mut PreparedWindow, fx: &st::Fixture, generation: u64) -> BoundWindow {
+        let bindings = WindowBindings {
+            key: sealed_key(fx),
+        };
+        w.bind(&shape(300, generation), &bindings, &inputs())
+            .expect("bind")
+    }
+
+    fn attach(
+        w: &PreparedWindow,
+        bound: &mut BoundWindow,
+        fx: &st::Fixture,
+    ) -> Result<(), Refusal> {
+        w.attach_sealed_table_witness(bound, &fx.registry, &fx.content)
+    }
+
+    #[test]
+    fn a_sealed_table_node_is_not_pm4_without_its_witness_and_submit_refuses() {
+        // The cached program (the node still `Conditional`) never plans as PM4.
+        let fx = st::Fixture::new(Vec::new());
+        let mut parts = sealed_parts(&fx);
+        parts.program = fx.authored.clone();
+        assert!(matches!(
+            make_plan(parts),
+            Err(Refusal::NotPm4 { node: 0, reason, .. }) if reason.contains("sealed_table witness not consumed")
+        ));
+
+        let (fx, mut w, log) = sealed_window(Vec::new());
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        assert!(matches!(
+            w.certify_exact(&mut bound),
+            Err(Refusal::SealedTableWitnessMissing { node: 0, .. })
+        ));
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::SealedTableWitnessMissing { node: 0, .. })
+        ));
+        assert_eq!(
+            log.lock().unwrap().submits,
+            0,
+            "the queue was never touched"
+        );
+
+        // A plan with no sealed-table node has nothing to attach.
+        let (ifx, mut iw, _) = indexed_window();
+        let mut bound = indexed_bind(&mut iw, &ifx, 1);
+        assert!(matches!(
+            iw.attach_sealed_table_witness(&mut bound, &fx.registry, &fx.content),
+            Err(Refusal::SealedTable(SealedTableError::Closure(_)))
+        ));
+    }
+
+    #[test]
+    fn bind_attach_submit_complete_walks_the_table_lease() {
+        let (fx, mut w, log) = sealed_window(Vec::new());
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        attach(&w, &mut bound, &fx).unwrap();
+        let witness = bound.sealed_table_witness().expect("attached");
+        assert_eq!(
+            witness.discharged_cases(),
+            vec![(0, fx.case_digest.as_str(), "sealed_table")]
+        );
+        w.certify_exact(&mut bound).unwrap();
+        let submission = w.submit(bound).unwrap();
+        assert_eq!(log.lock().unwrap().submits, 1);
+        // While the window is in flight the table cannot be retired.
+        assert!(matches!(
+            fx.registry.retire(st::TABLE),
+            Err(SealedTableError::Retire(m)) if m.contains("in flight")
+        ));
+        let done = submission.complete().unwrap();
+        assert!(done.receipt.same_as_hip_graph, "certified with the witness");
+        // Released: the next window binds anew and the table can then be retired.
+        let mut next = sealed_bind(&mut w, &fx, 2);
+        attach(&w, &mut next, &fx).unwrap();
+        w.submit(next).unwrap().complete().unwrap();
+        assert_eq!(fx.registry.retire(st::TABLE), Ok(st::GEN + 1));
+    }
+
+    /// The owner flow for a table that holds null entries (an absent expert),
+    /// end to end: seal with `NullEntries::Allow` (the receipt's `null_guarded`),
+    /// bind, consume the witness, certify, submit. The same table under a
+    /// certificate without a null guard never gets a witness.
+    #[test]
+    fn a_null_holding_table_is_consumed_only_under_a_null_guarded_certificate() {
+        let (fx, mut w, log) = sealed_window_of(st::Fixture::nullable(&st::guarded_record()));
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        attach(&w, &mut bound, &fx).expect("null-guarded certificate");
+        assert_eq!(
+            bound
+                .sealed_table_witness()
+                .expect("attached")
+                .discharged_cases(),
+            vec![(0, fx.case_digest.as_str(), "sealed_table")]
+        );
+        w.certify_exact(&mut bound).unwrap();
+        w.submit(bound).unwrap().complete().unwrap();
+        assert_eq!(log.lock().unwrap().submits, 1);
+
+        let (fx, mut w, log) = sealed_window_of(st::Fixture::nullable(&st::record()));
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        assert!(matches!(
+            attach(&w, &mut bound, &fx),
+            Err(Refusal::SealedTable(
+                SealedTableError::NullEntryUnguarded { .. }
+            ))
+        ));
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::SealedTableWitnessMissing { node: 0, .. })
+        ));
+        assert_eq!(log.lock().unwrap().submits, 0);
+    }
+
+    #[test]
+    fn unknown_quiescence_quarantines_the_table_and_a_proven_failure_releases_it() {
+        // Unknown after submit: the window may still read the table.
+        let (fx, mut w, log) = sealed_window(Vec::new());
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        attach(&w, &mut bound, &fx).unwrap();
+        let submission = w.submit(bound).unwrap();
+        log.lock().unwrap().wait_failure = Some(Quiescence::Unknown);
+        assert!(submission.complete().is_err());
+        assert!(matches!(
+            fx.registry.retire(st::TABLE),
+            Err(SealedTableError::Retire(m)) if m.contains("quarantined")
+        ));
+
+        for (q, retirable) in [(Quiescence::Proven, true), (Quiescence::Unknown, false)] {
+            let (fx, mut w, log) = sealed_window(Vec::new());
+            let mut bound = sealed_bind(&mut w, &fx, 1);
+            attach(&w, &mut bound, &fx).unwrap();
+            log.lock().unwrap().submit_failure = Some(q);
+            assert!(matches!(w.submit(bound), Err(Refusal::SubmitFailed { .. })));
+            assert_eq!(fx.registry.retire(st::TABLE).is_ok(), retirable, "{q:?}");
+        }
+    }
+
+    #[test]
+    fn a_modified_table_a_stale_generation_and_a_writer_node_are_refused() {
+        // The live table differs from the sealed digest: no witness.
+        let (fx, mut w, log) = sealed_window(Vec::new());
+        fx.content.bytes.lock().unwrap()[0] ^= 1;
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        assert!(matches!(
+            attach(&w, &mut bound, &fx),
+            Err(Refusal::SealedTable(SealedTableError::Modified { .. }))
+        ));
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::SealedTableWitnessMissing { .. })
+        ));
+        assert_eq!(log.lock().unwrap().submits, 0);
+
+        // Retired and re-sealed between attach and submit: the witness is
+        // stale and nothing is queued.
+        let (fx, mut w, log) = sealed_window(Vec::new());
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        attach(&w, &mut bound, &fx).unwrap();
+        fx.registry.retire(st::TABLE).unwrap();
+        fx.registry
+            .seal(
+                st::table_binding(),
+                st::ENTRIES,
+                &st::table_bytes(&st::entry_ptrs()),
+                &st::pointees(),
+                st::GEN + 1,
+            )
+            .unwrap();
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::SealedTable(SealedTableError::Stale(_)))
+        ));
+        assert_eq!(log.lock().unwrap().submits, 0);
+
+        // A kernarg image or grid changed after the bind.
+        let (fx, mut w, log) = sealed_window(Vec::new());
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        attach(&w, &mut bound, &fx).unwrap();
+        w.images[0][16] ^= 1;
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::SealedTable(SealedTableError::Node { node: 0, .. }))
+        ));
+        let mut bound = sealed_bind(&mut w, &fx, 2);
+        attach(&w, &mut bound, &fx).unwrap();
+        w.grids[0] = [9, 1, 1];
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::SealedTable(SealedTableError::Node { node: 0, .. }))
+        ));
+        assert_eq!(log.lock().unwrap().submits, 0);
+
+        // A program that can write a pointee cannot obtain a witness, so the
+        // node is never submitted.
+        let (fx, mut w, log) = sealed_window(vec![ib::extra_launch(
+            "writer",
+            st::W1 + 0x40,
+            st::w1(),
+            &[MemClass::VmemStore],
+        )]);
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        assert!(matches!(
+            attach(&w, &mut bound, &fx),
+            Err(Refusal::SealedTable(SealedTableError::Closure(m))) if m.contains("pointee")
+        ));
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::SealedTableWitnessMissing { node: 0, .. })
+        ));
+        assert_eq!(log.lock().unwrap().submits, 0);
+    }
+
+    #[test]
+    fn a_superseded_bind_refuses_the_table_attach_and_submit() {
+        let (fx, mut w, log) = sealed_window(Vec::new());
+        let mut first = sealed_bind(&mut w, &fx, 1);
+        let mut second = sealed_bind(&mut w, &fx, 2);
+        assert!(matches!(
+            attach(&w, &mut first, &fx),
+            Err(Refusal::StaleBound)
+        ));
+        attach(&w, &mut second, &fx).unwrap();
+        let mut third = sealed_bind(&mut w, &fx, 3);
+        attach(&w, &mut third, &fx).unwrap();
+        assert!(matches!(w.submit(second), Err(Refusal::StaleBound)));
+        assert_eq!(log.lock().unwrap().submits, 0);
+        w.submit(third).unwrap().complete().unwrap();
     }
 }

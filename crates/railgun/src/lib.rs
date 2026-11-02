@@ -35,6 +35,7 @@ pub mod mq6;
 #[cfg(feature = "npu")]
 pub mod npu;
 pub mod plan;
+pub mod sealed_table;
 pub mod shadow;
 pub mod window;
 
