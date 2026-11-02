@@ -3187,23 +3187,63 @@ pub(crate) fn ep_unit_static_owners(plan: &EpUnitPlan, rank: usize, layer: usize
         )
 }
 
+/// The pure half of [`ep_unit_split_refusal`]: refuse a feature that needs whole-layer
+/// expert tensors on a unit `plan`. With `donors` `None` (a suffix-donor reserve, or any other
+/// feature) any mixed layer on any rank refuses it. With explicit scratch `donors`
+/// ([`crate::ep_reserve::EpReservePlan::explicit_donors`]) only a donor layer that is mixed or
+/// wholly host on some rank refuses: the donors are the plan's forced whole-Resident layers
+/// (compact tensors, no unit arena), every other mixed layer is staged by the unit stage.
+pub(crate) fn ep_unit_plan_split_refusal(
+    plan: &EpUnitPlan,
+    what: &str,
+    donors: Option<&[usize]>,
+) -> Result<(), String> {
+    let ranks = plan.geometry().ranks;
+    let Some(donors) = donors else {
+        if (0..ranks).any(|rank| plan.layer_counts(rank).1 > 0) {
+            return Err(format!(
+                "{what} is not admitted on a load with per-expert VRAM units (HIPFIRE_QWEN4_EP_EXPERT_HOTSET): a mixed layer has no whole-layer expert tensors to stage or donate"
+            ));
+        }
+        return Ok(());
+    };
+    for &layer in donors {
+        if layer >= plan.geometry().layers {
+            return Err(format!(
+                "{what}: scratch donor layer {layer} is outside the {}-layer unit plan",
+                plan.geometry().layers
+            ));
+        }
+        if let Some(rank) =
+            (0..ranks).find(|&rank| plan.layer_state(rank, layer) != EpLayerState::Resident)
+        {
+            return Err(format!(
+                "{what}: scratch donor layer {layer} is {:?} on rank {rank}, not whole-resident (a donor lends whole-layer expert tensors; HIPFIRE_QWEN4_EP_EXPERT_HOTSET forces the donor layers whole)",
+                plan.layer_state(rank, layer)
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a feature that needs whole-layer expert tensors (the EP reserve's scratch
 /// donors) on a load whose unit plan splits any layer (the loader already forces these
 /// features off; this is the belt-and-braces admission check). The G2 expert stage is
 /// not one of them: a unit plan has its own stage ([`slab_stage`], `new_units`).
+/// `donors` is the reserve's explicit donor list (`None`: a suffix reserve or no reserve),
+/// see [`ep_unit_plan_split_refusal`]; explicit donors need a unit plan.
 pub(crate) fn ep_unit_split_refusal(
     weights: &Qwen4Weights,
     what: &str,
+    donors: Option<&[usize]>,
 ) -> Result<(), Qwen4GpuForwardError> {
-    let Some(plan) = weights.ep_unit_plan() else {
-        return Ok(());
-    };
-    if (0..plan.geometry().ranks).any(|rank| plan.layer_counts(rank).1 > 0) {
-        return Err(invalid(format!(
-            "{what} is not admitted on a load with per-expert VRAM units (HIPFIRE_QWEN4_EP_EXPERT_HOTSET): a mixed layer has no whole-layer expert tensors to stage or donate"
-        )));
+    match (weights.ep_unit_plan(), donors) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(invalid(format!(
+            "{what}: explicit scratch donors need a per-expert unit plan (the unit stage serves their borrowed tiles)"
+        ))),
+        (Some(plan), donors) => ep_unit_plan_split_refusal(plan, what, donors).map_err(invalid),
     }
-    Ok(())
 }
 
 /// A non-owning byte window over a live peer or tier payload allocation.
@@ -4160,7 +4200,10 @@ impl Qwen4MoeLayerRuntime {
         };
         // D1 per-expert units: a mixed trunk layer of this rank has no aggregate
         // `experts_{gate_up,down}_proj` tensors (`weights.resident` of them fails); its experts
-        // are slots of one VRAM arena and one pinned-host arena (`ep_unit_layer`).
+        // are slots of one VRAM arena and one pinned-host arena (`ep_unit_layer`). A scratch donor
+        // of a decoupled EP reserve over a unit plan is a forced whole-Resident layer: it has no
+        // unit arena (`ep_unit_layer` is `None`), so its `source_override` (the loan mirror) is
+        // admitted below; a unit layer never takes one.
         let unit_trunk =
             layer_label < config.num_hidden_layers && !moe.gate.name.starts_with("mtp.");
         let unit_layer = if unit_trunk {
@@ -5848,24 +5891,22 @@ impl Qwen4ExpertStage {
         self.restore_blocking(gpu)
     }
 
-    fn new(
-        gpu: &mut Gpu,
-        bundle: &Qwen4Bundle,
-        moe: &[Option<Qwen4MoeLayerRuntime>],
-        chunk_rows: usize,
-        host_sources: Option<&ep_reserve_forward::EpStageHostSources>,
-    ) -> Result<Option<Self>, Qwen4GpuForwardError> {
+    /// The arch and switch admission every stage constructor shares (gfx1201
+    /// under EP, the stage switch on); settles the host link before any stage
+    /// buffer takes VRAM. `false` (the constructor then returns `None`) when the
+    /// stage is not admitted on this rank.
+    fn admitted(gpu: &mut Gpu, bundle: &Qwen4Bundle) -> Result<bool, Qwen4GpuForwardError> {
         if let Some(placement) = bundle.weights.ep_placement() {
             if !rdna_compute::expert_capabilities::stage_policy(&gpu.arch).expert_parallel_stage {
                 eprintln!(
                     "qwen4 EP rank {}/{}: expert staging not admitted (needs gfx1201)",
                     placement.rank, placement.ranks
                 );
-                return Ok(None);
+                return Ok(false);
             }
         }
         if !crate::expert_residency::expert_stage_enabled(gpu) {
-            return Ok(None);
+            return Ok(false);
         }
         // Settle the host link (probe or cache hit) before any stage buffer
         // takes VRAM: the `min_rows` default reads it, and the 64 MiB probe
@@ -5873,11 +5914,28 @@ impl Qwen4ExpertStage {
         if rdna_compute::expert_capabilities::stage_reads_link(&gpu.arch) {
             let _ = crate::host_link::host_link(gpu);
         }
+        Ok(true)
+    }
+
+    fn new(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        moe: &[Option<Qwen4MoeLayerRuntime>],
+        chunk_rows: usize,
+        host_sources: Option<&ep_reserve_forward::EpStageHostSources>,
+    ) -> Result<Option<Self>, Qwen4GpuForwardError> {
+        if !Self::admitted(gpu, bundle)? {
+            return Ok(None);
+        }
         // A per-expert unit plan that is not a whole-layer split has mixed and
         // wholly-host layers and may have no resident layer: the donor design
         // cannot apply, so it takes the dedicated-buffer unit stage (the loader
         // charged those buffers by the same shared switches). A whole-layer
-        // plan, and every load without a plan, keeps the donor path below.
+        // plan, and every load without a plan, keeps the donor path below. The
+        // unit stage is also the one that serves a decoupled EP reserve's borrowed
+        // tiles over a unit plan ([`Self::new_reserve_units`], built by the
+        // forward over the explicit donors), so this S2 constructor builds nothing
+        // for a reserve (`host_sources`) on a unit plan.
         if crate::expert_ep_units::ep_unit_stage_kind(
             bundle.weights.ep_unit_plan().map(|plan| &**plan),
         ) == crate::expert_ep_units::EpUnitStageKind::Units
@@ -5885,7 +5943,7 @@ impl Qwen4ExpertStage {
             if host_sources.is_some() || !crate::expert_ep_units::ep_unit_stage_on(&gpu.arch) {
                 return Ok(None);
             }
-            return Self::new_units(gpu, bundle, moe, chunk_rows);
+            return Self::new_units(gpu, bundle, moe, chunk_rows, None);
         }
         let Some(first_host) = moe
             .iter()
@@ -11212,10 +11270,15 @@ impl Qwen4GpuForward {
                 Qwen4GpuForwardScratch::new_scoped(gpu, &bundle.config, max_chunk, mode, &scope)?;
             (scratch, host_token_bytes, host_ple_bytes, None)
         };
-        if ep_reserve_plan.is_some() {
-            if let Err(error) =
-                ep_unit_split_refusal(&bundle.weights, "the EP reserve (scratch-donor views)")
-            {
+        if let Some(plan) = ep_reserve_plan.as_ref() {
+            // Explicit donors (a unit plan's forced whole-Resident layers) refuse only a donor
+            // that is mixed or host on some rank; suffix donors keep the any-mixed refusal.
+            let donors = plan.explicit_donors.then_some(plan.donor_layers.as_slice());
+            if let Err(error) = ep_unit_split_refusal(
+                &bundle.weights,
+                "the EP reserve (scratch-donor views)",
+                donors,
+            ) {
                 let _ = scratch.free_gpu(gpu);
                 return Err(error);
             }
@@ -11294,8 +11357,13 @@ impl Qwen4GpuForward {
                 })?;
                 if let Some(reserve) = reserve.as_ref() {
                     // EP reserve borrowed compact view (`moe_borrow[0]`): every layer as the
-                    // EP decode runtime, except the scratch donors `[H, R)`, whose owned
-                    // experts name the loan's pinned mirror while their device bytes are scratch.
+                    // EP decode runtime, except the scratch donors (suffix `[H, R)`, or a unit
+                    // plan's explicit whole-Resident layers), whose owned experts name the
+                    // loan's pinned mirror while their device bytes are scratch. A borrowed tile
+                    // is the owner-routed compact route only (`EpBankRoute::TileExchange`): each
+                    // rank reads just its own experts, so no peer's donor entry is read while an
+                    // epoch is open (the Full/FullUnits peer tables name the peers' donor VRAM,
+                    // whole again after the all-rank restore every full-table call takes first).
                     let donors = &reserve.plan.donor_layers;
                     moe_borrow.push((0..bundle.config.num_hidden_layers).map(|_| None).collect());
                     populate_moe_runtimes(
@@ -11780,6 +11848,18 @@ impl Qwen4GpuForward {
                     // request S1 declines reads the host-mapped experts in place.
                     if single_scope && bundle.slowlink_profile().is_none() {
                         expert_stage = match (reserve.as_ref(), moe_borrow.first()) {
+                            // Explicit donors (unit-plan regime): the unit stage, over the
+                            // borrowed view, serves the tiles: mixed and host layers from their
+                            // pinned host regions, each donor layer from its loan mirror.
+                            (Some(reserve), Some(view)) if reserve.plan.explicit_donors => {
+                                Qwen4ExpertStage::new_reserve_units(
+                                    gpu,
+                                    bundle,
+                                    view,
+                                    max_chunk,
+                                    &reserve.host_sources,
+                                )?
+                            }
                             // EP reserve: the one borrowed-only S2 configuration over the borrowed
                             // view (first host layer H, donors H-2 / H-1, loan-mirror host
                             // sources for [H, R), the original pinned owners for [R, 48)).
@@ -11815,21 +11895,17 @@ impl Qwen4GpuForward {
                          on this rank (HIPFIRE_EP_OWNER_ROUTED_PREFILL, the symmetric IU4 route)",
                     ));
                 }
-                if stage.first_host != reserve.plan.donor_first_layer
-                    || stage.donors != reserve.plan.s2_donor_layers
-                    || stage.min_rows <= reserve.banks.resident_rows()
-                {
-                    return Err(invalid(format!(
-                        "EP reserve stage mismatch: first host layer {} / donors {:?} / min rows {} \
-                         against the plan's {} / {:?} (a borrowed-only stage must not serve the \
-                         {}-row resident bank)",
-                        stage.first_host,
-                        stage.donors,
-                        stage.min_rows,
-                        reserve.plan.donor_first_layer,
-                        reserve.plan.s2_donor_layers,
-                        reserve.banks.resident_rows()
-                    )));
+                if let Some(reason) = ep_reserve_forward::ep_reserve_stage_refusal(
+                    &reserve.plan,
+                    reserve.banks.resident_rows(),
+                    &ep_reserve_forward::EpReserveStageFacts {
+                        first_host: stage.first_host,
+                        donors: stage.donors,
+                        min_rows: stage.min_rows,
+                        serves_donor_layers: stage.unit_stage_serves(&reserve.plan.donor_layers),
+                    },
+                ) {
+                    return Err(invalid(reason));
                 }
             }
             #[cfg(target_os = "linux")]
@@ -17228,6 +17304,88 @@ mod ep_table_tests {
         assert_eq!(plan.layer_state(1, 1), EpLayerState::Resident);
         assert!(ep_unit_static_owners(&plan, 0, 1));
         assert!(!ep_unit_static_owners(&plan, 1, 1));
+    }
+
+    #[test]
+    fn unit_split_refusal_admits_resident_donors_and_refuses_mixed_or_host_ones() {
+        use super::ep_unit_plan_split_refusal as refusal;
+        // 3 layers x 8 experts over 2 ranks (4 owned per layer), 256-byte experts.
+        let geometry = EpUnitGeometry {
+            layers: 3,
+            experts_per_layer: 8,
+            ranks: 2,
+            gate_up_bytes: 256,
+            down_bytes: 256,
+        };
+        let unit = geometry.unit_bytes();
+        let pad = 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        let plan_of = |forced: &[usize], hot: &[u32], budgets: [u64; 2]| {
+            let mut ranking = hot.to_vec();
+            ranking.extend((0..24u32).filter(|id| !hot.contains(id)));
+            crate::expert_ep_units::place_routed_experts_units_forced(
+                &geometry,
+                EpRanking {
+                    rank: &ranking,
+                    counts: None,
+                    sha256: None,
+                },
+                &budgets,
+                forced,
+            )
+            .unwrap()
+        };
+        // Layer 0 forced whole on both ranks; layer 1 mixed (ids 8 and 9: one unit per rank
+        // resident); layer 2 host. Budget per rank: the forced layer + one unit and its arena pad.
+        let budget = 4 * unit + pad + unit + pad;
+        let plan = plan_of(&[0], &[8, 9], [budget, budget]);
+        assert_eq!(plan.layer_state(0, 0), EpLayerState::Resident);
+        assert_eq!(plan.layer_state(1, 0), EpLayerState::Resident);
+        assert!(matches!(plan.layer_state(0, 1), EpLayerState::Mixed { .. }));
+        assert!(matches!(plan.layer_state(1, 1), EpLayerState::Mixed { .. }));
+        assert_eq!(plan.layer_state(0, 2), EpLayerState::Host);
+        // Today's behavior (no explicit donors): any mixed layer refuses the feature.
+        let text = refusal(&plan, "the EP reserve", None).unwrap_err();
+        assert!(
+            text.contains("a mixed layer has no whole-layer expert tensors"),
+            "{text}"
+        );
+        // Explicit donors: a whole-Resident layer on every rank is admitted although the plan has
+        // mixed layers (the unit stage serves those).
+        assert_eq!(refusal(&plan, "the EP reserve", Some(&[0])), Ok(()));
+        // A mixed donor, a wholly host donor and a layer past the plan are refused, naming the layer
+        // and the state.
+        let text = refusal(&plan, "the EP reserve", Some(&[0, 1])).unwrap_err();
+        assert!(
+            text.contains("donor layer 1") && text.contains("Mixed"),
+            "{text}"
+        );
+        let text = refusal(&plan, "the EP reserve", Some(&[2])).unwrap_err();
+        assert!(
+            text.contains("donor layer 2") && text.contains("Host"),
+            "{text}"
+        );
+        let text = refusal(&plan, "the EP reserve", Some(&[3])).unwrap_err();
+        assert!(text.contains("outside the 3-layer unit plan"), "{text}");
+        // A layer resident on one rank only is not a donor of a symmetric reserve.
+        let uneven = plan_of(&[], &[0, 2, 4, 6], [4 * unit + pad, 0]);
+        assert_eq!(uneven.layer_state(0, 0), EpLayerState::Resident);
+        assert_eq!(uneven.layer_state(1, 0), EpLayerState::Host);
+        let text = refusal(&uneven, "the EP reserve", Some(&[0])).unwrap_err();
+        assert!(
+            text.contains("donor layer 0") && text.contains("rank 1"),
+            "{text}"
+        );
+        // No explicit donors and no mixed layer (whole-layer plans, an all-resident plan): unchanged.
+        for vram_layers in [0usize, 1, 3] {
+            let whole =
+                place_routed_experts_units(&geometry, &EpUnitSource::WholeLayers { vram_layers })
+                    .unwrap();
+            assert_eq!(refusal(&whole, "the EP reserve", None), Ok(()));
+            assert_eq!(
+                refusal(&whole, "the EP reserve", Some(&[0])).is_ok(),
+                vram_layers >= 1
+            );
+        }
     }
 }
 

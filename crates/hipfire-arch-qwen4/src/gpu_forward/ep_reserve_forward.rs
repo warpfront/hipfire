@@ -412,9 +412,10 @@ pub(crate) fn check_stage_plan(plan: &EpReservePlan) -> Result<(), String> {
     Ok(())
 }
 
-/// The S2 host-source resolver: per layer of `[H, R)` the pinned CPU span of
-/// each loan mirror (gate/up, down). Layers `[R, trunk)` resolve to their
-/// original pinned owners at the stage, as on an ordinary load.
+/// The stage host-source resolver: per donor layer (the suffix `[H, R)`, or a unit plan's
+/// explicit whole-Resident layers) the pinned CPU span of each loan mirror (gate/up, down).
+/// Layers outside the donor set resolve to their original pinned owners at the stage, as on an
+/// ordinary load.
 pub(crate) struct EpStageHostSources {
     /// The donor layers, ascending; `spans[i]` belongs to `layers[i]`.
     layers: Vec<usize>,
@@ -469,7 +470,7 @@ impl EpStageHostSources {
     }
 
     /// The mirrors' complete pinned bytes of `layer` (gate/up, down), `None`
-    /// outside `[H, R)`.
+    /// outside the donor layers.
     pub(crate) fn pair(&self, layer: usize) -> Option<[&[u8]; 2]> {
         let spans = self.spans.get(self.layers.binary_search(&layer).ok()?)?;
         // SAFETY: each span is the pinned host allocation of a loan mirror
@@ -486,13 +487,81 @@ impl EpStageHostSources {
 
     /// [`Self::pair`] with each mirror's device-visible base address (the
     /// pinned allocation's device alias) beside its pinned bytes, `None`
-    /// outside the donor layers.
-    #[allow(dead_code)] // read by the unit stage's donor regions (D1 S3)
+    /// outside the donor layers. The unit stage's donor regions read this
+    /// (`slab_stage::donor_stage_regions`).
     pub(crate) fn pair_with_device(&self, layer: usize) -> Option<[(&[u8], usize); 2]> {
         let bytes = self.pair(layer)?;
         let device = self.device.get(self.layers.binary_search(&layer).ok()?)?;
         Some([(bytes[0], device[0]), (bytes[1], device[1])])
     }
+
+    /// The donor layers with a loan mirror, ascending (the plan's
+    /// `donor_layers`).
+    pub(crate) fn layers(&self) -> &[usize] {
+        &self.layers
+    }
+
+    /// A resolver over caller-built spans, for the CPU tests of the unit
+    /// stage's donor regions: `parts[i] = (layer, [(cpu address, len);2],
+    /// [device base;2])`, layers ascending.
+    #[cfg(test)]
+    pub(crate) fn from_parts(parts: &[(usize, [(usize, usize); 2], [usize; 2])]) -> Self {
+        Self {
+            layers: parts.iter().map(|part| part.0).collect(),
+            spans: parts.iter().map(|part| part.1).collect(),
+            device: parts.iter().map(|part| part.2).collect(),
+        }
+    }
+}
+
+/// What the reserve admission reads of the built expert stage.
+pub(crate) struct EpReserveStageFacts {
+    /// The stage's first host (staged) layer.
+    pub first_host: usize,
+    /// The stage's S2 donor layers (the unit stage has none: `[usize::MAX; 2]`).
+    pub donors: [usize; 2],
+    pub min_rows: usize,
+    /// The stage reads every plan donor layer from its own unit-stage slot.
+    pub serves_donor_layers: bool,
+}
+
+/// Why the built stage cannot serve the reserve `plan`, `None` when it can. A suffix plan
+/// needs the S2 stage with exactly the plan's first host layer and S2 donors; a plan with
+/// explicit donors (`plan.explicit_donors`, no S2 donors) needs the unit stage serving every
+/// donor layer. Either stage must be borrowed-only: its `min_rows` above the resident bank.
+pub(crate) fn ep_reserve_stage_refusal(
+    plan: &EpReservePlan,
+    resident_rows: usize,
+    stage: &EpReserveStageFacts,
+) -> Option<String> {
+    let rows_bad = stage.min_rows <= resident_rows;
+    if plan.explicit_donors {
+        if rows_bad || !stage.serves_donor_layers {
+            return Some(format!(
+                "EP reserve stage mismatch: the unit stage serves the scratch donors {:?}: {} / \
+                 min rows {} (a borrowed-only stage must not serve the {resident_rows}-row \
+                 resident bank)",
+                plan.donor_layers, stage.serves_donor_layers, stage.min_rows
+            ));
+        }
+        return None;
+    }
+    if rows_bad
+        || stage.first_host != plan.donor_first_layer
+        || stage.donors != plan.s2_donor_layers
+    {
+        return Some(format!(
+            "EP reserve stage mismatch: first host layer {} / donors {:?} / min rows {} \
+             against the plan's {} / {:?} (a borrowed-only stage must not serve the \
+             {resident_rows}-row resident bank)",
+            stage.first_host,
+            stage.donors,
+            stage.min_rows,
+            plan.donor_first_layer,
+            plan.s2_donor_layers
+        ));
+    }
+    None
 }
 
 /// `mirror` as a typed, host-mapped source descriptor for a borrowed runtime:
@@ -2209,5 +2278,101 @@ mod tests {
         // Without hashes the keys are absent (the gate then rejects the record).
         let bare = prompt_rank_json(0, &record, 1, Duration::from_millis(1), Some(1), None);
         assert!(bare.get("donor_hash_after").is_none());
+    }
+
+    /// The plan with explicit donors (a unit plan's forced whole-Resident layers), the same
+    /// capacity as [`plan`].
+    fn explicit_plan() -> EpReservePlan {
+        let config = compact_test_config();
+        let forward = EpReserveForwardPlan::from_config(&config, Qwen4ForwardScratchMode::Full, 0)
+            .expect("pinned forward plan");
+        let geometry = EpRankGeometry::flash_next(&config, 2).expect("geometry");
+        let layer = geometry.layer_bytes().unwrap();
+        let (non_expert, reserve) = (6 * GIB, 6 * GIB);
+        let free = non_expert + reserve + layer * 33;
+        crate::ep_reserve::plan_ep_reserve_with_donors(
+            &forward,
+            &geometry,
+            &EpReserveCapacity {
+                free_per_rank: vec![free, free],
+                non_expert_bytes: non_expert,
+                reserve_bytes: reserve,
+                lane_bytes: 0,
+                host_budget_bytes: 64 * GIB,
+                min_resident_layers: EP_RESERVE_MIN_RESIDENT_LAYERS,
+            },
+            41,
+            &[40, 3, 17, 9, 22, 31, 12, 5, 44],
+        )
+        .expect("an explicit-donor plan")
+    }
+
+    #[test]
+    fn explicit_donor_plans_are_served_by_the_unit_stage_not_the_s2_donors() {
+        let plan = explicit_plan();
+        assert!(plan.explicit_donors);
+        check_stage_plan(&plan).unwrap();
+        assert_eq!(plan.donor_layers, vec![3, 9, 12, 17, 22, 31, 40]);
+        let facts = |first_host, donors, min_rows, serves| EpReserveStageFacts {
+            first_host,
+            donors,
+            min_rows,
+            serves_donor_layers: serves,
+        };
+        // The unit stage has no S2 donors and its first staged layer is whatever the plan stages:
+        // only "every donor has a slot" and "borrowed-only" matter.
+        assert_eq!(
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts(0, [usize::MAX; 2], 513, true)),
+            None
+        );
+        assert_eq!(
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts(7, [usize::MAX; 2], 4096, true)),
+            None
+        );
+        let text =
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts(0, [usize::MAX; 2], 513, false))
+                .expect("a stage without a donor slot is refused");
+        assert!(text.contains("[3, 9, 12, 17, 22, 31, 40]"), "{text}");
+        // A stage that would serve the resident bank is refused, whichever kind it is.
+        assert!(ep_reserve_stage_refusal(
+            &plan,
+            RESIDENT,
+            &facts(0, [usize::MAX; 2], RESIDENT, true)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn suffix_plans_keep_the_s2_stage_admission_exactly() {
+        let plan = plan();
+        assert!(!plan.explicit_donors);
+        let facts = |first_host, donors, min_rows| EpReserveStageFacts {
+            first_host,
+            donors,
+            min_rows,
+            // A suffix plan never asks the unit stage: this bit must not matter.
+            serves_donor_layers: false,
+        };
+        assert_eq!(
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts(26, [24, 25], 513)),
+            None
+        );
+        for (first_host, donors, min_rows) in [
+            (25, [24, 25], 513),
+            (26, [25, 24], 513),
+            (26, [24, 25], RESIDENT),
+            (26, [24, 25], 1),
+        ] {
+            let text =
+                ep_reserve_stage_refusal(&plan, RESIDENT, &facts(first_host, donors, min_rows))
+                    .unwrap_or_else(|| {
+                        panic!("{first_host} {donors:?} {min_rows} must be refused")
+                    });
+            assert!(
+                text.starts_with("EP reserve stage mismatch: first host layer"),
+                "{text}"
+            );
+            assert!(text.contains("against the plan's 26 / [24, 25]"), "{text}");
+        }
     }
 }

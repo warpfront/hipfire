@@ -354,23 +354,79 @@ pub(super) fn unit_stage_table(
 }
 
 /// The stage slot of every trunk layer of `rank` under `plan`: layers with a
-/// host region take consecutive slots, `layers` entries long.
+/// host region and the loan-mirror `donors` (whole-Resident layers of a
+/// decoupled EP reserve, read from their pinned mirror while their VRAM is
+/// scratch) take consecutive slots, `layers` entries long. `donors` is
+/// ascending and empty without an EP reserve.
 pub(super) fn unit_stage_slots(
     plan: &crate::expert_ep_units::EpUnitPlan,
     rank: usize,
     layers: usize,
+    donors: &[usize],
 ) -> Vec<Option<usize>> {
     let mut next = 0usize;
     (0..layers)
         .map(|layer| {
-            (layer < plan.geometry().layers && plan.stage_host_region_bytes(rank, layer) > 0).then(
-                || {
-                    next += 1;
-                    next - 1
-                },
-            )
+            (layer < plan.geometry().layers
+                && (plan.stage_host_region_bytes(rank, layer) > 0
+                    || donors.binary_search(&layer).is_ok()))
+            .then(|| {
+                next += 1;
+                next - 1
+            })
         })
         .collect()
+}
+
+/// Payload capacity `C` of each unit-stage buffer: the plan's largest host
+/// region, and with borrowed `donors` at least one whole layer region (a donor
+/// layer's compact gate/up plus down of the largest rank), exactly the charge
+/// `place_routed_experts_units_forced_staged` took.
+pub(super) fn unit_stage_capacity(
+    plan: &crate::expert_ep_units::EpUnitPlan,
+    donors: &[usize],
+) -> u64 {
+    let geometry = plan.geometry();
+    let donor_floor = if donors.is_empty() {
+        0
+    } else {
+        (0..geometry.ranks)
+            .map(|rank| geometry.owned_per_layer(rank) as u64)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(geometry.unit_bytes())
+    };
+    plan.max_stage_host_region_bytes().max(donor_floor)
+}
+
+/// The two regions (loan mirror gate/up, down) a borrowed donor `layer` stages
+/// from, and the CPU address of each region's pinned bytes: the region base is
+/// the mirror's device-visible address (the address the borrowed runtime's
+/// pointer-table entries carry), the bytes are the pinned host allocation the
+/// copy reads.
+pub(super) fn donor_stage_regions(
+    sources: &ep_reserve_forward::EpStageHostSources,
+    layer: usize,
+) -> Result<(Vec<UnitStageRegion>, Vec<usize>), String> {
+    let [(gate, gate_base), (down, down_base)] = sources
+        .pair_with_device(layer)
+        .ok_or_else(|| format!("layer {layer} has no loan mirror"))?;
+    if gate_base == 0 || down_base == 0 {
+        return Err(format!("layer {layer}: a loan mirror has no device alias"));
+    }
+    Ok((
+        vec![
+            UnitStageRegion {
+                base: gate_base,
+                len: gate.len(),
+            },
+            UnitStageRegion {
+                base: down_base,
+                len: down.len(),
+            },
+        ],
+        vec![gate.as_ptr() as usize, down.as_ptr() as usize],
+    ))
 }
 
 /// The next layer after `layer` of the same parity with a staged slot.
@@ -378,6 +434,13 @@ fn next_staged_layer(slots: &[Option<usize>], layer: usize) -> Option<usize> {
     (layer + 2..slots.len())
         .step_by(2)
         .find(|&next| slots[next].is_some())
+}
+
+/// Whether every one of `layers` has a stage slot.
+fn slots_serve(slots: &[Option<usize>], layers: &[usize]) -> bool {
+    layers
+        .iter()
+        .all(|&layer| slots.get(layer).copied().flatten().is_some())
 }
 
 /// Bytes of one stage buffer: the largest cold arena plus its tail pad.
@@ -1330,11 +1393,19 @@ impl Qwen4ExpertStage {
     /// are rebased onto the parity's dedicated stage buffer, all others (the
     /// mixed layer's VRAM arena, the zero dummy) keep their address. Nothing
     /// is overwritten and nothing is restored.
+    ///
+    /// `host_sources` is the decoupled EP reserve's loan resolver: its layers
+    /// are the whole-Resident scratch donors, whose VRAM is scratch during a
+    /// borrowed epoch. `moe` is then the borrowed view (`moe_borrow[0]`), whose
+    /// donor runtimes name the loan mirrors; each donor layer takes a slot of its
+    /// own whose two regions are the mirror gate/up and down (device-visible base,
+    /// pinned bytes), staged exactly like a host layer's aggregates.
     pub(super) fn new_units(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         moe: &[Option<Qwen4MoeLayerRuntime>],
         chunk_rows: usize,
+        host_sources: Option<&ep_reserve_forward::EpStageHostSources>,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let off = |reason: &str| {
             eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
@@ -1357,7 +1428,8 @@ impl Qwen4ExpertStage {
         }
         let config = &bundle.config;
         let rank = placement.rank;
-        let slots = unit_stage_slots(plan, rank, moe.len());
+        let donors: &[usize] = host_sources.map_or(&[], |sources| sources.layers());
+        let slots = unit_stage_slots(plan, rank, moe.len(), donors);
         let owned = placement.local_count(config.num_experts);
         // (layer, regions, CPU addresses of the regions, layout, expected rebased entries)
         let mut layouts: Vec<(
@@ -1378,7 +1450,8 @@ impl Qwen4ExpertStage {
                 continue;
             };
             // The forward's stage selection and `before_moe` wait read the
-            // runtime's layer bit; it must be exactly the plan's host layers.
+            // runtime's layer bit; it must be exactly the plan's host layers
+            // (and, on the borrowed view, the donor layers).
             if runtime.host_mapped() != planned {
                 return Err(invalid(format!(
                     "unit stage: layer {layer} runtime host_mapped {} disagrees with the plan ({planned})",
@@ -1390,8 +1463,27 @@ impl Qwen4ExpertStage {
             }
             let mut regions = Vec::with_capacity(2);
             let mut cpu = Vec::with_capacity(2);
-            let expected = match bundle.weights.ep_unit_layer(layer)? {
-                Some(unit) => {
+            let donor = donors.binary_search(&layer).is_ok();
+            let expected = match (donor, bundle.weights.ep_unit_layer(layer)?) {
+                (true, Some(_)) => {
+                    return Err(invalid(format!(
+                        "unit stage: scratch donor layer {layer} is a mixed unit layer"
+                    )));
+                }
+                (true, None) => {
+                    let sources = host_sources.expect("donor layers come from the host sources");
+                    if plan.layer_state(rank, layer)
+                        != crate::expert_ep_units::EpLayerState::Resident
+                    {
+                        return Err(invalid(format!(
+                            "unit stage: scratch donor layer {layer} is not whole-resident on rank {rank}"
+                        )));
+                    }
+                    (regions, cpu) = donor_stage_regions(sources, layer)
+                        .map_err(|reason| invalid(format!("unit stage: {reason}")))?;
+                    owned
+                }
+                (false, Some(unit)) => {
                     let bytes = unit.map.arena_entry_bytes(UnitTier::Host);
                     let Some(host) = gpu.host_bytes(unit.host) else {
                         return off("a mixed layer's host arena has no pinned host bytes");
@@ -1412,7 +1504,7 @@ impl Qwen4ExpertStage {
                     cpu.push(host.as_ptr() as usize);
                     unit.map.count(UnitTier::Host)
                 }
-                None => {
+                (false, None) => {
                     let weights = bundle
                         .weights
                         .layer(layer)
@@ -1465,12 +1557,12 @@ impl Qwen4ExpertStage {
             layouts.push((layer, regions, cpu, layout, expected));
         }
         let Some(first_host) = layouts.first().map(|(layer, ..)| *layer) else {
-            return off("this rank has no host expert layer");
+            return off("this rank has no host expert layer or borrowed donor layer");
         };
         // One buffer per layer parity: the largest staged payload of that
         // parity plus the zeroed tail pad; the loader charged the largest
         // region of any layer for each.
-        let capacity = plan.max_stage_host_region_bytes() as usize;
+        let capacity = unit_stage_capacity(plan, donors) as usize;
         let mut sizes = [ARENA_TAIL_PAD_BYTES; 2];
         for (layer, _, _, layout, _) in &layouts {
             if layout.used > capacity {
@@ -1599,10 +1691,19 @@ impl Qwen4ExpertStage {
         }
         let host_experts = layouts
             .iter()
+            .filter(|(layer, ..)| donors.binary_search(layer).is_err())
             .map(|(.., expected)| *expected)
             .sum::<usize>();
+        let donor_note = if donors.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} borrowed scratch-donor layers {donors:?} read from their pinned loan mirrors",
+                donors.len()
+            )
+        };
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through two VRAM stage buffers of {} and {} MiB (resident experts keep their VRAM arena address; nothing overwritten, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through two VRAM stage buffers of {} and {} MiB (resident experts keep their VRAM arena address; nothing overwritten, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows}){donor_note}",
             stage.min_rows,
             layouts.len(),
             sizes[0] >> 20,
@@ -1618,6 +1719,33 @@ impl Qwen4ExpertStage {
             ),
         );
         Ok(Some(stage))
+    }
+
+    /// The unit stage of a decoupled EP reserve whose scratch donors are explicit
+    /// ([`crate::ep_reserve::EpReservePlan::explicit_donors`]): the ordinary stage
+    /// admission, then [`Self::new_units`] over the borrowed view `view`
+    /// (`moe_borrow[0]`) with the loan's host sources. `Ok(None)` (printed) when the
+    /// stage is not admitted on this rank; the reserve then refuses the load.
+    pub(super) fn new_reserve_units(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        view: &[Option<Qwen4MoeLayerRuntime>],
+        chunk_rows: usize,
+        host_sources: &ep_reserve_forward::EpStageHostSources,
+    ) -> Result<Option<Self>, Qwen4GpuForwardError> {
+        if !Self::admitted(gpu, bundle)? || !crate::expert_ep_units::ep_unit_stage_on(&gpu.arch) {
+            return Ok(None);
+        }
+        Self::new_units(gpu, bundle, view, chunk_rows, Some(host_sources))
+    }
+
+    /// Whether this unit stage reads `layers` from its own slots (every layer a
+    /// decoupled reserve borrows must be one). Always `false` for a non-unit stage.
+    pub(super) fn unit_stage_serves(&self, layers: &[usize]) -> bool {
+        self.slab
+            .as_ref()
+            .and_then(|meta| meta.tier.as_ref())
+            .is_some_and(|tier| slots_serve(&tier.slots, layers))
     }
 
     /// The VRAM a staged host layer's arena (tier: experts) is copied into:
@@ -2757,7 +2885,7 @@ mod tests {
             assert_eq!(states[l], EpLayerState::Host, "layer {l}");
         }
         // Slots follow the host-bearing layers (everything but layer 1).
-        let slots = unit_stage_slots(&plan, 0, 8);
+        let slots = unit_stage_slots(&plan, 0, 8, &[]);
         assert_eq!(
             slots,
             vec![
@@ -2783,8 +2911,389 @@ mod tests {
         assert_eq!(next_staged_layer(&slots, 5), Some(7));
         assert_eq!(next_staged_layer(&slots, 7), None);
         // Rank 1 holds nothing (zero budget): all host, every layer a slot.
-        assert!(unit_stage_slots(&plan, 1, 8).iter().all(Option::is_some));
+        assert!(unit_stage_slots(&plan, 1, 8, &[])
+            .iter()
+            .all(Option::is_some));
         // A layer past the plan (an MTP head) is never staged.
-        assert_eq!(unit_stage_slots(&plan, 0, 9)[8], None);
+        assert_eq!(unit_stage_slots(&plan, 0, 9, &[])[8], None);
+    }
+
+    // ---- D1 unit stage over a decoupled EP reserve's donor layers ----
+
+    use crate::expert_ep_units::{
+        place_routed_experts_units_forced, place_routed_experts_units_forced_staged, EpLayerState,
+        EpRanking, EpUnitGeometry, EpUnitPlan, VRAM_ARENA_TAIL_PAD_BYTES,
+    };
+
+    fn donor_geometry(layers: usize) -> EpUnitGeometry {
+        EpUnitGeometry {
+            layers,
+            experts_per_layer: 8,
+            ranks: 2,
+            gate_up_bytes: UNIT_GU as u64,
+            down_bytes: UNIT_DN as u64,
+        }
+    }
+
+    /// `forced` layers whole on both ranks; `hot` ids of the ranking first; `units` extra
+    /// resident units per rank beyond the forced layers, in `mixed` touched layers.
+    fn forced_plan(
+        geometry: &EpUnitGeometry,
+        forced: &[usize],
+        hot: &[(usize, usize)],
+        extra_units: u64,
+        extra_layers: u64,
+        slack: u64,
+    ) -> EpUnitPlan {
+        let unit = geometry.unit_bytes();
+        let owned = geometry.owned_per_layer(0) as u64;
+        let budget = forced.len() as u64 * (owned * unit + 2 * VRAM_ARENA_TAIL_PAD_BYTES)
+            + extra_units * unit
+            + extra_layers * 2 * VRAM_ARENA_TAIL_PAD_BYTES
+            + slack;
+        let mut order: Vec<u32> = hot
+            .iter()
+            .map(|&(layer, expert)| (layer * geometry.experts_per_layer + expert) as u32)
+            .collect();
+        let taken: std::collections::BTreeSet<u32> = order.iter().copied().collect();
+        order.extend((0..geometry.total_ids() as u32).filter(|id| !taken.contains(id)));
+        place_routed_experts_units_forced(
+            geometry,
+            EpRanking {
+                rank: &order,
+                counts: None,
+                sha256: None,
+            },
+            &vec![budget; geometry.ranks],
+            forced,
+        )
+        .unwrap()
+    }
+
+    /// 8 layers: 1 and 5 forced donors, 6 forced whole-resident but NOT a donor, 3 mixed
+    /// (2 of 4 units per rank resident), every other layer host.
+    fn donor_plan() -> EpUnitPlan {
+        let g = donor_geometry(8);
+        // Rank 0 owns even experts, rank 1 odd ones: layer 3 keeps two units of each rank.
+        forced_plan(&g, &[1, 5, 6], &[(3, 0), (3, 2), (3, 1), (3, 3)], 2, 1, 0)
+    }
+
+    #[test]
+    fn ep_unit_stage_donor_layers_take_slots_beside_host_and_mixed_layers() {
+        let plan = donor_plan();
+        assert_eq!(plan.whole_resident_layers_all_ranks(), vec![1, 5, 6]);
+        assert!(matches!(plan.layer_state(0, 3), EpLayerState::Mixed { .. }));
+        for rank in 0..2 {
+            // A whole-Resident layer has no host region: only the donor list gives it a slot.
+            assert_eq!(plan.stage_host_region_bytes(rank, 1), 0);
+            let plain = unit_stage_slots(&plan, rank, 8, &[]);
+            assert_eq!(plain[1], None);
+            assert_eq!(plain[5], None);
+            assert_eq!(plain[6], None);
+            let donors = unit_stage_slots(&plan, rank, 8, &[1, 5]);
+            // Donors 1 and 5 join the host-bearing layers 0, 2, 3, 4, 7 in layer order; layer 6
+            // (whole-resident, not a donor) stays unstaged.
+            assert_eq!(
+                donors,
+                vec![
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    None,
+                    Some(6)
+                ],
+                "rank {rank}"
+            );
+            // Without donors the plan stages exactly the host-bearing layers.
+            assert_eq!(
+                plain.iter().flatten().count() + 2,
+                donors.iter().flatten().count()
+            );
+            // The parity chains run through the donors: odd 1 -> 3 -> 5 -> 7.
+            assert_eq!(next_staged_layer(&donors, 1), Some(3));
+            assert_eq!(next_staged_layer(&donors, 3), Some(5));
+            assert_eq!(next_staged_layer(&donors, 5), Some(7));
+            // Even: 0 -> 2 -> 4 -> (6 is not staged) none.
+            assert_eq!(next_staged_layer(&donors, 4), None);
+            assert!(slots_serve(&donors, &[1, 5]));
+            assert!(!slots_serve(&plain, &[1, 5]));
+            assert!(!slots_serve(&donors, &[1, 6]));
+            assert!(slots_serve(&donors, &[]));
+        }
+        // A donor past the plan (an MTP head) never gets a slot.
+        assert_eq!(unit_stage_slots(&plan, 0, 9, &[1, 5, 8])[8], None);
+    }
+
+    /// A fake loan: per donor layer two pinned buffers and two device aliases.
+    struct FakeLoan {
+        buffers: Vec<[Vec<u8>; 2]>,
+    }
+
+    impl FakeLoan {
+        const DEVICE: [usize; 2] = [0x40_0000_0000, 0x50_0000_0000];
+
+        fn new(layers: &[usize], owned: usize) -> Self {
+            Self {
+                buffers: layers
+                    .iter()
+                    .map(|_| [vec![0u8; owned * UNIT_GU], vec![0u8; owned * UNIT_DN]])
+                    .collect(),
+            }
+        }
+
+        fn device(slot: usize, index: usize) -> usize {
+            Self::DEVICE[slot] + index * 0x1_0000_0000
+        }
+
+        fn sources(&self, layers: &[usize]) -> ep_reserve_forward::EpStageHostSources {
+            let parts: Vec<_> = layers
+                .iter()
+                .zip(&self.buffers)
+                .enumerate()
+                .map(|(index, (&layer, pair))| {
+                    (
+                        layer,
+                        [
+                            (pair[0].as_ptr() as usize, pair[0].len()),
+                            (pair[1].as_ptr() as usize, pair[1].len()),
+                        ],
+                        [Self::device(0, index), Self::device(1, index)],
+                    )
+                })
+                .collect();
+            ep_reserve_forward::EpStageHostSources::from_parts(&parts)
+        }
+    }
+
+    #[test]
+    fn ep_unit_stage_donor_regions_are_the_two_loan_mirrors() {
+        let plan = donor_plan();
+        let owned = plan.geometry().owned_per_layer(0);
+        let donors = [1usize, 5];
+        let loan = FakeLoan::new(&donors, owned);
+        let sources = loan.sources(&donors);
+        assert_eq!(sources.layers(), &donors);
+        for (index, &layer) in donors.iter().enumerate() {
+            let (regions, cpu) = donor_stage_regions(&sources, layer).unwrap();
+            assert_eq!(
+                regions,
+                vec![
+                    UnitStageRegion {
+                        base: FakeLoan::device(0, index),
+                        len: owned * UNIT_GU
+                    },
+                    UnitStageRegion {
+                        base: FakeLoan::device(1, index),
+                        len: owned * UNIT_DN
+                    },
+                ],
+                "layer {layer}"
+            );
+            // The copy source is the pinned mirror, never the device alias.
+            assert_eq!(cpu[0], loan.buffers[index][0].as_ptr() as usize);
+            assert_eq!(cpu[1], loan.buffers[index][1].as_ptr() as usize);
+            // Gate/up first, then down at its 256-aligned offset: a whole layer region.
+            let layout = unit_stage_layout(&regions).unwrap();
+            assert_eq!(layout.dst, vec![0, owned * UNIT_GU]);
+            assert_eq!(
+                layout.used as u64,
+                plan.geometry().owned_per_layer(0) as u64 * plan.geometry().unit_bytes()
+            );
+        }
+        // Layers with no mirror (a mixed or host layer, a non-donor resident layer) are refused.
+        for layer in [0usize, 2, 3, 6] {
+            assert!(
+                donor_stage_regions(&sources, layer).is_err(),
+                "layer {layer}"
+            );
+        }
+        // A mirror without a device alias cannot be rebased onto.
+        let broken = ep_reserve_forward::EpStageHostSources::from_parts(&[(
+            1,
+            [
+                (
+                    loan.buffers[0][0].as_ptr() as usize,
+                    loan.buffers[0][0].len(),
+                ),
+                (
+                    loan.buffers[0][1].as_ptr() as usize,
+                    loan.buffers[0][1].len(),
+                ),
+            ],
+            [0, FakeLoan::device(1, 0)],
+        )]);
+        assert!(donor_stage_regions(&broken, 1).is_err());
+    }
+
+    /// The compact decode table of a layer whose owned experts (every `ranks`-th) sit in a
+    /// tensor of `stride`-byte experts at `base`, every other expert on the zero dummy.
+    fn compact_entries(base: usize, stride: usize, rank: usize, dummy: usize) -> Vec<usize> {
+        (0..8)
+            .map(|expert| {
+                if expert % 2 == rank {
+                    base + (expert / 2) * stride
+                } else {
+                    dummy
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ep_unit_stage_donor_table_rebases_only_its_mirror_entries() {
+        let plan = donor_plan();
+        let owned = plan.geometry().owned_per_layer(0);
+        let donors = [1usize, 5];
+        let loan = FakeLoan::new(&donors, owned);
+        let sources = loan.sources(&donors);
+        let (dummy, stage) = (0x5000_0000usize, 0x2_0000_0000usize);
+        let (regions, _) = donor_stage_regions(&sources, 1).unwrap();
+        let layout = unit_stage_layout(&regions).unwrap();
+        // The borrowed runtime's tables: owned experts at the mirror's device base.
+        let gate = compact_entries(FakeLoan::device(0, 0), UNIT_GU, 0, dummy);
+        let down = compact_entries(FakeLoan::device(1, 0), UNIT_DN, 0, dummy);
+        let (table, rebased) = unit_stage_table(&gate, &regions, &layout.dst, stage).unwrap();
+        assert_eq!(rebased, owned);
+        let out: Vec<usize> = table
+            .chunks_exact(8)
+            .map(|bytes| usize::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        for (expert, (&before, &after)) in gate.iter().zip(&out).enumerate() {
+            if expert % 2 == 0 {
+                assert_eq!(
+                    after,
+                    stage + (expert / 2) * UNIT_GU,
+                    "gate expert {expert}"
+                );
+            } else {
+                assert_eq!(after, before, "expert {expert} is the dummy");
+            }
+        }
+        let (table, rebased) = unit_stage_table(&down, &regions, &layout.dst, stage).unwrap();
+        assert_eq!(rebased, owned);
+        let out: Vec<usize> = table
+            .chunks_exact(8)
+            .map(|bytes| usize::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        for expert in (0..8).step_by(2) {
+            // The down mirror sits behind the gate/up mirror in the stage buffer.
+            assert_eq!(
+                out[expert],
+                stage + owned * UNIT_GU + (expert / 2) * UNIT_DN
+            );
+        }
+        // Another donor's entries (a different mirror) are not this layer's: nothing rebases, so
+        // a table that names the wrong mirror fails the per-table rebase count of `new_units`.
+        let other = compact_entries(FakeLoan::device(0, 1), UNIT_GU, 0, dummy);
+        let (_, rebased) = unit_stage_table(&other, &regions, &layout.dst, stage).unwrap();
+        assert_eq!(rebased, 0);
+        // A mixed layer's VRAM-arena entries sit outside the donor regions as well.
+        let vram = compact_entries(0x7000_0000, UNIT_GU, 0, dummy);
+        let (_, rebased) = unit_stage_table(&vram, &regions, &layout.dst, stage).unwrap();
+        assert_eq!(rebased, 0);
+    }
+
+    #[test]
+    fn ep_unit_stage_capacity_holds_one_whole_donor_layer_region() {
+        // 4 layers: donors 0 and 1 forced whole; layers 2 and 3 mixed with ONE host unit per
+        // rank (3 of 4 resident). No whole-host layer, so the plan's own largest host region is
+        // a single unit; only a donor layer raises the stage capacity to a whole layer.
+        let g = donor_geometry(4);
+        let hot: Vec<(usize, usize)> = [2usize, 3]
+            .iter()
+            .flat_map(|&layer| (0..6).map(move |expert| (layer, expert)))
+            .collect();
+        let plan = forced_plan(&g, &[0, 1], &hot, 6, 2, 0);
+        assert_eq!(plan.whole_resident_layers_all_ranks(), vec![0, 1]);
+        assert!(matches!(
+            plan.layer_state(0, 2),
+            EpLayerState::Mixed { host: 1, .. }
+        ));
+        let unit = g.unit_bytes();
+        let whole = g.owned_per_layer(0) as u64 * unit;
+        assert_eq!(plan.max_stage_host_region_bytes(), unit);
+        assert_eq!(unit_stage_capacity(&plan, &[]), unit);
+        assert_eq!(unit_stage_capacity(&plan, &[0, 1]), whole);
+    }
+
+    #[test]
+    fn ep_unit_stage_charge_covers_what_the_forward_stages() {
+        // The planner's staged charge (`place_routed_experts_units_forced_staged`) is at least the
+        // capacity `new_units` checks every staged layer against, with and without donors.
+        let g = donor_geometry(8);
+        let hot: Vec<u32> = [(3usize, 0usize), (3, 2), (3, 1), (3, 3)]
+            .iter()
+            .map(|&(layer, expert)| (layer * g.experts_per_layer + expert) as u32)
+            .collect();
+        let mut order = hot.clone();
+        order.extend((0..g.total_ids() as u32).filter(|id| !hot.contains(id)));
+        let unit = g.unit_bytes();
+        let owned = g.owned_per_layer(0) as u64;
+        let budget = 3 * (owned * unit + 2 * VRAM_ARENA_TAIL_PAD_BYTES)
+            + 4 * unit
+            + 2 * 2 * VRAM_ARENA_TAIL_PAD_BYTES
+            + 2 * (owned * unit + crate::expert_ep_units::EP_UNIT_STAGE_PAD_BYTES)
+            + crate::expert_ep_units::ep_unit_stage_table_bytes(&g);
+        for forced in [&[1usize, 5, 6][..], &[][..]] {
+            let budgets = vec![budget; g.ranks];
+            let staged = place_routed_experts_units_forced_staged(
+                &g,
+                EpRanking {
+                    rank: &order,
+                    counts: None,
+                    sha256: None,
+                },
+                &budgets,
+                forced,
+                true,
+            )
+            .unwrap();
+            let donors: Vec<usize> = forced.iter().copied().filter(|&layer| layer != 6).collect();
+            // A plan that is a whole-layer split takes the donor stage, which stages no host
+            // region of its own: only the donor floor remains of its capacity.
+            let units_stage = crate::expert_ep_units::ep_unit_stage_kind(Some(&staged.plan))
+                == crate::expert_ep_units::EpUnitStageKind::Units;
+            let need = if units_stage || !donors.is_empty() {
+                unit_stage_capacity(&staged.plan, &donors)
+            } else {
+                0
+            };
+            assert!(
+                need <= staged.stage.capacity,
+                "forced {forced:?}: the forward stages {need} B, the plan charged {} B",
+                staged.stage.capacity
+            );
+            if !forced.is_empty() {
+                assert!(staged.stage.capacity >= owned * unit);
+            }
+        }
+    }
+
+    #[test]
+    fn ep_unit_stage_without_donors_is_unchanged() {
+        // The no-donor path is the pre-reserve one: slots are the host-bearing layers and the
+        // capacity is the plan's largest host region.
+        let plan = donor_plan();
+        for rank in 0..2 {
+            let expected: Vec<Option<usize>> = {
+                let mut next = 0;
+                (0..8)
+                    .map(|layer| {
+                        (plan.stage_host_region_bytes(rank, layer) > 0).then(|| {
+                            next += 1;
+                            next - 1
+                        })
+                    })
+                    .collect()
+            };
+            assert_eq!(unit_stage_slots(&plan, rank, 8, &[]), expected);
+        }
+        assert_eq!(
+            unit_stage_capacity(&plan, &[]),
+            plan.max_stage_host_region_bytes()
+        );
     }
 }

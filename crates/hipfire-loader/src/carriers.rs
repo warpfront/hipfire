@@ -2913,14 +2913,16 @@ pub fn qwen4_ep_vram_layers(
 ) -> Result<Qwen4EpVramSplit, String> {
     // `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`: the per-expert plan replaces the
     // whole-layer residency below. The load's refusals are re-checked here (the
-    // carrier checks them first) and the decoupled reserve, which sizes
-    // whole-layer placements, is off with a note.
+    // carrier checks them first). The decoupled reserve, which sizes whole-layer
+    // placements, is off with a note, unless `HIPFIRE_EP_UNIT_RESERVE=1` plans the
+    // units under it with whole-resident donor layers (`qwen4_ep_units_donor_plan`).
     let units_path = qwen4_ep_units_flag();
     if units_path.is_some() {
         hipfire_arch_qwen4::expert_ep_units::ep_units_refusal(&qwen4_ep_units_facts(ranks, 1))
             .map_err(|error| format!("qwen4: {error}"))?;
     }
-    let request = if units_path.is_some() && request.attempts() {
+    let unit_reserve = units_path.is_some() && qwen4_ep_unit_reserve_on();
+    let request = if units_path.is_some() && !unit_reserve && request.attempts() {
         eprintln!(
             "qwen4 EP reserve decoupling: off ({} plans the experts per unit under the ordinary reserve)",
             hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
@@ -3178,6 +3180,8 @@ pub fn qwen4_ep_vram_layers(
             emu_check: &emu_check,
         },
     });
+    // Kept for the unit-under-reserve fallback below (`lane` is consumed here).
+    let lane_for_units = lane.clone();
     let mut split = qwen4_ep_vram_split(
         &config,
         free_per_rank,
@@ -3232,33 +3236,104 @@ pub fn qwen4_ep_vram_layers(
                     )
                 })?;
             let stacks = qwen4_ep_unit_stack_bytes(&manifest, &bytes_of, config.num_hidden_layers)?;
-            // The same reserve the whole-layer split above holds back: the
-            // ordinary reserve (placement charges applied) and, when a lane
-            // reservation applied, the AR-lane store.
-            let lane_bytes = split
-                .vram
-                .reservation
-                .as_ref()
-                .map_or(0, |reservation| reservation.lane_bytes);
+            let dims = (
+                config.num_hidden_layers,
+                config.num_experts,
+                config.num_experts_per_tok,
+            );
             // The unit stage's two VRAM buffers are fresh bytes: charged to every
             // rank's budget before the ranking walk, exactly where the forward
             // builds the stage (one shared predicate).
             let stage_on = hipfire_arch_qwen4::expert_ep_units::ep_unit_stage_on(&gpu.arch);
-            let staged = qwen4_ep_unit_plan(
-                path,
-                &base,
-                (
-                    config.num_hidden_layers,
-                    config.num_experts,
-                    config.num_experts_per_tok,
-                ),
-                ranks,
-                free_per_rank,
-                non_expert,
-                reserve.saturating_add(lane_bytes),
-                stacks,
-                stage_on,
-            )?;
+            // `HIPFIRE_EP_UNIT_RESERVE=1` with a decoupled reserve plan: the units are
+            // budgeted against the decoupled census and whole-resident donor layers
+            // replace the plan's suffix donors.
+            let donors = match (unit_reserve, split.reserve.as_deref(), attempt.as_ref()) {
+                (true, Some(suffix), Some(attempt)) => {
+                    let lane_bytes = split
+                        .vram
+                        .reservation
+                        .as_ref()
+                        .map_or(0, |reservation| reservation.lane_bytes);
+                    match qwen4_ep_units_donor_plan(&Qwen4EpUnitsDonorInputs {
+                        path,
+                        base: &base,
+                        dims,
+                        config: &config,
+                        ranks,
+                        free_per_rank,
+                        non_expert,
+                        stacks: &stacks,
+                        stage_on,
+                        suffix,
+                        lane_bytes,
+                        host: &attempt.host,
+                    }) {
+                        Ok(done) => Some(done),
+                        Err(why) if !attempt.forced => {
+                            eprintln!(
+                                "qwen4 EP unit reserve: not applied ({why}); the units are planned under the ordinary reserve"
+                            );
+                            None
+                        }
+                        Err(why) => return Err(why),
+                    }
+                }
+                (true, None, _) => {
+                    eprintln!(
+                        "qwen4 EP unit reserve: no decoupled reserve plan applies to this load; the units are planned under the ordinary reserve"
+                    );
+                    None
+                }
+                _ => None,
+            };
+            let staged = match donors {
+                Some((staged, reserve_plan)) => {
+                    eprintln!(
+                        "qwen4 EP unit reserve: decoupled reserve with {} whole-resident donor layers {:?} ({} MiB pinned mirror per rank)",
+                        reserve_plan.donor_layers.len(),
+                        reserve_plan.donor_layers,
+                        qwen4_ep_reserve_mirror_host_bytes(&reserve_plan) >> 20
+                    );
+                    split.reserve = Some(std::sync::Arc::new(reserve_plan));
+                    staged
+                }
+                None => {
+                    if split.reserve.is_some() {
+                        // The decoupled plan resolved but its donors did not: the ordinary
+                        // placement and reserve, exactly as without the reserve request.
+                        split = qwen4_ep_vram_split(
+                            &config,
+                            free_per_rank,
+                            non_expert,
+                            layer_experts,
+                            reserve,
+                            lane_for_units,
+                            None,
+                        )?;
+                    }
+                    // The same reserve the whole-layer split above holds back: the
+                    // ordinary reserve (placement charges applied) and, when a lane
+                    // reservation applied, the AR-lane store.
+                    let lane_bytes = split
+                        .vram
+                        .reservation
+                        .as_ref()
+                        .map_or(0, |reservation| reservation.lane_bytes);
+                    qwen4_ep_unit_plan(
+                        path,
+                        &base,
+                        dims,
+                        ranks,
+                        free_per_rank,
+                        non_expert,
+                        reserve.saturating_add(lane_bytes),
+                        stacks,
+                        stage_on,
+                        &[],
+                    )?
+                }
+            };
             if staged.stage.capacity > 0 {
                 eprintln!(
                     "qwen4 EP expert stage: {} MiB x 2 dedicated stage buffers + {} KiB pointer tables charged to every rank before the ranking walk ({} placements, {})",
@@ -3278,6 +3353,15 @@ pub fn qwen4_ep_vram_layers(
         }
     }
     Ok(split)
+}
+
+/// `HIPFIRE_EP_UNIT_RESERVE=1`: with a per-expert plan, keep the decoupled EP reserve (units
+/// budgeted against its census, whole-resident donor layers) instead of forcing it off. Default
+/// off: the flag behaves as before.
+const QWEN4_EP_UNIT_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE";
+
+fn qwen4_ep_unit_reserve_on() -> bool {
+    hipfire_config::developer_var(QWEN4_EP_UNIT_RESERVE_ENV).as_deref() == Ok("1")
 }
 
 /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, read once from the process configuration:
@@ -3348,6 +3432,7 @@ fn qwen4_ep_unit_plan(
     reserve_total: u64,
     stacks: (Vec<u64>, Vec<u64>),
     stage_on: bool,
+    forced_layers: &[usize],
 ) -> Result<hipfire_arch_qwen4::expert_ep_units::EpUnitStagedPlan, String> {
     use hipfire_arch_qwen4::expert_ep_units as units;
     let flag = units::EP_EXPERT_HOTSET_ENV;
@@ -3375,7 +3460,7 @@ fn qwen4_ep_unit_plan(
             units::EP_UNIT_BUDGET_DELTA_ENV
         );
     }
-    units::place_routed_experts_units_staged(
+    units::place_routed_experts_units_forced_staged(
         &geometry,
         units::EpRanking {
             rank: sidecar.rank(),
@@ -3386,9 +3471,154 @@ fn qwen4_ep_unit_plan(
             units::ep_unit_rank_budgets(free_per_rank, non_expert, reserve_total),
             budget_delta_mib,
         ),
+        forced_layers,
         stage_on,
     )
     .map_err(|error| format!("qwen4: {flag}: {error}"))
+}
+
+/// What [`qwen4_ep_units_donor_plan`] reads.
+struct Qwen4EpUnitsDonorInputs<'a> {
+    path: &'a std::path::Path,
+    base: &'a hipfire_arch_qwen4::expert_hotset::HotsetBase,
+    dims: (usize, usize, usize),
+    config: &'a hipfire_arch_qwen4::Qwen4Config,
+    ranks: usize,
+    free_per_rank: &'a [u64],
+    non_expert: u64,
+    stacks: &'a (Vec<u64>, Vec<u64>),
+    stage_on: bool,
+    /// The decoupled reserve plan the load resolved (suffix donors): its forward,
+    /// reserve census and resident layer count are the plan's inputs.
+    suffix: &'a hipfire_arch_qwen4::ep_reserve::EpReservePlan,
+    lane_bytes: u64,
+    host: &'a Qwen4EpReserveHost<'a>,
+}
+
+/// The per-expert plan under the DECOUPLED reserve (`HIPFIRE_EP_UNIT_RESERVE=1`): every rank's
+/// unit budget is `free - non_expert - (decoupled reserve + lane store)`, the donor layers of the
+/// reserve are whole-resident layers chosen from the ranking (the hottest layers: they need the
+/// fewest extra units to become whole), forced resident on every rank first, and the reserve plan
+/// is re-made over exactly those donors
+/// ([`hipfire_arch_qwen4::ep_reserve::plan_ep_reserve_with_donors`]). The unit stage reads the
+/// donors' mirrors during a borrowed prompt epoch, so it must be on. The aggregate pinned host
+/// (every rank's host units plus the donor mirrors) is checked like the reserve plan's own.
+/// `Err` leaves the caller to fall back to the ordinary reserve.
+fn qwen4_ep_units_donor_plan(
+    input: &Qwen4EpUnitsDonorInputs<'_>,
+) -> Result<
+    (
+        hipfire_arch_qwen4::expert_ep_units::EpUnitStagedPlan,
+        hipfire_arch_qwen4::ep_reserve::EpReservePlan,
+    ),
+    String,
+> {
+    use hipfire_arch_qwen4::ep_reserve as ep;
+    use hipfire_arch_qwen4::expert_ep_units as units;
+    use hipfire_arch_qwen4::expert_residency as residency;
+    if !input.stage_on {
+        return Err(
+            "the unit stage is off on this arch: it serves the donor layers' borrowed view".into(),
+        );
+    }
+    let reserve_total = input
+        .suffix
+        .reserve_bytes
+        .checked_add(input.lane_bytes)
+        .ok_or("the decoupled reserve plus the lane store overflows")?;
+    let geometry = ep::EpRankGeometry::flash_next(input.config, input.ranks)
+        .ok_or("the rank geometry overflows")?;
+    let plan_with = |forced: &[usize]| {
+        qwen4_ep_unit_plan(
+            input.path,
+            input.base,
+            input.dims,
+            input.ranks,
+            input.free_per_rank,
+            input.non_expert,
+            reserve_total,
+            input.stacks.clone(),
+            input.stage_on,
+            forced,
+        )
+    };
+    // The unforced plan ranks the layers; the donor count is the shortest prefix of that
+    // preference order whose whole layers pack the reserve's remaining roots.
+    let unforced = plan_with(&[])?;
+    let candidates = units::ep_unit_donor_layers(&unforced.plan, geometry.trunk_layers);
+    let probe_capacity = ep::EpReserveCapacity {
+        free_per_rank: input.free_per_rank.to_vec(),
+        non_expert_bytes: input.non_expert,
+        reserve_bytes: input.suffix.reserve_bytes,
+        lane_bytes: input.lane_bytes,
+        host_budget_bytes: u64::MAX,
+        min_resident_layers: 0,
+    };
+    let probe = ep::plan_ep_reserve_with_donors(
+        &input.suffix.forward,
+        &geometry,
+        &probe_capacity,
+        input.suffix.resident_layers,
+        &candidates,
+    )
+    .map_err(|refusal| format!("qwen4: {refusal}"))?;
+    let forced: Vec<usize> = candidates[..probe.donor_layers.len()].to_vec();
+    let staged = plan_with(&forced)?;
+    for rank in 0..input.ranks {
+        let resident = staged.plan.whole_resident_layers(rank);
+        if let Some(layer) = forced.iter().find(|layer| !resident.contains(layer)) {
+            return Err(format!(
+                "the forced donor layer {layer} is not whole-resident on rank {rank}"
+            ));
+        }
+    }
+    let host_experts = (0..input.ranks).fold(0u64, |total, rank| {
+        total.saturating_add(staged.plan.host_pinned_bytes(rank))
+    });
+    let allowance = qwen4_ep_reserve_host_allowance(input.host)?;
+    let capacity = ep::EpReserveCapacity {
+        host_budget_bytes: allowance.saturating_sub(host_experts),
+        ..probe_capacity
+    };
+    let plan = ep::plan_ep_reserve_with_donors(
+        &input.suffix.forward,
+        &geometry,
+        &capacity,
+        input.suffix.resident_layers,
+        &forced,
+    )
+    .map_err(|refusal| format!("qwen4: {refusal}"))?;
+    let mirrors = qwen4_ep_reserve_mirror_host_bytes(&plan).saturating_mul(input.ranks as u64);
+    let total = host_experts.saturating_add(mirrors);
+    let aggregate = |error: String| {
+        format!(
+            "the aggregate pinned host memory of {} ranks ({} MiB: {} MiB host units + {} MiB donor mirrors) is refused: {error}",
+            input.ranks,
+            total >> 20,
+            host_experts >> 20,
+            mirrors >> 20
+        )
+    };
+    residency::check_host_ram(total, input.host.mem_available, input.host.ttm_pool)
+        .map_err(&aggregate)?;
+    residency::check_gtt_cap(total, input.host.gtt).map_err(&aggregate)?;
+    (input.host.emu_check)(total)?;
+    Ok((staged, plan))
+}
+
+/// The aggregate host-memory allowance (all ranks together): RAM plus the TTM pool less the
+/// headroom, capped by the GTT room.
+fn qwen4_ep_reserve_host_allowance(host: &Qwen4EpReserveHost<'_>) -> Result<u64, String> {
+    use hipfire_arch_qwen4::expert_residency as residency;
+    let available = host.mem_available.ok_or(
+        "qwen4: EP reserve decoupling: MemAvailable is unreadable, so the aggregate pinned-host charge cannot be admitted",
+    )?;
+    let ram_allowance = available
+        .saturating_add(host.ttm_pool)
+        .saturating_sub(residency::HOST_RAM_HEADROOM_BYTES);
+    Ok(host.gtt.map_or(ram_allowance, |gtt| {
+        ram_allowance.min(gtt.limit_bytes.saturating_sub(gtt.used_bytes))
+    }))
 }
 
 /// Developer opt-in of the EP prefill-chunk auto-fit: exact `1` lets the load
@@ -5370,16 +5600,27 @@ fn load_qwen4_rank_unscoped(
     };
     let ep_ranks = ep.map_or(1, |placement| placement.ranks);
     // The per-expert plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`) is one EP rank's
-    // residency under the agreed whole-layer baseline split: never a band, never
-    // under the decoupled reserve, and the plan must be this mesh's.
+    // residency under the agreed whole-layer baseline split: never a band, under
+    // the decoupled reserve only with explicit donors that are whole-resident
+    // layers of this rank (`HIPFIRE_EP_UNIT_RESERVE`), and the plan must be this
+    // mesh's.
     if let Some(units) = &ep_units {
+        let rank = ep.map_or(0, |placement| placement.rank);
+        let reserve_ok = ep_reserve.as_deref().map_or(true, |plan| {
+            let resident = units.whole_resident_layers(rank);
+            plan.explicit_donors
+                && plan
+                    .donor_layers
+                    .iter()
+                    .all(|layer| resident.contains(layer))
+        });
         let consistent = ep.is_some_and(|placement| units.geometry().ranks == placement.ranks)
             && band.is_none()
-            && ep_reserve.is_none()
+            && reserve_ok
             && expert_vram_layers.is_some();
         if !consistent {
             return Err(format!(
-                "qwen4: {}: the per-expert plan needs an expert-parallel rank of its own mesh under an agreed split, no pipeline band and no decoupled reserve",
+                "qwen4: {}: the per-expert plan needs an expert-parallel rank of its own mesh under an agreed split, no pipeline band and no decoupled reserve (or one whose donors are this rank's whole-resident layers)",
                 hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
             ));
         }
@@ -16553,6 +16794,7 @@ mod ep_unit_plan_tests {
             1 << 30,
             (vec![512 * 1_740_800; 48], vec![512 * 870_400; 48]),
             true,
+            &[],
         )
         .unwrap_err();
         assert!(

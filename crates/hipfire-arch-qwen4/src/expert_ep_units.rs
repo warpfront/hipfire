@@ -119,6 +119,13 @@ pub enum EpUnitSource<'a> {
         ranking: EpRanking<'a>,
         rank_budget_bytes: Vec<u64>,
     },
+    /// [`Self::Ranking`] with `forced_layers` wholly resident on every rank first (see
+    /// [`place_routed_experts_units_forced`]).
+    RankingForced {
+        ranking: EpRanking<'a>,
+        rank_budget_bytes: Vec<u64>,
+        forced_layers: Vec<usize>,
+    },
 }
 
 /// Residency of one rank's owned experts of one layer.
@@ -186,6 +193,36 @@ impl EpUnitPlan {
                 host: owned - n,
             },
         }
+    }
+
+    /// Layers every owned expert of which `rank` keeps in VRAM (today's resident layers), ascending.
+    pub fn whole_resident_layers(&self, rank: usize) -> Vec<usize> {
+        (0..self.geometry.layers)
+            .filter(|&layer| self.layer_state(rank, layer) == EpLayerState::Resident)
+            .collect()
+    }
+
+    /// Layers that are [`EpLayerState::Resident`] on EVERY rank, ascending (the layers a decoupled
+    /// EP reserve can borrow as donors).
+    pub fn whole_resident_layers_all_ranks(&self) -> Vec<usize> {
+        (0..self.geometry.layers)
+            .filter(|&layer| {
+                (0..self.geometry.ranks)
+                    .all(|rank| self.layer_state(rank, layer) == EpLayerState::Resident)
+            })
+            .collect()
+    }
+
+    /// Resident units of `layer` summed over ranks.
+    pub fn layer_resident_units(&self, layer: usize) -> usize {
+        (0..self.geometry.ranks)
+            .map(|rank| {
+                self.layer_resident(rank, layer)
+                    .iter()
+                    .filter(|&&kept| kept)
+                    .count()
+            })
+            .sum()
     }
 
     /// Layers of `rank` in each state: `(resident, mixed, host)`.
@@ -384,93 +421,171 @@ pub fn place_routed_experts_units(
         EpUnitSource::Ranking {
             ranking,
             rank_budget_bytes,
-        } => {
-            if rank_budget_bytes.len() != g.ranks {
-                return Err(format!(
-                    "EP unit plan: {} rank budgets for {} ranks",
-                    rank_budget_bytes.len(),
-                    g.ranks
-                ));
-            }
-            let total = g.total_ids();
-            if ranking.rank.len() != total {
-                return Err(format!(
-                    "EP unit plan: the ranking has {} ids, the model has {} units ({} layers x {} experts)",
-                    ranking.rank.len(),
-                    total,
-                    g.layers,
-                    g.experts_per_layer
-                ));
-            }
-            if let Some(counts) = ranking.counts {
-                if counts.len() != total {
-                    return Err(format!(
-                        "EP unit plan: {} counts for {total} units",
-                        counts.len()
-                    ));
-                }
-            }
-            let mut seen = vec![false; total];
-            let mut remaining = rank_budget_bytes.clone();
-            let mut open = vec![true; g.ranks];
-            let mut touched = vec![false; g.ranks * g.layers];
-            let unit = g.unit_bytes();
-            for &id in ranking.rank {
-                let id = id as usize;
-                if id >= total {
-                    return Err(format!(
-                        "EP unit plan: ranking id {id} is outside the {total} units"
-                    ));
-                }
-                if std::mem::replace(&mut seen[id], true) {
-                    return Err(format!("EP unit plan: ranking id {id} appears twice"));
-                }
-                let (layer, expert) = (id / layer_span, id % layer_span);
-                let rank = expert % g.ranks;
-                if !open[rank] {
-                    continue;
-                }
-                let first = !touched[rank * g.layers + layer];
-                let charge = unit
-                    + if first {
-                        2 * VRAM_ARENA_TAIL_PAD_BYTES
-                    } else {
-                        0
-                    };
-                if charge > remaining[rank] {
-                    open[rank] = false;
-                    continue;
-                }
-                remaining[rank] -= charge;
-                touched[rank * g.layers + layer] = true;
-                resident[at(rank, layer, expert)] = true;
-            }
-            let coverage = (0..g.ranks)
-                .map(|rank| {
-                    ranking.counts.map(|counts| {
-                        let (mut kept, mut all) = (0u64, 0u64);
-                        for layer in 0..g.layers {
-                            for expert in (rank..g.experts_per_layer).step_by(g.ranks) {
-                                let count = counts[layer * layer_span + expert];
-                                all += count;
-                                if resident[at(rank, layer, expert)] {
-                                    kept += count;
-                                }
-                            }
-                        }
-                        (kept, all)
-                    })
-                })
-                .collect();
-            Ok(EpUnitPlan {
-                geometry: g,
-                resident,
-                ranking_sha256: ranking.sha256.map(str::to_owned),
-                coverage,
-                rank_budget_bytes: Some(rank_budget_bytes.clone()),
-            })
+        } => place_ranking(g, *ranking, rank_budget_bytes, &[]),
+        EpUnitSource::RankingForced {
+            ranking,
+            rank_budget_bytes,
+            forced_layers,
+        } => place_ranking(g, *ranking, rank_budget_bytes, forced_layers),
+    }
+}
+
+/// The `count` donor layers a decoupled EP reserve borrows, in PREFERENCE order: the layers the
+/// unforced ranking plan already keeps the most units of (summed over ranks; the hottest layers need
+/// the fewest extra units to become whole), ties to the lower layer index. `unforced` is the
+/// ranking plan placed with no forced layer. Returns fewer than `count` layers only when the model
+/// has fewer.
+pub fn ep_unit_donor_layers(unforced: &EpUnitPlan, count: usize) -> Vec<usize> {
+    let mut layers: Vec<usize> = (0..unforced.geometry.layers).collect();
+    layers.sort_by_key(|&layer| {
+        (
+            std::cmp::Reverse(unforced.layer_resident_units(layer)),
+            layer,
+        )
+    });
+    layers.truncate(count);
+    layers
+}
+
+/// A ranking plan with `forced_layers` wholly resident on every rank first (they count against the
+/// budget; the walk fills the rest). With no forced layer this is exactly
+/// [`place_routed_experts_units`] over [`EpUnitSource::Ranking`].
+pub fn place_routed_experts_units_forced(
+    geometry: &EpUnitGeometry,
+    ranking: EpRanking<'_>,
+    rank_budget_bytes: &[u64],
+    forced_layers: &[usize],
+) -> Result<EpUnitPlan, String> {
+    geometry.check()?;
+    place_ranking(*geometry, ranking, rank_budget_bytes, forced_layers)
+}
+
+/// The ranking walk of [`place_routed_experts_units`]; `forced_layers` are placed first as wholly
+/// resident layers (every owned expert on every rank, charged to the budget like any resident unit)
+/// and the walk skips their units. Forced layers are the whole-layer donors of a decoupled EP
+/// reserve (`ep_reserve`), which borrows the bytes of whole resident layers.
+fn place_ranking(
+    g: EpUnitGeometry,
+    ranking: EpRanking<'_>,
+    rank_budget_bytes: &[u64],
+    forced_layers: &[usize],
+) -> Result<EpUnitPlan, String> {
+    let layer_span = g.experts_per_layer;
+    let mut resident = vec![false; g.ranks * g.layers * layer_span];
+    let at =
+        |rank: usize, layer: usize, expert: usize| (rank * g.layers + layer) * layer_span + expert;
+    if rank_budget_bytes.len() != g.ranks {
+        return Err(format!(
+            "EP unit plan: {} rank budgets for {} ranks",
+            rank_budget_bytes.len(),
+            g.ranks
+        ));
+    }
+    let total = g.total_ids();
+    if ranking.rank.len() != total {
+        return Err(format!(
+            "EP unit plan: the ranking has {} ids, the model has {} units ({} layers x {} experts)",
+            ranking.rank.len(),
+            total,
+            g.layers,
+            g.experts_per_layer
+        ));
+    }
+    if let Some(counts) = ranking.counts {
+        if counts.len() != total {
+            return Err(format!(
+                "EP unit plan: {} counts for {total} units",
+                counts.len()
+            ));
         }
     }
+    let mut seen = vec![false; total];
+    let mut remaining = rank_budget_bytes.to_vec();
+    let mut open = vec![true; g.ranks];
+    let mut touched = vec![false; g.ranks * g.layers];
+    let unit = g.unit_bytes();
+    let mut forced_seen = vec![false; g.layers];
+    for &layer in forced_layers {
+        if layer >= g.layers {
+            return Err(format!(
+                "EP unit plan: forced resident layer {layer} is outside the {} layers",
+                g.layers
+            ));
+        }
+        if std::mem::replace(&mut forced_seen[layer], true) {
+            return Err(format!(
+                "EP unit plan: forced resident layer {layer} appears twice"
+            ));
+        }
+        for rank in 0..g.ranks {
+            let charge = g.owned_per_layer(rank) as u64 * unit + 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+            if charge > remaining[rank] {
+                return Err(format!(
+                    "EP unit plan: forced resident layer {layer} needs {charge} bytes on rank {rank}, the budget has {}",
+                    remaining[rank]
+                ));
+            }
+            remaining[rank] -= charge;
+            touched[rank * g.layers + layer] = true;
+            for expert in (rank..g.experts_per_layer).step_by(g.ranks) {
+                resident[at(rank, layer, expert)] = true;
+            }
+        }
+    }
+    for &id in ranking.rank {
+        let id = id as usize;
+        if id >= total {
+            return Err(format!(
+                "EP unit plan: ranking id {id} is outside the {total} units"
+            ));
+        }
+        if std::mem::replace(&mut seen[id], true) {
+            return Err(format!("EP unit plan: ranking id {id} appears twice"));
+        }
+        let (layer, expert) = (id / layer_span, id % layer_span);
+        let rank = expert % g.ranks;
+        if resident[at(rank, layer, expert)] || !open[rank] {
+            continue;
+        }
+        let first = !touched[rank * g.layers + layer];
+        let charge = unit
+            + if first {
+                2 * VRAM_ARENA_TAIL_PAD_BYTES
+            } else {
+                0
+            };
+        if charge > remaining[rank] {
+            open[rank] = false;
+            continue;
+        }
+        remaining[rank] -= charge;
+        touched[rank * g.layers + layer] = true;
+        resident[at(rank, layer, expert)] = true;
+    }
+    let coverage = (0..g.ranks)
+        .map(|rank| {
+            ranking.counts.map(|counts| {
+                let (mut kept, mut all) = (0u64, 0u64);
+                for layer in 0..g.layers {
+                    for expert in (rank..g.experts_per_layer).step_by(g.ranks) {
+                        let count = counts[layer * layer_span + expert];
+                        all += count;
+                        if resident[at(rank, layer, expert)] {
+                            kept += count;
+                        }
+                    }
+                }
+                (kept, all)
+            })
+        })
+        .collect();
+    Ok(EpUnitPlan {
+        geometry: g,
+        resident,
+        ranking_sha256: ranking.sha256.map(str::to_owned),
+        coverage,
+        rank_budget_bytes: Some(rank_budget_bytes.to_vec()),
+    })
 }
 
 /// Per-rank expert byte budget of a per-unit EP load: the bytes `auto`
@@ -1077,7 +1192,8 @@ pub struct EpUnitStagedPlan {
 /// The fixed point, over any placement function of the per-rank charge (bytes
 /// taken off every rank's budget): `C_0 = 0`, `plan_k = place(charge(C_k))`,
 /// `C_{k+1}` = the largest host region of `plan_k` (zero when the plan does
-/// not take the unit stage), stop at the first `C_{k+1} <= C_k`; the plan and
+/// not take the unit stage and `donor_floor` is zero; `donor_floor` is the whole-layer region a
+/// borrowed donor layer needs in the stage), stop at the first `C_{k+1} <= C_k`; the plan and
 /// `C_k` are returned. After [`EP_UNIT_STAGE_FIXED_POINT_ITERATIONS`]
 /// placements without a fixed point `C` is the largest whole-layer region. A
 /// plan that needs no unit stage returns zero charge (its placement was made
@@ -1085,15 +1201,17 @@ pub struct EpUnitStagedPlan {
 fn solve_stage_capacity(
     geometry: &EpUnitGeometry,
     stage_on: bool,
+    donor_floor: u64,
     mut place: impl FnMut(u64) -> Result<EpUnitPlan, String>,
 ) -> Result<EpUnitStagedPlan, String> {
     let tables = ep_unit_stage_table_bytes(geometry);
     let need = |plan: &EpUnitPlan| {
-        if ep_unit_stage_kind(Some(plan)) == EpUnitStageKind::Units {
+        let region = if ep_unit_stage_kind(Some(plan)) == EpUnitStageKind::Units {
             plan.max_stage_host_region_bytes()
         } else {
             0
-        }
+        };
+        region.max(donor_floor)
     };
     if !stage_on {
         return Ok(EpUnitStagedPlan {
@@ -1150,16 +1268,38 @@ pub fn place_routed_experts_units_staged(
     rank_budget_bytes: &[u64],
     stage_on: bool,
 ) -> Result<EpUnitStagedPlan, String> {
-    solve_stage_capacity(geometry, stage_on, |charge| {
-        place_routed_experts_units(
+    place_routed_experts_units_forced_staged(geometry, ranking, rank_budget_bytes, &[], stage_on)
+}
+
+/// [`place_routed_experts_units_staged`] with `forced_layers` wholly resident on every rank (the
+/// donor layers of a decoupled EP reserve). A borrowed donor layer is read through the unit stage,
+/// so with `stage_on` and a non-empty `forced_layers` the stage capacity `C` is at least one whole
+/// layer region.
+pub fn place_routed_experts_units_forced_staged(
+    geometry: &EpUnitGeometry,
+    ranking: EpRanking<'_>,
+    rank_budget_bytes: &[u64],
+    forced_layers: &[usize],
+    stage_on: bool,
+) -> Result<EpUnitStagedPlan, String> {
+    let donor_floor = if stage_on && !forced_layers.is_empty() {
+        (0..geometry.ranks)
+            .map(|rank| geometry.owned_per_layer(rank) as u64)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(geometry.unit_bytes())
+    } else {
+        0
+    };
+    solve_stage_capacity(geometry, stage_on, donor_floor, |charge| {
+        place_routed_experts_units_forced(
             geometry,
-            &EpUnitSource::Ranking {
-                ranking,
-                rank_budget_bytes: rank_budget_bytes
-                    .iter()
-                    .map(|budget| budget.saturating_sub(charge))
-                    .collect(),
-            },
+            ranking,
+            &rank_budget_bytes
+                .iter()
+                .map(|budget| budget.saturating_sub(charge))
+                .collect::<Vec<_>>(),
+            forced_layers,
         )
     })
 }
@@ -2233,7 +2373,7 @@ mod ep_unit_stage_tests {
         let order: Vec<u32> = (0..64).collect();
         let unit = g.unit_bytes();
         let mut calls = 0u64;
-        let result = solve_stage_capacity(&g, true, |_charge| {
+        let result = solve_stage_capacity(&g, true, 0, |_charge| {
             calls += 1;
             // `calls` host units, the rest resident (budget in units + the pads).
             let keep = 64 - calls.min(63);
@@ -2285,5 +2425,120 @@ mod ep_unit_stage_tests {
             vec![5 << 20, 0]
         );
         assert_eq!(ep_unit_apply_budget_delta(vec![10 << 20], -50), vec![0]);
+    }
+
+    fn forced_plan(
+        g: &EpUnitGeometry,
+        order: &[u32],
+        budget: u64,
+        forced: &[usize],
+    ) -> Result<EpUnitPlan, String> {
+        place_routed_experts_units_forced(
+            g,
+            EpRanking {
+                rank: order,
+                counts: None,
+                sha256: None,
+            },
+            &vec![budget; g.ranks],
+            forced,
+        )
+    }
+
+    #[test]
+    fn forced_layers_are_whole_resident_and_counted_in_the_budget() {
+        let g = geometry(48, 512, 2);
+        let order = permutation(48 * 512, 31);
+        let budget = 6000 * g.unit_bytes();
+        let plain = ranking_plan(&g, &order, budget);
+        assert_eq!(
+            forced_plan(&g, &order, budget, &[]).unwrap(),
+            plain,
+            "no forced layer is the plain ranking plan"
+        );
+        let forced = [5usize, 17, 40];
+        let plan = forced_plan(&g, &order, budget, &forced).unwrap();
+        for rank in 0..2 {
+            for &layer in &forced {
+                assert_eq!(plan.layer_state(rank, layer), EpLayerState::Resident);
+            }
+            assert!(plan.vram_bytes(rank) <= budget);
+        }
+        assert_eq!(
+            plan.whole_resident_layers_all_ranks()
+                .iter()
+                .filter(|l| forced.contains(l))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn forced_layers_reject_bad_input_and_overspend() {
+        let g = geometry(48, 512, 2);
+        let order = permutation(48 * 512, 32);
+        let budget = 6000 * g.unit_bytes();
+        assert!(forced_plan(&g, &order, budget, &[48])
+            .unwrap_err()
+            .contains("outside"));
+        assert!(forced_plan(&g, &order, budget, &[3, 3])
+            .unwrap_err()
+            .contains("twice"));
+        let tiny = 100 * g.unit_bytes();
+        assert!(forced_plan(&g, &order, tiny, &[3])
+            .unwrap_err()
+            .contains("needs"));
+    }
+
+    #[test]
+    fn donor_layers_prefer_the_hottest_and_are_deterministic() {
+        let g = geometry(48, 512, 2);
+        // A ranking that puts layer 30 first, then 7, then the rest by layer.
+        let mut order: Vec<u32> = Vec::new();
+        for layer in [30usize, 7] {
+            order.extend((0..512).map(|e| (layer * 512 + e) as u32));
+        }
+        for layer in (0..48).filter(|l| *l != 30 && *l != 7) {
+            order.extend((0..512).map(|e| (layer * 512 + e) as u32));
+        }
+        let plan = ranking_plan(&g, &order, 400 * g.unit_bytes());
+        assert_eq!(ep_unit_donor_layers(&plan, 3), vec![30, 7, 0]);
+        assert_eq!(ep_unit_donor_layers(&plan, 2), vec![30, 7]);
+        assert_eq!(ep_unit_donor_layers(&plan, 99).len(), 48);
+    }
+
+    #[test]
+    fn forced_stage_capacity_is_at_least_one_whole_layer_region() {
+        let g = geometry(48, 512, 2);
+        let order = permutation(48 * 512, 33);
+        let budget = 7000 * g.unit_bytes();
+        let ranking = EpRanking {
+            rank: &order,
+            counts: None,
+            sha256: None,
+        };
+        let whole = 256 * g.unit_bytes();
+        let plain = place_routed_experts_units_staged(&g, ranking, &vec![budget; 2], true).unwrap();
+        let forced = place_routed_experts_units_forced_staged(
+            &g,
+            ranking,
+            &vec![budget; 2],
+            &[9, 10, 11],
+            true,
+        )
+        .unwrap();
+        assert!(plain.stage.capacity <= whole);
+        assert_eq!(forced.stage.capacity, whole);
+        for rank in 0..2 {
+            for layer in [9usize, 10, 11] {
+                assert_eq!(forced.plan.layer_state(rank, layer), EpLayerState::Resident);
+            }
+        }
+        // Stage off: nothing is charged, the forced plan is the plain forced plan.
+        let off =
+            place_routed_experts_units_forced_staged(&g, ranking, &vec![budget; 2], &[9], false)
+                .unwrap();
+        assert_eq!(off.stage, EpUnitStageCharge::default());
+        assert_eq!(off.plan, forced_plan(&g, &order, budget, &[9]).unwrap());
     }
 }
