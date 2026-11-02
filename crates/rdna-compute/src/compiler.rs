@@ -1215,6 +1215,12 @@ impl KernelCompiler {
         self.cold_dir.as_deref()
     }
 
+    /// The arch-keyed hot cache directory (`<cache root>/<arch>`) JIT-compiled
+    /// and seeded objects live in.
+    pub fn hot_cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
     /// The target the compiler builds for (`gfx1201`, …).
     pub fn arch(&self) -> &str {
         &self.arch

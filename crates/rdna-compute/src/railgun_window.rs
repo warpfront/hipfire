@@ -423,6 +423,19 @@ impl Gpu {
             .and_then(corpus_beside_pack)
     }
 
+    /// Where this process's kernel objects live, for an owner that builds a
+    /// receipt corpus from them (see [`RailgunProvisionContext`]).
+    pub fn railgun_provision_context(&self) -> RailgunProvisionContext {
+        let hot_dir = self.compiler.hot_cache_dir().to_path_buf();
+        RailgunProvisionContext {
+            arch: self.arch.clone(),
+            toolchain_id: self.compiler.toolchain_id().to_owned(),
+            local_corpus_dir: local_corpus_dir(&hot_dir, &self.arch),
+            installed_pack_dir: self.compiler.installed_pack_dir().map(Path::to_path_buf),
+            hot_dir,
+        }
+    }
+
     /// Load railgun's copy and fill kernels (idempotent) and return the
     /// digests of the code objects that own them. Refused inside plan mode:
     /// a plan-mode load would be recorded, not performed.
@@ -918,6 +931,32 @@ pub fn corpus_beside_pack(pack_arch_dir: &Path) -> Option<PathBuf> {
     Some(pack_arch_dir.parent()?.parent()?.join("railgun-corpus"))
 }
 
+/// The per-user receipt corpus directory a locally built corpus lives in:
+/// `<cache root>/railgun-corpus/<arch>`, a sibling of the arch-keyed hot cache
+/// directory `<cache root>/<arch>` (always as writable as the cache itself).
+pub fn local_corpus_dir(hot_dir: &Path, arch: &str) -> PathBuf {
+    hot_dir
+        .parent()
+        .unwrap_or(hot_dir)
+        .join("railgun-corpus")
+        .join(arch)
+}
+
+/// What an owner needs to build a receipt corpus from the objects this process
+/// loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RailgunProvisionContext {
+    pub arch: String,
+    /// First line of `hipcc --version` (the corpus pin is its SHA-256).
+    pub toolchain_id: String,
+    /// The arch-keyed hot cache directory.
+    pub hot_dir: PathBuf,
+    /// The installed kernel pack arch directory, when one exists.
+    pub installed_pack_dir: Option<PathBuf>,
+    /// [`local_corpus_dir`] of `hot_dir`.
+    pub local_corpus_dir: PathBuf,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,5 +1302,13 @@ mod tests {
             Some(PathBuf::from("kernels/railgun-corpus"))
         );
         assert_eq!(corpus_beside_pack(Path::new("gfx1201")), None);
+    }
+
+    #[test]
+    fn the_local_corpus_is_a_per_user_sibling_of_the_hot_cache() {
+        assert_eq!(
+            local_corpus_dir(Path::new("/home/u/.hipfire/cache/gfx1201"), "gfx1201"),
+            PathBuf::from("/home/u/.hipfire/cache/railgun-corpus/gfx1201")
+        );
     }
 }
