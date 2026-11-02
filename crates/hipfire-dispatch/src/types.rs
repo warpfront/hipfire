@@ -687,11 +687,6 @@ pub enum ArchPredicate {
     /// builtins are gfx1201-guarded: no other arch may resolve them, so an
     /// fp8 cache fails closed at dispatch outside the admitted target.
     IsGfx1201,
-    /// HFQ3-G256 plain GEMV admission: RDNA1.1/RDNA2 via the sdot4 generic
-    /// kernel, plus gfx1100/1101/1102 where `gemv_hfq3g256_for_arch` selects
-    /// the RDNA3 wave32 scalar variant (`gemv_hfq3g256_rdna3`, the MQ3
-    /// production path). gfx110x has no sdot4 but does have the rdna3 kernel.
-    HasHfq3G256Gemv,
     HasMmq,
     /// MQ6G256 / HFQ6G256 GEMV admission (#478): everything `HasMmq` admits
     /// (gfx906, RDNA3, RDNA4) plus RDNA1/RDNA2. `gemv_hfq6g256` and
@@ -1044,7 +1039,11 @@ impl KernelKey {
             // dtype_arch_predicate matches exhaustively on DType, so this arm is
             // required for the match to compile.
             | BQ1G128 => ArchPredicate::Always,
-            HFQ3G256 => ArchPredicate::HasHfq3G256Gemv,
+            // gemv_hfq3g256 (`_ =>` arm of gemv_hfq3g256_for_arch) is a WMMA-free,
+            // sdot4-free [32,1,1] wave32 scalar kernel; gfx110x picks the rdna3
+            // twin. HasWave32 admits gfx1151/gfx12/RDNA1 (HIPF-241). Wave64 stays
+            // excluded, as for MQ3G256: no wave64 run has exercised it.
+            HFQ3G256 => ArchPredicate::HasWave32,
             // gemv_hfq3g128 is a WMMA-free, sdot4-free [32,1,1] wave32 scalar
             // kernel (the MQ3G256 rationale below): HasWave32 newly admits
             // RDNA1/2/3/4 incl. gfx1151; CDNA wave64 stays excluded until a
