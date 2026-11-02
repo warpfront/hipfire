@@ -2598,10 +2598,11 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
     )
 }
 
-/// Native Qwen4 MTP plans reuse through the session cache, not the shared
+/// A model whose speculative target keeps sessions (`spec_session_reuse`,
+/// e.g. Qwen4) plans reuse through the session cache, not the shared
 /// conversation/checkpoint planner. Environment disabling applies elsewhere.
-pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bool {
-    env_disabled || native_qwen4_mtp
+pub fn spec_cache_disabled_for(spec_session_reuse: bool, env_disabled: bool) -> bool {
+    env_disabled || spec_session_reuse
 }
 
 /// Where a Qwen4 session entry (plan, commit) runs, from whether the bundle's
@@ -2658,23 +2659,31 @@ pub(crate) fn plan_qwen4_session(
     state.session_plan(prompt, route)
 }
 
-/// The session route and reuse start a speculative request plans: `None`
-/// unless the model's speculative target restores session reuse points
-/// ([`ArchModel::spec_session_reuse`]) and the speculator names the route it
-/// resumes on ([`Speculator::session_route`]); then the deepest reuse point
-/// the speculator can resume ([`plan_resumable`]), 0 = cold. Host-only.
+/// The session route a speculative request on `model` plans and begins on:
+/// `None` unless the model's speculative target restores session reuse
+/// points ([`ArchModel::spec_session_reuse`]) and the speculator names the
+/// route it resumes on ([`Speculator::session_route`]).
 ///
 /// [`ArchModel::spec_session_reuse`]: hipfire_runtime::arch_model::ArchModel::spec_session_reuse
 /// [`Speculator::session_route`]: hipfire_runtime::spec::Speculator::session_route
+fn spec_session_route(
+    model: &dyn hipfire_runtime::arch_model::ArchModel,
+    spec: &dyn hipfire_runtime::spec::Speculator,
+) -> Option<SessionRoute> {
+    spec.session_route().filter(|_| model.spec_session_reuse())
+}
+
+/// The session route ([`spec_session_route`]) and reuse start a speculative
+/// request plans: the deepest reuse point the speculator can resume
+/// ([`plan_resumable`]), 0 = cold. Host-only.
+///
 /// [`plan_resumable`]: hipfire_runtime::session_cache::plan_resumable
 fn plan_spec_session(
     model: &dyn hipfire_runtime::arch_model::ArchModel,
     spec: &dyn hipfire_runtime::spec::Speculator,
     prompt: &[u32],
 ) -> Option<(SessionRoute, usize)> {
-    let route = spec
-        .session_route()
-        .filter(|_| model.spec_session_reuse())?;
+    let route = spec_session_route(model, spec)?;
     let start = hipfire_runtime::session_cache::plan_resumable(
         prompt.len(),
         |cap| model.session_plan_capped(prompt, route, cap),
@@ -2683,38 +2692,31 @@ fn plan_spec_session(
     Some((route, start))
 }
 
-/// Publishes pending Qwen4 session snapshots after a committed terminal and
-/// keeps the live state for an in-conversation continuation.
+/// Publishes pending session snapshots after a committed terminal and keeps
+/// the live state for an in-conversation continuation, for a model whose
+/// speculative target keeps sessions ([`ArchModel::spec_session_reuse`]).
 /// `conversation_tokens` is the consumed host history (prompt plus emitted
-/// tokens, empty after an unrepaired terminal); the bundle validates it
-/// against its device state. Takes the fields, not the whole model, so the
-/// borrows stay disjoint. A pipeline-parallel model commits every band
-/// through the mesh with its `Gpus`; an active mesh without `Gpus` commits
-/// nothing (the root alone would publish a partial record). No-op for other
-/// families.
-fn commit_qwen4_session(model: &mut LoadedModel) {
+/// tokens, empty after an unrepaired terminal); the model validates it
+/// against its device state. With the daemon's mesh `Gpus` the model commits
+/// through [`ArchModel::session_commit_live_mesh`] (a pipeline-parallel model
+/// publishes every band; its root alone publishes nothing). Takes the fields,
+/// not the whole model, so the borrows stay disjoint. No-op for other models.
+///
+/// [`ArchModel::spec_session_reuse`]: hipfire_runtime::arch_model::ArchModel::spec_session_reuse
+/// [`ArchModel::session_commit_live_mesh`]: hipfire_runtime::arch_model::ArchModel::session_commit_live_mesh
+fn commit_session(model: &mut LoadedModel) {
     let LoadedModel {
         state,
         pp_gpus,
         conversation_tokens,
         ..
     } = model;
-    let Some(state) = state.as_deref_mut() else {
+    let Some(state) = state.as_deref_mut().filter(|s| s.spec_session_reuse()) else {
         return;
     };
-    let Some(bundle) =
-        (&mut *state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
-    else {
-        return;
-    };
-    match qwen4_session_target(bundle.pp_mesh_active(), pp_gpus.is_some()) {
-        Qwen4SessionTarget::Root => state.session_commit_live(conversation_tokens),
-        Qwen4SessionTarget::Mesh => {
-            if let Some(gpus) = pp_gpus.as_mut() {
-                bundle.pp_session_commit_live(gpus, conversation_tokens);
-            }
-        }
-        Qwen4SessionTarget::Unreachable => {}
+    match pp_gpus.as_mut() {
+        Some(gpus) => state.session_commit_live_mesh(gpus, conversation_tokens),
+        None => state.session_commit_live(conversation_tokens),
     }
 }
 
@@ -3642,12 +3644,13 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    // Qwen4's shared history planner only renders; speculators that resume
-    // from the target's session cache plan reuse below
-    // (`plan_spec_session`).
+    // A model whose speculative target keeps sessions renders here but plans
+    // device reuse only through its session cache (`plan_spec_session`
+    // below); every other model keeps the conversation/checkpoint plan.
+    let session_reuse = m.state.as_deref().is_some_and(|s| s.spec_session_reuse());
     let cache_disabled = spec_cache_disabled_for(
-        is_qwen4,
-        !is_qwen4
+        session_reuse,
+        !session_reuse
             && hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
                 .ok()
                 .as_deref()
@@ -3690,9 +3693,7 @@ pub fn generate_dflash(
     } else {
         prompt_tokens
     };
-    // Qwen4 renders canonical history here, but only the session cache plans
-    // device reuse. Other families retain their conversation/checkpoint plan.
-    let (conversation_tokens, dflash_ckpt_positions): (&[u32], Vec<usize>) = if is_qwen4 {
+    let (conversation_tokens, dflash_ckpt_positions): (&[u32], Vec<usize>) = if session_reuse {
         (&[][..], Vec::new())
     } else {
         (
@@ -3708,7 +3709,7 @@ pub fn generate_dflash(
         && m.eviction.is_none()
         && pflash_bypass_reason.is_none()
         && !conversation_tokens.is_empty();
-    let cache_plan: Option<PromptCachePlan> = if is_qwen4 {
+    let cache_plan: Option<PromptCachePlan> = if session_reuse {
         None
     } else if try_jinja {
         if let Some(hist) = messages_history {
@@ -4152,7 +4153,7 @@ pub fn generate_dflash(
                     emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
                     return true;
                 }
-                commit_qwen4_session(m);
+                commit_session(m);
                 // No post-commit tool_calls event; calls live on staged terminal.
                 let mut action = qwen_dflash_cache_action(&terminal);
                 action.store = effects.store_cache && action.store;
@@ -4304,7 +4305,7 @@ pub fn generate_dflash(
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
             return true;
         }
-        commit_qwen4_session(m);
+        commit_session(m);
         // Safe stop/tool_calls only — length never stores; Abort suppressed above.
         if effects.store_cache {
             let stripped = strip_think_for_fingerprint(&decoded_full);
@@ -4525,6 +4526,12 @@ pub fn generate_spec(
             return None;
         }
     }
+    // The session route a speculative prefill begins on (the route
+    // `plan_spec_session` planned), read before the guard borrows the target.
+    let session_route = match (m.state.as_deref(), m.speculator.as_deref()) {
+        (Some(model), Some(spec)) => spec_session_route(model, spec),
+        _ => None,
+    };
     // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
     // (`m.model_path` is a disjoint field → no borrow conflict with the
     // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
@@ -4718,6 +4725,7 @@ pub fn generate_spec(
             gpu,
             spec.as_mut(),
             slot,
+            session_route,
             &prompt_tokens,
             &prefill_tokens,
             prefill_start,
@@ -5755,6 +5763,7 @@ pub fn generate_spec(
                 gpu,
                 spec.as_mut(),
                 slot,
+                session_route,
                 &plan.replay,
                 &plan.replay,
                 0,
@@ -11031,7 +11040,7 @@ pub fn generate_qwen4_ar(
                 .forward_token_or_argmax(device, token, logits)
                 .map_err(|error| error.to_string())
         },
-        commit_qwen4_session,
+        commit_session,
     );
 }
 
@@ -11283,6 +11292,7 @@ fn spec_prefill(
     gpu: &mut rdna_compute::Gpu,
     spec: &mut dyn Speculator,
     slot: &mut dyn SpecTarget,
+    session_route: Option<SessionRoute>,
     prompt_tokens: &[u32],
     prefill_tokens: &[u32],
     prefill_start: usize,
@@ -11291,31 +11301,29 @@ fn spec_prefill(
     abort: &dyn Fn() -> bool,
 ) -> Result<PrefillOutcome, String> {
     let Some(gpus) = pp else {
-        // Qwen4 DFlash2 prefills inside an AR-route session turn: the begin
-        // restores the planned prefix (or cold-starts) and arms the snapshot
-        // boundaries `spec_advance` publishes, so the speculator continues
-        // the target in place rather than resetting it (which would drop the
-        // turn).
-        if spec.name() == "dflash2" {
-            if let Some(bundle) = slot
-                .as_any_mut()
-                .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
-            {
-                let start = if cache_hit { prefill_start } else { 0 };
-                bundle
-                    .session_begin(gpu, prompt_tokens, start, SessionRoute::Ar)
-                    .map_err(|e| e.to_string())?;
-                return spec.prefill(
-                    gpu,
-                    slot,
-                    prompt_tokens,
-                    &prompt_tokens[start..],
-                    start,
-                    true,
-                    None,
-                    abort,
+        // A target-only (`Ar`) session route: the drafter does not begin the
+        // session itself (an `Mtp` drafter does, in its prefill), so the
+        // target's begin restores the planned prefix (or cold-starts) and
+        // arms the snapshot boundaries the prefill publishes; the speculator
+        // then continues the target in place rather than resetting it
+        // (which would drop the turn).
+        if session_route == Some(SessionRoute::Ar) {
+            let start = if cache_hit { prefill_start } else { 0 };
+            if !slot.session_begin(gpu, prompt_tokens, start, SessionRoute::Ar)? {
+                return Err(
+                    "speculative target declares session reuse but keeps no session".into(),
                 );
             }
+            return spec.prefill(
+                gpu,
+                slot,
+                prompt_tokens,
+                &prompt_tokens[start..],
+                start,
+                true,
+                None,
+                abort,
+            );
         }
         return spec.prefill(
             gpu,
@@ -11501,7 +11509,8 @@ mod plan_spec_session_tests {
     use hipfire_runtime::spec::{PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator};
     use rdna_compute::Gpu;
 
-    /// Reuse points at 4096 and 8192 plus a live hit at 10000.
+    /// `Ar` reuse points at 4096 and 8192 plus a live hit at 10000; `Mtp`
+    /// keeps only the 4096 snapshot.
     struct Model {
         spec_reuse: bool,
     }
@@ -11523,12 +11532,12 @@ mod plan_spec_session_tests {
             None
         }
         fn session_plan_capped(&self, prompt: &[u32], route: SessionRoute, cap: usize) -> usize {
-            assert_eq!(route, SessionRoute::Ar, "the speculator's route is planned");
             let top = cap.min(prompt.len() - 1);
-            [10000, 8192, 4096]
-                .into_iter()
-                .find(|&p| p <= top)
-                .unwrap_or(0)
+            let points: &[usize] = match route {
+                SessionRoute::Ar => &[10000, 8192, 4096],
+                SessionRoute::Mtp => &[4096],
+            };
+            points.iter().copied().find(|&p| p <= top).unwrap_or(0)
         }
         fn spec_session_reuse(&self) -> bool {
             self.spec_reuse
@@ -11609,6 +11618,15 @@ mod plan_spec_session_tests {
         assert_eq!(
             plan_spec_session(&model, &spec(20_000), &prompt),
             Some((SessionRoute::Ar, 0))
+        );
+        // The speculator's own route is the one planned.
+        let mtp = Spec {
+            route: Some(SessionRoute::Mtp),
+            window: 0,
+        };
+        assert_eq!(
+            plan_spec_session(&model, &mtp, &prompt),
+            Some((SessionRoute::Mtp, 4096))
         );
     }
 

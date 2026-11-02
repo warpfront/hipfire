@@ -1633,6 +1633,17 @@ impl SpecTarget for Qwen4Bundle {
         self
     }
 
+    fn session_begin(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+        route: SessionRoute,
+    ) -> Result<bool, String> {
+        Qwen4Bundle::session_begin(self, gpu, prompt, reused, route).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.reset(gpu)
             .map_err(|error| format!("Qwen4 reset_recurrent: {error}"))
