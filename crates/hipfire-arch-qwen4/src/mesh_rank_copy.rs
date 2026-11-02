@@ -1116,6 +1116,7 @@ mod tests {
 
     fn plan() -> LanePlan {
         LanePlan {
+            wide_verify: false,
             key: key(),
             kind: LaneKind::Decode,
             position: 40,
@@ -1771,6 +1772,7 @@ mod tests {
         fn drive(&mut self, forced: Option<Vec<u32>>) -> Driven {
             let e = epoch(1);
             let req = LaneRequest {
+                wide_verify: false,
                 epoch: e,
                 remaining: 99,
                 context_left: 99,

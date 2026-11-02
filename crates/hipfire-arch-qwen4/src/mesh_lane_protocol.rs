@@ -490,6 +490,10 @@ pub struct LaneRequest {
     /// Forced control tokens (not proposals).
     pub forced: Option<Vec<u32>>,
     pub sampling: SamplingMode,
+    /// The lane may verify in the wide pass: unseeded sampled (a greedy lane, or a
+    /// lane whose request carries a seed, keeps the row-exact groups). Effective only
+    /// with `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY=1` (`lane_is_wide`).
+    pub wide_verify: bool,
 }
 
 /// The admitted per-step limits (the `LaneSpecBudget` slice the protocol
@@ -565,6 +569,8 @@ pub struct LanePlan {
     /// (a lagging head the window must draft from).
     pub catch_up: Option<CatchUp>,
     pub sampling: SamplingMode,
+    /// See [`LaneRequest::wide_verify`].
+    pub wide_verify: bool,
     pub eos: Option<u32>,
     pub remaining: usize,
     /// The drafts budget the floor observes.
@@ -760,6 +766,9 @@ pub struct VerifyLane {
     pub rows: Vec<u32>,
     /// Arm the per-lane capture ring (a window with more than one row).
     pub capture: bool,
+    /// The lane verifies in the wide pass (flag on and unseeded sampled, or the lab
+    /// all-lanes override): its rows pack into 32-row groups with other wide lanes.
+    pub wide: bool,
 }
 
 /// One packed once-over-all-rows group: consecutive whole lanes, at most
@@ -769,6 +778,9 @@ pub struct RowGroup {
     pub first_lane: usize,
     pub lanes: usize,
     pub rows: usize,
+    /// A wide-class group (up to `QWEN4_EP_GATHER_VERIFY_ROWS` rows); the row-exact
+    /// groups hold at most [`LANE_MAX_ROWS`].
+    pub wide: bool,
 }
 
 /// The expected per-rank operation ledger of a verify (counts only; no
@@ -784,6 +796,9 @@ pub struct OpLedger {
     pub microbatches: usize,
     /// Head Draft invocations over the step's draft rounds.
     pub head_draft_calls: usize,
+    /// Of `row_groups`, the wide-class groups (the ledger's greedy/seeded vs
+    /// unseeded-sampled split; `row_groups - wide_groups` are row-exact).
+    pub wide_groups: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -819,6 +834,38 @@ pub fn pack_row_groups(rows: &[usize], max_rows: usize) -> Vec<RowGroup> {
                 first_lane: lane,
                 lanes: 1,
                 rows: r,
+                wide: false,
+            }),
+        }
+    }
+    groups
+}
+
+/// [`pack_row_groups`] over lanes of two classes: consecutive whole lanes of the SAME
+/// class pack together, row-exact lanes up to [`LANE_MAX_ROWS`] rows and wide lanes up
+/// to [`crate::gpu_forward::QWEN4_EP_GATHER_VERIFY_ROWS`] (a lane wider than its cap
+/// is its own group). Classes never share a group, so a mixed step runs its greedy /
+/// seeded lanes row-exact and its unseeded sampled lanes wide, in lane order. With no
+/// wide lane this is exactly [`pack_row_groups`] at [`LANE_MAX_ROWS`].
+pub fn pack_classed_row_groups(rows: &[usize], wide: &[bool]) -> Vec<RowGroup> {
+    debug_assert_eq!(rows.len(), wide.len());
+    let mut groups: Vec<RowGroup> = Vec::new();
+    for (lane, (&r, &w)) in rows.iter().zip(wide).enumerate() {
+        let cap = if w {
+            crate::gpu_forward::QWEN4_EP_GATHER_VERIFY_ROWS
+        } else {
+            LANE_MAX_ROWS
+        };
+        match groups.last_mut() {
+            Some(g) if g.wide == w && g.rows + r <= cap => {
+                g.rows += r;
+                g.lanes += 1;
+            }
+            _ => groups.push(RowGroup {
+                first_lane: lane,
+                lanes: 1,
+                rows: r,
+                wide: w,
             }),
         }
     }
@@ -1067,6 +1114,8 @@ pub struct OpCounts {
     pub head_draft_calls: usize,
     pub head_append_rows: usize,
     pub row_groups: usize,
+    /// Of `row_groups`, the wide-class groups.
+    pub wide_groups: usize,
     pub edge_count: usize,
     pub edge_bytes: u64,
     pub drafts_generated: usize,
@@ -1191,6 +1240,12 @@ pub fn merge_evidence(
             return incoherent(format!(
                 "rank {} row groups {} != expected {}",
                 w.rank, c.row_groups, l.row_groups
+            ));
+        }
+        if c.wide_groups != l.wide_groups {
+            return incoherent(format!(
+                "rank {} wide row groups {} != expected {}",
+                w.rank, c.wide_groups, l.wide_groups
             ));
         }
         if c.target_exchanges != l.target_exchanges {
@@ -2080,6 +2135,7 @@ impl MeshRoot {
                 max_drafts = max_drafts.min(share.saturating_sub(1));
             }
             let mut plan = LanePlan {
+                wide_verify: r.wide_verify,
                 key,
                 kind: LaneKind::Decode,
                 position: lane.position,
@@ -2664,11 +2720,14 @@ impl MeshRoot {
                         .collect()
                 }
             };
+            let wide = !matches!(l.kind, LaneKind::Forced(_))
+                && crate::gpu_forward_lanes::lane_is_wide(l.wide_verify);
             lanes.push(VerifyLane {
                 key: l.key,
                 position: l.position,
                 capture: rows.len() > 1,
                 rows,
+                wide,
             });
         }
         let b = &s.start.budgets;
@@ -2685,7 +2744,8 @@ impl MeshRoot {
                 .iter()
                 .map(|l| l.rows.len())
                 .collect();
-            for mut g in pack_row_groups(&rows, LANE_MAX_ROWS) {
+            let wide: Vec<bool> = lanes[first..first + n].iter().map(|l| l.wide).collect();
+            for mut g in pack_classed_row_groups(&rows, &wide) {
                 g.first_lane += first;
                 groups.push(g);
             }
@@ -2694,6 +2754,7 @@ impl MeshRoot {
         }
         let ledger = OpLedger {
             row_groups: groups.len(),
+            wide_groups: groups.iter().filter(|g| g.wide).count(),
             target_exchanges: match self.world[0].kind {
                 MeshKind::Pp | MeshKind::Single => 0,
                 MeshKind::Ep if s.start.stage.moe_once => s.start.stage.moe_layers * groups.len(),
@@ -2713,10 +2774,14 @@ impl MeshRoot {
             d.lane_key(&l.key)
                 .usize(l.position)
                 .slice(&l.rows)
-                .bool(l.capture);
+                .bool(l.capture)
+                .bool(l.wide);
         }
         for g in &groups {
-            d.usize(g.first_lane).usize(g.lanes).usize(g.rows);
+            d.usize(g.first_lane)
+                .usize(g.lanes)
+                .usize(g.rows)
+                .bool(g.wide);
         }
         let plan = VerifyPlan {
             key: s.start.key.clone(),
@@ -2773,6 +2838,7 @@ impl MeshRoot {
                 ));
             }
             if r.ledger.row_groups != plan.ledger.row_groups
+                || r.ledger.wide_groups != plan.ledger.wide_groups
                 || r.ledger.target_exchanges != plan.ledger.target_exchanges
                 || r.ledger.microbatches != plan.ledger.microbatches
             {
@@ -4353,6 +4419,7 @@ pub(crate) mod scripted {
             }
             let c = self.counts.entry(plan.key.clone()).or_default();
             c.row_groups = plan.ledger.row_groups;
+            c.wide_groups = plan.ledger.wide_groups;
             c.target_exchanges = plan.ledger.target_exchanges;
             if own.kind == MeshKind::Pp {
                 // PP2: one boundary; F32 streams of width 10240.
@@ -4465,6 +4532,7 @@ mod tests {
 
     fn req(tag: u64, remaining: usize) -> LaneRequest {
         LaneRequest {
+            wide_verify: false,
             epoch: epoch(tag),
             remaining,
             context_left: 10_000,
@@ -4970,7 +5038,7 @@ mod tests {
         ] {
             assert_eq!(
                 pack_row_groups(&rows, LANE_MAX_ROWS).len(),
-                row_group_count(&rows),
+                row_group_count(&rows, &vec![false; rows.len()]),
                 "{rows:?}"
             );
         }
@@ -4982,6 +5050,110 @@ mod tests {
                 "d={d}"
             );
         }
+    }
+
+    /// Wide verify (flag on): unseeded sampled lanes pack into one wide group, greedy /
+    /// seeded lanes stay row-exact; a mixed step splits its groups by class in lane
+    /// order and the ledger and every rank's counts carry the same split. Flag off,
+    /// or no unseeded lane, is the plain 8-row packing with no wide group.
+    #[test]
+    fn mesh_lane_protocol_wide_verify_routes_by_seed_and_splits_the_ledger() {
+        use crate::gpu_forward_lanes::TEST_WIDE_VERIFY;
+        // lane tag -> unseeded sampled (wide-eligible)
+        let cases: [(&str, bool, [bool; 8], usize, usize); 5] = [
+            // flag, eligible per lane, expected (groups, wide groups)
+            ("off", false, [true; 8], 4, 0),
+            ("all unseeded sampled", true, [true; 8], 1, 1),
+            ("all greedy/seeded", true, [false; 8], 4, 0),
+            (
+                "mixed",
+                true,
+                [true, true, true, true, false, false, true, true],
+                3,
+                2,
+            ),
+            (
+                "alternating",
+                true,
+                [true, false, true, false, true, false, true, false],
+                8,
+                4,
+            ),
+        ];
+        for (name, flag, eligible, groups, wide_groups) in cases {
+            TEST_WIDE_VERIFY.with(|c| c.set(Some((flag, false))));
+            let mut m = Mesh::new(MeshKind::Ep, false);
+            let reqs: Vec<LaneRequest> = (1..=8u64)
+                .map(|t| {
+                    let mut r = req(t, 1000);
+                    r.wide_verify = eligible[t as usize - 1];
+                    r
+                })
+                .collect();
+            for t in 1..=8u64 {
+                m.admit(t, 100, 7, None, Some(3));
+                script_matching(&m, t, 0, 8);
+            }
+            let out = m
+                .run_greedy(&reqs, &budgets(LabRoutes::Batched, 3))
+                .unwrap();
+            assert_eq!(out.lanes.len(), 8, "{name}");
+            let (rows, packed) = m.ranks[0]
+                .calls
+                .iter()
+                .find_map(|c| match c {
+                    Call::Verify(_, rows, groups) => Some((rows.clone(), groups.clone())),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(rows.iter().all(|r| r.len() == 4), "{name}");
+            assert_eq!(packed.len(), groups, "{name}: groups");
+            assert_eq!(
+                packed.iter().filter(|g| g.wide).count(),
+                wide_groups,
+                "{name}: wide groups"
+            );
+            // classes never share a group; every group respects its cap
+            for g in &packed {
+                let cap = if g.wide { 32 } else { LANE_MAX_ROWS };
+                assert!(g.rows <= cap, "{name}: {g:?}");
+                let lanes = g.first_lane..g.first_lane + g.lanes;
+                let expect = flag && eligible[g.first_lane];
+                assert!(
+                    lanes.clone().all(|l| (flag && eligible[l]) == expect),
+                    "{name}"
+                );
+                assert_eq!(g.wide, expect, "{name}");
+            }
+            assert_eq!(packed.iter().map(|g| g.rows).sum::<usize>(), 32, "{name}");
+            let ev = m.evidence(&out.key);
+            for e in &ev {
+                assert_eq!(e.counts.row_groups, groups, "{name}");
+                assert_eq!(e.counts.wide_groups, wide_groups, "{name}");
+            }
+            TEST_WIDE_VERIFY.with(|c| c.set(None));
+        }
+        // The lab all-lanes override makes every lane wide even when greedy.
+        TEST_WIDE_VERIFY.with(|c| c.set(Some((true, true))));
+        let mut m = Mesh::new(MeshKind::Ep, false);
+        let reqs: Vec<LaneRequest> = (1..=8).map(|t| req(t, 1000)).collect();
+        for t in 1..=8u64 {
+            m.admit(t, 100, 7, None, Some(3));
+            script_matching(&m, t, 0, 8);
+        }
+        m.run_greedy(&reqs, &budgets(LabRoutes::Batched, 3))
+            .unwrap();
+        let packed = m.ranks[0]
+            .calls
+            .iter()
+            .find_map(|c| match c {
+                Call::Verify(_, _, groups) => Some(groups.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(packed.len(), 1);
+        assert!(packed[0].wide);
+        TEST_WIDE_VERIFY.with(|c| c.set(None));
     }
 
     #[test]

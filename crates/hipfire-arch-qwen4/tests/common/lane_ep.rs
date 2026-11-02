@@ -990,6 +990,9 @@ impl LaneSamplerSpec {
             top_k: self.top_k,
             min_p: self.min_p,
             seed,
+            // `HIPFIRE_SAMPLED_MTP_UNSEEDED=1`: the lane routes as an unseeded sampled
+            // request (wide-verify eligible); the RNG seed itself stays fixed.
+            seeded: std::env::var("HIPFIRE_SAMPLED_MTP_UNSEEDED").as_deref() != Ok("1"),
         }
     }
 }
@@ -2156,7 +2159,8 @@ mod tests {
                 top_p: 0.95,
                 top_k: Some(20),
                 min_p: Some(0.05),
-                seed: 42
+                seed: 42,
+                seeded: std::env::var("HIPFIRE_SAMPLED_MTP_UNSEEDED").as_deref() != Ok("1"),
             }
         );
         assert_eq!(

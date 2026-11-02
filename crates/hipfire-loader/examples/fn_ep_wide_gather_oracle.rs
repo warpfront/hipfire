@@ -22,6 +22,11 @@
 //! (host-mapped, per-call owner assignment) and resident layers are both
 //! covered and reported separately.
 //!
+//! `--closed-scope [--tol T]`: the wide arm runs the sampled wide pass (verify scope
+//! CLOSED: ordinary routes of its width, grouped expert-union MoE, grouped down
+//! unscattered for the EP gather) and is judged by closeness to the row-exact groups
+//! (worst per-row relative L2 of the MoE output <= T, default 5e-3), not byte equality.
+//!
 //! `--seeds 0` skips the byte oracle (soak-only job).
 //!
 //! `--soak-secs S`: peer-skew soak. Until the deadline, random layer, random row
@@ -57,6 +62,8 @@ struct Args {
     rows: Vec<usize>,
     seeds: usize,
     soak_secs: u64,
+    closed_scope: bool,
+    tol: f64,
     skew_ms: u64,
     hang_secs: u64,
     reserve_lanes: usize,
@@ -79,6 +86,8 @@ fn parse_args() -> R<Args> {
         rows: vec![9, 12, 16, 17, 24, 31, 32],
         seeds: 3,
         soak_secs: 0,
+        closed_scope: false,
+        tol: 5e-3,
         skew_ms: 40,
         hang_secs: 120,
         reserve_lanes: 8,
@@ -101,6 +110,8 @@ fn parse_args() -> R<Args> {
             }
             "--rows" => args.rows = parse_list(&value("--rows")?)?,
             "--seeds" => args.seeds = value("--seeds")?.parse().map_err(e)?,
+            "--closed-scope" => args.closed_scope = true,
+            "--tol" => args.tol = value("--tol")?.parse().map_err(e)?,
             "--soak-secs" => args.soak_secs = value("--soak-secs")?.parse().map_err(e)?,
             "--skew-ms" => args.skew_ms = value("--skew-ms")?.parse().map_err(e)?,
             "--hang-secs" => args.hang_secs = value("--hang-secs")?.parse().map_err(e)?,
@@ -144,6 +155,13 @@ impl Rng {
 fn input_rows(seed: u64, rows: usize, hidden: usize) -> Vec<f32> {
     let mut rng = Rng(seed | 1);
     (0..rows * hidden).map(|_| rng.normal()).collect()
+}
+
+fn f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn fnv(bytes: &[u8]) -> u64 {
@@ -329,6 +347,8 @@ fn run(args: Args) -> R<i32> {
     let mut balanced_cases = 0usize;
     let mut resident_cases = 0usize;
     let mut balanced_layers = Vec::new();
+    let (mut close_rows, mut close_sum, mut close_max, mut byte_equal_cases) =
+        (0usize, 0f64, 0f64, 0usize);
     for &layer in layers.iter().filter(|_| args.seeds > 0) {
         for &n in &args.rows {
             for seed_ix in 0..args.seeds {
@@ -337,13 +357,14 @@ fn run(args: Args) -> R<i32> {
                     ^ ((n as u64) << 16)
                     ^ seed_ix as u64;
                 let input = input_rows(seed, n, hidden);
+                let wide_scope = if args.closed_scope { 0 } else { n };
                 let ref_groups = groups_of_8(n);
                 let (reference, balanced) = bundle
                     .ep_moe_layer_probe(&mut gpu, layer, &input, &ref_groups, ordinal, 0, 0, 0)
                     .map_err(|x| format!("layer {layer} rows {n} ref: {x}"))?;
                 ordinal += ref_groups.len();
                 let (wide, _) = bundle
-                    .ep_moe_layer_probe(&mut gpu, layer, &input, &[n], ordinal, n, 0, 0)
+                    .ep_moe_layer_probe(&mut gpu, layer, &input, &[n], ordinal, wide_scope, 0, 0)
                     .map_err(|x| format!("layer {layer} rows {n} wide: {x}"))?;
                 ordinal += 1;
                 cases += 1;
@@ -355,7 +376,33 @@ fn run(args: Args) -> R<i32> {
                 } else {
                     resident_cases += 1;
                 }
-                if let Some(at) = first_diff(&reference, &wide) {
+                if args.closed_scope {
+                    // Closeness mode (sampled wide pass: ordinary routes, scope closed):
+                    // per-row relative L2 of the MoE output vs the row-exact groups.
+                    let (r, w) = (f32s(&reference), f32s(&wide));
+                    let mut worst = 0f64;
+                    for row in 0..n {
+                        let (a, b) = (&r[row * hidden..][..hidden], &w[row * hidden..][..hidden]);
+                        let num: f64 = a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum();
+                        let den: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum();
+                        worst = worst.max((num / den.max(1e-30)).sqrt());
+                    }
+                    close_rows += n;
+                    close_sum += worst;
+                    close_max = close_max.max(worst);
+                    if first_diff(&reference, &wide).is_none() {
+                        byte_equal_cases += 1;
+                    }
+                    if worst > args.tol || !worst.is_finite() {
+                        eprintln!(
+                            "FAR layer {layer} rows {n} seed {seed_ix} balanced {balanced}: worst row rel L2 {worst:.3e}"
+                        );
+                        mismatches.push(json!({
+                            "layer": layer, "rows": n, "seed": seed_ix, "balanced": balanced,
+                            "worst_row_rel_l2": worst,
+                        }));
+                    }
+                } else if let Some(at) = first_diff(&reference, &wide) {
                     eprintln!(
                         "MISMATCH layer {layer} rows {n} seed {seed_ix} balanced {balanced}: first byte {at}"
                     );
@@ -376,6 +423,12 @@ fn run(args: Args) -> R<i32> {
     let oracle_ran = args.seeds > 0;
     report["oracle"] = json!({
         "ran": oracle_ran,
+        "closed_scope": args.closed_scope,
+        "tol": args.tol,
+        "closeness_worst_row_rel_l2_mean_over_cases": if cases > 0 { close_sum / cases as f64 } else { 0.0 },
+        "closeness_worst_row_rel_l2_max": close_max,
+        "closeness_rows": close_rows,
+        "byte_equal_cases": byte_equal_cases,
         "layers": layers.len(),
         "rows": args.rows,
         "seeds": args.seeds,

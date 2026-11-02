@@ -451,7 +451,25 @@ pub(crate) fn writes_slot_ordered_rows(
     !is_fp8(p)
         && p.expert_stage_ptrs.is_none()
         && !sym_iu4(gpu, p, use_path2)
-        && (!use_path2 || indexed_down(gpu, p, use_path2))
+        && (!use_path2
+            || indexed_down(gpu, p, use_path2)
+            || ep_grouped_down_unscatter(gpu, p, use_path2))
+}
+
+/// An EP row-gathered call whose routed down is the plain grouped F32 down
+/// (`HIPFIRE_QWEN4_WIDE_GROUPED_DOWN` at 9..=limit rows): its grouped rows are
+/// restored to canonical flat slot order in `down_expanded`
+/// (`moe_down_unscatter_k8`, copies every live slot) right after the down, so the
+/// peer gather and the slot-order combine read the layout the indexed down writes.
+/// Never on the symmetric IU4 or F16 WMMA downs (they keep BF16 grouped rows).
+fn ep_grouped_down_unscatter(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    p.ep_row_gather.is_some()
+        && use_path2
+        && !is_fp8(p)
+        && p.expert_stage_ptrs.is_none()
+        && !sym_iu4(gpu, p, use_path2)
+        && !down_wmma(gpu, p)
+        && !indexed_down(gpu, p, use_path2)
 }
 
 /// Prepare the routed expert activation basis.  The route's router/shared
@@ -2510,6 +2528,15 @@ fn down_stage(
             total_slots,
             p.n_exp,
         ))?;
+        if p.ep_row_gather.is_some() && ep_grouped_down_unscatter(gpu, p, true) {
+            hip(gpu.moe_down_unscatter_k8(
+                p.y_down_grouped,
+                p.inverse_perm,
+                p.down_expanded,
+                p.down_m,
+                total_slots,
+            ))?;
+        }
         // A BF16-source recipe rounds each grouped expert output before
         // weighted combination, just as on the scalar route.  The grouped
         // combine kernel performs that same RNE rounding on every row it
@@ -2597,7 +2624,20 @@ fn combine_stage(
     if indexed_down(gpu, p, use_path2) {
         return combine_stage(gpu, p, false, grouped_rows, false);
     }
-    if use_path2 && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2)) {
+    if use_path2 && ep_grouped_down_unscatter(gpu, p, use_path2) {
+        // The grouped down was unscattered to slot order for the EP gather: the
+        // canonical top-10 slot-order combine reads it.
+        let expanded = f32_view(p.down_expanded, 0, p.batch_size * p.k_top * p.down_m);
+        hip(gpu.moe_down_combine_top10_batched(
+            &expanded,
+            p.topk_indices,
+            p.topk_weights,
+            target,
+            p.down_m,
+            p.batch_size,
+            p.n_exp,
+        ))?;
+    } else if use_path2 && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2)) {
         // Both downs store BF16 grouped rows. The rank order goes to
         // `down_expanded`: unused on this route until the shared down, which
         // runs after the combine.

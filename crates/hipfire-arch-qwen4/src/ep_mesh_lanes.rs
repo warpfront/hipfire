@@ -170,6 +170,7 @@ struct ExecStep {
     catch_up_rows: usize,
     verify: Option<VerifyPlan>,
     row_groups: usize,
+    wide_groups: usize,
     totals: Option<(usize, usize, usize, usize)>,
     completed: StepPhase,
     unpriced: bool,
@@ -805,6 +806,7 @@ impl RankLane<'_> {
                     rows.push(LaneRows {
                         state: &mut lane.state,
                         tokens: &v.rows,
+                        wide: v.wide,
                         kind: if v.rows.len() == 1 {
                             LaneRowKind::Ar
                         } else {
@@ -973,6 +975,7 @@ fn rank_counts(step: &ExecStep, rank_head: bool) -> OpCounts {
         head_draft_calls: if rank_head { step.head_calls } else { 0 },
         head_append_rows: if rank_head { totals.3 } else { 0 },
         row_groups: step.row_groups,
+        wide_groups: step.wide_groups,
         edge_count: 0,
         edge_bytes: 0,
         drafts_generated: totals.0,
@@ -1054,6 +1057,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             catch_up_rows: 0,
             verify: None,
             row_groups: 0,
+            wide_groups: 0,
             totals: None,
             completed: StepPhase::Armed,
             unpriced,
@@ -1163,7 +1167,9 @@ impl LaneMeshExecutor for RankLane<'_> {
         };
         step.verify_us += t0.elapsed().as_secs_f64() * 1e6;
         step.verify_tally = tally;
-        step.row_groups = row_group_count(&row_counts);
+        let wide: Vec<bool> = plan.lanes.iter().map(|l| l.wide).collect();
+        step.row_groups = row_group_count(&row_counts, &wide);
+        step.wide_groups = plan.groups.iter().filter(|g| g.wide).count();
         step.completed = StepPhase::Verified;
         step.verify = Some(plan.clone());
         let mut first = 0usize;
@@ -1191,6 +1197,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             .collect();
         result.ledger = OpLedger {
             row_groups: self.exec.step.as_ref().map_or(0, |s| s.row_groups),
+            wide_groups: self.exec.step.as_ref().map_or(0, |s| s.wide_groups),
             target_exchanges: tally.trunk as usize,
             microbatches: 0,
             head_draft_calls: plan.ledger.head_draft_calls,

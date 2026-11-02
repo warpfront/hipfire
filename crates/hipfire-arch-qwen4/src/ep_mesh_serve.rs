@@ -36,6 +36,14 @@ use std::time::{Duration, Instant};
 /// The root-side sampler configuration of a sampled serve lane: the lane's
 /// AR sampler (temperature, top-p, top-k, min-p) with neutral penalties, the
 /// only kind a batch-sampled lane carries.
+/// Whether a lane may verify in the wide pass: only an UNSEEDED SAMPLED lane. A greedy
+/// lane (no sampling) and a sampled lane whose request carried an explicit seed keep
+/// the row-exact groups, so they reproduce across batch compositions
+/// (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` still gates the wide pass itself).
+pub(crate) fn lane_wide_eligible(sampling: Option<&LaneSampling>) -> bool {
+    sampling.is_some_and(|s| !s.seeded)
+}
+
 fn sampler_config(sampling: &LaneSampling) -> SpecRequestConfig {
     SpecRequestConfig {
         temp: sampling.temperature,
@@ -340,6 +348,8 @@ impl Qwen4Bundle {
             seeds.push(seed);
             retired_before.push(mesh.root().lane_retired(request.epoch).unwrap_or(false));
             lane_requests.push(LaneRequest {
+                // Unseeded sampled lanes may verify in the wide pass.
+                wide_verify: lane_wide_eligible(sampling.as_ref()),
                 epoch: request.epoch,
                 remaining: request.tokens_left.max(1),
                 context_left,
@@ -429,5 +439,30 @@ impl Qwen4Bundle {
             });
         }
         Ok((decoded, facts))
+    }
+}
+
+#[cfg(test)]
+mod wide_route_tests {
+    use super::*;
+
+    fn sampling(seeded: bool) -> LaneSampling {
+        LaneSampling {
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: None,
+            min_p: None,
+            seed: 12345,
+            seeded,
+        }
+    }
+
+    /// Greedy and seeded sampled requests land on the row-exact route; only an
+    /// unseeded sampled request is wide-eligible.
+    #[test]
+    fn seeded_and_greedy_lanes_are_row_exact_unseeded_sampled_is_wide() {
+        assert!(!lane_wide_eligible(None));
+        assert!(!lane_wide_eligible(Some(&sampling(true))));
+        assert!(lane_wide_eligible(Some(&sampling(false))));
     }
 }

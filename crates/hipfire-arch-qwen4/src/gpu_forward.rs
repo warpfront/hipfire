@@ -2589,10 +2589,10 @@ pub const QWEN4_EP_WIDE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_WIDE_VERIFY";
 /// The rows one gathered EP call may carry on this process: 8 by default, 32
 /// with [`QWEN4_EP_WIDE_VERIFY_ENV`]. Every rank reads the same process snapshot.
 pub fn qwen4_ep_gather_rows() -> usize {
-    ep_gather_rows(hipfire_config::developer_bool(
-        QWEN4_EP_WIDE_VERIFY_ENV,
-        false,
-    ))
+    ep_gather_rows(
+        hipfire_config::developer_bool(QWEN4_EP_WIDE_VERIFY_ENV, false)
+            || hipfire_config::qwen4_ep_sampled_wide_verify(),
+    )
 }
 
 /// [`qwen4_ep_gather_rows`] for an explicit flag value.

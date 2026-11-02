@@ -2194,6 +2194,9 @@ fn merged_json(m: &hipfire_arch_qwen4::mesh_lane_protocol::MergedCostEvidence) -
         "consumed_rows": m.counts.consumed_rows,
         "wall_us": m.wall_us,
         "critical_path_us": m.critical_path_us,
+        "draft_us": m.draft_us,
+        "verify_us": m.verify_us,
+        "prepare_us": m.prepare_us,
         "synchronized": m.synchronized,
         "priced": m.priced,
         "unpriced_reason": m.unpriced_reason,
@@ -2338,6 +2341,8 @@ fn drive_mtp_inner(
     let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
     let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
     let mut prefill_timing = PrefillTiming::default();
+    let (mut ev_verify, mut ev_draft, mut ev_groups): (Vec<f64>, Vec<f64>, Vec<f64>) =
+        (Vec::new(), Vec::new(), Vec::new());
     let (mut ev_wall, mut ev_crit, mut ev_ex, mut ev_head, mut ev_bytes, mut ev_priced) = (
         Vec::new(),
         Vec::new(),
@@ -2461,6 +2466,7 @@ fn drive_mtp_inner(
                 .lane_position(lane.epoch)
                 .ok_or_else(|| format!("lane {i}: the root lost its position"))?;
             requests.push(LaneRequest {
+                wide_verify: false,
                 epoch: lane.epoch,
                 remaining: cfg.tokens - lane.committed.len(),
                 context_left: max_seq.saturating_sub(position),
@@ -2505,6 +2511,9 @@ fn drive_mtp_inner(
         if let Some(prior) = mesh.last_evidence() {
             ev_wall.push(prior.wall_us);
             ev_crit.push(prior.critical_path_us);
+            ev_verify.push(prior.verify_us);
+            ev_draft.push(prior.draft_us);
+            ev_groups.push(prior.counts.row_groups as f64);
             ev_ex.push(prior.counts.target_exchanges as f64);
             ev_head.push(prior.counts.head_draft_calls as f64);
             ev_bytes.push(prior.counts.gather_bytes as f64);
@@ -2547,6 +2556,9 @@ fn drive_mtp_inner(
         "evidence_priced_steps": ev_priced.iter().filter(|p| **p).count(),
         "step_wall_us_median": median(&mut ev_wall.clone()),
         "step_critical_path_us_median": median(&mut ev_crit.clone()),
+        "verify_us_median": median(&mut ev_verify.clone()),
+        "draft_us_median": median(&mut ev_draft.clone()),
+        "row_groups_median": median(&mut ev_groups.clone()),
         "target_exchanges_median": median(&mut ev_ex.clone()),
         "head_draft_calls_median": median(&mut ev_head.clone()),
         "gather_bytes_median": median(&mut ev_bytes.clone()),

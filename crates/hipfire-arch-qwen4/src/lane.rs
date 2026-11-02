@@ -917,6 +917,10 @@ pub struct LaneSampling {
     /// The singleton's request seed (`request_seed_for`); the lane RNG starts
     /// where `reset_cpu_sampler_rng(seed)` leaves the sampler state (0 -> 1).
     pub seed: u32,
+    /// The request carried an explicit seed (the wire `seed`). A seeded sampled lane
+    /// verifies row-exact (reproducible across batch compositions); an unseeded one
+    /// may take the wide verify pass (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`).
+    pub seeded: bool,
 }
 
 impl LaneSampling {
@@ -4207,6 +4211,7 @@ mod lane_sampling_tests {
             min_p: [None, Some(0.05f32)][(case as usize / 9) % 2],
             // Seed 0 is the `reset_cpu_sampler_rng` 0 -> 1 mapping.
             seed: case.wrapping_mul(7919),
+            seeded: true,
         }
     }
 

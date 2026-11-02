@@ -1372,6 +1372,7 @@ pub fn drive_qwen4_lane_batch(
                         top_k: s.top_k,
                         min_p: s.min_p,
                         seed: request_seed_for(&key, req.client_seed),
+                        seeded: req.client_seed.is_some(),
                     };
                     if let Err(error) = Owner::of(m, gpu)?.set_sampling(&epoch, sampling) {
                         release_epoch(m, &epoch)?;

@@ -4677,6 +4677,31 @@ pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarErr
     process_value(name).ok_or(std::env::VarError::NotPresent)
 }
 
+/// `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` (developer, default off): EP lane verify of
+/// UNSEEDED SAMPLED lanes in one wide pass of up to 32 rows instead of
+/// `ceil(rows / 8)` row-exact groups. Greedy lanes and lanes with an explicit request
+/// seed keep the row-exact 8-row groups (a mixed step runs both kinds as separate
+/// groups). The wide group runs the ordinary prefill-class routes at its width (the
+/// verify scope stays closed: no row-exact twins, grouped expert-union MoE, never IU4
+/// on verify rows); its rows are distribution-equivalent, not byte-equal, to the
+/// row-exact ones, so a sampled request's output is reproducible across batch
+/// compositions only when it carries a seed. Implies the 32-row EP gather capacity
+/// (`HIPFIRE_QWEN4_EP_WIDE_VERIFY`).
+pub const QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY";
+
+/// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] read through the process snapshot.
+pub fn qwen4_ep_sampled_wide_verify() -> bool {
+    developer_bool(QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV, false)
+}
+
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` (lab, default off): with
+/// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] on, treat every lane (greedy and seeded
+/// included) as wide-class. For oracles that measure the wide pass with greedy
+/// prompts; never for serving.
+pub fn qwen4_ep_wide_verify_all_lanes() -> bool {
+    developer_bool("HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES", false)
+}
+
 pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
     process_value(name).map(Into::into)
 }

@@ -102,6 +102,7 @@ use crate::gpu_forward::{
     program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4GpuForward, Qwen4GpuForwardError,
     Qwen4GpuForwardScratch, ScratchField, DECODE_Q8_PER_LAYER, EPSILON,
 };
+use crate::mesh_lane_protocol::pack_classed_row_groups;
 use crate::ple_stage::ple_async_upload;
 use crate::program::{
     execute_final_hyper, execute_lm_head, seal_moe_for_layer, validate_final_hyper,
@@ -973,6 +974,9 @@ pub struct LaneRows<'a> {
     pub state: &'a mut Qwen4State,
     pub tokens: &'a [u32],
     pub kind: LaneRowKind,
+    /// The lane verifies in the wide pass (see [`lane_is_wide`]); `false` for AR-only
+    /// steps' exact rows and every prefill lane.
+    pub wide: bool,
 }
 
 /// The step's outputs; row `r` belongs to the lanes concatenated in order.
@@ -1095,10 +1099,57 @@ fn group_segments(rows: &[usize], max_rows: usize) -> Vec<Segment> {
 }
 
 /// The once-over-all-rows groups a step of decode lanes with these per-lane
-/// row counts runs ([`StageShare::OnceAllRows`] stages launch once per
-/// group).
-pub(crate) fn row_group_count(rows: &[usize]) -> usize {
-    group_segments(rows, LANE_MAX_ROWS).len()
+/// row counts and wide-verify classes runs ([`StageShare::OnceAllRows`] stages
+/// launch once per group). The mesh protocol's `seal_verify` packs with the same
+/// rule ([`pack_classed_row_groups`]), so the sealed ledger and the executed group
+/// count agree.
+pub(crate) fn row_group_count(rows: &[usize], wide: &[bool]) -> usize {
+    pack_classed_row_groups(rows, wide).len()
+}
+
+/// Whether a lane verifies in the wide pass: `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY=1`
+/// and the lane is an unseeded sampled lane (`plan_wide`, from the request), or the
+/// lab all-lanes override is set.
+pub fn lane_is_wide(plan_wide: bool) -> bool {
+    #[cfg(test)]
+    if let Some((flag, all_lanes)) = TEST_WIDE_VERIFY.with(|cell| cell.get()) {
+        return lane_is_wide_for(flag, all_lanes, plan_wide);
+    }
+    lane_is_wide_for(
+        hipfire_config::qwen4_ep_sampled_wide_verify(),
+        hipfire_config::qwen4_ep_wide_verify_all_lanes(),
+        plan_wide,
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only `(flag, all_lanes)` override of the process flags [`lane_is_wide`] reads.
+    pub(crate) static TEST_WIDE_VERIFY: std::cell::Cell<Option<(bool, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`lane_is_wide`] with the flag values given.
+pub const fn lane_is_wide_for(flag: bool, all_lanes: bool, plan_wide: bool) -> bool {
+    flag && (plan_wide || all_lanes)
+}
+
+/// The decode groups of a step as GPU segments: [`pack_classed_row_groups`] with each
+/// group's first row and first lane.
+fn classed_segments(rows: &[usize], wide: &[bool]) -> Vec<Segment> {
+    let mut begin = 0;
+    pack_classed_row_groups(rows, wide)
+        .into_iter()
+        .map(|group| {
+            let segment = Segment {
+                begin,
+                rows: group.rows,
+                first_lane: group.first_lane,
+            };
+            begin += group.rows;
+            segment
+        })
+        .collect()
 }
 
 /// Widest all-rows HC op: the wide-verify row bound every HC kernel arm admits
@@ -1666,6 +1717,9 @@ fn forward_lanes_with(
     // kernels (`HIPFIRE_FN_LANE_PM_ROWS`, column-identical to the 1-row
     // incumbents); every other forward keeps the incumbents.
     let rows_scope = std::mem::replace(&mut gpu.lane_rows_scope, true);
+    // A wide-class group (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`) runs with the
+    // verify scope CLOSED: its rows take the ordinary routes of their width
+    // (grouped expert-union MoE, prefill-class dense), never the row-exact twins.
     let result = forward_lanes_scoped(gpu, &mut forward, bundle, lanes, out, policy);
     gpu.lane_rows_scope = rows_scope;
     gpu.qwen4_scope = scope;
@@ -1732,6 +1786,7 @@ fn forward_wave_with(
             state: &mut *lane.state,
             tokens: lane.tokens,
             kind: LaneRowKind::Prefill,
+            wide: false,
         })
         .collect();
     let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
@@ -1854,6 +1909,11 @@ fn forward_lanes_scoped(
     // An automatic-default D2 split executes only on a non-prefill lane step.
     fwd.ensure_cpu_splice_eager(gpu, !out.prefill())?;
     let cpu_splice = fwd.has_cpu_deferred_experts();
+    if cpu_splice && !out.prefill() && lanes.iter().any(|lane| lane.wide) {
+        return Err(invalid(
+            "wide sampled verify cannot combine with the CPU routed-expert window",
+        ));
+    }
     policy.validate().map_err(invalid)?;
     if lanes.is_empty() {
         return Err(invalid("a lane step needs at least one lane"));
@@ -2059,14 +2119,12 @@ fn forward_lanes_scoped(
             first_lane: 0,
         }]
     } else {
-        group_segments(
-            &rows,
-            if cpu_splice {
-                crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
-            } else {
-                LANE_MAX_ROWS
-            },
-        )
+        if cpu_splice {
+            group_segments(&rows, crate::program::QWEN4_CPU_SPLICE_MAX_ROWS)
+        } else {
+            let wide: Vec<bool> = lanes.iter().map(|lane| lane.wide).collect();
+            classed_segments(&rows, &wide)
+        }
     };
     let widest = group_segs.iter().map(|seg| seg.rows).max().unwrap_or(1);
     let bf16_state = if prefill {
@@ -4744,6 +4802,71 @@ mod tests {
         );
         assert!(fallback_stages(&resolution).contains(&StageName::Argmax));
         assert!(!resolution.receipts.contains(&"R5"));
+    }
+
+    /// Wide-class groups: flag off, or no wide lane, is exactly the 8-row packing; a
+    /// wide run packs to 32 rows; classes never share a group; the GPU segments and
+    /// the protocol's groups agree on every shape.
+    #[test]
+    fn classed_groups_pack_by_class_and_match_the_protocol() {
+        assert!(!lane_is_wide_for(false, false, true));
+        assert!(!lane_is_wide_for(true, false, false));
+        assert!(lane_is_wide_for(true, false, true));
+        assert!(lane_is_wide_for(true, true, false));
+        assert!(!lane_is_wide_for(false, true, true));
+        let shapes: Vec<Vec<usize>> = vec![
+            vec![4; 8],
+            vec![4; 9],
+            vec![2, 3, 4, 5, 6, 7, 8, 1],
+            vec![1; 8],
+            vec![4, 4, 4, 4, 4, 4, 4, 4, 4],
+            vec![3; 11],
+            vec![8; 5],
+        ];
+        for rows in &shapes {
+            // no wide lane: identical to the plain 8-row grouping
+            let none = vec![false; rows.len()];
+            let plain = group_segments(rows, LANE_MAX_ROWS);
+            let classed = classed_segments(rows, &none);
+            assert_eq!(plain.len(), classed.len(), "{rows:?}");
+            for (a, b) in plain.iter().zip(&classed) {
+                assert_eq!(
+                    (a.begin, a.rows, a.first_lane),
+                    (b.begin, b.rows, b.first_lane)
+                );
+            }
+            // all wide: 32-row packing
+            let all = vec![true; rows.len()];
+            let wide = classed_segments(rows, &all);
+            assert_eq!(wide.len(), group_segments(rows, 32).len(), "{rows:?}");
+            assert_eq!(
+                wide.iter().map(|g| g.rows).sum::<usize>(),
+                rows.iter().sum::<usize>()
+            );
+            assert_eq!(row_group_count(rows, &all), wide.len());
+        }
+        // 8 lanes x 4 rows: four exact groups, one wide group
+        assert_eq!(row_group_count(&[4; 8], &[false; 8]), 4);
+        assert_eq!(row_group_count(&[4; 8], &[true; 8]), 1);
+        // a mixed step: classes are separate groups, in lane order
+        let rows = [4usize; 8];
+        let wide = [true, true, true, true, false, false, true, true];
+        let groups = crate::mesh_lane_protocol::pack_classed_row_groups(&rows, &wide);
+        let shape: Vec<(usize, usize, usize, bool)> = groups
+            .iter()
+            .map(|g| (g.first_lane, g.lanes, g.rows, g.wide))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(0, 4, 16, true), (4, 2, 8, false), (6, 2, 8, true)]
+        );
+        let seg = classed_segments(&rows, &wide);
+        assert_eq!(
+            seg.iter()
+                .map(|g| (g.begin, g.rows, g.first_lane))
+                .collect::<Vec<_>>(),
+            vec![(0, 16, 0), (16, 8, 4), (24, 8, 6)]
+        );
     }
 
     #[test]

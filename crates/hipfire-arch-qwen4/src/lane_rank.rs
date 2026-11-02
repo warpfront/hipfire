@@ -99,6 +99,7 @@ pub(crate) struct LaneFlight {
     naive: Vec<Option<GreedyAccept>>,
     /// Row groups the forward executed.
     row_groups: usize,
+    wide_groups: usize,
     /// Owed plus retained head rows the rank appended (the session's
     /// accounting of the decision).
     head_append_rows: usize,
@@ -345,6 +346,7 @@ impl LocalLaneRank<'_> {
                 rows.push(LaneRows {
                     state: &mut lane.state,
                     tokens: &vl.rows,
+                    wide: vl.wide,
                     kind: if vl.rows.len() == 1 {
                         LaneRowKind::Ar
                     } else {
@@ -421,7 +423,8 @@ impl LocalLaneRank<'_> {
             naive.push(window);
             first += rows;
         }
-        Ok((picks, naive, row_group_count(&dec_rows)))
+        let wide: Vec<bool> = plan.lanes.iter().map(|l| l.wide).collect();
+        Ok((picks, naive, row_group_count(&dec_rows, &wide)))
     }
 }
 
@@ -456,6 +459,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                 picks: Vec::new(),
                 naive: Vec::new(),
                 row_groups: 0,
+                wide_groups: 0,
                 head_append_rows: 0,
                 catch_up_rows: 0,
                 decision: None,
@@ -716,6 +720,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         flight.picks = picks;
         flight.naive = naive;
         flight.row_groups = row_groups;
+        flight.wide_groups = plan.groups.iter().filter(|g| g.wide).count();
         Ok(result)
     }
 
@@ -860,6 +865,7 @@ impl LaneFlight {
             head_draft_calls: self.head_calls,
             head_append_rows,
             row_groups: self.row_groups,
+            wide_groups: self.wide_groups,
             edge_count: 0,
             edge_bytes: 0,
             drafts_generated: decision.lanes.iter().map(|d| d.source.offered).sum(),
@@ -963,6 +969,7 @@ fn plan_and_draft_with(
             // positions remain at least).
             let left = forced.as_ref().map_or(0, Vec::len).max(budget + 1);
             LaneRequest {
+                wide_verify: false,
                 epoch,
                 remaining: left,
                 context_left: left,
@@ -1167,6 +1174,7 @@ mod tests {
 
         fn request(tag: u64, budget: usize) -> LaneRequest {
             LaneRequest {
+                wide_verify: false,
                 epoch: epoch(tag),
                 remaining: budget + 1,
                 context_left: budget + 1,
@@ -1285,7 +1293,7 @@ mod tests {
             let verify_windows = windows.iter().filter(|w| !w.2.drafts.is_empty()).count();
             let verified: usize = windows.iter().map(|w| w.2.drafts.len()).sum();
             let decode_lanes = windows.len();
-            let spill = row_group_count(&dec_rows).saturating_sub(1);
+            let spill = row_group_count(&dec_rows, &vec![false; dec_rows.len()]).saturating_sub(1);
             let spill_per_window = spill as f64 / verify_windows.max(1) as f64;
             if !prefill_ran {
                 self.cost.observe(decode_lanes, spill, verified, wall_us);

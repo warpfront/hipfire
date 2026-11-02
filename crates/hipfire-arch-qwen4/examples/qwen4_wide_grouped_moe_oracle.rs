@@ -98,7 +98,8 @@ impl Rng {
 }
 
 fn pool_row(seed: u64, idx: usize, k: usize) -> Vec<f32> {
-    let mut rng = Rng(seed ^ (idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ ((k as u64) << 32) | 1);
+    let mut rng =
+        Rng(seed ^ (idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ ((k as u64) << 32) | 1);
     let amp = AMPS[idx % AMPS.len()];
     (0..k)
         .map(|c| match (idx + c) % 97 {
@@ -132,10 +133,7 @@ fn row_set_sizes(rng: &mut Rng, count: usize) -> Vec<usize> {
 }
 
 fn groups8(rows: usize) -> Vec<(usize, usize)> {
-    (0..rows)
-        .step_by(8)
-        .map(|s| (s, 8.min(rows - s)))
-        .collect()
+    (0..rows).step_by(8).map(|s| (s, 8.min(rows - s))).collect()
 }
 
 fn bf16_to_f32(b: [u8; 2]) -> f32 {
@@ -367,7 +365,14 @@ fn indexed_chain(gpu: &mut Gpu, w: &LayerW, n: usize, io: &Io<'_>) -> Res<()> {
     let gate = nan_tensor(gpu, total * MI)?;
     let up = nan_tensor(gpu, total * MI)?;
     he(gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
-        &w.gu_ptrs, io.topk, io.x, &gate, &up, 2 * MI, HIDDEN, n,
+        &w.gu_ptrs,
+        io.topk,
+        io.x,
+        &gate,
+        &up,
+        2 * MI,
+        HIDDEN,
+        n,
     ))?;
     he(gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(&gate, &up, io.rot, MI, total, None))?;
     down_call(gpu, w, io, n)?;
@@ -378,7 +383,13 @@ fn indexed_chain(gpu: &mut Gpu, w: &LayerW, n: usize, io: &Io<'_>) -> Res<()> {
 
 /// The grouped (expert-unioned) gate/up route of the <=8-row call, then either the
 /// per-slot indexed down (`grouped_down == false`) or the grouped down + grouped combine.
-fn grouped_chain_with(gpu: &mut Gpu, w: &LayerW, n: usize, io: &Io<'_>, grouped_down: bool) -> Res<()> {
+fn grouped_chain_with(
+    gpu: &mut Gpu,
+    w: &LayerW,
+    n: usize,
+    io: &Io<'_>,
+    grouped_down: bool,
+) -> Res<()> {
     let total = n * K_TOP;
     let gr = grouped_rows_bound(total);
     let counts = zero_raw(gpu, N_EXP * 4)?;
@@ -387,9 +398,20 @@ fn grouped_chain_with(gpu: &mut Gpu, w: &LayerW, n: usize, io: &Io<'_>, grouped_
     let tiles = zero_raw(gpu, (gr / BLOCK_M) * 4)?;
     let inverse = zero_raw(gpu, total * 4)?;
     let y = he(gpu.upload_f32(&vec![0f32; gr * 2 * MI], &[gr * 2 * MI]))?;
-    he(gpu.moe_scatter_fused_top10(io.topk, &counts, &offsets, &sorted, &tiles, &inverse, total, N_EXP, gr, BLOCK_M))?;
+    he(gpu.moe_scatter_fused_top10(
+        io.topk, &counts, &offsets, &sorted, &tiles, &inverse, total, N_EXP, gr, BLOCK_M,
+    ))?;
     he(gpu.gemm_mq4g256v2_moe_grouped_top10(
-        &w.gu_ptrs, &tiles, &sorted, io.x, &y, 2 * MI, HIDDEN, K_TOP, gr, n,
+        &w.gu_ptrs,
+        &tiles,
+        &sorted,
+        io.x,
+        &y,
+        2 * MI,
+        HIDDEN,
+        K_TOP,
+        gr,
+        n,
     ))?;
     he(gpu.moe_gate_up_unscatter_silu_rotate128_top10(&y, &sorted, io.rot, MI, gr, true, None))?;
     let mut extra = Vec::new();
@@ -411,7 +433,8 @@ fn grouped_chain_with(gpu: &mut Gpu, w: &LayerW, n: usize, io: &Io<'_>, grouped_
         let mut rows = vec![0f32; total * HIDDEN];
         for slot in 0..total {
             let g = i32::from_le_bytes(inv[slot * 4..slot * 4 + 4].try_into().unwrap()) as usize;
-            rows[slot * HIDDEN..(slot + 1) * HIDDEN].copy_from_slice(&ydh[g * HIDDEN..(g + 1) * HIDDEN]);
+            rows[slot * HIDDEN..(slot + 1) * HIDDEN]
+                .copy_from_slice(&ydh[g * HIDDEN..(g + 1) * HIDDEN]);
         }
         he(gpu.hip.memcpy_htod(&io.out.buf, bytemuck_f32(&rows)))?;
         extra.push(yd);
@@ -419,7 +442,10 @@ fn grouped_chain_with(gpu: &mut Gpu, w: &LayerW, n: usize, io: &Io<'_>, grouped_
         down_call(gpu, w, io, n)?;
         combine_per_slot(gpu, io, n)?;
     }
-    for t in [counts, offsets, sorted, tiles, inverse, y].into_iter().chain(extra) {
+    for t in [counts, offsets, sorted, tiles, inverse, y]
+        .into_iter()
+        .chain(extra)
+    {
         he(gpu.free_tensor(t))?;
     }
     Ok(())
@@ -474,8 +500,12 @@ fn run_groups(
         let xv = x.sub_offset(first * HIDDEN, cnt * HIDDEN);
         let tv = topk.sub_offset(first * K_TOP * 4, cnt * K_TOP * 4);
         let wv = wts.sub_offset(first * K_TOP, cnt * K_TOP);
-        let rv = o.rot.sub_offset(GUARD + first * K_TOP * MI, cnt * K_TOP * MI);
-        let ov = o.out.sub_offset(GUARD + first * K_TOP * HIDDEN, cnt * K_TOP * HIDDEN);
+        let rv = o
+            .rot
+            .sub_offset(GUARD + first * K_TOP * MI, cnt * K_TOP * MI);
+        let ov = o
+            .out
+            .sub_offset(GUARD + first * K_TOP * HIDDEN, cnt * K_TOP * HIDDEN);
         let cv = o.comb.sub_offset(GUARD + first * HIDDEN, cnt * HIDDEN);
         let io = Io {
             x: &xv,
@@ -512,7 +542,11 @@ struct Fetched {
 }
 
 fn fetch_outs(gpu: &Gpu, o: &Outs, n: usize) -> Res<Fetched> {
-    let (r, d, c) = (fetch(gpu, &o.rot)?, fetch(gpu, &o.out)?, fetch(gpu, &o.comb)?);
+    let (r, d, c) = (
+        fetch(gpu, &o.rot)?,
+        fetch(gpu, &o.out)?,
+        fetch(gpu, &o.comb)?,
+    );
     let mut guard_bad = 0;
     if !guards_clean(&r, GUARD, n * K_TOP * MI) {
         guard_bad += 1;
@@ -572,7 +606,11 @@ fn run() -> Res<i32> {
         .value("--layers")
         .unwrap_or("0,20,47")
         .split(',')
-        .map(|s| s.trim().parse::<usize>().map_err(|e| format!("--layers: {e}")))
+        .map(|s| {
+            s.trim()
+                .parse::<usize>()
+                .map_err(|e| format!("--layers: {e}"))
+        })
         .collect::<Res<_>>()?;
     let row_sets: usize = args
         .value("--row-sets")
@@ -618,11 +656,18 @@ fn run() -> Res<i32> {
         let (w, router) = load_layer(&mut gpu, &hfq, layer)?;
         let routes_pool = route_pool(&router, &pool);
         let weights_pool = weight_pool(&router, &pool, &routes_pool);
-        println!("layer {layer}: experts uploaded, router applied to {} pool rows", pool.len());
+        println!(
+            "layer {layer}: experts uploaded, router applied to {} pool rows",
+            pool.len()
+        );
         for (set_id, (&n, pick)) in sizes.iter().zip(&picks).enumerate() {
             let host_x: Vec<f32> = pick.iter().flat_map(|&i| pool[i].iter().copied()).collect();
             let routes: Vec<[i32; K_TOP]> = pick.iter().map(|&i| routes_pool[i]).collect();
-            let topk_bytes: Vec<u8> = routes.iter().flatten().flat_map(|e| e.to_le_bytes()).collect();
+            let topk_bytes: Vec<u8> = routes
+                .iter()
+                .flatten()
+                .flat_map(|e| e.to_le_bytes())
+                .collect();
             let resid: Vec<f32> = host_x.iter().map(|v| v * 0.5).collect();
             let host_w: Vec<f32> = pick.iter().flat_map(|&i| weights_pool[i]).collect();
             let wts = he(gpu.upload_f32(&host_w, &[host_w.len()]))?;
@@ -674,11 +719,23 @@ fn run() -> Res<i32> {
             let _ = failed;
             {
                 let pairs: [(&'static str, &str, &str); 8] = [
-                    ("grouped_down_vs_grouped_wide", "grouped_down", "grouped_wide"),
-                    ("grouped_down_vs_indexed_wide", "grouped_down", "indexed_wide"),
+                    (
+                        "grouped_down_vs_grouped_wide",
+                        "grouped_down",
+                        "grouped_wide",
+                    ),
+                    (
+                        "grouped_down_vs_indexed_wide",
+                        "grouped_down",
+                        "indexed_wide",
+                    ),
                     ("grouped_down_vs_groups8", "grouped_down", "groups8"),
                     ("grouped_down_vs_single", "grouped_down", "single"),
-                    ("grouped_wide_vs_indexed_wide", "grouped_wide", "indexed_wide"),
+                    (
+                        "grouped_wide_vs_indexed_wide",
+                        "grouped_wide",
+                        "indexed_wide",
+                    ),
                     ("grouped_wide_vs_groups8", "grouped_wide", "groups8"),
                     ("grouped_wide_vs_single", "grouped_wide", "single"),
                     ("indexed_wide_vs_groups8", "indexed_wide", "groups8"),
@@ -739,8 +796,7 @@ fn run() -> Res<i32> {
         }
         let calls = st.calls.max(1) as f64;
         let mb = |reads: usize| reads as f64 / calls * GU_BYTES as f64 / 1e6;
-        per.entry(format!("L{layer}"))
-            .or_insert_with(|| json!({}))[n.to_string()] = json!({
+        per.entry(format!("L{layer}")).or_insert_with(|| json!({}))[n.to_string()] = json!({
             "calls": st.calls,
             "pairs": st.pairs.iter().map(|(k, v)| (k.to_string(), json!({
                 "mismatch_bytes_rot": v[0], "mismatch_bytes_down": v[1], "mismatch_bytes_combine": v[5], "mismatch_rows_combine": v[6],
@@ -789,12 +845,21 @@ fn run() -> Res<i32> {
         "layers_detail": per,
     });
     if let Some(out) = args.value("--out") {
-        std::fs::write(out, serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("write {out}: {e}"))?;
+        std::fs::write(
+            out,
+            serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("write {out}: {e}"))?;
     }
-    println!("SUMMARY row_sets={} launch_errors={total_err} mismatching_bytes_or_guards={total_bad}", sizes.len());
+    println!(
+        "SUMMARY row_sets={} launch_errors={total_err} mismatching_bytes_or_guards={total_bad}",
+        sizes.len()
+    );
     for (k, v) in &by_pair {
-        println!("  pair {k}: rot bytes {} down bytes {} combine bytes {} guard {}", v[0], v[1], v[5], v[4]);
+        println!(
+            "  pair {k}: rot bytes {} down bytes {} combine bytes {} guard {}",
+            v[0], v[1], v[5], v[4]
+        );
     }
     for (r, s) in &symbols {
         println!("  route {r} symbols {s:?}");
@@ -842,7 +907,9 @@ mod tests {
     #[test]
     fn census_unions_across_the_call_not_per_tile() {
         // 9 rows all routing to experts 0..10: one distinct set.
-        let rows: Vec<[i32; K_TOP]> = (0..9).map(|_| route([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])).collect();
+        let rows: Vec<[i32; K_TOP]> = (0..9)
+            .map(|_| route([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]))
+            .collect();
         let c = read_census(&rows);
         assert_eq!(c.distinct, 10);
         assert_eq!(c.indexed, 90);

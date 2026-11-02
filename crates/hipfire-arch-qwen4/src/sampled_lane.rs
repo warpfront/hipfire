@@ -755,6 +755,7 @@ mod tests {
         eos: Option<u32>,
     ) -> LanePlan {
         LanePlan {
+            wide_verify: false,
             key: key(tag, 0),
             kind: LaneKind::Decode,
             position: 10,
@@ -1788,6 +1789,7 @@ mod tests {
             let reqs: Vec<LaneRequest> = lanes
                 .iter()
                 .map(|&(t, mode)| LaneRequest {
+                    wide_verify: false,
                     epoch: epoch(t),
                     remaining: 1_000_000,
                     context_left: 1_000_000,
@@ -1995,6 +1997,7 @@ mod tests {
                 head_lag_rows: 4,
             };
             let reqs = [LaneRequest {
+                wide_verify: false,
                 epoch: epoch(1),
                 remaining: 1_000_000,
                 context_left: 1_000_000,

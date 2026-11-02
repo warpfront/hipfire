@@ -42,6 +42,7 @@ fn budgets(lab: LabRoutes, k: usize) -> WindowBudgets {
 
 fn req(tag: u64, remaining: usize) -> LaneRequest {
     LaneRequest {
+        wide_verify: false,
         epoch: epoch(tag),
         remaining,
         context_left: 10_000,
@@ -974,6 +975,7 @@ impl MeshFanout for SampledFan {
 
 fn sampled_req(tag: u64) -> LaneRequest {
     LaneRequest {
+        wide_verify: false,
         sampling: SamplingMode::Leviathan,
         ..req(tag, 64)
     }
