@@ -219,21 +219,51 @@ pub fn provision(
             marker_path(spec).display()
         ));
     }
-    let outcome = run(spec, binary, timeout);
-    match &outcome {
-        Ok(_) => {
+    match run(spec, binary, timeout) {
+        Ok(done) => {
             let _ = fs::remove_file(marker_path(spec));
+            Ok(done)
         }
-        Err(reason) => record_refusal(spec, &fp, reason),
+        Err(f) => {
+            if f.persist {
+                record_refusal(spec, &fp, &f.reason);
+            }
+            Err(f.reason)
+        }
     }
-    outcome
+}
+
+/// A failed run. `persist` is `false` for a refusal a retry can fix: the
+/// subcommand named modules with no hot cache entry (the process had not
+/// compiled them yet), so a later process (whose cache then differs, or whose
+/// run loaded more) must try again instead of reading a stale refusal.
+struct Failure {
+    reason: String,
+    persist: bool,
+}
+
+impl From<String> for Failure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            persist: true,
+        }
+    }
+}
+
+/// The report lists modules the program needs that have no hot cache entry.
+fn names_missing_entries(report: &Option<serde_json::Value>) -> bool {
+    report
+        .as_ref()
+        .and_then(|v| v.get("missing")?.as_array())
+        .is_some_and(|m| !m.is_empty())
 }
 
 fn run(
     spec: &ProvisionSpec,
     binary: Option<&Path>,
     timeout: Duration,
-) -> Result<Provisioned, String> {
+) -> Result<Provisioned, Failure> {
     let binary = binary.ok_or_else(|| {
         format!("{BINARY} not found beside the executable, in $HIPFIRE_HOME/bin or on PATH")
     })?;
@@ -277,10 +307,11 @@ fn run(
                 return Err(format!(
                     "{BINARY} from-cache did not finish within {} s and was killed",
                     timeout.as_secs()
-                ));
+                )
+                .into());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(format!("waiting for {BINARY}: {e}")),
+            Err(e) => return Err(format!("waiting for {BINARY}: {e}").into()),
         }
     };
     let text = fs::read_to_string(&log_path).unwrap_or_default();
@@ -302,10 +333,10 @@ fn run(
         let code = status
             .code()
             .map_or("killed by a signal".to_owned(), |c| format!("exit {c}"));
-        return Err(format!(
-            "{BINARY} from-cache {code}: {}",
-            reason("no report")
-        ));
+        return Err(Failure {
+            reason: format!("{BINARY} from-cache {code}: {}", reason("no report")),
+            persist: !names_missing_entries(&report),
+        });
     }
     let ok = report
         .as_ref()
@@ -315,14 +346,16 @@ fn run(
         return Err(format!(
             "{BINARY} from-cache exited 0 without an ok report: {}",
             reason("no report")
-        ));
+        )
+        .into());
     }
     if !spec.out_dir.join(railgun_corpus::CORPUS_INDEX).is_file() {
         return Err(format!(
             "{BINARY} from-cache reported ok but {} holds no {}",
             spec.out_dir.display(),
             railgun_corpus::CORPUS_INDEX
-        ));
+        )
+        .into());
     }
     Ok(Provisioned {
         out_dir: spec.out_dir.clone(),
