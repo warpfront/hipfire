@@ -21,7 +21,7 @@
 
 use crate::config::{Lfm3Config, MixerKind};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, source_bytes_to_f32_vec};
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
@@ -203,7 +203,12 @@ pub struct Lfm3LayerWeights {
 }
 
 pub struct Lfm3Weights {
-    pub embed: GpuTensor, // model.embed_tokens.weight (raw, for embedding_lookup)
+    pub embed: GpuTensor, // model.embed_tokens.weight (raw, for embedding lookup)
+    /// Storage format of `embed`; selects the per-token embedding-lookup kernel.
+    /// The HFQ path ships Q8_0, but a safetensors/Dir source is F16/BF16 — which
+    /// must be widened to an F32 gather table (a Q8 kernel would misread the
+    /// F16/BF16 bytes as Q8 blocks and emit word salad). Mirrors lfm2moe.
+    pub embed_format: EmbeddingFormat,
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
     pub lm_head: WeightTensor, // tied = embed_tokens (loaded as a weight tensor)
     pub layers: Vec<Lfm3LayerWeights>,
@@ -298,10 +303,37 @@ impl Lfm3Weights {
         let sandwich = cfg.use_sandwich_norm;
 
         // Globals. embed_tokens is the shared (tied) lm_head.
-        let (_eqt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
-        let embed = gpu
-            .upload_raw(&embed_bytes, &[embed_bytes.len()])
-            .map_err(|e| format!("lfm3: upload embed: {e:?}"))?;
+        let (eqt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
+        let (embed_format, embed) = match eqt {
+            3 => {
+                let buf = gpu
+                    .upload_raw(&embed_bytes, &[embed_bytes.len()])
+                    .map_err(|e| format!("lfm3: upload embed: {e:?}"))?;
+                (EmbeddingFormat::Q8_0, buf)
+            }
+            6 => {
+                let buf = gpu
+                    .upload_raw(&embed_bytes, &[embed_bytes.len()])
+                    .map_err(|e| format!("lfm3: upload embed: {e:?}"))?;
+                (EmbeddingFormat::HFQ4G256, buf)
+            }
+            1 => {
+                // F16 embedding → widen to an F32 gather table.
+                let f32_data: Vec<f32> = embed_bytes
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let buf = gpu
+                    .upload_f32(&f32_data, &[cfg.vocab_size, hidden])
+                    .map_err(|e| format!("lfm3: upload embed F32: {e:?}"))?;
+                (EmbeddingFormat::F32, buf)
+            }
+            other => {
+                return Err(format!(
+                    "lfm3: unsupported embedding quant_type {other} (expected 1,3,6)"
+                ))
+            }
+        };
         let embedding_norm = load_f32(hfq, gpu, "model.embedding_norm.weight", &[hidden])?;
         let lm_head = load_wt(hfq, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
 
@@ -403,6 +435,7 @@ impl Lfm3Weights {
         let _ = (conv_state_count, kv_count);
         Ok(Lfm3Weights {
             embed,
+            embed_format,
             embedding_norm,
             lm_head,
             layers,
@@ -568,16 +601,46 @@ pub fn load_weights_from_source(
     let sandwich = cfg.use_sandwich_norm;
 
     let (eqt, edt, embed_bytes) = read_tensor_from_source(source, "model.embed_tokens.weight")?;
-    let embed_converted: Vec<u8>;
-    let embed_bytes: &[u8] = if eqt == 1 && edt == "BF16" {
-        embed_converted = bf16_bytes_to_f16(embed_bytes);
-        &embed_converted
-    } else {
-        embed_bytes
+    let (embed_format, embed) = match eqt {
+        3 => {
+            let buf = gpu
+                .upload_raw(embed_bytes, &[embed_bytes.len()])
+                .map_err(|e| format!("lfm3: upload embed: {e:?}"))?;
+            (EmbeddingFormat::Q8_0, buf)
+        }
+        6 => {
+            let buf = gpu
+                .upload_raw(embed_bytes, &[embed_bytes.len()])
+                .map_err(|e| format!("lfm3: upload embed: {e:?}"))?;
+            (EmbeddingFormat::HFQ4G256, buf)
+        }
+        1 | 16 => {
+            // F16/BF16 embedding → widen to an F32 gather table. `edt`
+            // distinguishes F16 from BF16 (qt==1 covers both); the F32 table
+            // routes through `embedding_lookup`'s D2D copy, not the Q8 kernel.
+            let f32_data: Vec<f32> = source_bytes_to_f32_vec(edt, embed_bytes);
+            let expected = cfg
+                .vocab_size
+                .checked_mul(hidden)
+                .ok_or_else(|| "lfm3: embedding vocab*hidden overflow".to_string())?;
+            if f32_data.len() != expected {
+                return Err(format!(
+                    "lfm3: embedding F32 count {} != vocab*hidden {}",
+                    f32_data.len(),
+                    expected
+                ));
+            }
+            let buf = gpu
+                .upload_f32(&f32_data, &[cfg.vocab_size, hidden])
+                .map_err(|e| format!("lfm3: upload embed F32: {e:?}"))?;
+            (EmbeddingFormat::F32, buf)
+        }
+        other => {
+            return Err(format!(
+                "lfm3: unsupported embedding quant_type {other} (expected 1,3,6,16)"
+            ))
+        }
     };
-    let embed = gpu
-        .upload_raw(embed_bytes, &[embed_bytes.len()])
-        .map_err(|e| format!("lfm3: upload embed: {e:?}"))?;
     let embedding_norm =
         load_f32_from_source(source, gpu, "model.embedding_norm.weight", &[hidden])?;
     let lm_head = load_wt_from_source(source, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
@@ -743,6 +806,7 @@ pub fn load_weights_from_source(
     let _ = (conv_state_count, kv_count);
     Ok(Lfm3Weights {
         embed,
+        embed_format,
         embedding_norm,
         lm_head,
         layers,
