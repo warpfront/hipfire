@@ -469,9 +469,10 @@ impl RaonBundle {
         let chunk = self.prefill_step_rows();
         let n_chunks = tokens.len().div_ceil(chunk);
         for (ci, piece) in tokens.chunks(chunk).enumerate() {
+            drain_decode_stream(gpu)?;
             self.forward_chunk(gpu, piece, ci + 1 == n_chunks)?;
         }
-        Ok(())
+        drain_decode_stream(gpu)
     }
 
     /// Attach the session cache: [`session_prefill`](Self::session_prefill)
@@ -558,6 +559,10 @@ impl RaonBundle {
     ///
     /// The driver runs without live continuation, so every resume point is a
     /// position of the cold chunk grid and the result equals a cold prefill's.
+    ///
+    /// Returns with the decode stream drained (see [`drain_decode_stream`]), so
+    /// the caller's logits readback, whichever stream it uses, has nothing in
+    /// flight to wait on.
     pub fn session_prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -609,6 +614,7 @@ impl RaonBundle {
             let stop = boundary.unwrap_or(len).min(len);
             for piece in prompt[pos..stop].chunks(step) {
                 pos += piece.len();
+                drain_decode_stream(gpu)?;
                 self.forward_chunk(gpu, piece, pos == len)?;
                 hipfire_runtime::prefill_progress::report(pos, len);
             }
@@ -619,7 +625,7 @@ impl RaonBundle {
                 .unwrap_or(Ok(()))?;
             }
         }
-        Ok(())
+        drain_decode_stream(gpu)
     }
 
     /// One decode step: consume `token`, leave its logits in
@@ -1066,4 +1072,32 @@ impl RaonBundle {
         }
         weights.free_gpu(gpu);
     }
+}
+
+/// Block the host until everything enqueued on the decode stream (the device's
+/// [`Gpu::active_stream`]) has executed; a no-op while there is none (every
+/// launch is then on the legacy stream and the blocking copies that follow
+/// order themselves).
+///
+/// [`RaonBundle::prefill`] and [`RaonBundle::session_prefill`] call it before
+/// every chunk and once more at the end. Each chunk's first host step is a
+/// stream-ordered token upload that the host waits for, and the request path
+/// ends in a blocking prompt-logits copy on the legacy null stream. Issued
+/// while earlier work is still running on the decode stream (the state reset
+/// before the first chunk, the previous chunk, the last chunk), either copy
+/// makes the runtime park a cross-queue dependency on its own queue until the
+/// decode queue finishes, and with HIP's default 4 hardware queues a fresh
+/// R9700 process whose queues cross runs the in-flight kernels 7% slower
+/// while that dependency is parked (pp4096 8,560 vs 9,180 tok/s;
+/// `GPU_MAX_HW_QUEUES=1` has no crossing and never shows it). The host waits
+/// for the same work either way, so draining first costs nothing and leaves
+/// the copy nothing to park on; no work moves to another queue.
+fn drain_decode_stream(gpu: &Gpu) -> Result<(), String> {
+    let Some(stream) = gpu.active_stream.as_ref() else {
+        return Ok(());
+    };
+    gpu.bind_thread()
+        .and_then(|()| gpu.hip.stream_synchronize(stream))
+        .and_then(|()| gpu.take_device_wait_error())
+        .map_err(|e| format!("raon1_mini: drain decode stream after prefill: {e:?}"))
 }
