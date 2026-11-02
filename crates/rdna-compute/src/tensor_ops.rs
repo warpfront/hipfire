@@ -1200,12 +1200,40 @@ pub fn gated_delta_q8_inline_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> 
     gpu.flags.qwen4_gdn_q8_inline_enabled() && gated_delta_q8_inline_geometry(gpu, p)
 }
 
+/// Shape part of [`gated_delta_conv_qknorm_geometry`]: the kernel hard-codes 16 key heads of
+/// 128 (its first 16 channel blocks are the 32 q|k heads, remapped to one head per wave), so the
+/// TP2 trunk shard's rank-local 8 key / 24 value heads (5120 channels) never take it and fall
+/// back to the plain convolution + separate Q/K-norm launches; q|k|v channel order,
+/// `channels % 256 == 0`, K=4 with a 3-row ring, and a BF16 convolution output.
+#[allow(clippy::too_many_arguments)]
+fn conv_qknorm_shape_admits(
+    key_heads: usize,
+    key_dim: usize,
+    qkv_width: usize,
+    step_rows: usize,
+    conv_channels: usize,
+    conv_rows: usize,
+    history_rows: usize,
+    kernel_size: usize,
+    output_bf16: bool,
+) -> bool {
+    key_heads == 16
+        && key_dim == 128
+        && qkv_width == conv_channels
+        && conv_rows == step_rows
+        && conv_channels >= 4096
+        && conv_channels % 256 == 0
+        && history_rows == 3
+        && kernel_size == 4
+        && output_bf16
+}
+
 /// Whether H5's convolution that also writes the normalized Q/K
 /// (`gated_delta_conv_qknorm_bf16_f32_batched_k4`) can run this chunk, flag
 /// aside: exact gfx1151 wave32 on the chunked route (so never a recorder, a
 /// graph capture or the persistent gfx1201/gfx1100-persistent route), 16 key
 /// heads of 128 in q|k|v channel order, `channels % 256 == 0`, K=4 with a
-/// 3-row ring, and a BF16 convolution output.
+/// 3-row ring, and a BF16 convolution output ([`conv_qknorm_shape_admits`]).
 pub fn gated_delta_conv_qknorm_geometry(
     gpu: &Gpu,
     step: &GatedDeltaStepBatched<'_>,
@@ -1214,15 +1242,17 @@ pub fn gated_delta_conv_qknorm_geometry(
     gpu.arch_caps.is_gfx1151()
         && gpu.arch_caps.has_wmma_w32()
         && gated_delta_chunk_route(gpu, step)
-        && step.key_heads == 16
-        && step.key_dim == 128
-        && step.qkv_width == conv.channels
-        && conv.rows == step.rows
-        && conv.channels >= 4096
-        && conv.channels % 256 == 0
-        && conv.history_rows == 3
-        && conv.kernel_size == 4
-        && conv.output.dtype == DType::BF16
+        && conv_qknorm_shape_admits(
+            step.key_heads,
+            step.key_dim,
+            step.qkv_width,
+            step.rows,
+            conv.channels,
+            conv.rows,
+            conv.history_rows,
+            conv.kernel_size,
+            conv.output.dtype == DType::BF16,
+        )
 }
 
 /// [`gated_delta_conv_qknorm_geometry`] under
@@ -11763,6 +11793,135 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The H5 convolution + Q/K-norm kernel hard-codes 16 key heads of 128: its 16 / 48 shape
+    /// (10240 channels) is admitted as before, the TP2 trunk shard's rank-local 8 / 24 shape
+    /// (5120 channels, still >= 4096 and a multiple of 256) is refused so it runs the plain
+    /// convolution + separate Q/K-norm launches.
+    #[test]
+    fn conv_qknorm_shape_pins_sixteen_key_heads_and_the_shard_shape_declines() {
+        // (key heads, key dim, step qkv width, step rows, conv channels, conv rows, history rows,
+        //  kernel size, BF16 output)
+        assert!(conv_qknorm_shape_admits(
+            16, 128, 10240, 4096, 10240, 4096, 3, 4, true
+        ));
+        assert!(!conv_qknorm_shape_admits(
+            8, 128, 5120, 4096, 5120, 4096, 3, 4, true
+        ));
+        for (channels, key_heads) in [(8192usize, 16usize), (10240, 8), (10240, 32), (4096, 16)] {
+            let admitted = key_heads == 16;
+            assert_eq!(
+                conv_qknorm_shape_admits(key_heads, 128, channels, 64, channels, 64, 3, 4, true),
+                admitted,
+                "{key_heads} key heads, {channels} channels"
+            );
+        }
+        // Every other precondition still gates the 16-head shape.
+        for (qkv, rows_conv, history, kernel, bf16) in [
+            (10112usize, 4096usize, 3usize, 4usize, true),
+            (10240, 4095, 3, 4, true),
+            (10240, 4096, 2, 4, true),
+            (10240, 4096, 3, 5, true),
+            (10240, 4096, 3, 4, false),
+        ] {
+            assert!(
+                !conv_qknorm_shape_admits(
+                    16, 128, qkv, 4096, 10240, rows_conv, history, kernel, bf16
+                ),
+                "{qkv} {rows_conv} {history} {kernel} {bf16}"
+            );
+        }
+    }
+
+    /// The GDN recurrent state follows the value-head count: the rank-local 24-head slot of every
+    /// format (F32, Q8, Q8Ef plus its live F16 residual) is exactly half the 48-head one, and the
+    /// strict state descriptor check accepts the 24-head tensors and refuses them as 48-head.
+    #[test]
+    fn gdn_state_slots_halve_for_the_shard_and_the_descriptor_check_follows_the_head_count() {
+        for (format, bytes48, residual48) in [
+            (GdnStateFormat::F32, 48 * 128 * 128 * 4, 0),
+            (GdnStateFormat::Q8, 48 * 128 * (128 + 4), 0),
+            (
+                GdnStateFormat::Q8Ef,
+                48 * 128 * (128 + 4),
+                48 * 128 * 128 * 2,
+            ),
+        ] {
+            assert_eq!(format.state_bytes(48, 128, 128), bytes48, "{format:?}");
+            assert_eq!(format.state_bytes(24, 128, 128) * 2, bytes48, "{format:?}");
+            assert_eq!(
+                format.residual_bytes(48, 128, 128),
+                residual48,
+                "{format:?}"
+            );
+            assert_eq!(
+                format.residual_bytes(24, 128, 128) * 2,
+                residual48,
+                "{format:?}"
+            );
+        }
+        assert_eq!(GdnStateFormat::Q8.state_bytes(48, 128, 128), 811_008);
+        assert_eq!(GdnStateFormat::Q8.state_bytes(24, 128, 128), 405_504);
+        let tensor = |storage: &mut Vec<u8>, numel: usize, dtype: DType| GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(storage.as_mut_ptr().cast(), storage.len())
+            },
+            shape: vec![numel],
+            dtype,
+        };
+        let slot_bytes = GdnStateFormat::Q8.state_bytes(24, 128, 128);
+        let ring_bytes = 8 * slot_bytes;
+        let mut slot = vec![0u8; slot_bytes];
+        let mut residual = vec![0u8; GdnStateFormat::Q8Ef.residual_bytes(24, 128, 128)];
+        let mut ring = vec![0u8; ring_bytes];
+        let state = tensor(&mut slot, slot_bytes, DType::Raw);
+        let ef = tensor(&mut residual, 24 * 128 * 128, DType::F16);
+        let row_states = tensor(&mut ring, ring_bytes, DType::Raw);
+        // 24 value heads: Q8 and Q8Ef (with and without the verify ring) are admitted ...
+        assert!(
+            validate_gdn_state(GdnStateFormat::Q8, &state, None, None, 1, 24, 128, 128).is_ok()
+        );
+        assert!(validate_gdn_state(
+            GdnStateFormat::Q8Ef,
+            &state,
+            Some(&ef),
+            Some(&row_states),
+            8,
+            24,
+            128,
+            128
+        )
+        .is_ok());
+        // ... a ring too short for the rows asked, or a 48-head claim over 24-head tensors, is not.
+        assert!(validate_gdn_state(
+            GdnStateFormat::Q8,
+            &state,
+            None,
+            Some(&row_states),
+            9,
+            24,
+            128,
+            128
+        )
+        .is_err());
+        assert!(
+            validate_gdn_state(GdnStateFormat::Q8, &state, None, None, 1, 48, 128, 128).is_err()
+        );
+        assert!(validate_gdn_state(
+            GdnStateFormat::Q8Ef,
+            &state,
+            Some(&ef),
+            None,
+            1,
+            48,
+            128,
+            128
+        )
+        .is_err());
+        // The fused step + gated norm's optional head-pair rotation counts value_heads / 2 pairs
+        // against the 256 arrival counters: 12 for the shard, 24 for Flash-Next.
+        assert!(24 / 2 <= GDN_PAIR_COUNTERS && 48 / 2 <= GDN_PAIR_COUNTERS);
     }
 
     #[test]

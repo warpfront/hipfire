@@ -56,7 +56,15 @@ pub const TRUNK_SHARD_ROUTE_READY: bool = false;
 
 /// Whether the developer switch asks for the shard (`1`/`true`/`on`) and the route exists.
 pub fn trunk_shard_requested() -> bool {
-    TRUNK_SHARD_ROUTE_READY && trunk_shard_env_set()
+    requested_given(TRUNK_SHARD_ROUTE_READY, trunk_shard_env_set())
+}
+
+/// [`trunk_shard_requested`] with both inputs passed in: the route's readiness and the raw
+/// switch. The CPU tests of the load path drive every `*_for(requested)` helper below with
+/// `requested_given(true, true)` instead of flipping the inert const or the process
+/// environment.
+pub const fn requested_given(route_ready: bool, env_set: bool) -> bool {
+    route_ready && env_set
 }
 
 /// The raw environment switch (what a user asked for, regardless of route readiness).
@@ -70,21 +78,64 @@ pub fn trunk_shard_env_set() -> bool {
     )
 }
 
+/// Whether the native MTP head stays loaded (replicated, on the GLOBAL config) under the
+/// shard. It does not yet: the first route is AR-only, so the load drops the head. THE one
+/// decision for it: artifact admission ([`crate::artifact`]), the profile
+/// ([`Qwen4Config::into_headless`]), the manifest and every spec/lane gate follow from the
+/// head-free config it yields; the later MTP-under-shard slice flips this and relaxes
+/// [`Qwen4Config::trunk_shard_local`]'s head refusal.
+pub const fn trunk_shard_keeps_mtp() -> bool {
+    false
+}
+
+/// Whether a load drops the native MTP head because the shard asks for it.
+pub fn trunk_shard_drops_mtp_head() -> bool {
+    drops_head_for(trunk_shard_requested())
+}
+
+/// [`trunk_shard_drops_mtp_head`] for an explicit `requested`.
+pub const fn drops_head_for(requested: bool) -> bool {
+    requested && !trunk_shard_keeps_mtp()
+}
+
 /// The census view of the shard for a `ranks`-way EP load: `Some` when the switch is on and
-/// the load is two-rank (the only shard width), else `None` (unchanged census).
+/// the load is two-rank (the only shard width), else `None` (unchanged census). `config` is
+/// the GLOBAL config (the census sizes the whole tensors the shard cuts).
 pub fn census_trunk(config: &Qwen4Config, ranks: usize) -> Option<(TrunkDims, QsaMode)> {
-    (ranks == 2 && trunk_shard_requested())
-        .then(|| (TrunkDims::from_config(config), QsaMode::GroupInterleaved))
+    census_trunk_for(trunk_shard_requested(), config, ranks)
+}
+
+/// [`census_trunk`] for an explicit `requested`.
+pub fn census_trunk_for(
+    requested: bool,
+    config: &Qwen4Config,
+    ranks: usize,
+) -> Option<(TrunkDims, QsaMode)> {
+    (ranks == 2 && requested).then(|| {
+        // A rank-local config would halve the dims twice: always cut from the global one.
+        let global = config.replica_geometry();
+        (TrunkDims::from_config(&global), QsaMode::GroupInterleaved)
+    })
 }
 
 /// The rank-local config a two-rank EP load of rank `placement.rank` runs under when the
 /// shard is on (`Ok(None)` when it is off). Refused loudly when the switch is on but the
-/// load is not two-rank EP or the profile carries the native MTP head.
+/// load is not two-rank EP or the config still carries the native MTP head (artifact
+/// admission drops it under the switch, [`trunk_shard_drops_mtp_head`]).
 pub fn load_local_config(
     config: &Qwen4Config,
     placement: Option<Qwen4EpPlacement>,
 ) -> Result<Option<Qwen4Config>, String> {
-    if !trunk_shard_requested() {
+    load_local_config_for(trunk_shard_requested(), config, placement)
+}
+
+/// [`load_local_config`] for an explicit `requested`.
+pub fn load_local_config_for(
+    requested: bool,
+    config: &Qwen4Config,
+    placement: Option<Qwen4EpPlacement>,
+) -> Result<Option<Qwen4Config>, String> {
+    if !requested {
         return Ok(None);
     }
     let placement = placement

@@ -575,7 +575,7 @@ pub fn qwen4_forward_scratch_mode(
         source_symmetric,
         source_slab,
         ple_key_value_bf16,
-        flash_next_profile: matches!(config.profile, crate::config::Qwen4Profile::FlashNext),
+        flash_next_profile: config.profile.is_packed_flash_next(),
     }
     .mode()
 }
@@ -1509,12 +1509,6 @@ pub(crate) fn layer_desc<'a>(
                 routed_experts: moe,
                 router: moe.router.dispatch_ref(),
                 shared,
-                intermediate: moe
-                    .experts
-                    .first()
-                    .map(|expert| expert.gate_up.m)
-                    .unwrap_or_default()
-                    / 2,
                 experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
                 expert_gate_up_dtypes: moe
                     .slab
@@ -3497,12 +3491,45 @@ fn ep_lever_on(value: Option<&str>) -> bool {
     value != Some("0")
 }
 
+/// Whether the owner-routed chunk MoE is on for an EP load: its lever (default on, exact `0`
+/// off) and NOT the trunk-shard route, whose FFN of every forward is this rank's partial
+/// reduced by the fused all-reduce of its HC write. The owner-routed tile exchange completes
+/// the routed FFN on every rank, so it cannot ride that route (it would double the routed
+/// half in the reduction); with the shard on it is never admitted, installed or lowered.
+fn ep_owner_routed_prefill_on(value: Option<&str>, trunk_shard: bool) -> bool {
+    ep_lever_on(value) && !trunk_shard
+}
+
 fn qwen4_ep_owner_routed_prefill_enabled() -> bool {
-    ep_lever_on(
+    ep_owner_routed_prefill_on(
         hipfire_config::developer_var(QWEN4_EP_OWNER_ROUTED_PREFILL_ENV)
             .ok()
             .as_deref(),
+        crate::weights::trunk_shard::trunk_shard_requested(),
     )
+}
+
+/// Whether an EP rank runs a COMPACT-table chunk route on every layer (and so may build the
+/// G2 expert stage, whose donor overwrites no peer reads): the admitted owner-routed tile
+/// route, or the trunk-shard partial chunk route (the rank's own compact table, non-owned
+/// experts the zero dummy, no peer expert read).
+fn ep_stage_chunk_route(tile_admitted: bool, trunk_shard: bool) -> bool {
+    tile_admitted || trunk_shard
+}
+
+/// The symmetric-IU4 verdict the compact chunk tables take under the trunk-shard partial
+/// chunk route: the one per MoE layer taken on the full tables (same experts, same bytes), or
+/// `None` when the counts disagree (nothing is adopted, the compact layers keep the F16 route).
+fn partial_route_symmetric(full: &[bool], compact_layers: usize) -> Option<Vec<bool>> {
+    (full.len() == compact_layers).then(|| full.to_vec())
+}
+
+/// Whether an FFN HC write carries the trunk-shard all-reduce: the forward's FFN is the
+/// rank's partial (`ffn_partial`), the layer is a MoE layer (a dense FFN is complete on every
+/// rank: reducing it would double it) and the write's `mixed` rows are the FFN output scratch
+/// the partial lands in (a call whose output is elsewhere keeps the local write).
+fn ffn_write_carries_ar(ffn_partial: bool, moe_layer: bool, mixed_is_ffn_output: bool) -> bool {
+    ffn_partial && moe_layer && mixed_is_ffn_output
 }
 
 /// Rank counts the owner-routed chunk MoE admits: EP2 through EP8, matching the mesh
@@ -7014,12 +7041,6 @@ pub(crate) fn seal_moe_rows<'a>(
         routed_experts: runtime.routed_view(true, rows, rows, false, 8),
         router: runtime.router.dispatch_ref(),
         shared,
-        intermediate: runtime
-            .experts
-            .first()
-            .map(|expert| expert.gate_up.m)
-            .unwrap_or_default()
-            / 2,
         experts_all_gate_up_mq4: runtime.experts_all_gate_up_mq4,
         expert_gate_up_dtypes: runtime
             .slab
@@ -9359,7 +9380,11 @@ impl<'a> LayerPhaseEnv<'a> {
             // chunk: the compact table), so the all-reduce replaces the HC write; a call whose
             // output is not `scratch.ffn_output` keeps the local write.
             ar: crate::trunk_route::ffn_writer().filter(|_| {
-                self.ffn_partial && mixed.buf.as_ptr() == scratch.ffn_output.buf.as_ptr()
+                ffn_write_carries_ar(
+                    self.ffn_partial,
+                    matches!(description.ffn, Qwen4FfnBinding::Moe(_)),
+                    mixed.buf.as_ptr() == scratch.ffn_output.buf.as_ptr(),
+                )
             }),
             rotation: &scratch.rotation,
             state_bf16: self.bf16_state,
@@ -12070,7 +12095,10 @@ impl Qwen4GpuForward {
                         hipfire_config::developer_var(Qwen4ExpertStage::EP_ENV)
                             .ok()
                             .as_deref(),
-                    ) && ep.as_ref().is_some_and(|state| state.tile.is_some()))
+                    ) && ep_stage_chunk_route(
+                        ep.as_ref().is_some_and(|state| state.tile.is_some()),
+                        crate::weights::trunk_shard::trunk_shard_requested(),
+                    ))
                 {
                     // An S1 load charged its own page ring instead of the G2
                     // stage (`PlacementCharges::slowlink` with `staged = false`):
@@ -12925,10 +12953,31 @@ impl Qwen4GpuForward {
                 })
                 .collect();
         }
+        // Trunk-shard partial chunk route (no tile exchange installs the verdict): the compact
+        // tables the chunks bind are the same experts and bytes the full tables were verified
+        // on, so each takes its layer's verdict and a chunk runs the route one card / EP2 runs.
+        let partial_verdicts = crate::weights::trunk_shard::trunk_shard_requested()
+            .then(|| {
+                partial_route_symmetric(
+                    &full.iter().map(|l| l.symmetric).collect::<Vec<_>>(),
+                    layers,
+                )
+            })
+            .flatten();
         ep.moe_full = full;
         ep.balanced = balanced;
         ep.slot_owner = slot_owner;
         ep.gather = Some(gather);
+        if let Some(verdicts) = partial_verdicts {
+            for (layer, &verdict) in self.moe.iter_mut().flatten().zip(&verdicts) {
+                layer.symmetric = verdict;
+            }
+            for runtimes in self.moe_borrow.iter_mut() {
+                for (layer, &verdict) in runtimes.iter_mut().flatten().zip(&verdicts) {
+                    layer.symmetric = verdict;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -15231,11 +15280,13 @@ impl Qwen4GpuForward {
         // the output streams after the program, on the compute stream. The
         // parity observer keeps its historical unsplit transport. A stream
         // capture keeps mapped reads too: a staged forward forks a copy
-        // stream and its failure recovery synchronizes the device.
+        // stream and its failure recovery synchronizes the device. The trunk-shard partial
+        // chunk binds the compact table on EVERY layer (no full table, no peer donor read), the
+        // condition [`Qwen4ExpertStage::begin_forward`] stages on.
         let expert_stage = match self
             .expert_stage
             .as_ref()
-            .filter(|stage| stage.begin_forward(tile_active))
+            .filter(|stage| stage.begin_forward(tile_active || trunk_chunk_partial))
             .filter(|_| self.ep_reserve.is_none() || self.borrow_runtimes_active)
         {
             Some(stage)
@@ -20494,6 +20545,58 @@ mod ep_rank_generic_tests {
         assert!(!ep_lever_on(Some("0")));
     }
 
+    /// The owner-routed tile exchange completes the routed FFN on every rank, so the trunk
+    /// shard (whose FFN is each rank's partial) never admits it; without the shard the lever
+    /// is exactly the shared EP lever rule.
+    #[test]
+    fn trunk_shard_turns_the_owner_routed_prefill_off() {
+        for value in [None, Some("1"), Some(""), Some("true"), Some("0")] {
+            assert_eq!(ep_owner_routed_prefill_on(value, false), ep_lever_on(value));
+            assert!(!ep_owner_routed_prefill_on(value, true), "{value:?}");
+        }
+    }
+
+    /// The G2 expert stage is built on a compact-table chunk route: the admitted tile route
+    /// (unchanged) or the trunk-shard partial route; never for a full-table EP load.
+    #[test]
+    fn expert_stage_follows_the_compact_chunk_route() {
+        assert!(!ep_stage_chunk_route(false, false));
+        assert!(ep_stage_chunk_route(true, false));
+        assert!(ep_stage_chunk_route(false, true));
+        assert!(ep_stage_chunk_route(true, true));
+    }
+
+    /// The compact chunk tables adopt the full tables' verdicts one per MoE layer, and only
+    /// when the counts agree.
+    #[test]
+    fn partial_route_adopts_the_full_table_symmetric_verdicts() {
+        assert_eq!(
+            partial_route_symmetric(&[true, false, true], 3),
+            Some(vec![true, false, true])
+        );
+        assert_eq!(partial_route_symmetric(&[], 0), Some(vec![]));
+        assert_eq!(partial_route_symmetric(&[true, true], 3), None);
+        assert_eq!(partial_route_symmetric(&[true, true, true], 2), None);
+    }
+
+    /// An FFN HC write carries the all-reduce only for a MoE layer's partial in the FFN
+    /// output scratch while the route is active; every other combination keeps the local write
+    /// (a dense FFN is complete on every rank, a foreign output is not the partial).
+    #[test]
+    fn ffn_hc_write_carries_the_all_reduce_only_for_the_moe_partial() {
+        for partial in [false, true] {
+            for moe in [false, true] {
+                for in_scratch in [false, true] {
+                    assert_eq!(
+                        ffn_write_carries_ar(partial, moe, in_scratch),
+                        partial && moe && in_scratch,
+                        "partial {partial} moe {moe} scratch {in_scratch}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn owner_routed_prefill_admits_exactly_ep2_through_ep8_on_gfx1100_and_gfx1201() {
         for ranks in 2usize..=8 {
@@ -20981,6 +21084,35 @@ mod seal_view_identity_tests {
             let (selected, view) = rt.bind(true, false, true, true, false, 64, 64);
             assert_eq!(selected.id, STATIC_ID);
             assert_eq!(view.immutable_identity(), Some(selected.id));
+        }
+    }
+
+    /// Trunk-shard partial chunk route: EVERY chunk size binds the rank's compact static table
+    /// and its view (never the EP full table, whose peer-owned experts would complete the
+    /// routed FFN on both ranks), and the balanced live runtime stays a gathered-shape thing
+    /// (it is never built for a chunk). The gathered shapes are unchanged: the balanced live
+    /// runtime on a balanced layer, else the static table.
+    #[test]
+    fn trunk_shard_partial_chunks_bind_the_compact_static_view_at_every_size() {
+        for split in [false, true] {
+            let rt = Runtimes::new(split);
+            for rows in [9usize, 16, 64, 511, 512, 513, 2048, 4096] {
+                for d2_phase in [false, true] {
+                    // (balanced layers are not consulted for a chunk: `ep_gathered` is false.)
+                    let (selected, view) = rt.bind(true, false, true, true, d2_phase, rows, rows);
+                    assert_eq!(selected.id, STATIC_ID, "rows {rows}");
+                    assert!(view.immutable_identity().is_some());
+                    // The pre-shard chunk (no tile route, no partial route) is the full table.
+                    let (full, _) = rt.bind(true, false, true, false, d2_phase, rows, rows);
+                    assert_eq!(full.id, FULL_ID, "rows {rows}");
+                }
+            }
+            for rows in 1..=8usize {
+                let (balanced, _) = rt.bind(true, true, false, false, true, rows, rows);
+                assert_eq!(balanced.id, LIVE_ID, "rows {rows}");
+                let (plain, _) = rt.bind(true, false, false, false, true, rows, rows);
+                assert_eq!(plain.id, STATIC_ID, "rows {rows}");
+            }
         }
     }
 

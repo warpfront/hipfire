@@ -4263,19 +4263,23 @@ fn placement_inputs_charged(
     // The kernels' pool workspaces at the largest requested chunk, exactly
     // (every short-tail remainder included). The dense GDN scan's scratch is
     // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
-    // Q8 or Q8Ef GDN state (`qwen4_dense_gdn_admits`) and the pinned
-    // 16-key/48-value-head, 128-dim, 10240-wide geometry (its opt-out flag
+    // Q8 or Q8Ef GDN state (`qwen4_dense_gdn_admits`) and an admitted head
+    // geometry (`qwen4_dense_gdn_geometry_admits`, the route's own pure
+    // predicate: the pinned 16-key/48-value-head, 128-dim, 10240-wide
+    // geometry or the TP2 trunk shard's rank-local 8/24 one; the charge is
+    // the 48-head upper bound for both; the opt-out flag
     // only lowers the charge, so it is ignored). The census charges A for both
     // formats and the thread-local EF scratch only for plain Q8; a Q8Ef live
     // residual is charged once by the state owner, not here.
     let dense_gdn = rdna_compute::scratch::qwen4_dense_gdn_admits(&gpu.arch, state_format.gdn)
-        && config.linear_num_key_heads == 16
-        && config.linear_num_value_heads == 48
-        && config.linear_key_head_dim == 128
-        && config.linear_value_head_dim == 128
-        && 2 * config.linear_num_key_heads * config.linear_key_head_dim
-            + config.linear_num_value_heads * config.linear_value_head_dim
-            == 10240;
+        && rdna_compute::scratch::qwen4_dense_gdn_geometry_admits(
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            2 * config.linear_num_key_heads * config.linear_key_head_dim
+                + config.linear_num_value_heads * config.linear_value_head_dim,
+        );
     // The routed-expert I4 MoE terms exist only for a profile whose routed
     // experts run the grouped I4 route; a dense or synthetic profile
     // (no experts, or dimensions that route cannot take) charges none of

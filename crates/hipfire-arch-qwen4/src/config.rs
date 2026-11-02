@@ -35,6 +35,9 @@ pub const ARCHITECTURE_NAME: &str = "Qwen4ExpForConditionalGeneration";
 pub const FLASH_NEXT_PROFILE_ID: &str = "qwen3.8-flash-next";
 /// Stable profile id of the AR-only Flash-Next profile ([`Qwen4Profile::FlashNextArOnly`]).
 pub const FLASH_NEXT_AR_ONLY_PROFILE_ID: &str = "qwen3.8-flash-next-ar";
+/// Stable profile id of the head-dropped packed Flash-Next profile
+/// ([`Qwen4Profile::FlashNextHeadless`]).
+pub const FLASH_NEXT_HEADLESS_PROFILE_ID: &str = "qwen3.8-flash-next-headless";
 /// Top-level JSON key of the explicit developer-profile marker.
 pub const PROFILE_KEY: &str = "hipfire_profile";
 /// Spelling current Transformers normalizes `full_attention` to.  It is an
@@ -252,6 +255,16 @@ pub enum Qwen4Profile {
     /// entry point sees a head-free profile instead of a config that claims a
     /// head the artifact does not carry.
     FlashNextArOnly,
+    /// The pinned PACKED Flash-Next trunk loaded without its native MTP head
+    /// (the TP trunk shard runs AR-only, `HIPFIRE_QWEN4_EP_TRUNK_SHARD`).  Unlike
+    /// [`Self::FlashNextArOnly`] it is NOT the stock-FP8 recipe: the artifact is the
+    /// shipped packed `mq4-xts` one (its `mtp.*` tensors stay in the file, unread), the
+    /// recipe is [`crate::weights::Qwen4TierRecipe::FlashNextPacked`], and the
+    /// stock-FP8 numerical pins (F32 GDN state, BF16 trunk) do not apply.  Never parsed
+    /// from a config: artifact admission derives it through
+    /// [`Qwen4Config::into_headless`] when
+    /// [`crate::weights::trunk_shard::trunk_shard_drops_mtp_head`] holds.
+    FlashNextHeadless,
     /// Developer-only synthetic geometry with pinned HC/GDN/QSA equations.
     Synthetic(Qwen4SyntheticProfile),
 }
@@ -261,18 +274,36 @@ impl Qwen4Profile {
         match self {
             Self::FlashNext => FLASH_NEXT_PROFILE_ID,
             Self::FlashNextArOnly => FLASH_NEXT_AR_ONLY_PROFILE_ID,
+            Self::FlashNextHeadless => FLASH_NEXT_HEADLESS_PROFILE_ID,
             Self::Synthetic(profile) => &profile.id,
         }
     }
 
     /// The pinned Flash-Next geometry, with or without the MTP head.
     pub const fn is_flash_next(&self) -> bool {
-        matches!(self, Self::FlashNext | Self::FlashNextArOnly)
+        matches!(
+            self,
+            Self::FlashNext | Self::FlashNextArOnly | Self::FlashNextHeadless
+        )
     }
 
-    /// Flash-Next geometry admitted without the native MTP head.
+    /// The stock-FP8 Flash-Next profile ([`Self::FlashNextArOnly`]): head-free AND bound
+    /// to the stock-FP8 recipe's numerical pins (F32 GDN state, BF16 trunk). The head-free
+    /// predicate that does not imply the recipe is [`Self::is_headless`].
     pub const fn is_ar_only(&self) -> bool {
         matches!(self, Self::FlashNextArOnly)
+    }
+
+    /// Flash-Next geometry admitted without the native MTP head, under either recipe
+    /// ([`Self::FlashNextArOnly`] stock FP8, [`Self::FlashNextHeadless`] packed).
+    pub const fn is_headless(&self) -> bool {
+        matches!(self, Self::FlashNextArOnly | Self::FlashNextHeadless)
+    }
+
+    /// The packed (non-stock) Flash-Next trunk, with or without its head: the profiles
+    /// whose forward takes the Flash-Next packed-kernel routes.
+    pub const fn is_packed_flash_next(&self) -> bool {
+        matches!(self, Self::FlashNext | Self::FlashNextHeadless)
     }
 
     pub const fn is_synthetic(&self) -> bool {
@@ -286,7 +317,9 @@ impl Qwen4Profile {
 
     pub const fn equation_source(&self) -> Qwen4EquationSource {
         match self {
-            Self::FlashNext | Self::FlashNextArOnly => Qwen4EquationSource::PinnedUpstream,
+            Self::FlashNext | Self::FlashNextArOnly | Self::FlashNextHeadless => {
+                Qwen4EquationSource::PinnedUpstream
+            }
             Self::Synthetic(profile) => profile.equation_source,
         }
     }
@@ -1104,9 +1137,9 @@ impl Qwen4Config {
             }
         }
         match &self.profile {
-            Qwen4Profile::FlashNext | Qwen4Profile::FlashNextArOnly => {
-                self.validate_flash_next()?
-            }
+            Qwen4Profile::FlashNext
+            | Qwen4Profile::FlashNextArOnly
+            | Qwen4Profile::FlashNextHeadless => self.validate_flash_next()?,
             Qwen4Profile::Synthetic(profile) => self.validate_synthetic(profile)?,
         }
         self.validate_typed_agreement()
@@ -1129,15 +1162,19 @@ impl Qwen4Config {
     /// The rank-local config of `rank` of `parts` of a TP trunk shard: GDN key/value heads and
     /// q heads divided by `parts` (KV heads stay: the q heads of a rank are an equal share of
     /// every KV group), the shared-expert intermediate this rank's share. Defined only for a
-    /// validated global AR-only Flash-Next config (the native MTP head reads the global
-    /// geometry and is not sharded).
+    /// validated global head-free Flash-Next config ([`Qwen4Profile::is_headless`]; the
+    /// native MTP head reads the global geometry and is not sharded yet). Whether a load
+    /// drops the head for the shard is ONE decision,
+    /// [`crate::weights::trunk_shard::trunk_shard_keeps_mtp`]; the slice that keeps the
+    /// head replicated on the global config relaxes the head refusal below.
     pub fn trunk_shard_local(&self, rank: usize, parts: usize) -> Result<Self, String> {
         if self.trunk_shard.is_some() {
             return Err("qwen4: the config is already a trunk-shard config".into());
         }
-        if !self.profile.is_ar_only() || self.mtp.is_some() {
+        if !self.profile.is_headless() || self.mtp.is_some() {
             return Err(
-                "qwen4: the trunk shard needs the AR-only Flash-Next profile (no native MTP head)"
+                "qwen4: the trunk shard needs a head-free Flash-Next profile (no native MTP head; \
+                 the artifact is admitted headless under HIPFIRE_QWEN4_EP_TRUNK_SHARD)"
                     .into(),
             );
         }
@@ -1203,16 +1240,44 @@ impl Qwen4Config {
         self.trunk_shard_global().unwrap_or_else(|_| self.clone())
     }
 
+    /// Why a peer loaded as rank `rank` of `ranks` is not the same model as `rank0` (the
+    /// config of rank 0), or `None` when it is. Ranks agree on the GLOBAL geometry
+    /// ([`Self::replica_geometry`]) although their rank-local configs differ; on top of
+    /// that the shard must be on for every rank or for none, over `ranks` parts, each rank
+    /// holding its own slice (another rank's local config would size state and scratch for
+    /// another rank's weights).
+    pub fn replica_mismatch(&self, rank0: &Self, rank: usize, ranks: usize) -> Option<String> {
+        if self.replica_geometry() != rank0.replica_geometry() {
+            return Some("the loaded peer's model configuration differs from rank 0".to_string());
+        }
+        let expected = rank0.trunk_shard.map(|(_, parts)| (rank, parts));
+        if self.trunk_shard != expected
+            || rank0.trunk_shard.is_some_and(|(_, parts)| parts != ranks)
+        {
+            return Some(format!(
+                "the loaded peer's trunk shard is {:?}, expected {expected:?} (rank 0: {:?}, {ranks} ranks)",
+                self.trunk_shard, rank0.trunk_shard
+            ));
+        }
+        None
+    }
+
     /// The AR-only form of a validated Flash-Next config: the
     /// [`Qwen4Profile::FlashNextArOnly`] profile with no MTP head (`mtp` and
     /// its scalar mirrors cleared).  Selected by an artifact recipe that omits
     /// the head (`Qwen4TierRecipe::StockFp8`), never by config contents, so a
     /// head-free artifact is admitted as head-free instead of under a config
     /// that names a head nothing loads.  Only Flash-Next converts.
-    pub fn into_ar_only(mut self) -> Result<Self, String> {
+    pub fn into_ar_only(self) -> Result<Self, String> {
         match self.profile {
             Qwen4Profile::FlashNext => {}
             Qwen4Profile::FlashNextArOnly => return Ok(self),
+            Qwen4Profile::FlashNextHeadless => {
+                return Err(format!(
+                "qwen4: profile {} is the packed head-dropped form, not the stock-FP8 AR-only one",
+                self.profile.id()
+            ))
+            }
             Qwen4Profile::Synthetic(_) => {
                 return Err(format!(
                     "qwen4: profile {} has no AR-only form (only Flash-Next does)",
@@ -1220,8 +1285,38 @@ impl Qwen4Config {
                 ))
             }
         }
+        self.drop_head(Qwen4Profile::FlashNextArOnly)
+    }
+
+    /// The head-dropped PACKED form of a validated Flash-Next config: the
+    /// [`Qwen4Profile::FlashNextHeadless`] profile with no MTP head (`mtp` and its scalar
+    /// mirrors cleared), geometry unchanged. Selected by the trunk shard's load
+    /// ([`crate::weights::trunk_shard::trunk_shard_drops_mtp_head`]), never by config
+    /// contents or the artifact recipe (the artifact is the shipped packed one). Unlike
+    /// [`Self::into_ar_only`] it does not bind the stock-FP8 numerical pins.
+    pub fn into_headless(self) -> Result<Self, String> {
+        match self.profile {
+            Qwen4Profile::FlashNext => {}
+            Qwen4Profile::FlashNextHeadless => return Ok(self),
+            Qwen4Profile::FlashNextArOnly => {
+                return Err(format!(
+                "qwen4: profile {} is the stock-FP8 AR-only form; it has no packed headless form",
+                self.profile.id()
+            ))
+            }
+            Qwen4Profile::Synthetic(_) => {
+                return Err(format!(
+                    "qwen4: profile {} has no headless form (only Flash-Next does)",
+                    self.profile.id()
+                ))
+            }
+        }
+        self.drop_head(Qwen4Profile::FlashNextHeadless)
+    }
+
+    fn drop_head(mut self, profile: Qwen4Profile) -> Result<Self, String> {
         self.validate()?;
-        self.profile = Qwen4Profile::FlashNextArOnly;
+        self.profile = profile;
         self.mtp = None;
         self.mtp_num_hidden_layers = 0;
         self.mtp_use_dedicated_embeddings = false;
@@ -1302,7 +1397,7 @@ impl Qwen4Config {
         expect(self.tie_word_embeddings, false, "tie_word_embeddings")?;
         // The AR-only profile carries no head, so its scalar mirror is 0
         // ("0 when the head is absent"); the checkpoint profile pins one layer.
-        let mtp_layers = if self.profile.is_ar_only() { 0 } else { 1 };
+        let mtp_layers = if self.profile.is_headless() { 0 } else { 1 };
         expect(
             self.mtp_num_hidden_layers,
             mtp_layers,
@@ -1350,10 +1445,10 @@ impl Qwen4Config {
         if self.ple.as_ref() != Some(&Qwen4PleConfig::flash_next()) {
             return Err("qwen4: typed ple is not the pinned Flash-Next PLE".into());
         }
-        if self.profile.is_ar_only() {
+        if self.profile.is_headless() {
             return match self.mtp {
                 None => Ok(()),
-                Some(_) => Err("qwen4: the AR-only Flash-Next profile carries no MTP head".into()),
+                Some(_) => Err("qwen4: a head-free Flash-Next profile carries no MTP head".into()),
             };
         }
         self.mtp
@@ -2427,6 +2522,7 @@ fn validate_profile_id(id: &str) -> Result<(), String> {
     }
     if id.eq_ignore_ascii_case(FLASH_NEXT_PROFILE_ID)
         || id.eq_ignore_ascii_case(FLASH_NEXT_AR_ONLY_PROFILE_ID)
+        || id.eq_ignore_ascii_case(FLASH_NEXT_HEADLESS_PROFILE_ID)
     {
         return Err(format!(
             "qwen4: profile id {id:?} is reserved for the pinned Flash-Next profiles"
@@ -3023,6 +3119,139 @@ mod tests {
         assert!(validate_profile_id(FLASH_NEXT_AR_ONLY_PROFILE_ID).is_err());
     }
 
+    /// The head-dropped packed profile (trunk shard load) is derived like the stock AR-only
+    /// one but is a DIFFERENT profile: it keeps the packed identity (not the stock-FP8
+    /// numerical pins), is head-free everywhere, and neither profile converts into the other.
+    #[test]
+    fn headless_profile_is_packed_flash_next_without_mtp() {
+        let flash = compact_test_config();
+        let headless = flash.clone().into_headless().expect("headless form");
+        assert_eq!(headless.profile, Qwen4Profile::FlashNextHeadless);
+        assert_eq!(headless.profile.id(), FLASH_NEXT_HEADLESS_PROFILE_ID);
+        let profile = &headless.profile;
+        assert!(profile.is_flash_next() && profile.is_headless() && profile.is_packed_flash_next());
+        assert!(!profile.is_ar_only(), "not the stock-FP8 profile");
+        assert!(!profile.developer_only());
+        assert!(headless.mtp.is_none());
+        assert_eq!(headless.mtp_num_hidden_layers, 0);
+        assert!(!headless.mtp_use_dedicated_embeddings);
+        // everything but the profile and the head is the checkpoint geometry
+        let mut same = headless.clone();
+        same.profile = Qwen4Profile::FlashNext;
+        same.mtp = flash.mtp.clone();
+        same.mtp_num_hidden_layers = flash.mtp_num_hidden_layers;
+        same.mtp_use_dedicated_embeddings = flash.mtp_use_dedicated_embeddings;
+        assert_eq!(same, flash);
+        headless.validate().expect("headless validates");
+        assert_eq!(headless.clone().into_headless().unwrap(), headless);
+        // the stock AR-only profile keeps its own, distinct, pins
+        let stock = flash.clone().into_ar_only().unwrap();
+        assert!(stock.profile.is_ar_only() && stock.profile.is_headless());
+        assert!(!stock.profile.is_packed_flash_next());
+        assert_ne!(stock.profile, headless.profile);
+        assert!(stock.clone().into_headless().is_err());
+        assert!(headless.clone().into_ar_only().is_err());
+        // dropping the head must not move the numerical contract: the recurrent state keeps
+        // the checkpoint's `auto` / explicit formats (the stock-FP8 profile pins F32)
+        for request in ["", "auto", "q8", "q8_ef", "fp32"] {
+            assert_eq!(
+                crate::state::resolve_gdn_format(request, &headless),
+                crate::state::resolve_gdn_format(request, &flash),
+                "{request:?}"
+            );
+        }
+        assert_ne!(
+            crate::state::resolve_gdn_format("auto", &stock),
+            crate::state::resolve_gdn_format("auto", &headless)
+        );
+        // a head bolted back on (or the mirror alone) is refused; the head-bearing profile
+        // still requires its head
+        let mut headed = headless.clone();
+        headed.mtp = flash.mtp.clone();
+        headed.mtp_num_hidden_layers = 1;
+        assert!(headed.validate().is_err());
+        let mut mirror = headless.clone();
+        mirror.mtp_num_hidden_layers = 1;
+        assert!(mirror.validate().is_err());
+        assert!(validate_profile_id(FLASH_NEXT_HEADLESS_PROFILE_ID).is_err());
+        // a synthetic profile has no headless form
+        let mut synthetic = synthetic_test_config(
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 64,
+            },
+            64,
+            2,
+            false,
+            false,
+        );
+        assert!(synthetic.clone().into_headless().is_err());
+        synthetic.profile = Qwen4Profile::FlashNextHeadless;
+        assert!(synthetic.validate().is_err());
+    }
+
+    /// The load under the shard: the head is dropped (headless global config), then each
+    /// rank's local config is cut from it. The two local configs differ, round trip through
+    /// the global one, keep the head-free profile, and are mutually consistent replicas.
+    #[test]
+    fn headless_global_config_shards_into_replica_consistent_local_configs() {
+        use crate::weights::trunk_shard::{drops_head_for, load_local_config_for};
+        let flash = compact_test_config();
+        let headless = flash.clone().into_headless().unwrap();
+        // the packed head-bearing config is refused until the head policy flips
+        assert!(flash.trunk_shard_local(0, 2).is_err());
+        let placement = |rank| Some(crate::weights::Qwen4EpPlacement { rank, ranks: 2 });
+        assert!(!crate::weights::trunk_shard::trunk_shard_keeps_mtp());
+        assert!(drops_head_for(true) && !drops_head_for(false));
+        let locals: Vec<Qwen4Config> = (0..2)
+            .map(|r| {
+                load_local_config_for(true, &headless, placement(r))
+                    .expect("local config")
+                    .expect("the switch is on")
+            })
+            .collect();
+        for (rank, local) in locals.iter().enumerate() {
+            assert_eq!(local.profile, Qwen4Profile::FlashNextHeadless);
+            assert!(local.mtp.is_none() && local.mtp_num_hidden_layers == 0);
+            assert_eq!(local.trunk_shard, Some((rank, 2)));
+            local.validate().expect("the local config validates");
+            assert_eq!(local.trunk_shard_global().unwrap(), headless);
+            assert_eq!(local.replica_geometry(), headless);
+        }
+        assert_ne!(locals[0], locals[1]);
+        // switch off: no local config; a head-bearing config or a non-EP2 load refuses
+        assert_eq!(load_local_config_for(false, &flash, None).unwrap(), None);
+        assert!(load_local_config_for(true, &flash, placement(0)).is_err());
+        assert!(load_local_config_for(true, &headless, None).is_err());
+        assert!(load_local_config_for(
+            true,
+            &headless,
+            Some(crate::weights::Qwen4EpPlacement { rank: 0, ranks: 4 })
+        )
+        .is_err());
+        // the census always cuts from the GLOBAL geometry, even when handed a local config
+        let census =
+            |config: &Qwen4Config| crate::weights::trunk_shard::census_trunk_for(true, config, 2);
+        assert_eq!(census(&headless), census(&locals[0]));
+        assert_eq!(census(&locals[0]), census(&locals[1]));
+        assert!(crate::weights::trunk_shard::census_trunk_for(false, &headless, 2).is_none());
+        assert!(crate::weights::trunk_shard::census_trunk_for(true, &headless, 1).is_none());
+
+        // check_replica: rank 1's peer against rank 0's config
+        assert_eq!(locals[1].replica_mismatch(&locals[0], 1, 2), None);
+        assert_eq!(locals[0].replica_mismatch(&locals[1], 0, 2), None);
+        // a peer holding the wrong rank's local config, or an unsharded one, or a different
+        // model, is refused
+        assert!(locals[0].replica_mismatch(&locals[0], 1, 2).is_some());
+        assert!(headless.replica_mismatch(&locals[0], 1, 2).is_some());
+        assert!(locals[1].replica_mismatch(&headless, 1, 2).is_some());
+        assert!(locals[1].replica_mismatch(&locals[0], 1, 4).is_some());
+        let mut other = locals[1].clone();
+        other.rope_theta *= 2.0;
+        assert!(other.replica_mismatch(&locals[0], 1, 2).is_some());
+        // unsharded EP: the plain replica equality is unchanged
+        assert_eq!(flash.replica_mismatch(&flash, 1, 2), None);
+        assert!(headless.replica_mismatch(&flash, 1, 2).is_some());
+    }
     fn fixture() -> Value {
         let layers: Vec<_> = (0..48)
             .map(|idx| {

@@ -895,7 +895,7 @@ impl Qwen4Manifest {
         let stock_fp8 = recipe.is_stock_fp8();
         let profile_admits_recipe = match &recipe {
             Qwen4TierRecipe::FlashNextPacked { .. } | Qwen4TierRecipe::FlashNextSlab { .. } => {
-                matches!(config.profile, Qwen4Profile::FlashNext)
+                config.profile.is_packed_flash_next()
             }
             Qwen4TierRecipe::StockFp8 => config.profile.is_ar_only(),
             Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
@@ -4395,7 +4395,9 @@ pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), Weigh
         reason: reason.to_string(),
     };
     match &config.profile {
-        Qwen4Profile::FlashNext | Qwen4Profile::FlashNextArOnly => {
+        Qwen4Profile::FlashNext
+        | Qwen4Profile::FlashNextArOnly
+        | Qwen4Profile::FlashNextHeadless => {
             if !matches!(
                 &config.ffn,
                 Qwen4FfnConfig::Moe {
@@ -4410,12 +4412,12 @@ pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), Weigh
             if config.ple.is_none() {
                 return Err(unsupported("the Qwen4 executor requires PLE"));
             }
-            match (config.profile.is_ar_only(), config.mtp.is_some()) {
+            match (config.profile.is_headless(), config.mtp.is_some()) {
                 (false, false) => Err(unsupported(
                     "the Qwen4 executor requires the native MTP head",
                 )),
                 (true, true) => Err(unsupported(
-                    "the AR-only Flash-Next profile carries no MTP head",
+                    "a head-free Flash-Next profile carries no MTP head",
                 )),
                 _ => Ok(()),
             }
@@ -4956,6 +4958,82 @@ mod tests {
         assert!(admit_executable_profile(&pinned_config()).is_ok());
     }
 
+    /// The head-dropped packed profile (trunk shard load) declares the SAME packed manifest
+    /// as the checkpoint profile minus every `mtp.*` weight (the head and its tied
+    /// embedding alias), under the packed recipe (not stock FP8), including on one rank of
+    /// an expert-parallel mesh; it assembles under its recipe and binds no head.
+    #[test]
+    fn headless_manifest_is_the_packed_manifest_without_the_mtp_head() {
+        let flash = pinned_config();
+        let headless = flash.clone().into_headless().unwrap();
+        admit_executable_profile(&headless).expect("headless Flash-Next is executable");
+        let mut headed = headless.clone();
+        headed.mtp = flash.mtp.clone();
+        assert!(admit_executable_profile(&headed).is_err());
+        let with_head = Qwen4Manifest::build(&flash).unwrap();
+        let without = Qwen4Manifest::build(&headless).unwrap();
+        assert!(
+            matches!(
+                without.identity.recipe,
+                Qwen4TierRecipe::FlashNextPacked { .. }
+            ),
+            "{:?}",
+            without.identity.recipe
+        );
+        assert_eq!(without.identity.recipe, with_head.identity.recipe);
+        assert_eq!(without.identity.profile_id, "qwen3.8-flash-next-headless");
+        let head = |entry: &&WeightEntry| entry.name.starts_with("mtp.");
+        assert!(with_head.weights.iter().filter(head).count() > 0);
+        assert_eq!(without.weights.iter().filter(head).count(), 0);
+        assert!(without
+            .metadata
+            .iter()
+            .all(|entry| !entry.name.starts_with("mtp.")));
+        let kept: Vec<_> = with_head
+            .weights
+            .iter()
+            .filter(|entry| !entry.name.starts_with("mtp."))
+            .cloned()
+            .collect();
+        assert_eq!(without.weights, kept, "trunk entries are untouched");
+        assert_eq!(without.state, with_head.state);
+        // the recipe/profile pairings: packed under headless, stock only under stock AR-only
+        assert!(Qwen4Manifest::build_with_recipe(&headless, Qwen4TierRecipe::StockFp8).is_err());
+        let stock = flash.into_ar_only().unwrap();
+        assert!(
+            Qwen4Manifest::build_with_recipe(&stock, with_head.identity.recipe.clone()).is_err()
+        );
+        assert_eq!(
+            assembly_manifest(&headless, &with_head.identity.recipe).unwrap(),
+            without
+        );
+        // expert parallel: the same experts shard, no MTP stack remains
+        let ep = |manifest: &Qwen4Manifest, rank| {
+            manifest
+                .clone()
+                .with_expert_parallel(Qwen4EpPlacement { rank, ranks: 2 })
+                .unwrap()
+        };
+        for rank in 0..2 {
+            let local = ep(&without, rank);
+            assert!(local
+                .weights
+                .iter()
+                .all(|entry| !entry.name.starts_with("mtp.")));
+            let sharded = |manifest: &Qwen4Manifest| {
+                manifest
+                    .weights
+                    .iter()
+                    .filter(|entry| {
+                        !entry.name.starts_with("mtp.")
+                            && matches!(entry.policy, ShardPolicy::ExpertSharded { .. })
+                    })
+                    .count()
+            };
+            assert_eq!(sharded(&local), sharded(&ep(&with_head, rank)));
+            assert!(sharded(&local) > 0);
+        }
+    }
     /// A fake device address (never dereferenced) for table-geometry tests.
     fn fake_tensor(base: usize, bytes: usize, shape: Vec<usize>, dtype: DType) -> GpuTensor {
         GpuTensor {

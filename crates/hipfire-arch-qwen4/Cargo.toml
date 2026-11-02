@@ -148,3 +148,9 @@ required-features = ["lab", "reference-parity"]
 [[test]]
 name = "slowlink_prefill_hw"
 required-features = ["lab", "reference-parity"]
+
+# Trunk-shard layer oracle: one real layer, unsharded vs the TP2 trunk shard on injected HC
+# streams (GPU for `run`; `plan`, `selftest` and `compare` are CPU-only).
+[[example]]
+name = "trunk_shard_layer_oracle"
+required-features = ["lab"]

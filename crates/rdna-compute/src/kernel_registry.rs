@@ -1717,8 +1717,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "fn_gdn_dense_producer",
                 "fn_gdn_dense_producer_v2_f32",
                 "fn_gdn_dense_producer_v2_bf16",
+                "fn_gdn_dense_producer_v2_f32_k8v24",
+                "fn_gdn_dense_producer_v2_bf16_k8v24",
                 "fn_gdn_dense_gate_bf16in",
                 "fn_gdn_dense_gate_i8",
+                "fn_gdn_dense_gate_i8_p12",
                 "fn_gdn_dense_gate_rotate_bf16in"
             ]
         );

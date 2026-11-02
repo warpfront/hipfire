@@ -19,6 +19,15 @@
 //! the F32 projection): the qkv projection arrives as BF16 bits (the producer only reads it
 //! through its BF16 rounding) and the load-batched `fn_gdn_dense_producer_v2_{f32,bf16}` entries
 //! run; every stored byte is the v1 producer's.
+//!
+//! Head geometry: the kernels are compiled for the Flash-Next 16 key / 48 value heads and for the
+//! TP2 trunk shard's rank-local 8 / 24 ([`crate::scratch::QWEN4_DENSE_GDN_GEOMETRIES`], the one
+//! pure admission shared with the prefill-workspace census). The 16 / 48 entries are byte for byte
+//! the pre-shard ones; the 8 / 24 geometry has its own load-batched producer entries
+//! (`..._k8v24`) and gate entry (`fn_gdn_dense_gate_i8_p12`), so it needs
+//! `HIPFIRE_QWEN4_GDN_CHAIN_FUSE` (the v1 producer is 16 / 48 only). The KKT solve and the chunk
+//! scan take their head counts as kernel arguments. The thread-local A / EF scratch is sized at
+//! the 48-head upper bound, which is also what the census charges.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -31,11 +40,120 @@ use crate::tensor_ops::{
 };
 use crate::{DType, Gpu, GpuTensor};
 
+/// Bytes of the thread-local zero-entry EF scratch at the 48-value-head upper bound over every
+/// admitted geometry ([`crate::scratch::QWEN4_DENSE_GDN_GEOMETRIES`]): a smaller geometry zeroes
+/// and reads only the first [`Geometry::ef_bytes`] of it.
 const EF_BYTES: usize = 48 * 128 * 128 * 2;
-/// Bytes of one A row of the KKT solve: 48 value heads x 64 BF16 columns.
+/// Bytes of one A row of the KKT solve at the same upper bound: 48 value heads x 64 BF16 columns
+/// (A is `[row][value head][64]`, so a 24-head geometry strides its rows by half of this).
 const A_ROW_BYTES: usize = 48 * 64 * 2;
 /// Admission floor of [`applies`]: below this row count the route never runs.
 const MIN_ROWS: usize = 64;
+
+/// One admitted head geometry ([`crate::scratch::QWEN4_DENSE_GDN_GEOMETRIES`]; 128-wide heads).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Geometry {
+    key_heads: usize,
+    value_heads: usize,
+}
+
+impl Geometry {
+    /// `Some` for an admitted `(key heads, value heads)` pair.
+    fn of(key_heads: usize, value_heads: usize) -> Option<Self> {
+        crate::scratch::QWEN4_DENSE_GDN_GEOMETRIES
+            .contains(&(key_heads, value_heads))
+            .then_some(Self {
+                key_heads,
+                value_heads,
+            })
+    }
+
+    /// Q (or K) channels of the convolution.
+    fn qk(self) -> usize {
+        self.key_heads * 128
+    }
+
+    /// V channels of the convolution (= the gated output width = the out projection's K).
+    fn value_width(self) -> usize {
+        self.value_heads * 128
+    }
+
+    /// Convolution channels: q | k | v.
+    fn channels(self) -> usize {
+        2 * self.qk() + self.value_width()
+    }
+
+    /// Producer grid x: one block per q head, k head and v head, the gate-params block and the
+    /// EF-zero block (82 for 16 / 48).
+    fn producer_blocks(self) -> usize {
+        2 * self.key_heads + self.value_heads + 2
+    }
+
+    /// Bytes of one state's F16 EF plane (`[head][row][key]`).
+    fn ef_bytes(self) -> usize {
+        self.value_heads * 128 * 128 * 2
+    }
+
+    /// Bytes of the Q8 codes of the state slot (`[head][row][key]` i8); the F32 row scales follow.
+    fn state_codes(self) -> usize {
+        self.value_heads * 128 * 128
+    }
+
+    /// Bytes of the Q8 row scales of the state slot (`[head][row]` f32).
+    fn state_scales(self) -> usize {
+        self.value_heads * 128 * 4
+    }
+
+    /// Producer entry of this geometry: the v1 entry (16 / 48 with the chain fusion off) or the
+    /// load-batched entry by input dtype; `None` where the geometry has no such entry.
+    fn producer_entry(self, chain_fuse: bool, bf16_input: bool) -> Option<&'static str> {
+        match (self.key_heads, self.value_heads, chain_fuse, bf16_input) {
+            (16, 48, false, _) => Some("fn_gdn_dense_producer"),
+            (16, 48, true, true) => Some("fn_gdn_dense_producer_v2_bf16"),
+            (16, 48, true, false) => Some("fn_gdn_dense_producer_v2_f32"),
+            (8, 24, true, true) => Some("fn_gdn_dense_producer_v2_bf16_k8v24"),
+            (8, 24, true, false) => Some("fn_gdn_dense_producer_v2_f32_k8v24"),
+            _ => None,
+        }
+    }
+}
+
+/// The `fn_gdn_dense_gate_i8` entry of a value-head count (24 head pairs per row for 48 heads, 12
+/// for 24); `None` where no entry exists.
+fn gate_i8_entry(value_heads: usize, value_dim: usize) -> Option<&'static str> {
+    match (value_heads, value_dim) {
+        (48, 128) => Some("fn_gdn_dense_gate_i8"),
+        (24, 128) => Some("fn_gdn_dense_gate_i8_p12"),
+        _ => None,
+    }
+}
+
+/// The row-count part of [`applies`]: at least [`MIN_ROWS`] rows, and a final 512-row commit
+/// segment of 64..512 rows or none (the mseg segment geometry).
+fn rows_admitted(n: usize) -> bool {
+    n >= MIN_ROWS && (n % 512 == 0 || (64..512).contains(&(n % 512)))
+}
+
+/// The geometry part of [`applies`]: an admitted head geometry
+/// ([`crate::scratch::qwen4_dense_gdn_geometry_admits`]) with a producer entry for the chain
+/// fusion setting. The 8 / 24 shard geometry has only the load-batched entries.
+fn geometry_runs(
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    qkv_width: usize,
+    chain_fuse: bool,
+) -> bool {
+    crate::scratch::qwen4_dense_gdn_geometry_admits(
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        qkv_width,
+    ) && Geometry::of(key_heads, value_heads)
+        .is_some_and(|geometry| geometry.producer_entry(chain_fuse, false).is_some())
+}
 
 /// Bytes of the thread-local A scratch for a `rows`-row step: `round64(rows)`
 /// rows of [`A_ROW_BYTES`] (KKT writes whole 64-row blocks). 0 below the
@@ -119,24 +237,25 @@ fn admits_state(arch: &str, format: GdnStateFormat, has_residual: bool) -> bool 
     crate::scratch::qwen4_dense_gdn_admits(arch, format) && has_residual == format.has_residual()
 }
 
-/// Exact gfx1201 FN geometry, Q8 or Q8Ef state (with its live residual), no
-/// capture/recording, and the mseg segment geometry. Other steps retain the
-/// incumbent recurrence.
+/// Exact gfx1201 FN geometry (16 / 48 heads, or the TP2 shard's 8 / 24), Q8 or Q8Ef state (with
+/// its live residual), no capture/recording, and the mseg segment geometry. Other steps retain
+/// the incumbent recurrence.
 pub fn applies(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
-    let n = p.rows;
     gpu.flags.fn_gdn_dense_scan
         && admits_state(&gpu.arch, p.format, p.residual.is_some())
         && p.row_states.is_none()
-        && p.key_heads == 16
-        && p.value_heads == 48
-        && p.key_dim == 128
-        && p.value_dim == 128
-        && p.qkv_width == 10240
+        && geometry_runs(
+            p.key_heads,
+            p.value_heads,
+            p.key_dim,
+            p.value_dim,
+            p.qkv_width,
+            gpu.flags.qwen4_gdn_chain_fuse_enabled(),
+        )
         && p.projection.dtype == DType::F32
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
-        && n >= MIN_ROWS
-        && (n % 512 == 0 || (64..512).contains(&(n % 512)))
+        && rows_admitted(p.rows)
 }
 
 fn launch(
@@ -185,20 +304,42 @@ pub fn run(
         p.key_dim,
         p.value_dim,
     )?;
+    let geometry = Geometry::of(p.key_heads, p.value_heads)
+        .filter(|_| {
+            crate::scratch::qwen4_dense_gdn_geometry_admits(
+                p.key_heads,
+                p.value_heads,
+                p.key_dim,
+                p.value_dim,
+                p.qkv_width,
+            )
+        })
+        .ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "fn_gdn_dense: head geometry not admitted by the dense scan",
+            )
+        })?;
+    if conv.channels != geometry.channels() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "fn_gdn_dense: convolution width is not the q | k | v width of the head geometry",
+        ));
+    }
     let n = p.rows;
     let n64 = n.div_ceil(64) * 64;
     // KKT clamps K loads to the last real row and guards G/beta; mseg clamps
     // Q/K/V loads, guards its controls, and only stores output for tok<rows.
     // Neither reads Q/K/V/G/beta pad rows. KKT DOES write a full 64-row A
     // block, so only A needs padded scratch. Q/K/V alias the dead F32 conv
-    // destination (n64*10240*2 <= n*10240*4 for admitted n>=64); the producer
+    // destination (n64 * channels * 2 <= n * channels * 4 for admitted n>=64); the producer
     // also zeros their pad rows. G aliases gate, beta stays in its original
     // plane, and BF16 scan output aliases the F32 recurrent destination.
-    let q_bytes = n64 * 2048 * 2;
+    let q_bytes = n64 * geometry.qk() * 2;
     let q = raw(p.projection, 0, q_bytes);
     let k = raw(p.projection, q_bytes, q_bytes);
-    let v = raw(p.projection, q_bytes * 2, n64 * 6144 * 2);
-    let out = raw(p.output, 0, n * 6144 * 2);
+    let v = raw(p.projection, q_bytes * 2, n64 * geometry.value_width() * 2);
+    let out = raw(p.output, 0, n * geometry.value_width() * 2);
     let mut slot = SCRATCH.with(|s| {
         let mut slots = s.borrow_mut();
         let index = slots
@@ -241,7 +382,7 @@ pub fn run(
         // not clear (`ef_words == 0`) and the scan reads on entry and rewrites on exit.
         let (ef_plane, ef_words): (&GpuTensor, usize) = match (p.residual, s.ef.as_ref()) {
             (Some(residual), _) => (residual, 0),
-            (None, Some(ef)) => (ef, EF_BYTES / 4),
+            (None, Some(ef)) => (ef, geometry.ef_bytes() / 4),
             (None, None) => {
                 return Err(hip_bridge::HipError::new(
                     0,
@@ -275,16 +416,34 @@ pub fn run(
         args.push_f32((p.key_dim as f32).sqrt().recip());
         args.push_i32(ef_words as i32);
         // `HIPFIRE_QWEN4_GDN_CHAIN_FUSE`: the load-batched producer (same bytes), entry by
-        // the projection's dtype; `=0` keeps the v1 entry (which reads either dtype).
-        let producer = match (gpu.flags.qwen4_gdn_chain_fuse_enabled(), conv.input.dtype) {
-            (false, _) => "fn_gdn_dense_producer",
-            (true, DType::BF16) => "fn_gdn_dense_producer_v2_bf16",
-            (true, _) => "fn_gdn_dense_producer_v2_f32",
+        // the projection's dtype; `=0` keeps the v1 entry (which reads either dtype). The
+        // 8 / 24 shard geometry has only the load-batched entries (`applies` requires them).
+        let chain_fuse = gpu.flags.qwen4_gdn_chain_fuse_enabled();
+        if geometry.producer_entry(chain_fuse, false).is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fn_gdn_dense: no producer entry for this head geometry",
+            ));
+        }
+        // One literal per arm (the launcher ABI gate resolves the kernel name from them); the
+        // check above admits only 16 / 48 (any entry) and 8 / 24 (load-batched entries).
+        let producer = match (geometry.key_heads, chain_fuse, conv.input.dtype) {
+            (16, false, _) => "fn_gdn_dense_producer",
+            (16, true, DType::BF16) => "fn_gdn_dense_producer_v2_bf16",
+            (16, true, _) => "fn_gdn_dense_producer_v2_f32",
+            (_, _, DType::BF16) => "fn_gdn_dense_producer_v2_bf16_k8v24",
+            (_, _, _) => "fn_gdn_dense_producer_v2_f32_k8v24",
         };
-        launch(gpu, producer, [82, (n64 / 32) as u32, 1], 256, &mut args)?;
+        launch(
+            gpu,
+            producer,
+            [geometry.producer_blocks() as u32, (n64 / 32) as u32, 1],
+            256,
+            &mut args,
+        )?;
         gpu.gdn_chunk_kkt_solve_batched(&k, p.gate, p.beta, &s.a, n, p.key_heads, p.value_heads)?;
-        let codes = raw(p.state, 0, 48 * 128 * 128);
-        let scales = raw(p.state, 48 * 128 * 128, 48 * 128 * 4);
+        let codes = raw(p.state, 0, geometry.state_codes());
+        let scales = raw(p.state, geometry.state_codes(), geometry.state_scales());
         gpu.gdn_chunk_scan_layer_mseg(
             &q,
             &k,
@@ -351,16 +510,15 @@ pub fn gate(
 
 /// Whether [`gate_i8`] replaces the gate + the MQ6 out projection's A8 producer
 /// (`HIPFIRE_QWEN4_GDN_I8_FUSE`, default on for exact gfx1201): the 48 x 128 FN
-/// value geometry, whose 6144 columns are 24 whole 256-wide rotation groups of
-/// two heads, with the recurrent plane, `z` and `norm` 16-byte aligned (the kernel
-/// loads eight elements per lane). The caller has checked [`applies`] and the out
-/// projection's INT8 route ([`Gpu::gemm_mq6g256v2_i8_applies`], eager only), so no
-/// recorder or capture state is consulted here.
+/// value geometry (6144 columns = 24 whole 256-wide rotation groups of two heads) or the
+/// 24 x 128 TP2 shard geometry (3072 columns = 12 groups), with the recurrent plane, `z` and
+/// `norm` 16-byte aligned (the kernel loads eight elements per lane). The caller has checked
+/// [`applies`] and the out projection's INT8 route ([`Gpu::gemm_mq6g256v2_i8_applies`], eager
+/// only), so no recorder or capture state is consulted here.
 pub fn gate_i8_applies(gpu: &Gpu, p: &GatedDeltaGateBatched<'_>) -> bool {
     gpu.flags.qwen4_gdn_i8_fuse_enabled()
         && p.rows > 0
-        && p.value_heads == 48
-        && p.value_dim == 128
+        && gate_i8_entry(p.value_heads, p.value_dim).is_some()
         && [p.recurrent_output, p.z, p.norm]
             .iter()
             .all(|t| (t.buf.as_ptr() as usize).is_multiple_of(16))
@@ -373,6 +531,16 @@ pub fn gate_i8_applies(gpu: &Gpu, p: &GatedDeltaGateBatched<'_>) -> bool {
 /// nothing else (`p.output` is not written). Returns the blocks' device pointer for
 /// [`Gpu::gemm_mq6g256v2_i8_prequant`]; valid until the next A8 producer.
 pub fn gate_i8(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<*mut c_void> {
+    if gate_i8_entry(p.value_heads, p.value_dim).is_none() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "fn_gdn_dense: no gate_i8 entry for this value-head geometry",
+        ));
+    }
+    let entry = match p.value_heads {
+        24 => "fn_gdn_dense_gate_i8_p12",
+        _ => "fn_gdn_dense_gate_i8",
+    };
     let k = p.value_heads * p.value_dim;
     // The unfused producer flushes a deferred residual add before reading.
     gpu.flush_residual_fold()?;
@@ -388,8 +556,8 @@ pub fn gate_i8(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<*mut c
     args.push_i32(p.rows as i32);
     launch(
         gpu,
-        "fn_gdn_dense_gate_i8",
-        // One wave per 256-wide group, two groups per workgroup (rows * 24 is even).
+        entry,
+        // One wave per 256-wide group, two groups per workgroup (rows * (24 or 12) is even).
         [(p.rows * (k / 256) / 2) as u32, 1, 1],
         64,
         &mut args,
@@ -484,6 +652,163 @@ mod tests {
                     "{arch} {format:?} residual={residual}"
                 );
             }
+        }
+    }
+
+    /// The pre-shard 16 / 48 geometry keeps every launch constant it had as a literal (10240
+    /// channels, 82 producer blocks, the 1.5 MiB EF plane, the 48 x 128 x 128 Q8 codes), and the
+    /// rank-local 8 / 24 shard geometry is exactly half of each.
+    #[test]
+    fn geometry_constants_pin_flash_next_and_halve_for_the_shard() {
+        let full = Geometry::of(16, 48).expect("flash-next");
+        assert_eq!(full.qk(), 2048);
+        assert_eq!(full.value_width(), 6144);
+        assert_eq!(full.channels(), 10240);
+        assert_eq!(full.producer_blocks(), 82);
+        assert_eq!(full.ef_bytes(), EF_BYTES);
+        assert_eq!(full.state_codes(), 48 * 128 * 128);
+        assert_eq!(full.state_scales(), 48 * 128 * 4);
+        assert_eq!(
+            GdnStateFormat::Q8.state_bytes(48, 128, 128),
+            full.state_codes() + full.state_scales()
+        );
+        let half = Geometry::of(8, 24).expect("rank-local shard");
+        assert_eq!(half.qk(), 1024);
+        assert_eq!(half.value_width(), 3072);
+        assert_eq!(half.channels(), 5120);
+        assert_eq!(half.producer_blocks(), 42);
+        assert_eq!(half.ef_bytes() * 2, full.ef_bytes());
+        assert_eq!(half.state_codes() * 2, full.state_codes());
+        assert_eq!(half.state_scales() * 2, full.state_scales());
+        assert_eq!(
+            GdnStateFormat::Q8.state_bytes(24, 128, 128),
+            half.state_codes() + half.state_scales()
+        );
+        assert_eq!(half.channels() * 2, full.channels());
+        for (kh, vh) in [(8, 48), (16, 24), (4, 12), (32, 96), (16, 32), (0, 0)] {
+            assert_eq!(Geometry::of(kh, vh), None, "{kh}/{vh}");
+        }
+    }
+
+    /// The thread-local scratch is sized at the 48-head upper bound the census charges: every
+    /// admitted geometry's EF plane and A rows fit it.
+    #[test]
+    fn scratch_upper_bound_covers_every_admitted_geometry() {
+        for (key_heads, value_heads) in crate::scratch::QWEN4_DENSE_GDN_GEOMETRIES {
+            let g = Geometry::of(key_heads, value_heads).expect("admitted");
+            assert!(g.ef_bytes() <= EF_BYTES, "{key_heads}/{value_heads}");
+            assert!(
+                value_heads * 64 * 2 <= A_ROW_BYTES,
+                "{key_heads}/{value_heads}"
+            );
+            assert_eq!(g.ef_bytes() % 16, 0, "the EF zero block stores whole uint4");
+        }
+    }
+
+    /// Producer entry by (geometry, chain fusion, input dtype): the three pre-shard entries are
+    /// unchanged; the shard geometry has the two load-batched entries only.
+    #[test]
+    fn producer_entries_by_geometry() {
+        let full = Geometry::of(16, 48).unwrap();
+        assert_eq!(
+            full.producer_entry(false, false),
+            Some("fn_gdn_dense_producer")
+        );
+        assert_eq!(
+            full.producer_entry(false, true),
+            Some("fn_gdn_dense_producer")
+        );
+        assert_eq!(
+            full.producer_entry(true, false),
+            Some("fn_gdn_dense_producer_v2_f32")
+        );
+        assert_eq!(
+            full.producer_entry(true, true),
+            Some("fn_gdn_dense_producer_v2_bf16")
+        );
+        let half = Geometry::of(8, 24).unwrap();
+        assert_eq!(half.producer_entry(false, false), None);
+        assert_eq!(half.producer_entry(false, true), None);
+        assert_eq!(
+            half.producer_entry(true, false),
+            Some("fn_gdn_dense_producer_v2_f32_k8v24")
+        );
+        assert_eq!(
+            half.producer_entry(true, true),
+            Some("fn_gdn_dense_producer_v2_bf16_k8v24")
+        );
+    }
+
+    /// `applies`' geometry part: the 16 / 48 pin (10240 channels) holds with the chain fusion on
+    /// or off, the 8 / 24 shard geometry (5120 channels) only with it on, nothing else runs.
+    #[test]
+    fn geometry_admission_pins_old_results_and_adds_the_shard_shape() {
+        for chain_fuse in [false, true] {
+            assert!(geometry_runs(16, 48, 128, 128, 10240, chain_fuse));
+            assert_eq!(
+                geometry_runs(8, 24, 128, 128, 5120, chain_fuse),
+                chain_fuse,
+                "the shard geometry has no v1 producer"
+            );
+            for (kh, vh, kd, vd, qkv) in [
+                (16, 48, 128, 128, 5120),
+                (8, 24, 128, 128, 10240),
+                (16, 32, 128, 128, 8192),
+                (16, 48, 64, 128, 10240),
+                (16, 48, 128, 64, 10240),
+                (8, 48, 128, 128, 8192),
+            ] {
+                assert!(!geometry_runs(kh, vh, kd, vd, qkv, chain_fuse));
+            }
+        }
+    }
+
+    /// `applies`' row-count part is unchanged: at least 64 rows, a final partial 512-row
+    /// segment of 64..512 rows or none.
+    #[test]
+    fn row_admission_is_the_mseg_segment_geometry() {
+        for (rows, want) in [
+            (0, false),
+            (63, false),
+            (64, true),
+            (65, true),
+            (511, true),
+            (512, true),
+            (513, false),
+            (575, false),
+            (576, true),
+            (1024, true),
+            (1025, false),
+            (4096, true),
+            (4096 + 63, false),
+            (4096 + 64, true),
+        ] {
+            assert_eq!(rows_admitted(rows), want, "{rows} rows");
+        }
+    }
+
+    /// The fused gate + A8 producer: 48 value heads (24 pairs per row) as before, 24 value
+    /// heads (12 pairs) for the shard; a head width other than 128 or any other head count has no
+    /// entry (the unfused gate + `mq_rotate_x_i8_gfx12` chain runs).
+    #[test]
+    fn gate_i8_entries_by_value_heads() {
+        assert_eq!(gate_i8_entry(48, 128), Some("fn_gdn_dense_gate_i8"));
+        assert_eq!(gate_i8_entry(24, 128), Some("fn_gdn_dense_gate_i8_p12"));
+        for (heads, dim) in [
+            (48, 64),
+            (24, 64),
+            (32, 128),
+            (12, 128),
+            (0, 128),
+            (16, 128),
+        ] {
+            assert_eq!(gate_i8_entry(heads, dim), None, "{heads} x {dim}");
+        }
+        // Whole 256-wide rotation groups of head pairs, an even number of groups per launch row
+        // pair: the launch grid `rows * pairs / 2` is exact for every row count.
+        for heads in [48usize, 24] {
+            assert_eq!(heads * 128 % 256, 0);
+            assert_eq!((heads / 2) % 2, 0);
         }
     }
 }

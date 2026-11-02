@@ -6593,6 +6593,13 @@ impl Qwen4Bundle {
         plan: std::sync::Arc<crate::ep_reserve::EpReservePlan>,
     ) -> Result<(), BundleError> {
         let fail = |message: String| BundleError::Forward(format!("EP reserve attach: {message}"));
+        if self.config.trunk_shard.is_some() {
+            return Err(fail(
+                "a trunk-shard rank sizes its scratch from its rank-local config; the shared \
+                 reserve plan was cut from the global one"
+                    .to_string(),
+            ));
+        }
         if self.execution.is_some() {
             return Err(fail(
                 "Qwen4 forward resources are already attached".to_string(),

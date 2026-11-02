@@ -1803,6 +1803,30 @@ pub fn qwen4_dense_gdn_admits(arch: &str, format: crate::tensor_ops::GdnStateFor
         )
 }
 
+/// Head geometries `(key heads, value heads)` the dense GDN scan kernels (`fn_gdn_dense`; 128-wide
+/// heads, K = 4 convolution) are compiled for: the Flash-Next geometry and the rank-local geometry
+/// of the TP2 trunk shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`: half the heads of each).
+pub const QWEN4_DENSE_GDN_GEOMETRIES: [(usize, usize); 2] = [(16, 48), (8, 24)];
+
+/// Whether the dense GDN scan kernels take this head geometry: one of
+/// [`QWEN4_DENSE_GDN_GEOMETRIES`], 128-wide key and value heads, and the matching q | k | v
+/// convolution width. A pure function shared by the route's own admission
+/// (`fn_gdn_dense::applies`) and the prefill-workspace census, so the census charges the dense
+/// scan's scratch exactly where the route can run (it charges the 48-head upper bound, which
+/// covers every admitted geometry).
+pub fn qwen4_dense_gdn_geometry_admits(
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    qkv_width: usize,
+) -> bool {
+    key_dim == 128
+        && value_dim == 128
+        && QWEN4_DENSE_GDN_GEOMETRIES.contains(&(key_heads, value_heads))
+        && qkv_width == 2 * key_heads * key_dim + value_heads * value_dim
+}
+
 /// Model dimensions the Qwen4 prefill workspace census reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen4PrefillWorkspaceDims {
@@ -4966,6 +4990,36 @@ mod prefill_workspace_tests {
         assert!(qwen4_dense_gdn_admits("gfx1201", Q8));
         assert!(qwen4_dense_gdn_admits("gfx1201", Q8Ef));
         assert!(!qwen4_dense_gdn_admits("gfx1201", F32));
+    }
+
+    /// The dense GDN scan's head geometry: the Flash-Next 16 / 48 pin of the incumbent route
+    /// (10240-wide) is unchanged, the TP2 trunk shard's rank-local 8 / 24 (5120-wide) is
+    /// admitted, everything else (other head counts, the 8 / 48 and 16 / 24 mixes, a head
+    /// width other than 128, a mismatched q | k | v width) keeps the incumbent recurrence.
+    #[test]
+    fn dense_gdn_geometry_pins_flash_next_and_admits_the_rank_local_shard() {
+        assert!(qwen4_dense_gdn_geometry_admits(16, 48, 128, 128, 10240));
+        assert!(qwen4_dense_gdn_geometry_admits(8, 24, 128, 128, 5120));
+        for (kh, vh, kd, vd, qkv) in [
+            (16, 48, 128, 128, 5120),
+            (8, 24, 128, 128, 10240),
+            (8, 48, 128, 128, 8192),
+            (16, 24, 128, 128, 7168),
+            (4, 12, 128, 128, 2560),
+            (16, 32, 128, 128, 8192),
+            (16, 48, 64, 128, 10240),
+            (16, 48, 128, 64, 10240),
+            (0, 0, 128, 128, 0),
+        ] {
+            assert!(
+                !qwen4_dense_gdn_geometry_admits(kh, vh, kd, vd, qkv),
+                "{kh}/{vh} {kd}x{vd} qkv {qkv}"
+            );
+        }
+        // Every admitted geometry fits the 48-head upper bound the census charges.
+        for (kh, vh) in QWEN4_DENSE_GDN_GEOMETRIES {
+            assert!(vh <= 48 && vh % kh == 0 && vh / kh == 3, "{kh}/{vh}");
+        }
     }
 
     #[test]

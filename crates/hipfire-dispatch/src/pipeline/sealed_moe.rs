@@ -7987,6 +7987,91 @@ mod tests {
         assert!(params.expert_iu4.is_none());
     }
 
+    /// The shared expert is validated against its OWN declared width. A trunk shard rank holds
+    /// it as a K-slice (half of the fixture's 4 here; 384 / 256 of 640 in the model): the
+    /// weights, the declared width and both scratch views must agree, and a declared width left
+    /// at the routed expert's (the two coincide at 640 on one card) is refused, decode and
+    /// prefill alike. The equal-width cases are the pre-shard behaviour.
+    #[test]
+    fn shared_validation_pins_the_declared_width_to_the_sliced_weights() {
+        use crate::families::moe::{MoeSharedDecode, MoeSharedPrefill, MoeSharedWeights};
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+
+        let s = prefill_scratch(0xE9_0000);
+        let base = ep_prefill_params(
+            &s,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+        );
+        let prefill = |declared: usize, weights_m: usize| {
+            let params = MoePrefillParams {
+                prelude: crate::families::moe::MoePrefillPrelude {
+                    shared: Some(MoeSharedPrefill {
+                        weights: MoeSharedWeights {
+                            selector: shaped_weight(&s.y_down_grouped, DType::MQ4G256, 1, 4),
+                            gate: shaped_weight(&s.gate_batch, DType::MQ4G256, weights_m, 4),
+                            up: shaped_weight(&s.up_batch, DType::MQ4G256, weights_m, 4),
+                            down: shaped_weight(&s.down_expanded, DType::MQ4G256, 4, weights_m),
+                        },
+                        intermediate: declared,
+                        scalar: &s.shared_scalar,
+                        gate_out: &s.shared_gate,
+                        up_out: &s.shared_up,
+                        rotated: &s.shared_rotated,
+                    }),
+                    ..base.prelude
+                },
+                ..base
+            };
+            validate_shared_prefill(&params, 4).is_ok()
+        };
+        assert!(prefill(4, 4), "the one-card width");
+        assert!(prefill(2, 2), "a K-slice declared as sliced");
+        assert!(!prefill(4, 2), "a slice declared at the routed width");
+        assert!(!prefill(2, 4), "whole weights declared as a slice");
+
+        let d = decode_scratch(0xEA_8000);
+        let base = ep_decode_params(
+            &d,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            0,
+            8,
+            4,
+            crate::families::moe::MoeEpMode::None,
+            None,
+            false,
+        );
+        let decode = |declared: usize, weights_m: usize| {
+            let params = MoeParams {
+                shared: Some(MoeSharedDecode {
+                    weights: MoeSharedWeights {
+                        selector: shaped_weight(&d.backing, DType::MQ4G256, 1, 4),
+                        gate: shaped_weight(&d.backing, DType::MQ4G256, weights_m, 4),
+                        up: shaped_weight(&d.backing, DType::MQ4G256, weights_m, 4),
+                        down: shaped_weight(&d.backing, DType::MQ4G256, 4, weights_m),
+                    },
+                    intermediate: declared,
+                    scalar: &d.scalar_buf,
+                    gate_out: &d.gate_buf,
+                    up_out: &d.up_buf,
+                }),
+                ..base
+            };
+            validate_shared_decode(&params, 4).is_ok()
+        };
+        assert!(decode(4, 4), "the one-card width");
+        assert!(decode(2, 2), "a K-slice declared as sliced");
+        assert!(!decode(4, 2), "a slice declared at the routed width");
+        assert!(!decode(2, 4), "whole weights declared as a slice");
+    }
+
     fn ep_prefill_table() -> (ExpertTable, ExpertBindingCache, CompactFixture) {
         let dtype = DType::MQ4G256;
         let table = ep_table(4, 2, dtype);

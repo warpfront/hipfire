@@ -3101,8 +3101,12 @@ impl Qwen4EpPeer {
                 forward.ep_placement()
             ));
         }
-        if self.bundle.config.replica_geometry() != config.replica_geometry() {
-            return Err("the loaded peer's model configuration differs from rank 0".to_string());
+        if let Some(error) =
+            self.bundle
+                .config
+                .replica_mismatch(config, placement.rank, placement.ranks)
+        {
+            return Err(error);
         }
         let theirs = self.bundle.ep_replication_fingerprint();
         if theirs != *fingerprint {

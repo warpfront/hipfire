@@ -3971,4 +3971,192 @@ mod tests {
             false
         ));
     }
+
+    fn flash_next_geometry(shared: usize) -> MoeRouteGeometry {
+        MoeRouteGeometry {
+            shared_intermediate: shared,
+            ..FIXED_ROUTE_GEOMETRY
+        }
+    }
+
+    fn flash_next_policy(capability: MoeRouteCapability, shared: usize) -> MoeRoutePolicy {
+        MoeRoutePolicy {
+            capability,
+            geometry: flash_next_geometry(shared),
+            formats: MoeRouteFormats {
+                router: DType::BF16,
+                shared_selector: DType::BF16,
+                shared_gate: DType::BF16,
+                shared_up: DType::BF16,
+                shared_down: DType::BF16,
+                routed_gate_up: DType::MQ4G256V2,
+                routed_down: DType::MQ4G128V2,
+            },
+            slab_cold_codec: None,
+            expert_keep_mask: 0,
+        }
+    }
+
+    /// The shared-expert width rule of the QT44/QT53 and slab routes: the model's 640 (pinned
+    /// before the trunk shard) and every 128-multiple below it (a trunk shard rank's K-slice:
+    /// 384 / 256), nothing else. Widths that are not a 128-multiple (320 is the split the
+    /// prefill K-admission refuses), zero, or wider than the model stay refused.
+    #[test]
+    fn shared_width_geometry_admits_the_model_width_and_its_128_multiple_slices_only() {
+        for shared in [640usize, 512, 384, 256, 128] {
+            assert!(
+                fixed_route_geometry_up_to_shared_width(flash_next_geometry(shared)),
+                "shared {shared}"
+            );
+        }
+        for shared in [0usize, 1, 64, 127, 129, 320, 641, 768, 1280] {
+            assert!(
+                !fixed_route_geometry_up_to_shared_width(flash_next_geometry(shared)),
+                "shared {shared}"
+            );
+        }
+        // Every other axis of the geometry stays pinned, whatever the shared width.
+        for shared in [640usize, 384, 256] {
+            let base = flash_next_geometry(shared);
+            for broken in [
+                MoeRouteGeometry {
+                    experts: 511,
+                    ..base
+                },
+                MoeRouteGeometry { top_k: 8, ..base },
+                MoeRouteGeometry {
+                    hidden: 2048,
+                    ..base
+                },
+                MoeRouteGeometry {
+                    routed_intermediate: 512,
+                    ..base
+                },
+            ] {
+                assert!(
+                    !fixed_route_geometry_up_to_shared_width(broken),
+                    "{broken:?}"
+                );
+            }
+        }
+    }
+
+    /// The grouped QT44/QT53 and slab route predicates apply the width rule through the
+    /// policy; the model's own 640 selects exactly as before the shard.
+    #[test]
+    fn grouped_and_slab_geometry_follow_the_shared_width() {
+        let grouped = |capability: MoeRouteCapability, shared: usize| {
+            grouped_route_geometry_supported(
+                &flash_next_policy(capability, shared),
+                512,
+                10,
+                2560,
+                640,
+                2560,
+                2560,
+                640,
+                DType::MQ4G256V2,
+                DType::MQ4G128V2,
+            )
+        };
+        let slab = |shared: usize| {
+            slab_route_geometry_supported(
+                None,
+                &flash_next_policy(MoeRouteCapability::SlabCodecGrouped, shared),
+                512,
+                10,
+                2560,
+                640,
+                2560,
+                2560,
+                640,
+                &MoeDtypes {
+                    routed_gate_up: DType::MQ4G256V2,
+                    routed_down: DType::MQ4G128V2,
+                    ..uniform_mq4()
+                },
+                false,
+            )
+        };
+        for capability in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            for (shared, want) in [
+                (640, true),
+                (512, true),
+                (384, true),
+                (256, true),
+                (320, false),
+            ] {
+                assert_eq!(grouped(capability, shared), want, "{capability:?} {shared}");
+            }
+        }
+        for (shared, want) in [
+            (640, true),
+            (384, true),
+            (256, true),
+            (320, false),
+            (0, false),
+        ] {
+            assert_eq!(slab(shared), want, "slab {shared}");
+        }
+        // The routed side is untouched by the shard: the routed width must still be 640.
+        assert!(!grouped_route_geometry_supported(
+            &flash_next_policy(MoeRouteCapability::Qt44Qt53Grouped, 384),
+            512,
+            10,
+            2560,
+            512,
+            2560,
+            2560,
+            512,
+            DType::MQ4G256V2,
+            DType::MQ4G128V2,
+        ));
+        // The grouped shape predicate also serves the slab declaration (the same fixed-shape
+        // stages; its own predicate adds the dtype-table contract); the FP8 one is neither.
+        assert!(grouped(MoeRouteCapability::SlabCodecGrouped, 384));
+        assert!(!grouped(MoeRouteCapability::Fp8B128Grouped, 640));
+        assert!(!slab_route_geometry_supported(
+            None,
+            &flash_next_policy(MoeRouteCapability::Qt44Qt53Grouped, 384),
+            512,
+            10,
+            2560,
+            640,
+            2560,
+            2560,
+            640,
+            &uniform_mq4(),
+            false,
+        ));
+    }
+
+    /// The qt=55 FP8 route is NOT part of the shared-width relaxation: it keeps the exact
+    /// 512/10/2560/640/640 geometry.
+    #[test]
+    fn fp8_grouped_geometry_keeps_the_exact_shared_width() {
+        let fp8 = |shared: usize| {
+            let mut policy = flash_next_policy(MoeRouteCapability::Fp8B128Grouped, shared);
+            policy.formats.routed_gate_up = DType::FP8E4M3B128;
+            policy.formats.routed_down = DType::FP8E4M3B128;
+            fp8_grouped_route_geometry_supported(
+                &policy,
+                512,
+                10,
+                2560,
+                640,
+                2560,
+                2560,
+                640,
+                DType::FP8E4M3B128,
+                DType::FP8E4M3B128,
+            )
+        };
+        assert!(fp8(640));
+        for shared in [512usize, 384, 256, 128] {
+            assert!(!fp8(shared), "fp8 shared {shared}");
+        }
+    }
 }

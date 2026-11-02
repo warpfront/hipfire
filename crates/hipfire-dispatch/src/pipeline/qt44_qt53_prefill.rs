@@ -1256,10 +1256,14 @@ impl HcRowFoldNext {
 impl HcSharedDown {
     /// What the shared down needs of `write`, or `None` when its operands
     /// are not the plain four-branch F32-typed streams / gates it folds into.
+    /// Always `None` for a write that carries the trunk-shard all-reduce
+    /// ([`HyperWriteOp::ar`]): the folded epilogue would write the rank's UNREDUCED partial
+    /// into the streams, so the shared down runs unfused and the fused all-reduce write follows.
     pub(crate) fn offer(write: &super::layer_ops::HyperWriteOp<'_>) -> Option<Self> {
         let wide = write.branches.checked_mul(write.hidden)?;
         let (streams_len, gates_len) = (write.rows.checked_mul(wide)?, write.rows.checked_mul(4)?);
-        (write.branches == 4
+        (write.ar.is_none()
+            && write.branches == 4
             && write.input.buf.as_ptr() == write.output.buf.as_ptr()
             && write.input.dtype == DType::F32
             && write.input.numel() >= streams_len
@@ -4230,5 +4234,91 @@ mod scratch_tests {
         huge.rows = usize::MAX / 4;
         assert!(fp8().requirement(&huge).is_err());
         assert!(fp8_grouped_rows_bound(usize::MAX, N_EXP).is_err());
+    }
+}
+
+#[cfg(test)]
+mod hc_ar_tests {
+    use super::super::layer_ops::{HyperWriteAr, HyperWriteOp};
+    use super::*;
+
+    struct NoReduce;
+
+    impl HyperWriteAr for NoReduce {
+        fn ar_hyper_write(
+            &self,
+            _gpu: &mut Gpu,
+            _partial: &GpuTensor,
+            _streams: &GpuTensor,
+            _gates: &GpuTensor,
+            _rows: usize,
+            _state_bf16: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn fake(ptr: usize, elems: usize, dtype: DType) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    ptr as *mut std::ffi::c_void,
+                    elems * dtype.size(),
+                )
+            },
+            shape: vec![elems],
+            dtype,
+        }
+    }
+
+    fn weight(buf: &GpuTensor, m: usize, k: usize) -> WeightRef<'_> {
+        WeightRef {
+            buf,
+            dtype: buf.dtype,
+            m,
+            k,
+            row_stride: k,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    /// The shared down's GEMM-epilogue HC fold (and, through it, the HC row fold) is offered
+    /// only the plain local HC write: a write that carries the trunk-shard all-reduce is
+    /// never offered, so the shared down runs unfused and the fused all-reduce write reduces
+    /// the rank's partial (a folded epilogue would write the UNREDUCED partial into the
+    /// streams). Without the all-reduce the offer is exactly the pre-shard one.
+    #[test]
+    fn shared_down_hc_fold_is_never_offered_a_fused_all_reduce_write() {
+        let (rows, wide) = (2usize, 4 * 2560);
+        let streams = fake(0x10_0000, rows * wide, DType::F32);
+        let norm = fake(0x20_0000, wide, DType::BF16);
+        let normalized = fake(0x30_0000, rows * wide, DType::F32);
+        let mixed = fake(0x40_0000, rows * 2560, DType::F32);
+        let gates = fake(0x50_0000, rows * 4, DType::F32);
+        let inject = fake(0x60_0000, 4 * wide, DType::BF16);
+        let rotation = fake(0x70_0000, rows * 2560, DType::F32);
+        let write = |ar: Option<&'static dyn HyperWriteAr>| HyperWriteOp {
+            state_bf16: true,
+            input: &streams,
+            norm_weight: &norm,
+            block_inject: weight(&inject, 4, wide),
+            normalized: &normalized,
+            mixed: &mixed,
+            gates: &gates,
+            output: &streams,
+            rows,
+            branches: 4,
+            hidden: 2560,
+            rotation: &rotation,
+            ar,
+        };
+        let local = HcSharedDown::offer(&write(None)).expect("the plain local write is offered");
+        assert_eq!((local.rows, local.hidden), (rows, 2560));
+        assert!(local.state_bf16 && local.row_fold.is_none());
+        assert!(HcSharedDown::offer(&write(Some(&NoReduce))).is_none());
     }
 }

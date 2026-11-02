@@ -244,6 +244,12 @@ pub fn admit_ep_reserve(facts: &EpReserveFacts<'_>) -> Result<(), Refusal> {
     if !facts.flash_next {
         return no("not the pinned Flash-Next profile");
     }
+    // The plan is ONE global-config scratch layout placed byte for byte on both ranks
+    // (`validate_placements`); a trunk-shard rank sizes its scratch from its own rank-local
+    // config (half the heads, 384 / 256 shared width), so no shared plan fits either rank.
+    if crate::weights::trunk_shard::trunk_shard_requested() {
+        return no("the trunk shard sizes each rank's scratch from its rank-local config");
+    }
     if facts.expert_qt != Some((44, 53)) {
         return no("expert recipe is not the pinned QT44/QT53 pair");
     }

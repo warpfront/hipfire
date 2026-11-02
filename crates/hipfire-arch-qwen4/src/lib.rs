@@ -66,6 +66,10 @@ pub mod host_link;
 pub mod kv_backend;
 #[cfg(feature = "lab")]
 pub(crate) mod lab_draft_rounds;
+/// Trunk-shard layer oracle engine: injected-stream block runs of the real forward program
+/// and the CPU-side contract analysis (`examples/trunk_shard_layer_oracle.rs`).
+#[cfg(feature = "lab")]
+pub mod lab_trunk_oracle;
 /// Read-only lab observation of the production sampled MTP accepting window.
 #[cfg(feature = "lab")]
 pub mod lab_window;

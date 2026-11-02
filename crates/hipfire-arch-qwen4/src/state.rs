@@ -6716,6 +6716,77 @@ mod tests {
         );
     }
 
+    /// The rank-local TP2 trunk-shard config (24 value / 8 key GDN heads) sizes the GDN state
+    /// from its own head counts: the recurrent slot of every format, its live F16 residual, the
+    /// 3-row conv ring and the verify ring all halve against the global config while the QSA
+    /// arenas (KV replicated) and everything else stay byte-for-byte, and the global config's
+    /// figures are unchanged.
+    #[test]
+    fn trunk_shard_local_config_halves_the_gdn_state_and_the_verify_ring() {
+        let global = crate::config::compact_test_config()
+            .into_ar_only()
+            .expect("ar-only");
+        let locals = [0, 1].map(|rank| global.trunk_shard_local(rank, 2).expect("local config"));
+        // The global figures of `row_capture_bytes_charge_the_gdn_storage_dtype`.
+        assert_eq!(
+            Qwen4State::row_capture_bytes(&global, GdnStateFormat::F32, 4),
+            Some(917_920_320)
+        );
+        assert_eq!(
+            Qwen4State::row_capture_bytes(&global, GdnStateFormat::Q8, 4),
+            Some(245_520_960)
+        );
+        for local in &locals {
+            // 36 x (2R ring slots + F32 inputs 4R x 5120 and recurrence 4R x 5168) + 4R x 3072
+            // F32 output + 36 x 16 table; Q8 slots are 24 x 128 x 132 bytes.
+            assert_eq!(
+                Qwen4State::row_capture_bytes(local, GdnStateFormat::F32, 4),
+                Some(458_960_448)
+            );
+            assert_eq!(
+                Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 4),
+                Some(122_760_768)
+            );
+            assert_eq!(
+                Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 1),
+                Some(0)
+            );
+        }
+        let (heads, key_heads) = (
+            locals[0].linear_num_value_heads,
+            locals[0].linear_num_key_heads,
+        );
+        assert_eq!((heads, key_heads), (24, 8));
+        let conv = (2 * key_heads * GDN_HEAD_DIM + heads * GDN_HEAD_DIM)
+            * locals[0].linear_conv_kernel_dim.saturating_sub(1)
+            * std::mem::size_of::<f32>();
+        for (name, format) in allocation_formats() {
+            let slot = format
+                .gdn
+                .storage()
+                .state_bytes(heads, GDN_HEAD_DIM, GDN_HEAD_DIM);
+            let residual = format.gdn.residual_bytes(heads, GDN_HEAD_DIM, GDN_HEAD_DIM);
+            // Recurrent + conv, doubled by the snapshot mirror, plus the live-only residual.
+            let gdn_layer = 2 * (slot + conv) + residual;
+            for context in allocation_contexts() {
+                let whole = Qwen4State::device_bytes(&global, format, &context).expect("global");
+                for local in &locals {
+                    let part = Qwen4State::device_bytes(local, format, &context).expect("local");
+                    assert_eq!(
+                        whole - part,
+                        local.n_linear_layers() * gdn_layer,
+                        "{name} {context:?}"
+                    );
+                }
+                assert_eq!(
+                    Qwen4State::device_bytes(&locals[0], format, &context),
+                    Qwen4State::device_bytes(&locals[1], format, &context),
+                    "{name} {context:?}: the ranks hold equal state"
+                );
+            }
+        }
+    }
+
     #[test]
     fn row_capture_64_byte_plan_covers_both_halves_and_all_inputs() {
         let config = crate::config::compact_test_config();

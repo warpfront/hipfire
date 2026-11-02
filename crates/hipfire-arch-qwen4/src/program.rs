@@ -293,7 +293,6 @@ pub struct Qwen4MoeBinding<'a> {
     pub router: WeightRef<'a>,
     pub shared: MoeSharedWeights<'a>,
     pub route_policy: MoeRoutePolicy,
-    pub intermediate: usize,
     pub experts_all_gate_up_mq4: bool,
     /// Expert-slab layers whose experts mix codecs: every expert's gate/up and
     /// down dtype, and the codec-tag tensor. `None` on every other layer (a
@@ -1195,7 +1194,9 @@ fn build_moe_prefill<'a>(
             up: moe.shared.up,
             down: moe.shared.down,
         },
-        intermediate: moe.intermediate,
+        // The shared expert's own width: the rank-local K-slice under the trunk shard (384 /
+        // 256 of 640), never the routed expert width the two coincide at on one card.
+        intermediate: moe_dims.shared_intermediate,
         scalar: scratch.moe_scalar,
         gate_out: scratch.moe_gate,
         up_out: scratch.moe_up,
@@ -1804,6 +1805,26 @@ mod expert_iu4_binding_tests {
         assert_eq!(production.matches("MoePrefillParams {").count(), 1);
         assert_eq!(production.matches("expert_iu4:").count(), 1);
         assert_eq!(production.matches("expert_iu4: None,").count(), 1);
+    }
+
+    /// The sealed MoE declares its shared expert at the config's own (rank-local, under the
+    /// trunk shard 384 / 256) shared width in BOTH protocols: the decode and the grouped
+    /// prefill constructors read it from the program dims, and no constructor reads the routed
+    /// expert width (what `Qwen4MoeBinding::intermediate` carried) for the shared expert -- the
+    /// two coincide at 640 on one card only, and a call that disagrees with its route policy's
+    /// shared width selects no grouped route.
+    #[test]
+    fn decode_and_prefill_bind_the_shared_expert_at_the_dims_shared_width() {
+        let src = include_str!("program.rs");
+        let production = src.split(concat!("#[cfg", "(test)]")).next().unwrap();
+        assert_eq!(
+            production
+                .matches("intermediate: moe_dims.shared_intermediate,")
+                .count(),
+            2
+        );
+        assert!(!production.contains("moe.intermediate"));
+        assert!(!production.contains("pub intermediate: usize,\n    pub experts_all_gate_up_mq4"));
     }
 }
 

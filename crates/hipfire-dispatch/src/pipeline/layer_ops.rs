@@ -793,6 +793,11 @@ fn project_trunk_masked_inner(
                     if [fold.z, fold.beta, fold.alpha]
                         .iter()
                         .all(|j| dense.contains(j))
+                        // The fold's SET epilogue splits beta | alpha at 48 value-head rows each
+                        // (`gemm_zba_v2b_scatter`); the TP2 shard's 24-head matrices decline to
+                        // the separate SETs below.
+                        && projections[fold.beta].0.m == 48
+                        && projections[fold.alpha].0.m == 48
                         && hip(gpu.gemm_qwen4_trunk_zba_iu4(
                             fold.rows,
                             &prepared,
