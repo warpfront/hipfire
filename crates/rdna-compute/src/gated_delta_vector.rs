@@ -26,9 +26,8 @@ pub const GATED_DELTA_NET_VECTOR_SERIAL_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_vector_serial.hip");
 pub const CAUSAL_CONV_DEPTHWISE_ROWS_SRC: &str =
     include_str!("../../../kernels/src/causal_conv_depthwise_rows.hip");
-pub const GATED_RMSNORM_SIGMOID_ROWS_SRC: &str =
-    include_str!("../../../kernels/src/gated_rmsnorm_sigmoid_rows.hip");
-pub const RAON_RDA_PREPARE_SRC: &str = include_str!("../../../kernels/src/raon_rda_prepare.hip");
+pub const GATED_RMSNORM_SIGMOID_ROWS_SRC: &str = crate::kernels::GATED_RMSNORM_SIGMOID_ROWS_SRC;
+pub const RAON_RDA_PREPARE_SRC: &str = crate::kernels::RAON_RDA_PREPARE_SRC;
 pub const RAON_RDA_CONV_PREPARE_SRC: &str =
     include_str!("../../../kernels/src/raon_rda_conv_prepare.hip");
 pub const GATED_RMSNORM_SIGMOID_ROWS_W128_SRC: &str =

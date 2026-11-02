@@ -5436,6 +5436,14 @@ pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100: &[u8] =
 /// Bare lowercase SHA-256 of [`GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100`], without a newline.
 pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256: &str =
     include_str!("../../../kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco.sha256");
+/// Raon RDA gated RMSNorm (`gated_rmsnorm_sigmoid_rows_f32`), launched by
+/// `gated_delta_vector` (module `gated_rmsnorm_sigmoid_rows`); lives here so the kernel registry
+/// can inventory it without the `deltanet` feature.
+pub const GATED_RMSNORM_SIGMOID_ROWS_SRC: &str =
+    include_str!("../../../kernels/src/gated_rmsnorm_sigmoid_rows.hip");
+/// Raon RDA prepare (`raon_rda_prepare_f32`), launched by `gated_delta_vector` (module
+/// `raon_rda_prepare`); see [`GATED_RMSNORM_SIGMOID_ROWS_SRC`].
+pub const RAON_RDA_PREPARE_SRC: &str = include_str!("../../../kernels/src/raon_rda_prepare.hip");
 /// gfx1100 PM twins of the generic gated-delta ops (two kernels, one module):
 /// `gated_delta_net_vector_serial_f32_pm_gfx1100` and `causal_conv_depthwise_silu_rows_f32_pm_gfx1100`,
 /// the card-judged hipcc candidates `R2Rda-05-rs-tv8-prio` / `R1Conv-04-rpw32-k4` sealed by

@@ -27,11 +27,13 @@ use std::ffi::c_void;
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
-const SITU_SRC: &str = include_str!("../../../kernels/src/ffn_situ.hip");
+pub(crate) const SITU_SRC: &str = include_str!("../../../kernels/src/ffn_situ.hip");
 const GROUPED_SRC: &str = include_str!("../../../kernels/src/ffn_grouped_activation_pad.hip");
-const ROUTER_SRC: &str = include_str!("../../../kernels/src/ffn_router_renorm.hip");
-const COMBINE_SRC: &str = include_str!("../../../kernels/src/ffn_moe_combine_policy.hip");
-const COMBINE_W2_SRC: &str = include_str!("../../../kernels/src/ffn_moe_combine_policy_w2.hip");
+pub(crate) const ROUTER_SRC: &str = include_str!("../../../kernels/src/ffn_router_renorm.hip");
+pub(crate) const COMBINE_SRC: &str =
+    include_str!("../../../kernels/src/ffn_moe_combine_policy.hip");
+pub(crate) const COMBINE_W2_SRC: &str =
+    include_str!("../../../kernels/src/ffn_moe_combine_policy_w2.hip");
 
 const SITU_MODULE: &str = "ffn_situ";
 const GROUPED_MODULE: &str = "ffn_grouped_activation_pad";

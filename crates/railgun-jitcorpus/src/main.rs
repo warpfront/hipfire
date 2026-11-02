@@ -21,6 +21,14 @@
 //! node sequence the certified DFlash window builder dumped
 //! (`HIPFIRE_DFLASH_RAILGUN_SEQUENCE_OUT`), added as the node set
 //! `dflash-whole16-gfx1201` so the corpus covers every module of that plan.
+//! Both also take `--program-sequence FILE` (repeatable) with an optional
+//! `--program-arch A` (default gfx1201): the Raon plain-AR decode body's launch
+//! sequence (`sequence.jsonl` of the probe's inventory phase: `symbol`, `module`
+//! and the loaded object's `sha256` per kernel node), added as its own program
+//! `raon-ar-decode-<arch>` (never relabelled as the DFlash window). `check` then
+//! requires every node to resolve to a verified record for exactly that object.
+//! `--only-program ID` (repeatable) restricts `build`/`check` to the named
+//! programs (plus railgun's own kernels), e.g. `raon-ar-decode-gfx1201`.
 //! check  --corpus DIR
 //!     CI gate: every node of every admitted default program and of
 //!     railgun's own kernels must resolve, under the runtime's current JIT
@@ -51,6 +59,9 @@ struct Args {
     archs: Vec<String>,
     jobs: usize,
     window_sequences: Vec<PathBuf>,
+    program_sequences: Vec<PathBuf>,
+    program_arch: String,
+    only_programs: Vec<String>,
 }
 
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
@@ -64,6 +75,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
         archs: Vec::new(),
         jobs: 16,
         window_sequences: Vec::new(),
+        program_sequences: Vec::new(),
+        program_arch: "gfx1201".to_owned(),
+        only_programs: Vec::new(),
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -76,6 +90,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
             "--capture" => a.capture = Some(value()?.into()),
             "--arch" => a.archs.push(value()?),
             "--window-sequence" => a.window_sequences.push(value()?.into()),
+            "--program-sequence" => a.program_sequences.push(value()?.into()),
+            "--program-arch" => a.program_arch = value()?,
+            "--only-program" => a.only_programs.push(value()?),
             "--jobs" => a.jobs = value()?.parse().map_err(|e| format!("--jobs: {e}"))?,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -104,6 +121,16 @@ fn run() -> Result<bool> {
             format!("dflash-whole16-gfx1201-{}", i + 1)
         };
         inventory.add_window_sequence(&id, "gfx1201", &text)?;
+    }
+    for (i, path) in args.program_sequences.iter().enumerate() {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let id = corpus::raon_ar_program_id(&args.program_arch, i);
+        inventory
+            .add_program_sequence(&id, &args.program_arch, &text)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    if !args.only_programs.is_empty() {
+        inventory.retain_programs(&args.only_programs)?;
     }
     if args.archs.is_empty() {
         args.archs = corpus::archs(&inventory);
@@ -143,20 +170,40 @@ fn run() -> Result<bool> {
                 .collect();
             let coverage = corpus::check(&jit, &programs);
             println!(
-                "{:<28} {:<8} {:>5} {:>7} {:>6} {:>7} {:>7}",
-                "program", "arch", "nodes", "covered", "proven", "unknown", "missing"
+                "{:<28} {:<8} {:>5} {:>7} {:>6} {:>7} {:>5} {:>7}",
+                "program", "arch", "nodes", "covered", "proven", "unknown", "cond", "missing"
             );
             for c in &coverage {
                 println!(
-                    "{:<28} {:<8} {:>5} {:>7} {:>6} {:>7} {:>7}",
+                    "{:<28} {:<8} {:>5} {:>7} {:>6} {:>7} {:>5} {:>7}",
                     c.program,
                     c.arch,
                     c.nodes,
                     c.covered,
                     c.proven,
                     c.unknown,
+                    c.conditional,
                     c.missing.len()
                 );
+            }
+            // Not errors: the record exists, but the node is not Proven on its own
+            // (conditional: valid only under the runtime's generation-bound witness;
+            // unknown: the owner will decline the program).
+            for c in &coverage {
+                for n in &c.unproven {
+                    println!(
+                        "NOTE railgun JIT corpus: {} ({}) node {} is {}{}",
+                        c.program,
+                        c.arch,
+                        n.symbol,
+                        n.status,
+                        if n.status == "conditional" {
+                            " (needs a witness at run time)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
             }
             let mut ok = true;
             for c in coverage.iter().filter(|c| !c.missing.is_empty()) {

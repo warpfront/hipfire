@@ -6563,14 +6563,199 @@ pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>
     Ok(entries)
 }
 
+/// JIT modules the Raon-1-mini-preview plain-AR decode body (gfx1201, mq4-xts A8
+/// attention, singleton) loads and that [`entries`] and [`default_route_entries`]
+/// do not carry: the mHC stream mixers, the RDA prepare and gated RMSNorm,
+/// the SITU/router/combine FFN producers, the MoE gate/up GEMV, the MLA latent
+/// attention kernels and the device position counter. Module names and symbol
+/// lists are those of the loaded objects (`railgun-cert` receipts of the
+/// probe's `run/objs`); each source is the expression the cited launcher passes
+/// to `ensure_kernel` on the shipped route, so `railgun-jitcorpus` compiles the
+/// runtime's own recipe. Exact gfx1201 only: the Raon railgun program is a
+/// gfx1201 program, and gfx1100 gets its own inventory once it has a transport.
+pub fn raon_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
+    let arch: &'static str = SUPPORTED_ARCHES
+        .iter()
+        .copied()
+        .find(|&candidate| candidate == arch)
+        .ok_or_else(|| RegistryError::UnsupportedArch(arch.to_owned()))?;
+    let mut entries = Vec::new();
+    macro_rules! add {
+        ($module:literal, $src:expr, [$($symbol:literal),+ $(,)?]) => {
+            entries.push(entry(arch, $module, &[$($symbol),+], ($src).into(), extra_flags))
+        };
+    }
+    if arch == "gfx1201" {
+        add!(
+            "stream_mix_broadcast",
+            crate::stream_mix::STREAM_MIX_BROADCAST_SRC,
+            [
+                "stream_mix_broadcast",
+                "stream_mix_broadcast_bf16",
+                "stream_mix_widen_rows"
+            ]
+        ); // stream_mix.rs:295
+        add!(
+            "stream_mix_route_aggregate",
+            crate::stream_mix::STREAM_MIX_ROUTE_AGGREGATE_SRC,
+            [
+                "stream_mix_route_aggregate_n4_k10",
+                "stream_mix_route_aggregate_n4_k10_bf16"
+            ]
+        ); // stream_mix.rs:421
+        add!(
+            "stream_mix_postmix",
+            crate::stream_mix::STREAM_MIX_MIX_SRC,
+            ["stream_mix_postmix", "stream_mix_postmix_bf16"]
+        ); // stream_mix.rs:546
+        add!(
+            "stream_mix_mean",
+            crate::stream_mix::STREAM_MIX_MEAN_SRC,
+            ["stream_mix_mean", "stream_mix_mean_bf16"]
+        ); // stream_mix.rs:595
+        add!(
+            "qwen4_bf16_round_trip",
+            kernels::QWEN4_BF16_ROUND_TRIP_SRC,
+            ["bf16_round_trip_f32_strided"]
+        ); // norm.rs:2648
+        add!(
+            "raon_rda_prepare",
+            kernels::RAON_RDA_PREPARE_SRC,
+            ["raon_rda_prepare_f32"]
+        ); // gated_delta_vector.rs:609
+        add!(
+            "gated_rmsnorm_sigmoid_rows",
+            kernels::GATED_RMSNORM_SIGMOID_ROWS_SRC,
+            ["gated_rmsnorm_sigmoid_rows_f32"]
+        ); // gated_delta_vector.rs:486
+        add!(
+            "ffn_situ",
+            crate::ffn_activation::SITU_SRC,
+            [
+                "ffn_swiglu_rows_f32",
+                "ffn_swiglu_clamp_rows_f32",
+                "ffn_situ_rows_f32"
+            ]
+        ); // ffn_activation.rs:483
+        add!(
+            "ffn_router_renorm",
+            crate::ffn_activation::ROUTER_SRC,
+            ["ffn_moe_router_topk_f32"]
+        ); // ffn_activation.rs:1057
+        add!(
+            "ffn_moe_combine_policy",
+            crate::ffn_activation::COMBINE_SRC,
+            ["ffn_moe_combine_f32", "ffn_round_bf16_f32"]
+        ); // ffn_activation.rs:1188,1259
+        add!(
+            "ffn_moe_combine_policy_w2",
+            crate::ffn_activation::COMBINE_W2_SRC,
+            ["ffn_moe_combine_f32_w2"]
+        ); // ffn_activation.rs:1188 (combine_w2_route: exact gfx1201)
+        add!(
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
+            kernels::gemv_mq4g256v2_moe_gate_up_k8_indexed_batched_src(false),
+            ["gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"]
+        ); // gemv.rs:18265 (is_gfx1151 = false)
+        add!(
+            "latent_attention_split",
+            crate::latent_attention::LATENT_ATTENTION_SPLIT_SRC,
+            [
+                "latent_attention_split_kv_bf16",
+                "latent_attention_rms_rows_bf16"
+            ]
+        ); // latent_attention.rs:154
+        add!(
+            "latent_attention_decompress",
+            crate::latent_attention::LATENT_ATTENTION_DECOMPRESS_SRC,
+            [
+                "latent_attention_gather_latent_f32",
+                "latent_attention_scatter_expanded_bf16",
+                "latent_attention_decompress_dense",
+                "latent_attention_scatter_expanded_q8"
+            ]
+        ); // latent_attention.rs
+        add!(
+            "latent_attention_gate",
+            crate::latent_attention::LATENT_ATTENTION_GATE_SRC,
+            ["latent_attention_gate_bf16"]
+        ); // latent_attention.rs
+        add!(
+            "latent_attention_decode",
+            crate::latent_attention_decode::LATENT_ATTENTION_DECODE_SRC,
+            [
+                "latent_attention_decode_partial",
+                "latent_attention_decode_merge",
+                "latent_attention_decode_partial_q8"
+            ]
+        ); // latent_attention_decode.rs:301
+        add!(
+            "device_counter_add",
+            crate::device_counter::DEVICE_COUNTER_ADD_SRC,
+            ["device_counter_add_i32"]
+        ); // device_counter.rs:39
+    }
+    Ok(entries)
+}
+
+/// An embedded native code object a program loads in place of a hipcc module
+/// and that is not an accepted `pm_decode` twin ([`crate::pm_decode_twins`]):
+/// no incumbent HIP source, keyed by the SHA-256 of the image the runtime loads.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeObject {
+    pub arch: &'static str,
+    pub module: &'static str,
+    pub image: &'static [u8],
+    /// Pinned SHA-256 of `image` (bare lowercase hex).
+    pub image_sha256: &'static str,
+    pub symbols: &'static [&'static str],
+}
+
+/// Embedded native objects the Raon decode body loads: on exact gfx1201 the
+/// sealed `gated_delta_vector_pm` twin (RDA recurrence and depthwise causal
+/// conv), through `ensure_embedded_kernel` under `HIPFIRE_GATED_DELTA_VECTOR_PM`
+/// (default on). Registry presence is not permission: the launcher admits it
+/// per launch shape (head dim, kernel size).
+pub fn native_object_entries(arch: &str) -> Result<Vec<NativeObject>, RegistryError> {
+    let arch: &'static str = SUPPORTED_ARCHES
+        .iter()
+        .copied()
+        .find(|&candidate| candidate == arch)
+        .ok_or_else(|| RegistryError::UnsupportedArch(arch.to_owned()))?;
+    let mut out = Vec::new();
+    if arch == "gfx1201" {
+        // `gated_delta_vector_pm::GFX1201` (same module, image, pin and symbols; the deltanet-gated
+        // launcher module is not reachable here without the feature, a test there pins the equality).
+        out.push(NativeObject {
+            arch,
+            module: "gated_delta_vector_pm_gfx1201",
+            image: kernels::GATED_DELTA_VECTOR_PM_GFX1201,
+            image_sha256: kernels::GATED_DELTA_VECTOR_PM_GFX1201_SHA256.trim(),
+            symbols: &[
+                "gated_delta_net_vector_serial_f32_pm_gfx1201",
+                "causal_conv_depthwise_silu_rows_f32_pm_gfx1201",
+            ],
+        });
+    }
+    Ok(out)
+}
+
 /// Every module railgun's JIT receipt corpus may compile for `arch`: the
-/// installer inventory followed by [`default_route_entries`] and
-/// [`railgun_entries`]. A module name appears once per arch: a default-route
+/// installer inventory followed by [`default_route_entries`],
+/// [`raon_entries`] and [`railgun_entries`]. A module name appears once per arch: a default-route
 /// module the installer inventory already carries with the same source is
 /// listed once (a differing source stays and fails the uniqueness test).
 pub fn corpus_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
     let mut all = entries(arch, extra_flags)?;
     for entry in default_route_entries(arch, extra_flags)? {
+        if !all
+            .iter()
+            .any(|e| e.module == entry.module && e.source == entry.source)
+        {
+            all.push(entry);
+        }
+    }
+    for entry in raon_entries(arch, extra_flags)? {
         if !all
             .iter()
             .any(|e| e.module == entry.module && e.source == entry.source)
@@ -11401,6 +11586,100 @@ mod tests {
                     entry.module
                 );
             }
+        }
+    }
+
+    /// The Raon plain-AR decode body's modules are inventoried on exact gfx1201 only, once, with the
+    /// symbols of the loaded objects (probe `run/objs` receipts), and each name is a registry module
+    /// the launcher's `ensure_kernel` passes. Embedded sealed images are pinned by digest.
+    #[test]
+    fn raon_decode_modules_are_inventoried_on_gfx1201_only() {
+        let raon = raon_entries("gfx1201", "").unwrap();
+        let modules: Vec<&str> = raon.iter().map(|e| e.module).collect();
+        assert_eq!(
+            modules,
+            [
+                "stream_mix_broadcast",
+                "stream_mix_route_aggregate",
+                "stream_mix_postmix",
+                "stream_mix_mean",
+                "qwen4_bf16_round_trip",
+                "raon_rda_prepare",
+                "gated_rmsnorm_sigmoid_rows",
+                "ffn_situ",
+                "ffn_router_renorm",
+                "ffn_moe_combine_policy",
+                "ffn_moe_combine_policy_w2",
+                "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
+                "latent_attention_split",
+                "latent_attention_decompress",
+                "latent_attention_gate",
+                "latent_attention_decode",
+                "device_counter_add",
+            ]
+        );
+        let all = corpus_entries("gfx1201", "").unwrap();
+        for entry in &raon {
+            let in_corpus = all.iter().find(|e| e.module == entry.module).unwrap();
+            assert_eq!(in_corpus.source, entry.source, "{}", entry.module);
+            assert!(!entry.symbols.is_empty());
+        }
+        let symbols = |m: &str| -> Vec<&str> {
+            raon.iter()
+                .find(|e| e.module == m)
+                .unwrap()
+                .symbols
+                .to_vec()
+        };
+        assert_eq!(
+            symbols("latent_attention_decode"),
+            [
+                "latent_attention_decode_partial",
+                "latent_attention_decode_merge",
+                "latent_attention_decode_partial_q8"
+            ]
+        );
+        assert_eq!(
+            symbols("ffn_moe_combine_policy_w2"),
+            ["ffn_moe_combine_f32_w2"]
+        );
+        // The sources are the launchers' own constants (module and source travel together).
+        assert_eq!(
+            raon.iter()
+                .find(|e| e.module == "ffn_situ")
+                .unwrap()
+                .source(),
+            crate::ffn_activation::SITU_SRC
+        );
+        for arch in SUPPORTED_ARCHES.iter().filter(|a| **a != "gfx1201") {
+            assert!(raon_entries(arch, "").unwrap().is_empty(), "{arch}");
+        }
+        assert!(matches!(
+            raon_entries("gfx1200", ""),
+            Err(RegistryError::UnsupportedArch(_))
+        ));
+    }
+
+    #[test]
+    fn raon_embedded_native_objects_are_pinned_and_exact_arch() {
+        use sha2::{Digest, Sha256};
+        let natives = native_object_entries("gfx1201").unwrap();
+        assert_eq!(natives.len(), 1);
+        let n = natives[0];
+        assert_eq!(n.module, "gated_delta_vector_pm_gfx1201");
+        assert_eq!(
+            n.symbols,
+            [
+                "gated_delta_net_vector_serial_f32_pm_gfx1201",
+                "causal_conv_depthwise_silu_rows_f32_pm_gfx1201"
+            ]
+        );
+        assert_eq!(format!("{:x}", Sha256::digest(n.image)), n.image_sha256);
+        // Not a hipcc module and not an accepted pm_decode twin: no registry source to recompile.
+        assert!(lookup("gfx1201", n.module, "").is_err());
+        assert!(crate::pm_decode_twins::pm_decode_module("gfx1201", true, n.module).is_none());
+        for arch in SUPPORTED_ARCHES.iter().filter(|a| **a != "gfx1201") {
+            assert!(native_object_entries(arch).unwrap().is_empty(), "{arch}");
         }
     }
 

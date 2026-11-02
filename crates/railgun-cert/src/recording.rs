@@ -82,7 +82,8 @@ pub enum Verdict {
     NotEquivalent,
 }
 
-/// Default programs (design §0 D10, §6 cutover list, §7 M0a).
+/// Programs the inventory classifies: the default Redline programs (design §0
+/// D10, §6 cutover list, §7 M0a) and the opt-in Raon railgun AR program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Program {
@@ -97,6 +98,13 @@ pub enum Program {
     /// DFlash2 B=16 cycle on gfx1201 (draft + verify + commit; pre-railgun
     /// default: verify HipGraph after a direct warmup window).
     DflashGfx1201,
+    /// Raon-1-mini-preview plain-AR decode on gfx1201 (singleton, mq4-xts, A8
+    /// attention) authored and executed by the Raon railgun owner
+    /// (an opt-in developer flag, default off, so not a default program). The
+    /// body is planned under the HIP-graph capture branch (`capture_mode`),
+    /// not the Redline recorder: it is compared with the Raon HIP graph arm
+    /// (the same branch) and with the eager control.
+    RaonArGfx1201,
 }
 
 pub const PROGRAMS: &[Program] = &[
@@ -106,6 +114,7 @@ pub const PROGRAMS: &[Program] = &[
     Program::Mq4rGfx1151,
     Program::Ds4Gfx1151,
     Program::DflashGfx1201,
+    Program::RaonArGfx1201,
 ];
 
 /// A default program whose recorded branch differs, and where.
@@ -740,7 +749,10 @@ pub const DECISIONS: &[Decision] = &[
         kernels: &["convert_f32_to_f16", "pack_f32_to_fp8_gfx12"],
         verdict: ByteExact,
         evidence: "the conversion is a pure elementwise function of the source bytes into the same scratch; the eager skip is taken only on the cache-coherence premise that the source is unchanged since the cached conversion (every producer invalidates via `invalidate_x_caches_for`, scratch.rs:1842-1849). Obligation: the premise itself (a stale-pointer hit is an eager-path bug, cf. muse-glimmer/forward.rs:3660-3668); G2 arm 3 confirms",
-        reaches: &[reach(DflashGfx1201, "every verify window (MQ4V2 WMMA GEMMs take F16 x; `convert_f32_to_f16` is in the cycle's kernel list) and the direct draft GEMMs", "g0; arm3 in the pre-railgun direct warmup window")],
+        reaches: &[
+            reach(DflashGfx1201, "every verify window (MQ4V2 WMMA GEMMs take F16 x; `convert_f32_to_f16` is in the cycle's kernel list) and the direct draft GEMMs", "g0; arm3 in the pre-railgun direct warmup window"),
+            reach(RaonArGfx1201, "every decode GEMM that takes F16 x: `convert_f32_to_f16` is 75 of the 1207 launches of the ctx512 body (probe inventory, `sequence.jsonl`); the Raon owner plans the same capture branch as the Raon HIP graph, so only the eager control skips a cache hit", "g0"),
+        ],
     },
     Decision {
         id: "graph-capture-lifecycle",
@@ -1160,7 +1172,7 @@ pub const DECISIONS: &[Decision] = &[
         switches: "Graph: decode step recorded in gpu.graphs and replayed per token; Eager: per-launch dispatch of the same kernels (the oracle/control route)",
         kernels: &[],
         verdict: Invariant,
-        evidence: "decided once at load from the process backend request and never re-read per forward, so the eager and recorded forward of one process agree; both modes dispatch the same launchers on the same buffers. No railgun default program is a Raon program",
+        evidence: "decided once at load from the process backend request and never re-read per forward, so the eager and recorded forward of one process agree; both modes dispatch the same launchers on the same buffers. The Raon AR program (`RaonArGfx1201`, opt-in developer flag) is not a default and runs only in Graph mode: this decision does not reach it",
         reaches: &[],
     },
     Decision {
@@ -4219,6 +4231,45 @@ mod tests {
                 l.id
             );
         }
+    }
+
+    /// The Raon AR program is in the inventory the recording-inventory CLI emits (G0 selects it by name),
+    /// is classified without being refused, and names only decisions the inventory knows.
+    #[test]
+    fn raon_ar_program_is_inventoried_by_name_and_not_refused() {
+        assert!(PROGRAMS.contains(&Program::RaonArGfx1201));
+        assert_eq!(
+            serde_json::to_value(Program::RaonArGfx1201).unwrap(),
+            "raon_ar_gfx1201"
+        );
+        let inventory = inventory_json();
+        let programs = inventory["programs"].as_object().unwrap();
+        assert_eq!(programs.len(), PROGRAMS.len());
+        let raon = &programs["raon_ar_gfx1201"];
+        assert_eq!(raon["refused_as_default"], false);
+        assert!(raon["refused_by"].as_array().unwrap().is_empty());
+        let decisions = recording_dependent_decisions(Program::RaonArGfx1201);
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.id == "fp16-fp8-x-conversion-cache" && d.seen_by == "g0"),
+            "{decisions:?}"
+        );
+        for d in &decisions {
+            assert!(decision(d.id).is_some(), "{}", d.id);
+            assert_ne!(d.verdict, Verdict::NotEquivalent, "{}", d.id);
+        }
+        assert!(!refused_default_programs().contains_key(&Program::RaonArGfx1201));
+        // No pre-program launch: the AR token is a device input and every launch is inside the body.
+        assert!(pre_program_launches(Program::RaonArGfx1201).is_empty());
+        // The other programs' rows are unchanged by adding it.
+        assert_eq!(
+            recording_dependent_decisions(Program::DflashGfx1201)
+                .iter()
+                .filter(|d| d.id == "fp16-fp8-x-conversion-cache")
+                .count(),
+            1
+        );
     }
 
     #[test]
