@@ -612,6 +612,16 @@ harness exports pending their cleanup.
 | `HIPFIRE_FAULT_HIP` / `HIPFIRE_FAULT_PREFIX_PUBLISH` / `HIPFIRE_FAULT_MTP_FULL_REJECT` | Test-only fault injection used by `test_serve_prefix_cache`: `HIP` fails one `upload`/`launch`/`sync` below the HIP bridge, `PREFIX_PUBLISH=1` fails the first prefix-cache publication, `MTP_FULL_REJECT=1` forces every MTP draft to be rejected. Never set in production. |
 | `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): records HIP recipes, module handles/images and resolved symbols for offline route-closure audits. Qwen3.5-family loads also print `route plan axes:` with the resolved architecture, heads, speculation route, context ceiling, KV/state formats, backend and prefill chunk, including when `HIPFIRE_ROUTE_PLAN=0` is used. A sealed route has every planned module bound before `loaded` and no unplanned loads afterwards. Never set in production or timing runs. |
 
+`HIPFIRE_EP_MTP_LANE_NATIVE_ALL=1` (developer, default off) makes every lane slot
+an MTP lane and stops the step-level switch from forcing AR windows by lane count
+(`lane_switch::max_active` becomes unbounded, `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` is
+then ignored); the per-lane floor (`LaneCostModel`-priced, AR-row units) decides per
+window whether native beats an AR row. With it on and `HIPFIRE_EP_MTP_LANE_K` unset the
+lane draft-depth cap is 5 instead of 2 (each lane's `batched_depth` picks its own depth
+from its measured per-position acceptance, so code lanes run deep and story lanes stop at
+2-3). It reserves MTP state for every lane (fewer resident experts) and is not a default:
+the 8-lane sampled oracle flags slot 7 when slot 7 carries MTP state.
+
 Flash-Next/Qwen4 PP native MTP serves greedy requests and sampled requests with
 the default Leviathan verify (`HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
 and neutral penalties. Penalized requests (repeat/presence/frequency),
@@ -1486,8 +1496,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_LAB_UNIT_HITS` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-loader/examples/fn_mesh_lane_oracle.rs | developer |
 | `HIPFIRE_EP_MTP_LANES` | crates/hipfire-arch-qwen4/src/ep_reserve.rs, crates/hipfire-daemon/src/main.rs | developer |
 | `HIPFIRE_EP_MTP_LANE_COPY` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/tests/common/lane_suite.rs | developer |
-| `HIPFIRE_EP_MTP_LANE_K` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | developer |
+| `HIPFIRE_EP_MTP_LANE_K` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/lane_switch.rs | developer |
 | `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` | crates/hipfire-arch-qwen4/src/lane_switch.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | developer |
+| `HIPFIRE_EP_MTP_LANE_NATIVE_ALL` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/lane_switch.rs | developer |
 | `HIPFIRE_EP_MTP_RESERVE_SHARE` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/ep_reserve.rs | developer |
 | `HIPFIRE_EP_ORACLE_DUMP` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs, tools/ep_bisect.py | harness |
 | `HIPFIRE_EP_ORACLE_DUMP_PRE_STEP` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |

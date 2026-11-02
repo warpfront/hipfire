@@ -1256,6 +1256,100 @@ mod tests {
         assert!(units.is_finite() && units > 1.0, "{units}");
     }
 
+    /// Per-position acceptance on the parity fixture (`REDLINE-TP2` 11, hipfire
+    /// singleton baseline): depths 4 and 5 are not measured and take the depth-3
+    /// rate. Story at T=1 and code at T=1.
+    const STORY_AGREEMENT: [f32; 5] = [0.666, 0.568, 0.617, 0.617, 0.617];
+    const CODE_AGREEMENT: [f32; 5] = [1.0, 0.955, 0.914, 0.914, 0.914];
+
+    fn agreement_of(rates: &[f32]) -> Vec<(f32, f32)> {
+        rates.iter().map(|&r| (r * 1000.0, 1000.0)).collect()
+    }
+
+    /// The lane's own depth choice (`batched_depth` over the per-depth window
+    /// price) at lane count `lanes`, the model's per-window price in AR rows
+    /// (`window_units`, spill share `(groups - 1) / lanes`), for a cap `k`.
+    /// Returns `(depth, tokens per AR-row-unit at that depth)`: above 1.0 the
+    /// native window beats an AR row.
+    fn chosen_depth(
+        model: &LaneCostModel,
+        lanes: usize,
+        agreement: &[(f32, f32)],
+        k: usize,
+    ) -> (usize, f32) {
+        // A window of depth `d` makes every lane carry `1 + d` rows, so the
+        // spill (row groups beyond the first) is the depth's own.
+        let mut cost = vec![1.0f32];
+        cost.extend((1..=k).map(|d| {
+            let rows = vec![1 + d; lanes];
+            let spill = crate::gpu_forward_lanes::row_group_count(&rows).saturating_sub(1);
+            model.window_units(lanes, d, spill as f64 / lanes as f64)
+        }));
+        let depth = batched_depth(agreement, k, &cost);
+        if depth == 0 {
+            return (0, 1.0);
+        }
+        let mut prefix = 1.0f32;
+        let mut expected = 1.0f32;
+        for &(a, t) in &agreement[..depth] {
+            prefix *= a / t;
+            expected += prefix;
+        }
+        (depth, expected / cost[depth])
+    }
+
+    /// The R9700 EP2 truth `[F, a, r, G]` (us) that FLOOR.md's receipts imply:
+    /// AR step 19.4 ms at C1 and 64 ms at C8 (F + a = 19.4, F + 8a = 64: a 6.4,
+    /// F 13.0 ms), 5.5 ms per extra draft at C1 (`FLOOR` 13), and the 8-lane
+    /// 4-row window 259 ms (3 spill groups: 24 verified drafts x 5.5 + 3 G
+    /// = 259 - 64, so G 21 ms). ARITH on receipts, not a fit to a trace: the
+    /// lane cost model fits these online from the serve's own step walls.
+    const R9700_FLOOR_TRUTH_US: [f64; 4] = [13_000.0, 6_400.0, 5_500.0, 21_000.0];
+
+    #[test]
+    fn adaptive_depth_follows_acceptance_and_the_lane_count_on_the_r9700_floor_model() {
+        let mut model = LaneCostModel::new();
+        feed(&mut model, R9700_FLOOR_TRUTH_US, 0, 800);
+        let story = agreement_of(&STORY_AGREEMENT);
+        let code = agreement_of(&CODE_AGREEMENT);
+        let mut table = String::from("lanes | story depth/gain | code depth/gain\n");
+        for lanes in 1..=8 {
+            let (sd, sg) = chosen_depth(&model, lanes, &story, 5);
+            let (cd, cg) = chosen_depth(&model, lanes, &code, 5);
+            table.push_str(&format!("{lanes} | {sd} / {sg:.2} | {cd} / {cg:.2}\n"));
+            // A confident class is never routed shallower than an unsure one.
+            assert!(cd >= sd, "C{lanes}: code depth {cd} < story depth {sd}");
+            // At C1 both classes pay natively.
+            if lanes == 1 {
+                assert!(sg > 1.0 && cg > 1.0, "{table}");
+            }
+        }
+        // Code at its measured acceptance keeps a deep window at low
+        // concurrency; story stays shallow (<= 3) everywhere.
+        let (cd1, _) = chosen_depth(&model, 1, &code, 5);
+        assert!(cd1 >= 4, "{table}");
+        for lanes in 1..=8 {
+            assert!(chosen_depth(&model, lanes, &story, 5).0 <= 3, "{table}");
+        }
+        eprintln!("{table}");
+    }
+
+    #[test]
+    fn deeper_lane_caps_never_lower_the_gain_the_lane_can_pick() {
+        // A larger store cap only adds depths to choose from.
+        let mut model = LaneCostModel::new();
+        feed(&mut model, R9700_FLOOR_TRUTH_US, 0, 800);
+        let code = agreement_of(&CODE_AGREEMENT);
+        for lanes in 1..=8 {
+            let mut last = 0.0f32;
+            for k in 1..=5 {
+                let (_, gain) = chosen_depth(&model, lanes, &code, k);
+                assert!(gain >= last - 1e-3, "C{lanes} K{k}: {gain} < {last}");
+                last = gain;
+            }
+        }
+    }
+
     #[test]
     fn a_window_without_drafts_costs_one_unit() {
         let mut model = LaneCostModel::new();

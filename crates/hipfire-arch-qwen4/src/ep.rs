@@ -2133,12 +2133,13 @@ pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
 
 /// Draft depth of EP native-MTP lanes: the load's resolved K capped at
 /// `HIPFIRE_EP_MTP_LANE_K` (default 2: with 3 MTP lanes it keeps 24 resident
-/// expert layers at 8 lanes where K=3 x 4 lanes keeps 23; measured).
+/// expert layers at 8 lanes where K=3 x 4 lanes keeps 23; measured; 5 under
+/// `HIPFIRE_EP_MTP_LANE_NATIVE_ALL`, see `lane_switch::default_lane_k`).
 pub fn ep_lane_spec_k(resolved_k: usize) -> usize {
     let cap = hipfire_config::developer_var("HIPFIRE_EP_MTP_LANE_K")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2);
+        .unwrap_or_else(crate::lane_switch::default_lane_k);
     resolved_k
         .min(cap)
         .min(crate::gpu_forward_lanes::LANE_MAX_ROWS - 1)

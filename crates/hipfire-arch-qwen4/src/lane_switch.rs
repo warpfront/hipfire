@@ -23,14 +23,70 @@
 /// at K=2 keep 24 resident expert layers at 8 lanes; measured).
 pub const DEFAULT_MAX_ACTIVE: usize = 3;
 
+/// `HIPFIRE_EP_MTP_LANE_NATIVE_ALL=1` (developer; default off): every lane slot
+/// carries MTP state and no step is forced to AR windows by the lane count.
+/// The per-lane floor (`mtp_lanes::LaneSpecPolicy`, priced by the store's
+/// `LaneCostModel` in AR-row units) then decides per window whether a native
+/// window beats an AR row, so the step-level switch above stops overriding it.
+/// It reserves MTP state (target ring, head) for every lane, which costs
+/// resident experts, and it makes slot 7 a native lane, which the 8-lane
+/// sampled oracle currently flags (lane 7, `PARITY.md` 4.9 (j)): not a default
+/// until that is explained and the wide verify has landed.
+pub const NATIVE_ALL_ENV: &str = "HIPFIRE_EP_MTP_LANE_NATIVE_ALL";
+
+/// The `max_active` [`NATIVE_ALL_ENV`] stands for: above any lane count a store
+/// can have, and small enough that `max_active + 2` cannot overflow.
+pub const NATIVE_ALL_MAX_ACTIVE: usize = 1 << 16;
+
+/// Lane draft-depth cap when [`NATIVE_ALL_ENV`] is on and `HIPFIRE_EP_MTP_LANE_K`
+/// is unset: the per-lane depth chooser (`batched_depth` over each lane's
+/// measured per-depth agreement and priced windows) picks the depth up to this,
+/// so a code lane (per-position acceptance 1.00/.955/.914) runs deep and a
+/// story lane (.67/.57/.62) stops at 2-3 inside the same cap.
+pub const NATIVE_ALL_LANE_K: usize = 5;
+
+/// The shipped lane draft-depth cap (`HIPFIRE_EP_MTP_LANE_K` unset, flag off).
+pub const DEFAULT_LANE_K: usize = 2;
+
+/// [`NATIVE_ALL_ENV`] on.
+pub fn native_all() -> bool {
+    hipfire_config::developer_bool(NATIVE_ALL_ENV, false)
+}
+
+/// `max_active` for a flag state and an explicit `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE`
+/// value: [`NATIVE_ALL_MAX_ACTIVE`] when the flag is on (the explicit value is
+/// then ignored), else the explicit value or [`DEFAULT_MAX_ACTIVE`], at least 1.
+pub fn max_active_for(native_all: bool, explicit: Option<usize>) -> usize {
+    if native_all {
+        return NATIVE_ALL_MAX_ACTIVE;
+    }
+    explicit.unwrap_or(DEFAULT_MAX_ACTIVE).max(1)
+}
+
+/// The lane draft-depth cap for a flag state: [`NATIVE_ALL_LANE_K`] on,
+/// [`DEFAULT_LANE_K`] off.
+pub fn default_lane_k_for(native_all: bool) -> usize {
+    if native_all {
+        NATIVE_ALL_LANE_K
+    } else {
+        DEFAULT_LANE_K
+    }
+}
+
+/// [`default_lane_k_for`] under the process environment.
+pub fn default_lane_k() -> usize {
+    default_lane_k_for(native_all())
+}
+
 /// `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` (developer; the name predates PP), else
-/// [`DEFAULT_MAX_ACTIVE`]. At least 1.
+/// [`DEFAULT_MAX_ACTIVE`]; unbounded under [`NATIVE_ALL_ENV`]. At least 1.
 pub fn max_active() -> usize {
-    hipfire_config::developer_var("HIPFIRE_EP_MTP_LANE_MAX_ACTIVE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_ACTIVE)
-        .max(1)
+    max_active_for(
+        native_all(),
+        hipfire_config::developer_var("HIPFIRE_EP_MTP_LANE_MAX_ACTIVE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok()),
+    )
 }
 
 /// The window mode of a step carrying `active` decoding lanes after a step
@@ -82,5 +138,33 @@ mod tests {
     fn spec_lanes_are_capped_by_the_store() {
         assert_eq!(spec_lane_count(8, 4), 4);
         assert_eq!(spec_lane_count(2, 4), 2);
+    }
+
+    #[test]
+    fn native_all_lifts_max_active_and_raises_the_depth_cap() {
+        assert_eq!(max_active_for(false, None), DEFAULT_MAX_ACTIVE);
+        assert_eq!(max_active_for(false, Some(0)), 1);
+        assert_eq!(max_active_for(false, Some(6)), 6);
+        // The flag wins over an explicit cap.
+        assert_eq!(max_active_for(true, Some(2)), NATIVE_ALL_MAX_ACTIVE);
+        assert_eq!(default_lane_k_for(false), DEFAULT_LANE_K);
+        assert_eq!(default_lane_k_for(true), NATIVE_ALL_LANE_K);
+        assert_eq!(DEFAULT_LANE_K, 2, "the shipped default the oracle pins");
+    }
+
+    #[test]
+    fn native_all_runs_native_windows_at_every_lane_count() {
+        let cap = max_active_for(true, None);
+        for lanes in 1..=64 {
+            assert!(native_mode(lanes, false, cap), "{lanes}");
+            assert!(native_mode(lanes, true, cap), "{lanes}");
+            assert_eq!(
+                spec_lane_count(lanes, cap),
+                lanes,
+                "every slot is an MTP slot"
+            );
+        }
+        // `max_active + 2` cannot overflow
+        assert!(native_mode(cap, false, cap));
     }
 }
