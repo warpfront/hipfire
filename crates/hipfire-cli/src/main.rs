@@ -3017,6 +3017,54 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
                 200,
             ))?;
         }
+        (&Method::Get, "/v1/realtime") => {
+            // Liquid Agent `voice.js` (Phase 5c): WS-upgrades omniURL (keeping
+            // the /v1 prefix) to ws://…/v1/realtime and speaks the [OI]
+            // Realtime event subset. tiny_http hands over the raw socket via
+            // Request::upgrade; tungstenite runs RFC6455 framing on top.
+            let is_ws_request = request
+                .headers()
+                .iter()
+                .any(|header| header.field.equiv("Sec-WebSocket-Key"))
+                && request
+                    .headers()
+                    .iter()
+                    .any(|header| header.field.equiv("Upgrade"));
+            let ws_key = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("Sec-WebSocket-Key"))
+                .map(|header| header.value.as_str().to_owned());
+            match (is_ws_request, ws_key) {
+                (true, Some(key)) if !key.is_empty() => {
+                    let accept = realtime_websocket_accept_key(&key);
+                    let response = Response::empty(101)
+                        .with_header(header("Upgrade", "websocket"))
+                        .with_header(header("Connection", "Upgrade"))
+                        .with_header(header("Sec-WebSocket-Accept", &accept));
+                    // Upgrade writes the 101 and returns the raw stream. The
+                    // session owns it from here (thread-per-connection, the
+                    // same model as every other handle_http arm).
+                    let remote = request.remote_addr().copied();
+                    let stream = request.upgrade("websocket", response);
+                    thread::spawn(move || {
+                        let result = match remote {
+                            Some(remote) => run_realtime_session(stream, shared, &remote),
+                            None => Err(anyhow!("no remote address on the upgraded connection")),
+                        };
+                        if let Err(error) = result {
+                            eprintln!("[hipfire] realtime session ended: {error:#}");
+                        }
+                    });
+                }
+                _ => {
+                    request.respond(openai_error(
+                        "websocket upgrade required (Sec-WebSocket-Key missing)",
+                        426,
+                    ))?;
+                }
+            }
+        }
         (&Method::Options, _) => {
             request.respond(
                 Response::empty(204)
@@ -3325,6 +3373,7 @@ fn tts_generate(
     input: &str,
     max_steps: u64,
     _guard: AdmissionGuard,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<u8>> {
     use base64::Engine as _;
     let model = shared.default_model.clone();
@@ -3350,6 +3399,14 @@ fn tts_generate(
     let mut wav: Option<Vec<u8>> = None;
     let mut streamed_pcm: Vec<u8> = Vec::new();
     runtime.engine.generate(&generate, |event| {
+        // Cooperative cancellation (Phase 5c realtime): the abort path in
+        // Engine::generate drains the daemon's cancellation transcript and
+        // releases the generation, mirroring the mid-stream HTTP disconnect.
+        if let Some(flag) = cancel {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(hipfire_client::ClientError::Cancelled);
+            }
+        }
         match event.get("type").and_then(serde_json::Value::as_str) {
             // Batch terminal audio event: the full WAV, base64.
             Some("audio") => {
@@ -3419,7 +3476,7 @@ fn respond_tts(
     let (sender, receiver) = mpsc::channel::<ResponseChunk>();
     let (status_tx, status_rx) = mpsc::channel::<Result<usize, String>>();
     thread::spawn(move || {
-        match tts_generate(&shared, &input, max_steps, guard) {
+        match tts_generate(&shared, &input, max_steps, guard, None) {
             Ok(wav) => {
                 let len = wav.len();
                 let (ack_tx, ack_rx) = mpsc::channel();
@@ -3463,6 +3520,774 @@ fn respond_tts(
         }
     }
     Ok(())
+}
+
+/// Compute the RFC6455 `Sec-WebSocket-Accept` value for a client handshake key.
+fn realtime_websocket_accept_key(client_key: &str) -> String {
+    use sha1::{Digest, Sha1};
+    const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut hasher = Sha1::new();
+    hasher.update(client_key.as_bytes());
+    hasher.update(GUID.as_bytes());
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+/// Recover the raw fd of the just-upgraded realtime connection by matching
+/// the request's peer address against every socket fd of this process
+/// (Phase 5c). tiny_http hands the upgraded stream back as an opaque
+/// `Box<dyn ReadWrite>`, which cannot be put into non-blocking mode — but a
+/// realtime voice session MUST poll (a blocked reader would never drain the
+/// turn worker's audio deltas, and `response.cancel` could sit unread for a
+/// whole turn when the client's mic pauses). `try_clone` dups the descriptor,
+/// so the original fd (still owned by tiny_http's Box) is left untouched.
+fn realtime_connection_fd(remote: &std::net::SocketAddr) -> Option<std::os::unix::io::RawFd> {
+    let dir = std::fs::read_dir("/proc/self/fd").ok()?;
+    let mut found: Option<std::os::unix::io::RawFd> = None;
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Ok(fd) = name
+            .to_str()
+            .unwrap_or("")
+            .parse::<std::os::unix::io::RawFd>()
+        else {
+            continue;
+        };
+        if fd < 3 {
+            continue;
+        }
+        let Some(peer) = (unsafe { realtime_peer_of(fd) }) else {
+            continue;
+        };
+        // Match the exact peer endpoint (ip + ephemeral port): unique per
+        // connection, so this cannot match the HTTP listener or another
+        // client's socket.
+        if peer == *remote {
+            found = Some(fd);
+        }
+    }
+    found
+}
+
+/// Peer address of an open socket fd, via `getpeername(2)`. Returns None for
+/// non-socket fds (files, pipes, eventfds — every other entry in /proc/self/fd).
+unsafe fn realtime_peer_of(fd: std::os::unix::io::RawFd) -> Option<std::net::SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if libc::getpeername(
+        fd,
+        &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+        &mut len,
+    ) != 0
+    {
+        return None;
+    }
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let addr = &*(&storage as *const libc::sockaddr_storage as *const libc::sockaddr_in);
+            let octets = addr.sin_addr.s_addr.to_ne_bytes();
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(octets),
+                u16::from_be(addr.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let addr = &*(&storage as *const libc::sockaddr_storage as *const libc::sockaddr_in6);
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(addr.sin6_addr.s6_addr),
+                u16::from_be(addr.sin6_port),
+                addr.sin6_flowinfo,
+                addr.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Server → client event for one realtime voice turn (Phase 5c): the turn
+/// worker performs ASR (not emitted — Liquid Agent's omni.js transcribes
+/// separately for display), streams the text reply as
+/// `response.output_text.delta`, then speaks it in sentence-chunked omni TTS
+/// as headerless base64 PCM16 @ 24 kHz `response.output_audio.delta`, and
+/// closes with `response.done`.
+struct RealtimeTurnRequest {
+    /// Conversation text for this turn: the committed utterance transcript +
+    /// any `conversation.item.create` notes, joined by newlines.
+    user_text: String,
+}
+
+/// Per-connection realtime session state shared between the WS loop thread
+/// and the turn worker thread.
+#[derive(Default)]
+struct RealtimeSessionState {
+    /// `session.update` fields (v1: tools/tool_choice accepted-and-ignored).
+    instructions: Option<String>,
+    max_output_tokens: u64,
+    /// Whether `output_modalities` includes "audio" (default true — voice).
+    output_audio: bool,
+    /// Accumulated mic PCM16 mono @ 16 kHz (input_audio_buffer.append).
+    input_pcm: Vec<u8>,
+    /// Transcript of the last committed utterance (not emitted to the client).
+    pending_transcript: Option<String>,
+    /// Conversation history for follow-up turns: (role, content) pairs.
+    history: Vec<(String, String)>,
+    /// Conversation items queued since the last turn (camera notes etc.).
+    queued_items: Vec<String>,
+    /// Set by `response.cancel`; checked by every daemon event callback.
+    /// Arc so the turn worker can hold a clone across TTS stages without
+    /// pinning the state mutex (a pinned guard deadlocks the WS loop thread,
+    /// which then can neither read the cancel frame nor drain audio deltas).
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RealtimeSessionState {
+    fn new() -> Self {
+        Self {
+            max_output_tokens: 400,
+            output_audio: true,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ..Default::default()
+        }
+    }
+}
+
+/// Outbound WS message from the turn worker to the WS loop thread.
+enum RealtimeOutbound {
+    Text(String),
+}
+
+/// Send one WS text frame on the nonblocking write half, retrying EAGAIN
+/// until the kernel accepts the frame (a large audio delta can exceed the
+/// send buffer). Fatal errors propagate.
+fn realtime_send(
+    ws: &mut tungstenite::WebSocket<std::net::TcpStream>,
+    message: tungstenite::Message,
+) -> Result<()> {
+    loop {
+        match ws.send(message.clone()) {
+            Ok(()) => return Ok(()),
+            Err(tungstenite::Error::Io(ref err))
+                if err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// One connected realtime voice session (Phase 5c).
+///
+/// Threading: turns run on a worker thread (so `response.cancel` can arrive
+/// mid-turn and abort the in-flight daemon request); the worker's outbound
+/// events flow through an mpsc channel. The loop thread owns BOTH sides of
+/// the socket and POLLS it: the connection fd is recovered via
+/// [`realtime_connection_fd`] and duplicated into reader/writer halves put
+/// into non-blocking mode, so one loop can interleave `read` (WouldBlock →
+/// continue), the outbound drain, and `flush` every ~10 ms. This makes the
+/// session fully client-independent: audio deltas and cancel handling never
+/// wait on inbound traffic (unlike a blocking-read design, which would stall
+/// whenever the client's mic pauses mid-turn). Before the loop starts,
+/// `session.created` is written directly (voice.js waits for it before its
+/// first send, so nothing can race).
+fn run_realtime_session(
+    stream: Box<dyn tiny_http::ReadWrite + Send>,
+    shared: Arc<ServeShared>,
+    remote: &std::net::SocketAddr,
+) -> Result<()> {
+    use std::net::TcpStream;
+    use std::os::unix::io::FromRawFd;
+    use tungstenite::{Message as WsMessage, WebSocket};
+    // Keep the opaque Box alive-but-untouched: the data path is the duplicated
+    // fd (forget() leaks our temporary TcpStream handle without closing the
+    // shared descriptor — tiny_http's Box still owns and closes it).
+    let fd = realtime_connection_fd(remote)
+        .ok_or_else(|| anyhow!("could not locate the upgraded connection fd for {remote}"))?;
+    let tcp = unsafe { TcpStream::from_raw_fd(fd) };
+    tcp.set_nonblocking(true)?;
+    let reader = tcp.try_clone()?;
+    let writer = tcp.try_clone()?;
+    std::mem::forget(tcp);
+    // PARK the upgraded Box for the whole session instead of dropping it:
+    // dropping would hand tiny_http's BufReader back to its sequential-read
+    // chain, and the connection task would then COMPETE with our poll reader
+    // for incoming bytes (stealing WebSocket frames) and eventually close the
+    // socket halves out from under the session. Parked, tiny_http blocks on an
+    // internal channel and never touches the socket again; the Box is dropped
+    // when this function returns (session over).
+    let _parked_stream = stream;
+
+    let mut ws_read: WebSocket<TcpStream> =
+        WebSocket::from_raw_socket(reader, tungstenite::protocol::Role::Server, None);
+    let mut ws_write: WebSocket<TcpStream> =
+        WebSocket::from_raw_socket(writer, tungstenite::protocol::Role::Server, None);
+
+    let state = std::sync::Arc::new(std::sync::Mutex::new(RealtimeSessionState::new()));
+    let (outbound_tx, outbound_rx) = mpsc::channel::<RealtimeOutbound>();
+    // Initial server event: voice.js reads input/output sample rates from it.
+    let session_created = serde_json::json!({
+        "type": "session.created",
+        "session": {
+            "audio": {
+                "input": { "format": { "rate": 16000 } },
+                "output": { "format": { "rate": 24000 } },
+            },
+        },
+    });
+    realtime_send(&mut ws_write, WsMessage::text(session_created.to_string()))?;
+
+    // A poll-loop helper: pull everything the turn worker queued, then push
+    // it to the wire (tungstenite buffers partial writes; flush retries).
+    macro_rules! drain_outbound {
+        ($ws_write:expr) => {
+            loop {
+                match outbound_rx.try_recv() {
+                    Ok(RealtimeOutbound::Text(json)) => {
+                        // The socket is non-blocking: a full kernel send
+                        // buffer (large audio deltas) surfaces as EAGAIN —
+                        // poll the write side and retry until the frame is
+                        // queued. tungstenite keeps unflushed state, so a
+                        // later flush() completes the wire write.
+                        realtime_send(&mut ws_write, WsMessage::text(json.clone()))?;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+            loop {
+                match $ws_write.flush() {
+                    Ok(()) => break,
+                    Err(tungstenite::Error::Io(ref err))
+                        if err.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break, // fatal write errors surface on the next send/read
+                }
+            }
+        };
+    }
+
+    loop {
+        match ws_read.read() {
+            Ok(message) => match message {
+                WsMessage::Text(text) => {
+                    let event: serde_json::Value = match serde_json::from_str(&text) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            realtime_send(&mut ws_write, WsMessage::text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "error": { "message": format!("unparseable realtime event: {error}") },
+                                })
+                                .to_string(),
+                            ))?;
+                            let _ = ws_write.flush();
+                            continue;
+                        }
+                    };
+                    match event.get("type").and_then(serde_json::Value::as_str) {
+                        Some("session.update") => {
+                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(instructions) = event
+                                .pointer("/session/instructions")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
+                                st.instructions = Some(instructions.to_owned());
+                            }
+                            if let Some(tokens) = event
+                                .pointer("/session/max_output_tokens")
+                                .and_then(serde_json::Value::as_u64)
+                            {
+                                st.max_output_tokens = tokens.clamp(64, 4096);
+                            }
+                            if let Some(modalities) = event
+                                .pointer("/session/output_modalities")
+                                .and_then(serde_json::Value::as_array)
+                            {
+                                st.output_audio = modalities
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .any(|m| m == "audio");
+                            }
+                            // v1: tools/tool_choice accepted-and-ignored (no
+                            // server-side tool loop yet — the plan's v2).
+                        }
+                        Some("input_audio_buffer.append") => {
+                            if let Some(audio) =
+                                event.get("audio").and_then(serde_json::Value::as_str)
+                            {
+                                use base64::Engine as _;
+                                match base64::engine::general_purpose::STANDARD.decode(audio) {
+                                    Ok(pcm) => state
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .input_pcm
+                                        .extend_from_slice(&pcm),
+                                    Err(error) => eprintln!(
+                                        "[realtime] input_audio_buffer.append base64 decode failed: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                        Some("input_audio_buffer.clear") => {
+                            state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .input_pcm
+                                .clear();
+                        }
+                        Some("input_audio_buffer.commit") => {
+                            // The utterance boundary. Transcribe NOW
+                            // (synchronous — voice.js's next action is a
+                            // ≥2.5 s camera-note wait before response.create,
+                            // so this never races a turn) and hold the
+                            // transcript as this turn's user text. NOT
+                            // emitted: Liquid Agent's omni.js transcribe()
+                            // renders the transcript in the UI separately.
+                            let pcm = {
+                                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                                std::mem::take(&mut st.input_pcm)
+                            };
+                            let min_samples = 16_000usize * 2 * 3 / 10; // voice.js: ≥0.3 s
+                            if pcm.len() < min_samples {
+                                drain_outbound!(ws_write);
+                                continue;
+                            }
+                            match realtime_asr(&shared, &pcm) {
+                                Ok(transcript) => {
+                                    state
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .pending_transcript = Some(transcript);
+                                }
+                                Err(error) => {
+                                    eprintln!("[realtime] commit ASR failed: {error:#}");
+                                    realtime_send(&mut ws_write, WsMessage::text(
+                                        serde_json::json!({
+                                            "type": "error",
+                                            "error": { "message": format!("transcription failed: {error:#}") },
+                                        })
+                                        .to_string(),
+                                    ))?;
+                                    let _ = ws_write.flush();
+                                }
+                            }
+                        }
+                        Some("conversation.item.create") => {
+                            let item = event
+                                .get("item")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            let item_type = item.get("type").and_then(serde_json::Value::as_str);
+                            match item_type {
+                                // Camera notes / typed text join the pending turn.
+                                Some("message")
+                                    if item.get("role").and_then(serde_json::Value::as_str)
+                                        == Some("user") =>
+                                {
+                                    let text = openai_content_text(item.get("content"));
+                                    if !text.trim().is_empty() {
+                                        state
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .queued_items
+                                            .push(text.trim().to_owned());
+                                    }
+                                }
+                                // v2: server-side tool loop. v1 accepts-and-ignores.
+                                Some("function_call_output") => {
+                                    eprintln!(
+                                        "[realtime] ignoring function_call_output (v1: no tools)"
+                                    );
+                                }
+                                other => {
+                                    eprintln!("[realtime] ignoring item.create type {other:?}");
+                                }
+                            }
+                        }
+                        Some("response.create") => {
+                            // Gather this turn's user text under the state
+                            // lock, then hand the turn to the worker thread.
+                            let turn = {
+                                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut parts: Vec<String> = Vec::new();
+                                if let Some(t) = st.pending_transcript.take() {
+                                    if !t.trim().is_empty() {
+                                        parts.push(t.trim().to_owned());
+                                    }
+                                }
+                                parts.extend(std::mem::take(&mut st.queued_items));
+                                if parts.is_empty() {
+                                    None
+                                } else {
+                                    st.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    Some(RealtimeTurnRequest {
+                                        user_text: parts.join("\n"),
+                                    })
+                                }
+                            };
+                            match turn {
+                                None => {
+                                    // A create with nothing pending: complete
+                                    // an empty response so the client's
+                                    // `responding` latch releases.
+                                    realtime_send(
+                                        &mut ws_write,
+                                        WsMessage::text(
+                                            serde_json::json!({
+                                                "type": "response.done",
+                                                "response": { "status": "completed" },
+                                            })
+                                            .to_string(),
+                                        ),
+                                    )?;
+                                    let _ = ws_write.flush();
+                                }
+                                Some(turn) => {
+                                    let shared = Arc::clone(&shared);
+                                    let state = Arc::clone(&state);
+                                    let tx = outbound_tx.clone();
+                                    thread::spawn(move || {
+                                        run_realtime_turn(&shared, &state, &turn, &tx);
+                                    });
+                                }
+                            }
+                        }
+                        Some("response.cancel") => {
+                            // Abort the in-flight daemon request; the turn
+                            // worker sees the flag (or the Cancelled error),
+                            // emits response.done status=cancelled, and the
+                            // admission slot is released by the drain.
+                            state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .cancel
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Some(other) => {
+                            eprintln!("[realtime] ignoring event {other:?}");
+                        }
+                        None => {
+                            eprintln!("[realtime] ignoring event without type");
+                        }
+                    }
+                }
+                WsMessage::Binary(_) => {
+                    // voice.js streams browser mic audio to the SERVER over
+                    // its own socket only; upstream (this session) is
+                    // JSON-only.
+                }
+                WsMessage::Ping(payload) => {
+                    ws_read.send(WsMessage::Pong(payload))?;
+                    let _ = ws_read.flush();
+                }
+                WsMessage::Close(_) => {
+                    let _ = ws_write.close(None);
+                    let _ = ws_write.flush();
+                    return Ok(());
+                }
+                WsMessage::Pong(_) | WsMessage::Frame(_) => {}
+            },
+            Err(tungstenite::Error::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Ok(())
+            }
+            Err(error) => return Err(error.into()),
+        }
+        drain_outbound!(ws_write);
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+/// Run one realtime voice turn on the worker thread (Phase 5c, v1: no
+/// server-side tools). Pipeline per the plan: text reply streamed with
+/// thinking off → sentence-chunked omni TTS → headerless PCM audio deltas →
+/// `response.done`. Cancellation at any stage emits `response.done` with
+/// status `cancelled`.
+fn run_realtime_turn(
+    shared: &Arc<ServeShared>,
+    state: &std::sync::Arc<std::sync::Mutex<RealtimeSessionState>>,
+    turn: &RealtimeTurnRequest,
+    tx: &mpsc::Sender<RealtimeOutbound>,
+) {
+    let emit = |value: serde_json::Value| {
+        let _ = tx.send(RealtimeOutbound::Text(value.to_string()));
+    };
+    let cancelled =
+        |st: &RealtimeSessionState| st.cancel.load(std::sync::atomic::Ordering::Relaxed);
+    // Stage 1 — text reply (thinking off; spoken replies don't think).
+    let (instructions, max_tokens, want_audio, history) = {
+        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            st.instructions.clone().unwrap_or_else(|| {
+                "You are a helpful voice assistant. Keep replies short and conversational."
+                    .to_owned()
+            }),
+            st.max_output_tokens as usize,
+            st.output_audio,
+            st.history.clone(),
+        )
+    };
+    let mut messages: Vec<serde_json::Value> =
+        vec![serde_json::json!({ "role": "system", "content": instructions })];
+    for (role, content) in &history {
+        messages.push(serde_json::json!({ "role": role, "content": content }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": turn.user_text }));
+
+    let cancel_flag =
+        std::sync::Arc::clone(&state.lock().unwrap_or_else(|e| e.into_inner()).cancel);
+    let reply = match realtime_text(shared, &messages, max_tokens, &cancel_flag) {
+        Ok(reply) => reply,
+        Err(error) => {
+            let was_cancelled = {
+                let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                cancelled(&st)
+            };
+            if was_cancelled {
+                emit(serde_json::json!({
+                    "type": "response.done",
+                    "response": { "status": "cancelled" },
+                }));
+            } else {
+                eprintln!("[realtime] text stage failed: {error:#}");
+                emit(serde_json::json!({
+                    "type": "error",
+                    "error": { "message": format!("reply generation failed: {error:#}") },
+                }));
+            }
+            return;
+        }
+    };
+    let reply_visible = strip_realtime_tool_markers(&reply);
+    for chunk in chunk_text_for_tts(&reply_visible) {
+        emit(serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": chunk,
+        }));
+    }
+
+    // Record the exchange for follow-up turns (before audio — the client may
+    // cancel mid-speech and immediately start a new turn).
+    {
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.history.push(("user".to_owned(), turn.user_text.clone()));
+        st.history
+            .push(("assistant".to_owned(), reply_visible.clone()));
+        let excess = st.history.len().saturating_sub(20);
+        if excess > 0 {
+            st.history.drain(..excess);
+        }
+    }
+
+    // Stage 2 — spoken reply, sentence-chunked (first audio latency + small
+    // cancellable chunks). Each chunk is one interleaved omni TTS request.
+    if want_audio && !reply_visible.trim().is_empty() {
+        for chunk in chunk_text_for_tts(&reply_visible) {
+            let cancel_flag =
+                std::sync::Arc::clone(&state.lock().unwrap_or_else(|e| e.into_inner()).cancel);
+            let max_steps = tts_max_steps_for_input(&chunk);
+            let pcm = match tts_generate_no_guard(shared, &chunk, max_steps, Some(&cancel_flag)) {
+                Ok(pcm) => pcm,
+                Err(error) => {
+                    let was_cancelled = cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
+                    if was_cancelled {
+                        emit(serde_json::json!({
+                            "type": "response.done",
+                            "response": { "status": "cancelled" },
+                        }));
+                    } else {
+                        eprintln!("[realtime] tts stage failed: {error:#}");
+                        // Text already delivered — keep the voice turn alive
+                        // with the remaining chunks skipped.
+                        emit(serde_json::json!({
+                            "type": "response.done",
+                            "response": { "status": "completed" },
+                        }));
+                    }
+                    return;
+                }
+            };
+            use base64::Engine as _;
+            emit(serde_json::json!({
+                "type": "response.output_audio.delta",
+                "delta": base64::engine::general_purpose::STANDARD.encode(&pcm),
+            }));
+        }
+    }
+    // Grace window before the terminal: a client `response.cancel` that
+    // raced the last audio delta (one poll tick + network) must still win —
+    // voice.js keys its post-turn behavior on status "cancelled".
+    let was_cancelled = {
+        let deadline = Instant::now() + Duration::from_millis(150);
+        loop {
+            let cancelled_now = {
+                let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                cancelled(&st)
+            };
+            if cancelled_now || Instant::now() >= deadline {
+                break cancelled_now;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    };
+    emit(serde_json::json!({
+        "type": "response.done",
+        "response": {
+            "status": if was_cancelled { "cancelled" } else { "completed" },
+        },
+    }));
+}
+
+/// Text-stage daemon call for the realtime turn: [OI]-style messages with
+/// thinking off (`max_think_tokens: 1`), streaming `token` events folded into
+/// the reply string. Runs on the turn worker; the runtime lock serializes
+/// against the HTTP paths.
+fn realtime_text(
+    shared: &Arc<ServeShared>,
+    messages: &[serde_json::Value],
+    max_tokens: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<String> {
+    let model = shared.default_model.clone();
+    let mut runtime = shared
+        .runtime
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    runtime.ensure_model(&model, &shared.meta, None)?;
+    let required_max_seq = (max_tokens as u64).saturating_add(1024);
+    if runtime.current_max_seq < required_max_seq {
+        runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
+    }
+    let generate = serde_json::json!({
+        "type": "generate",
+        "id": request_id(),
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "max_think_tokens": 1, // spoken replies: thinking off
+        "attempt_id": next_attempt_id(),
+    });
+    let mut reply = String::new();
+    runtime.engine.generate(&generate, |event| {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(hipfire_client::ClientError::Cancelled);
+        }
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+            && event.get("reasoning").and_then(serde_json::Value::as_bool) != Some(true)
+        {
+            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                reply.push_str(text);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(reply)
+}
+
+/// ASR daemon call for the realtime commit (Phase 5c): the committed mic PCM
+/// (16 kHz mono PCM16) WAV-wrapped and sent through the LFM3-Audio route with
+/// the official ASR system prompt. The transcript is held server-side (the
+/// client transcribes separately for display).
+fn realtime_asr(shared: &Arc<ServeShared>, pcm16_mono_16k: &[u8]) -> Result<String> {
+    let wav = pcm16_wav_bytes(pcm16_mono_16k, 16_000);
+    use base64::Engine as _;
+    let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+    let model = shared.default_model.clone();
+    let mut runtime = shared
+        .runtime
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    runtime.ensure_model(&model, &shared.meta, None)?;
+    let generate = serde_json::json!({
+        "type": "generate",
+        "id": request_id(),
+        "prompt": "", // audio-only turn (the Phase 5b splice fix anchors it)
+        "system": "Perform ASR in English.",
+        "audio_base64": audio_b64,
+        "max_tokens": 512,
+        "temperature": 0.0,
+        "attempt_id": next_attempt_id(),
+    });
+    let mut transcript = String::new();
+    runtime.engine.generate(&generate, |event| {
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
+            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                transcript.push_str(text);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(transcript.trim().to_owned())
+}
+
+/// Guard-free `tts_generate` for the realtime worker (admission is a server
+/// concept for concurrent HTTP requests; the realtime session is one client
+/// running one turn at a time).
+fn tts_generate_no_guard(
+    shared: &Arc<ServeShared>,
+    input: &str,
+    max_steps: u64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<u8>> {
+    let guard = shared
+        .admission
+        .acquire()
+        .map_err(|error| anyhow!("admission: {error}"))?;
+    tts_generate(shared, input, max_steps, guard, cancel)
+}
+
+/// Strip LFM3 native tool-call markers from a voice reply so nothing gets
+/// spoken (Phase 5c v1: the server-side tool loop is v2).
+fn strip_realtime_tool_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<tool_call>") {
+        out.push_str(&remaining[..start]);
+        let after = &remaining[start + "<tool_call>".len()..];
+        remaining = match after.find("</tool_call>") {
+            Some(end) => &after[end + "</tool_call>".len()..],
+            None => "",
+        };
+    }
+    out.push_str(remaining);
+    out.trim().to_owned()
+}
+
+/// Split a reply into sentence/clause chunks for spoken delivery: each chunk
+/// is one TTS request (low first-audio latency, small cancellable pieces).
+fn chunk_text_for_tts(text: &str) -> Vec<String> {
+    const MIN_CHUNK: usize = 120;
+    const MAX_CHUNK: usize = 300;
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut piece = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        piece.push(c);
+        let sentence_end = matches!(c, '.' | '!' | '?' | '。' | '！' | '？' | '…' | ';' | '；');
+        let is_ws_follow = chars.peek().is_some_and(|n| n.is_whitespace());
+        if (sentence_end
+            && is_ws_follow
+            && current.chars().count() + piece.chars().count() >= MIN_CHUNK)
+            || current.chars().count() + piece.chars().count() >= MAX_CHUNK
+        {
+            current.push_str(piece.trim_start_matches('\n'));
+            current.push(' ');
+            chunks.push(current.trim().to_owned());
+            current = String::new();
+            piece = String::new();
+        }
+    }
+    current.push_str(&piece);
+    let tail = current.trim();
+    if !tail.is_empty() {
+        chunks.push(tail.to_owned());
+    }
+    chunks.retain(|c| !c.is_empty());
+    chunks
 }
 
 /// Convert a daemon v2 structured tool-call JSON object into canonical [`ToolCall`].
@@ -9738,6 +10563,47 @@ mod tests {
             u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
             pcm.len() as u32
         );
+    }
+
+    #[test]
+    fn realtime_accept_key_matches_rfc6455_example() {
+        // RFC 6455 §1.3: the opening-handshake known-answer vector.
+        assert_eq!(
+            realtime_websocket_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn strip_realtime_tool_markers_removes_calls() {
+        assert_eq!(
+            strip_realtime_tool_markers(
+                "Sure thing. <tool_call>\n<function=x>\n</tool_call> Done."
+            ),
+            "Sure thing.  Done."
+        );
+        // Unterminated marker swallows the rest (never spoken).
+        assert_eq!(strip_realtime_tool_markers("Hi <tool_call>oops"), "Hi");
+        assert_eq!(strip_realtime_tool_markers("clean"), "clean");
+    }
+
+    #[test]
+    fn chunk_text_for_tts_splits_sentences_and_flushes_tail() {
+        let text = "The quick brown fox jumps over the lazy dog near the river bank. \
+                    Pack my box with five dozen liquor jugs while the wizard keeps his job. \
+                    How vexingly quick daft zebras jump! \
+                    Then a final tail without any terminal punctuation at all";
+        let chunks = chunk_text_for_tts(text);
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks, got {chunks:?}"
+        );
+        assert!(chunks.iter().all(|c| !c.trim().is_empty()));
+        // Reassembly (modulo inserted separators) preserves all words.
+        let joined: String = chunks.join(" ");
+        for word in text.split_whitespace() {
+            assert!(joined.contains(word), "lost word {word:?} in {chunks:?}");
+        }
     }
 
     #[test]
