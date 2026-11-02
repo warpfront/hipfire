@@ -709,11 +709,16 @@ fn new_i64_compare_rows_pin_their_llvm_text() {
             .map(|w| u32::from_str_radix(w, 16).unwrap())
             .collect();
         assert_eq!((row.sample, table.as_slice()), (text, words), "{name}");
-        // v_add_f32_e64 predates this work (gfx1100 has it at the same encoding); the others are gfx1201-table only.
+        // v_add_f32_e64 predates this work (gfx1100 has it at the same encoding); the others are gfx1201-table only,
+        // except v_ashrrev_i64, which gfx1100 (and gfx1151, whose table is the gfx1100 table plus deltas) gained later
+        // (`gfx11_decode_gap_tests`: the Raon gather word, llvm-mc verified for both).
         if name == "v_add_f32_e64" {
             continue;
         }
         for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1030] {
+            if name == "v_ashrrev_i64" && arch != Arch::Gfx1030 {
+                continue;
+            }
             let e = gfx12::decode_for(arch, words).unwrap_err().to_string();
             assert!(e.contains("undefined"), "{arch:?} {name}: {e}");
         }

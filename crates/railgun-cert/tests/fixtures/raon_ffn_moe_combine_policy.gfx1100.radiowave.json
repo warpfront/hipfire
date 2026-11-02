@@ -1,0 +1,218 @@
+{
+  "schema_version": 5,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1793593531,
+  "source": "/home/kaden/qcal/release-0.4.5/raon-railgun-x/kcache/gfx1100/ffn_moe_combine_policy.cf242ce594624907.hip",
+  "output": "/home/kaden/qcal/release-0.4.5/raon-railgun-x/kcache/gfx1100/ffn_moe_combine_policy.cf242ce594624907.hsaco",
+  "arch": "gfx1100",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg",
+  "command": [
+    "/opt/rocm/core/bin/hipcc",
+    "hipfire-kernel-cache",
+    "ffn_moe_combine_policy"
+  ],
+  "source_sha256": "c24555812e1daa115985dd3b31b909be0dd5eba628783c5ccc84f991202dd998",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "106d451be5e67c26d0e20bbb3262f07a916faa9a1df38fc6ba01abd11ea9415c",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1100",
+    "identity": {
+      "architecture": "gfx1100",
+      "elf_machine_id": 65,
+      "isa": {
+        "major": 11,
+        "minor": 0,
+        "stepping": 0
+      }
+    },
+    "kernels": [
+      {
+        "name": "ffn_moe_combine_f32",
+        "wavefront_size": 32,
+        "vgpr_count": 24,
+        "sgpr_count": 46,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 40,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 48,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 64,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 68,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 72,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 76,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 80,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 84,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 88,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 299,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 2,
+          "global_stores": 2,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 7,
+          "kernarg_scalar_loads": 4,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 3,
+          "wait_instructions": 42,
+          "delay_alu_instructions": 33,
+          "memory_clause_instructions": 1,
+          "max_consecutive_vmem_instructions": 1
+        }
+      },
+      {
+        "name": "ffn_round_bf16_f32",
+        "wavefront_size": 32,
+        "vgpr_count": 5,
+        "sgpr_count": 18,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 31,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 1,
+          "global_stores": 1,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 2,
+          "kernarg_scalar_loads": 2,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 8,
+          "delay_alu_instructions": 5,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 1
+        }
+      }
+    ]
+  }
+}

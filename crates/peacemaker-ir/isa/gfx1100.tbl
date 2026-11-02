@@ -483,3 +483,6 @@ v_cmpx_gt_i64_e32	vopc	0xd4	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_cvt_u32_u16_e64	vop3	0x1eb	VDST:32,SRC0:16	VDST	SRC0	-	-	v_cvt_u32_u16_e64 v143, v2.l	D5EB008F 02010102	src1_unused:ignored:0x1ff:0x00/0x80/0x101,src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_min_i32_dpp	vop2_dpp	0x11	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_min_i32_dpp v0, v0, v0 row_xmask:1 row_mask:0xf bank_mask:0xf bound_ctrl:1	220000FA FF096100	dpp_fi:honored:0x40000
 v_or_b32_dpp	vop2_dpp	0x1c	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_or_b32_dpp v5, v5, v5 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1	380A0AFA FF090105	dpp_fi:honored:0x40000
+v_cmp_ge_i64_e64	vop3	0x56	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_ge_i64_e64 s28, s[12:13], s[2:3]	D456001C 0200040C	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_ashrrev_i64	vop3	0x33e	VDST:64,SRC0:32,SRC1:64	VDST	SRC0,SRC1	-	-	v_ashrrev_i64 v[0:1], 31, v[0:1]	D73E0000 0202009F	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmpx_gt_u64_e32	vopc	0xdc	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_gt_u64_e32 s[6:7], v[2:3]	7DB80406	-

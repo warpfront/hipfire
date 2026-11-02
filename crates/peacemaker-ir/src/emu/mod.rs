@@ -27,6 +27,8 @@ mod dot;
 #[cfg(test)]
 mod gate_ops_tests;
 #[cfg(test)]
+mod gfx11_decode_gap_tests;
+#[cfg(test)]
 mod gfx12_decode_gap_tests;
 mod hw;
 pub use hw::RunReport;
