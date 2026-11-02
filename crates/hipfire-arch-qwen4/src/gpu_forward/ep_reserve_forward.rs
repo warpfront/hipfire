@@ -360,6 +360,26 @@ pub(crate) fn ep_reserve_layout(
 /// ending at the resident count, S2 donors `H-2`/`H-1` ordered by parity and
 /// disjoint from every scratch donor, all inside the trunk.
 pub(crate) fn check_stage_plan(plan: &EpReservePlan) -> Result<(), String> {
+    if plan.explicit_donors {
+        // Caller-chosen donors (unit-plan regime): any ascending set of
+        // distinct trunk layers, no S2 donors (the unit stage serves tiles).
+        let sorted = plan.donor_layers.windows(2).all(|pair| pair[0] < pair[1]);
+        if plan.donor_layers.is_empty()
+            || !sorted
+            || plan
+                .donor_layers
+                .iter()
+                .any(|&layer| layer >= plan.trunk_layers)
+            || plan.donor_first_layer != plan.donor_layers[0]
+        {
+            return Err(format!(
+                "explicit scratch donors {:?} are not an ascending set of distinct layers of the \
+                 {}-layer trunk",
+                plan.donor_layers, plan.trunk_layers
+            ));
+        }
+        return Ok(());
+    }
     let first = plan.donor_first_layer;
     let end = plan.resident_layers;
     if plan.donor_layers.is_empty()
@@ -396,8 +416,12 @@ pub(crate) fn check_stage_plan(plan: &EpReservePlan) -> Result<(), String> {
 /// each loan mirror (gate/up, down). Layers `[R, trunk)` resolve to their
 /// original pinned owners at the stage, as on an ordinary load.
 pub(crate) struct EpStageHostSources {
-    first: usize,
+    /// The donor layers, ascending; `spans[i]` belongs to `layers[i]`.
+    layers: Vec<usize>,
     spans: Vec<[(usize, usize); 2]>,
+    /// Device-visible base address of each mirror (the pinned allocation's
+    /// device alias), `device[i]` for `layers[i]`, `[gate/up, down]`.
+    device: Vec<[usize; 2]>,
 }
 
 impl EpStageHostSources {
@@ -407,6 +431,7 @@ impl EpStageHostSources {
         plan: &EpReservePlan,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let mut spans = Vec::with_capacity(plan.donor_layers.len());
+        let mut device = Vec::with_capacity(plan.donor_layers.len());
         for &layer in &plan.donor_layers {
             let span = |slot: EpDonorSlot| -> Result<(usize, usize), Qwen4GpuForwardError> {
                 let mirror = loan.mirror(layer, slot).ok_or_else(|| {
@@ -425,17 +450,28 @@ impl EpStageHostSources {
                     })
             };
             spans.push([span(EpDonorSlot::GateUp)?, span(EpDonorSlot::Down)?]);
+            let base = |slot: EpDonorSlot| -> Result<usize, Qwen4GpuForwardError> {
+                loan.mirror(layer, slot)
+                    .map(|mirror| mirror.tensor.buf.as_ptr() as usize)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "EP reserve loan has no mirror of layer {layer} {slot:?}"
+                        ))
+                    })
+            };
+            device.push([base(EpDonorSlot::GateUp)?, base(EpDonorSlot::Down)?]);
         }
         Ok(Self {
-            first: plan.donor_first_layer,
+            layers: plan.donor_layers.clone(),
             spans,
+            device,
         })
     }
 
     /// The mirrors' complete pinned bytes of `layer` (gate/up, down), `None`
     /// outside `[H, R)`.
     pub(crate) fn pair(&self, layer: usize) -> Option<[&[u8]; 2]> {
-        let spans = self.spans.get(layer.checked_sub(self.first)?)?;
+        let spans = self.spans.get(self.layers.binary_search(&layer).ok()?)?;
         // SAFETY: each span is the pinned host allocation of a loan mirror
         // (`EpReserveLoan` owns it until its `release`, which the forward runs
         // after the stage that reads these bytes is freed); nothing writes a
@@ -446,6 +482,16 @@ impl EpStageHostSources {
                 std::slice::from_raw_parts(address as *const u8, len)
             }),
         )
+    }
+
+    /// [`Self::pair`] with each mirror's device-visible base address (the
+    /// pinned allocation's device alias) beside its pinned bytes, `None`
+    /// outside the donor layers.
+    #[allow(dead_code)] // read by the unit stage's donor regions (D1 S3)
+    pub(crate) fn pair_with_device(&self, layer: usize) -> Option<[(&[u8], usize); 2]> {
+        let bytes = self.pair(layer)?;
+        let device = self.device.get(self.layers.binary_search(&layer).ok()?)?;
+        Some([(bytes[0], device[0]), (bytes[1], device[1])])
     }
 }
 
@@ -1788,7 +1834,8 @@ mod tests {
             .map(|&layer| [vec![layer as u8; 64], vec![!(layer as u8); 32]])
             .collect();
         let resolver = EpStageHostSources {
-            first: plan.donor_first_layer,
+            layers: plan.donor_layers.clone(),
+            device: vec![[0, 0]; plan.donor_layers.len()],
             spans: buffers
                 .iter()
                 .map(|pair| {

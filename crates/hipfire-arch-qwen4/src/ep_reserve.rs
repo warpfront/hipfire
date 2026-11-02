@@ -706,6 +706,11 @@ pub struct EpReservePlan {
     pub donor_layers: Vec<usize>,
     /// S2 donors `H-2`, `H-1`, ordered by parity (even layer first).
     pub s2_donor_layers: [usize; EP_RESERVE_S2_DONORS],
+    /// The donors were chosen by the caller ([`plan_ep_reserve_with_donors`]):
+    /// not a suffix of the resident prefix, no S2 donors (`s2_donor_layers`
+    /// is `[0, 0]`); the unit stage serves the borrowed tiles. `false` is
+    /// the suffix plan of [`plan_ep_reserve`].
+    pub explicit_donors: bool,
     /// Segments, ascending layer, gate/up before down.
     pub segments: Vec<EpReserveSegment>,
     pub(crate) placements: Vec<EpReserveRootPlacement>,
@@ -776,6 +781,13 @@ fn digest_of(plan: &EpReservePlan) -> u64 {
     }
     h.u64(plan.resident_layers as u64);
     h.u64(plan.trunk_layers as u64);
+    if plan.explicit_donors {
+        // Suffix plans keep their historical digest.
+        h.u64(u64::MAX);
+        for layer in &plan.donor_layers {
+            h.u64(*layer as u64);
+        }
+    }
     h.u64(plan.donor_first_layer as u64);
     for layer in plan.s2_donor_layers {
         h.u64(layer as u64);
@@ -859,36 +871,151 @@ pub fn plan_ep_reserve(
     let max_donors = resident.saturating_sub(EP_RESERVE_S2_DONORS);
     let mut found = None;
     for donors in 1..=max_donors {
-        let first = resident - donors;
-        let mut segments = Vec::with_capacity(donors * 2);
-        for layer in first..resident {
-            segments.push(EpReserveSegment {
-                layer,
-                slot: EpDonorSlot::GateUp,
-                capacity: geometry.gate_up_bytes,
-            });
-            segments.push(EpReserveSegment {
-                layer,
-                slot: EpDonorSlot::Down,
-                capacity: geometry.down_bytes,
-            });
-        }
-        let caps: Vec<u64> = segments.iter().map(|segment| segment.capacity).collect();
-        if checked_sum(caps.iter().copied()).map_or(true, |total| total < needed) {
-            continue;
-        }
-        if let Some(placed) = pack_roots(&roots, &caps) {
-            found = Some((first, segments, placed));
+        let layers: Vec<usize> = (resident - donors..resident).collect();
+        if let Some((segments, placed)) = pack_donor_layers(&roots, needed, geometry, &layers) {
+            found = Some((layers, segments, placed));
             break;
         }
     }
-    let (first, segments, placed) = found.ok_or_else(|| {
+    let (layers, segments, placed) = found.ok_or_else(|| {
         Refusal::new(format!(
             "the remaining roots ({} MiB) do not pack into whole-layer donors within {max_donors} layers",
             needed / MIB
         ))
     })?;
-    let donors = resident - first;
+    let first = layers[0];
+    let mut s2 = [first - 2, first - 1];
+    if s2[0] % 2 != 0 {
+        s2.swap(0, 1);
+    }
+    assemble_plan(
+        forward, geometry, capacity, resident, layers, s2, false, segments, placed,
+    )
+}
+
+/// Segments of `layers` (ascending), gate/up before down, and the packing of
+/// `roots` into them, or `None` when they do not hold `needed` bytes.
+#[allow(clippy::type_complexity)]
+fn pack_donor_layers(
+    roots: &[(ScratchField, u64)],
+    needed: u64,
+    geometry: &EpRankGeometry,
+    layers: &[usize],
+) -> Option<(Vec<EpReserveSegment>, Vec<(ScratchField, usize, u64, u64)>)> {
+    let mut segments = Vec::with_capacity(layers.len() * 2);
+    for &layer in layers {
+        segments.push(EpReserveSegment {
+            layer,
+            slot: EpDonorSlot::GateUp,
+            capacity: geometry.gate_up_bytes,
+        });
+        segments.push(EpReserveSegment {
+            layer,
+            slot: EpDonorSlot::Down,
+            capacity: geometry.down_bytes,
+        });
+    }
+    let caps: Vec<u64> = segments.iter().map(|segment| segment.capacity).collect();
+    if checked_sum(caps.iter().copied()).map_or(true, |total| total < needed) {
+        return None;
+    }
+    let placed = pack_roots(roots, &caps)?;
+    Some((segments, placed))
+}
+
+/// [`plan_ep_reserve`] with the scratch donors chosen by the caller instead
+/// of the suffix `[H, resident)`: the unit-plan (D1) regime, where the
+/// donors are whole-resident layers wherever the planner put them.
+///
+/// `candidates` are trunk layers, in preference order, that are
+/// whole-resident on EVERY rank (the caller's contract, checked against the
+/// unit plan, not here); the plan takes the shortest prefix of them whose
+/// whole-layer segments hold every remaining root and returns the donors
+/// ascending in [`EpReservePlan::donor_layers`]. `resident_layers` is
+/// informational (the layers the planner counts resident per rank). The
+/// plan has no S2 donors ([`EpReservePlan::explicit_donors`]): the unit
+/// stage serves the borrowed tiles. Capacity checks other than the host
+/// mirror budget (`free_per_rank`, `reserve_bytes`, `lane_bytes`,
+/// `min_resident_layers`) are the unit planner's and are not repeated.
+pub fn plan_ep_reserve_with_donors(
+    forward: &EpReserveForwardPlan,
+    geometry: &EpRankGeometry,
+    capacity: &EpReserveCapacity,
+    resident_layers: usize,
+    candidates: &[usize],
+) -> Result<EpReservePlan, Refusal> {
+    if geometry.ranks == 0 || geometry.trunk_layers == 0 {
+        return Err(Refusal::new("invalid layer geometry"));
+    }
+    if geometry.layer_bytes().filter(|&bytes| bytes > 0).is_none() {
+        return Err(Refusal::new("layer expert bytes overflow or are zero"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for &layer in candidates {
+        if layer >= geometry.trunk_layers || !seen.insert(layer) {
+            return Err(Refusal::new(format!(
+                "donor candidate layer {layer} is outside the {}-layer trunk or repeated",
+                geometry.trunk_layers
+            )));
+        }
+    }
+    if resident_layers > geometry.trunk_layers {
+        return Err(Refusal::new("resident layer count exceeds the trunk"));
+    }
+    let roots: Vec<(ScratchField, u64)> = forward
+        .remaining_roots
+        .iter()
+        .map(|root| (root.field, root.bytes))
+        .collect();
+    let needed = forward.remaining_bytes()?;
+    let mut found = None;
+    for donors in 1..=candidates.len() {
+        let mut layers = candidates[..donors].to_vec();
+        layers.sort_unstable();
+        if let Some((segments, placed)) = pack_donor_layers(&roots, needed, geometry, &layers) {
+            found = Some((layers, segments, placed));
+            break;
+        }
+    }
+    let (layers, segments, placed) = found.ok_or_else(|| {
+        Refusal::new(format!(
+            "the remaining roots ({} MiB) do not pack into the {} whole-resident donor candidates",
+            needed / MIB,
+            candidates.len()
+        ))
+    })?;
+    assemble_plan(
+        forward,
+        geometry,
+        capacity,
+        resident_layers,
+        layers,
+        [0; EP_RESERVE_S2_DONORS],
+        true,
+        segments,
+        placed,
+    )
+}
+
+/// The plan tail shared by both donor choices: placements, touched extents,
+/// host mirror accounting against the budget, digest.
+#[allow(clippy::too_many_arguments)]
+fn assemble_plan(
+    forward: &EpReserveForwardPlan,
+    geometry: &EpRankGeometry,
+    capacity: &EpReserveCapacity,
+    resident: usize,
+    layers: Vec<usize>,
+    s2: [usize; EP_RESERVE_S2_DONORS],
+    explicit_donors: bool,
+    segments: Vec<EpReserveSegment>,
+    placed: Vec<(ScratchField, usize, u64, u64)>,
+) -> Result<EpReservePlan, Refusal> {
+    let layer_bytes = geometry
+        .layer_bytes()
+        .ok_or_else(|| Refusal::new("layer expert bytes overflow"))?;
+    let donors = layers.len();
+    let first = layers[0];
     let placements: Vec<EpReserveRootPlacement> = placed
         .iter()
         .map(|&(field, segment, offset, bytes)| EpReserveRootPlacement {
@@ -936,16 +1063,13 @@ pub fn plan_ep_reserve(
     }
     let restore_bytes_per_rank =
         checked_sum(touched.iter().map(|extent| extent.len)).ok_or_else(overflow)?;
-    let mut s2 = [first - 2, first - 1];
-    if s2[0] % 2 != 0 {
-        s2.swap(0, 1);
-    }
     let mut plan = EpReservePlan {
         forward: forward.clone(),
         resident_layers: resident,
         donor_first_layer: first,
-        donor_layers: (first..resident).collect(),
+        donor_layers: layers,
         s2_donor_layers: s2,
+        explicit_donors,
         segments,
         placements,
         touched,
@@ -1394,6 +1518,76 @@ mod tests {
             .flat_map(|_| [g.gate_up_bytes, g.down_bytes])
             .collect();
         assert!(pack_roots(&roots, &caps).is_some());
+    }
+
+    #[test]
+    fn explicit_donors_pack_like_the_suffix_and_follow_the_callers_layers() {
+        let fwd = forward();
+        let g = geometry();
+        let suffix = plan_ep_reserve(&fwd, &g, &capacity_for(33, 0)).unwrap();
+        // The suffix as an explicit list packs identically (same segments,
+        // placements, touched extents, mirrors) and differs only in the flag,
+        // the absent S2 donors and the digest.
+        let candidates: Vec<usize> = (26..33).collect();
+        let same =
+            plan_ep_reserve_with_donors(&fwd, &g, &capacity_for(33, 0), 33, &candidates).unwrap();
+        assert!(same.explicit_donors && !suffix.explicit_donors);
+        assert_eq!(same.donor_layers, suffix.donor_layers);
+        assert_eq!(same.segments, suffix.segments);
+        assert_eq!(same.placements, suffix.placements);
+        assert_eq!(same.touched, suffix.touched);
+        assert_eq!(same.mirror_bytes_per_rank, suffix.mirror_bytes_per_rank);
+        assert_eq!(same.restore_bytes_per_rank, suffix.restore_bytes_per_rank);
+        assert_eq!(same.s2_donor_layers, [0, 0]);
+        assert_ne!(same.digest, suffix.digest);
+        // Interleaved donors in preference order: the shortest prefix that
+        // holds the roots (seven layers), returned ascending; surplus
+        // candidates are not taken.
+        let preferred = [40usize, 3, 17, 9, 22, 31, 12, 5, 44];
+        let plan =
+            plan_ep_reserve_with_donors(&fwd, &g, &capacity_for(33, 0), 41, &preferred).unwrap();
+        assert_eq!(plan.donor_layers, vec![3, 9, 12, 17, 22, 31, 40]);
+        assert_eq!(plan.donor_first_layer, 3);
+        assert_eq!(plan.segments.len(), 14);
+        assert_eq!(plan.mirror_bytes_per_rank, 7 * g.layer_bytes().unwrap());
+        assert_eq!(
+            plan.segments.iter().map(|s| s.layer).collect::<Vec<_>>(),
+            [3, 3, 9, 9, 12, 12, 17, 17, 22, 22, 31, 31, 40, 40]
+        );
+        assert!(plan.touched.len() <= plan.segments.len());
+        assert_eq!(
+            plan,
+            plan_ep_reserve_with_donors(&fwd, &g, &capacity_for(33, 0), 41, &preferred).unwrap()
+        );
+        assert!(crate::gpu_forward::ep_reserve_forward::check_stage_plan(&plan).is_ok());
+        // Six candidates cannot hold the roots; repeats and out-of-trunk
+        // layers fail closed; the host mirror budget still binds.
+        assert!(
+            plan_ep_reserve_with_donors(&fwd, &g, &capacity_for(33, 0), 33, &preferred[..6])
+                .is_err()
+        );
+        assert!(plan_ep_reserve_with_donors(&fwd, &g, &capacity_for(33, 0), 33, &[3, 3]).is_err());
+        assert!(
+            plan_ep_reserve_with_donors(&fwd, &g, &capacity_for(33, 0), 33, &[g.trunk_layers])
+                .is_err()
+        );
+        let mut cap = capacity_for(33, 0);
+        cap.host_budget_bytes = 2 * 7 * g.layer_bytes().unwrap() - 1;
+        assert!(plan_ep_reserve_with_donors(&fwd, &g, &cap, 33, &preferred).is_err());
+        // A different donor set is a different digest (ranks must agree).
+        let other = plan_ep_reserve_with_donors(
+            &fwd,
+            &g,
+            &capacity_for(33, 0),
+            41,
+            &[41, 3, 17, 9, 22, 31, 12],
+        )
+        .unwrap();
+        assert_ne!(other.digest, plan.digest);
+        // A broken explicit plan is refused by the stage check.
+        let mut broken = plan.clone();
+        broken.donor_layers.reverse();
+        assert!(crate::gpu_forward::ep_reserve_forward::check_stage_plan(&broken).is_err());
     }
 
     #[test]

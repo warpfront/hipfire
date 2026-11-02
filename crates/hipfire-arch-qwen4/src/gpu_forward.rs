@@ -11205,7 +11205,7 @@ impl Qwen4GpuForward {
                     // EP reserve borrowed compact view (`moe_borrow[0]`): every layer as the
                     // EP decode runtime, except the scratch donors `[H, R)`, whose owned
                     // experts name the loan's pinned mirror while their device bytes are scratch.
-                    let donors = reserve.plan.donor_first_layer..reserve.plan.resident_layers;
+                    let donors = &reserve.plan.donor_layers;
                     moe_borrow.push((0..bundle.config.num_hidden_layers).map(|_| None).collect());
                     populate_moe_runtimes(
                         moe_borrow.last_mut().expect("pushed above"),
