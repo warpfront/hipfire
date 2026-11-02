@@ -16,7 +16,7 @@
 //!   with attested `rolled_back=true`.
 //! - P3 abort today: attested `aborted`+`done(aborted)`; unattested collapses
 //!   to one correlated error (shape pinned via the same emitters
-//!   `emit_pipeline_cancel_after_rollback` uses).
+//!   `emit_cancel_after_rollback_for_route` uses).
 //!
 //! E2/E3 update the P2/S1/S2/S4 assertions to the attested shape
 //! (`rolled_back=true`); the abort-shape and policy-gate tests never change.
@@ -25,12 +25,12 @@
 
 use hipfire_engine::terminal::*;
 use hipfire_generate::ar::{
-    emit_generation_cancel, emit_generation_start, qwen_ar_forward_fail_action,
-    qwen_ar_forward_fail_message, write_error, GenerationRoute, GenerationRouteScope,
+    emit_generation_start, qwen_ar_forward_fail_action, qwen_ar_forward_fail_message, write_error,
+    GenerationRoute, GenerationRouteScope,
 };
 use hipfire_generate::common::{
-    attest_rollback_steps, emit_fail_closed_error, emit_fail_closed_error_for_route,
-    RollbackEpilogue,
+    attest_rollback_steps, emit_cancel_after_rollback_for_route, emit_fail_closed_error,
+    emit_fail_closed_error_for_route, RollbackEpilogue,
 };
 
 static TERMINAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -301,7 +301,17 @@ fn pp_abort_attested_cancel_shape_stable() {
     {
         let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
         emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, false);
-        emit_generation_cancel(GenerationRoute::PipelineParallel, &mut sink, id, 2);
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_cancel_after_rollback_for_route(
+            GenerationRoute::PipelineParallel,
+            &mut sink,
+            id,
+            2,
+            &ep,
+        );
     }
     let events = parse_lines(&sink);
     assert!(
@@ -321,6 +331,7 @@ fn pp_abort_attested_cancel_shape_stable() {
         .collect();
     assert_eq!(done.len(), 1);
     assert_eq!(done[0]["finish_reason"], "aborted");
+    assert_eq!(done[0]["completion_tokens"], 2);
     teardown();
 }
 
@@ -339,13 +350,11 @@ fn pp_abort_unattested_error_shape_stable() {
             rolled_back: false,
             context: Some("pp rank1 device_synchronize: injected".to_string()),
         };
-        emit_fail_closed_error_for_route(
+        emit_cancel_after_rollback_for_route(
             GenerationRoute::PipelineParallel,
             &mut sink,
-            Some(id),
-            "client cancelled; fail-closed rollback could not be attested",
-            "validation",
-            false,
+            id,
+            2,
             &ep,
         );
     }
@@ -356,11 +365,13 @@ fn pp_abort_unattested_error_shape_stable() {
         .collect();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["rolled_back"], false);
+    let message = errors[0]["message"].as_str().unwrap();
     assert!(
-        errors[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("pp rank1 device_synchronize"),
+        message.starts_with("client cancelled; fail-closed rollback could not be attested"),
+        "unattested abort must name the cancel: {events:?}"
+    );
+    assert!(
+        message.contains("pp rank1 device_synchronize"),
         "unattested abort must carry reset context: {events:?}"
     );
     assert!(

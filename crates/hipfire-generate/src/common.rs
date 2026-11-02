@@ -131,6 +131,10 @@ pub fn normalize_asst_turn_for_fingerprint(s: &str) -> String {
     hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned()
 }
 
+/// Error message of a client cancel whose fail-closed rollback was not attested.
+pub const UNATTESTED_CANCEL_MESSAGE: &str =
+    "client cancelled; fail-closed rollback could not be attested";
+
 /// Cancel terminal after production fail-closed rollback attestation.
 ///
 /// Attested rollback (`rolled_back`) keeps the fold-compatible
@@ -150,7 +154,31 @@ pub fn emit_spec_cancel_after_rollback(
     emit_fail_closed_error(
         stdout,
         Some(id),
-        "client cancelled; fail-closed rollback could not be attested",
+        UNATTESTED_CANCEL_MESSAGE,
+        "validation",
+        false,
+        epilogue,
+    );
+}
+
+/// [`emit_spec_cancel_after_rollback`] through an explicitly selected producer
+/// route (EP and pipeline-parallel serve loops own their route).
+pub fn emit_cancel_after_rollback_for_route(
+    route: crate::ar::GenerationRoute,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+    epilogue: &RollbackEpilogue,
+) {
+    if epilogue.rolled_back {
+        crate::ar::emit_generation_cancel(route, stdout, id, completion_tokens);
+        return;
+    }
+    emit_fail_closed_error_for_route(
+        route,
+        stdout,
+        Some(id),
+        UNATTESTED_CANCEL_MESSAGE,
         "validation",
         false,
         epilogue,
@@ -730,36 +758,6 @@ pub fn ds4_ar_ep_cache_action(
             wire_tool_calls,
             ..
         } => ds4_turn_cache_action(*store_cache, visible_for_cache, wire_tool_calls.clone()),
-    }
-}
-
-/// Pure Commit/Abort side-effect gate for DS4 AR / EP / spec successful
-/// terminals. Commit preserves the intended release/store/done flags; Abort
-/// suppresses all three so producers never store or release after cancel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ds4ClientCommitEffects {
-    pub release_tool_calls: bool,
-    pub store_cache: bool,
-    pub emit_done: bool,
-}
-
-// helper ds4_client_commit_effects 7398..7416
-pub fn ds4_client_commit_effects(
-    decision: ClientTerminalDecision,
-    intended_release: bool,
-    intended_store: bool,
-) -> Ds4ClientCommitEffects {
-    match decision {
-        ClientTerminalDecision::Commit => Ds4ClientCommitEffects {
-            release_tool_calls: intended_release,
-            store_cache: intended_store,
-            emit_done: true,
-        },
-        ClientTerminalDecision::Abort => Ds4ClientCommitEffects {
-            release_tool_calls: false,
-            store_cache: false,
-            emit_done: false,
-        },
     }
 }
 
