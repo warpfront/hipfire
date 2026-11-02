@@ -599,6 +599,8 @@ module	gemm_mq6g256v2_wmma_fp8_split_bf16_db_gfx1201	developer-opt-in	Non-defaul
 module	gemm_mq6g256v2_wmma_fp8_split_bf16_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8 route with BF16 output (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
 module	gemm_mq6g256v2_wmma_fp8_split_db_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8_DB=1 (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
 module	gemm_mq6g256v2_wmma_fp8_split_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8 (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
+module	gemm_mq8g256_mmq_i8_gfx11	codec-outside-core-rungs	MQ8G256 prefill GEMM (gfx1100/gfx1151 i8-MMQ); run by the Raon attention-class MQ8G256 projections (hipfire-arch-raon/src/projection.rs), an arch outside the admitted core artifact rungs; rdna-compute/src/gemm_mq8g256.rs:633
+module	gemm_mq8g256_mmq_i8_gfx12	codec-outside-core-rungs	MQ8G256 prefill GEMM (gfx1200/gfx1201 i8 WMMA); run by the Raon attention-class MQ8G256 projections (hipfire-arch-raon/src/projection.rs), an arch outside the admitted core artifact rungs; rdna-compute/src/gemm_mq8g256.rs:633
 module	gemm_paro_q4g128_moe_grouped_mmq_gfx1151	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2706-2733
 module	gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2706-2733
 module	gemm_paro_q4g128_moe_grouped_wmma_k2	codec-outside-core-rungs	PARO route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2710-2737
@@ -973,6 +975,7 @@ module	gemv_mq6g256v2_moe_gate_up_k8_indexed_batched	config-opt-in	Requires spec
 module	gemv_mq6g256v2_xbatch	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:43197
 module	gemv_mq6g256v2_xbatch_residual	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:43197
 module	gemv_mq8g256	codec-outside-core-rungs	MQ8G256 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:567
+module	gemv_mq8g256_b	codec-outside-core-rungs	MQ8G256 layout-B decode/verify GEMV (singleton, rows-exact R2..16 and the fused-rotate n<=2 entry); run by the Raon attention-class MQ8G256 projections, an arch outside the admitted core artifact rungs; rdna-compute/src/gemv_mq8_rows.rs:199
 module	gemv_paro_q4g128_moe_down_k8_indexed_batched	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:4846-4856
 module	gemv_paro_q4g128_moe_gate_up_indexed	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:4419-4429
 module	gemv_paro_q4g128_moe_gate_up_k8_indexed_batched	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:5457-5468
@@ -1119,6 +1122,7 @@ module	moe_scatter_permute_k8	no-caller	No production caller; only definitions, 
 module	moe_softmax_topk_k8	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/pipeline/sandwich.rs:1269
 module	moe_softmax_topk_k8_batched	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/pipeline/sandwich.rs:1164
 module	moe_unscatter_silu_clamp_k8	non-core-family	Non-core family route: DeepSeek4, MiniMax/Maple; forward.rs:871
+module	mq8_rotate_quantize_x_batched	codec-outside-core-rungs	MQ8G256 batched FWHT256 activation producer shared by the prefill GEMM and the n>=3 row-exact verify GEMV; run by the Raon attention-class MQ8G256 projections, an arch outside the admitted core artifact rungs; rdna-compute/src/gemm_mq8g256.rs:475
 module	mq_rotate_x_dual_fp8_gfx12	codec-outside-core-rungs	MFP4/HFP4 route absent from admitted core artifact rungs; gemv.rs:7715-7717
 module	mq_rotate_x_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemv.rs:6058-6063
 module	mq_rotate_x_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640

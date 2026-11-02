@@ -1085,6 +1085,10 @@ pub const MQ_ROTATE_X_GFX942_SRC: &str =
     include_str!("../../../kernels/src/mq_rotate_x.gfx942.hip");
 pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
+/// MQ8G256 decode GEMV (`gemv_mq8g256_b_r1_u*`) and verify rows-exact GEMVs (`_r2` .. `_r16`) on weight
+/// layout B (f16 scale plane + aligned int8 code plane), reading the batched producer's activation planes.
+/// One association for every R: row r of an R-row launch is bit-identical to the R = 1 kernel on X row r.
+pub const GEMV_MQ8G256_B_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256_b.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
 /// MQ6-G256 batched GEMM for pre-rotated x. Scalar baseline mirroring
@@ -4416,6 +4420,26 @@ pub const GEMM_Q8_0_MMQ_I8_GFX11_SRC: &str =
 /// aligned weight base or K % 64 != 0.
 pub const GEMM_Q8_0_MMQ_I8_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_mmq_i8.gfx12.hip");
+
+/// MQ8G256 (qt14) activation producer for the prefill GEMMs below: batched
+/// `mq8_rotate_quantize_x` (sign-FWHT256, amax/127, rint, clamp), F32 X [N, K] ->
+/// int8 [N, K] + F32 scales [K/256, N]. One portable source for gfx12 and gfx11
+/// (wave32). K % 256 == 0, 16-byte aligned X / signs / Xq.
+pub const MQ8_ROTATE_QUANTIZE_X_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/mq8_rotate_quantize_x_batched.hip");
+
+/// MQ8G256 prefill GEMM for gfx12 (gfx1200/gfx1201): qt14 weights (258 B groups read in
+/// place, "layout A", or the aligned repack, "layout B") x per-(token, 256-group) int8
+/// activations on `v_wmma_i32_16x16x16_iu8`, K128-epoch fma fold, F32 output (plus `_bf16`
+/// twins). Y[N,M] = X[N,K] @ W[M,K]^T with K % 256 == 0.
+pub const GEMM_MQ8G256_MMQ_I8_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq8g256_mmq_i8.gfx12.hip");
+
+/// gfx11 (gfx1100, gfx1151) twin of [`GEMM_MQ8G256_MMQ_I8_GFX12_SRC`] on the gfx11 i8-MMQ
+/// body: same layouts, same K128 fold (bit-identical to the gfx12 kernels), tiles 128x128,
+/// 64x128 and 64x64.
+pub const GEMM_MQ8G256_MMQ_I8_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq8g256_mmq_i8.gfx11.hip");
 
 /// FP8 twin of [`GEMM_Q8_0_MMQ_I8_GFX12_SRC`]: Q8_0 int8 weights converted to E4M3 at LDS
 /// staging x per-row per-32-K E4M3 activations on `v_wmma_f32_16x16x16_fp8_fp8`, F32 output.

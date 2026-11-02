@@ -444,6 +444,13 @@ pub struct ScratchState {
     /// Bumped by every [`Self::reserve_q8_a8_x`] (each producer launch rewrites the sidecar), so
     /// prepared activations can detect that a later quantizer overwrote them.
     pub q8_a8_x_generation: u64,
+    /// MQ8G256 prefill sidecar: int8 [N, K] codes followed by F32 scales [K/256, N]
+    /// (`mq8_rotate_quantize_x_batched`), laid out by [`mq8_x_layout`].
+    pub mq8_x_scratch: Option<DeviceBuffer>,
+    pub mq8_x_scratch_bytes: usize,
+    /// Bumped by every [`Self::reserve_mq8_x`] (each producer launch rewrites the sidecar), so
+    /// prepared activations can detect that a later quantizer overwrote them.
+    pub mq8_x_generation: u64,
     /// A8 `block_i8_128` sidecar, [K/128, N] of 136-byte blocks.
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
@@ -1902,6 +1909,15 @@ pub fn qwen4_prefill_workspace_terms(
 pub(crate) fn q8_a8_x_layout(k: usize, n: usize) -> (usize, usize) {
     let scales_off = (n * k).next_multiple_of(256);
     (scales_off, scales_off + n * (k / 32) * 4)
+}
+
+/// Byte layout of the MQ8G256 activation sidecar for `(k, n)`:
+/// `(scales_offset, total_bytes)`. int8 `[n, k]` at 0, F32 scales
+/// `[k / 256, n]` (`Xs[group * n + token]`) at a 256-byte aligned offset.
+#[inline]
+pub(crate) fn mq8_x_layout(k: usize, n: usize) -> (usize, usize) {
+    let scales_off = (n * k).next_multiple_of(256);
+    (scales_off, scales_off + n * (k / 256) * 4)
 }
 
 #[inline]
@@ -3382,6 +3398,31 @@ impl ScratchState {
         )?;
         self.q8_a8_x_generation = self.q8_a8_x_generation.wrapping_add(1);
         let base = self.q8_a8_x_scratch.as_ref().unwrap().as_ptr();
+        Ok((
+            base,
+            (base as *mut u8).wrapping_add(scales_off) as *mut c_void,
+        ))
+    }
+
+    /// Grow the MQ8G256 activation sidecar to hold `(k, n)` and return
+    /// `(xq, xs)` device pointers (int8 `[n, k]` and F32 scales `[k/256, n]`).
+    /// Callers invalidate graphs before growth (see `Gpu::mq8_quantize_x`); the
+    /// producer overwrites every byte it reads.
+    pub(crate) fn reserve_mq8_x(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<(*mut c_void, *mut c_void)> {
+        let (scales_off, needed) = mq8_x_layout(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq8_x_scratch,
+            &mut self.mq8_x_scratch_bytes,
+            needed,
+        )?;
+        self.mq8_x_generation = self.mq8_x_generation.wrapping_add(1);
+        let base = self.mq8_x_scratch.as_ref().unwrap().as_ptr();
         Ok((
             base,
             (base as *mut u8).wrapping_add(scales_off) as *mut c_void,

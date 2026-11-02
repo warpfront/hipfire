@@ -53,6 +53,7 @@ pub mod gemm;
 mod gemm_fp8_verify;
 mod gemm_mq6_fp8;
 mod gemm_mq6_i8;
+mod gemm_mq8g256;
 mod gemm_q8_a8;
 mod gemm_q8_fp8;
 mod gemm_q8_mmq_gfx11;
@@ -60,6 +61,7 @@ mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
+pub mod gemv_mq8_rows;
 mod gemv_q8x;
 pub mod ggml_convert;
 pub mod ggml_mmvq;
@@ -146,6 +148,10 @@ pub use gemm_fp8_verify::{
 };
 pub use gemm_mq6_fp8::Mq6Fp8Arm;
 pub use gemm_mq6_i8::{QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM};
+pub use gemm_mq8g256::{
+    mq8_admits, mq8_pick_tile, mq8g256_a_bytes, mq8g256_b_bytes, mq8g256_b_code_offset,
+    mq8g256_repack_b, Mq8Activations, Mq8Tile, Mq8WLayout,
+};
 pub use gemm_q8_a8::{Q8A8Activations, Q8A8Sched, Q8A8Tile};
 pub use gemm_q8_fp8::Q8Fp8Activations;
 pub use gemm_q8_mmq_gfx11::{q8_mmq_gfx11_admits, q8_mmq_pick_tile, Q8MmqActivations, Q8MmqTile};

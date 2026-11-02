@@ -309,7 +309,8 @@ fn validate_mq4v2_xt_source(
                 // (qt2) and the router as BF16 (qt16); the class map is arch 19's own.
                 && !(source.arch_id == crate::raon::RAON_ARCH_ID
                     && (tensor.quant_type == 2
-                        || (tensor.quant_type == 16 && tensor.name.ends_with(".moe.gate.weight"))))
+                        || (tensor.quant_type == 16 && tensor.name.ends_with(".moe.gate.weight"))
+                        || (tensor.quant_type == 14 && crate::raon::is_mq8_attn_class(&tensor.name))))
     }) {
         return Err(format!(
             "input is not the MQ4V2-XT type map: `{}` has qt={}",
@@ -1314,6 +1315,7 @@ pub(crate) fn run() {
             &args.format,
             args.mq4v2_symmetric,
             args.tier.as_deref(),
+            args.raon_attn_mq8,
         ) {
             Ok(summary) => {
                 eprintln!(

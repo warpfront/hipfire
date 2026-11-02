@@ -10,6 +10,7 @@ pub mod generic_elem;
 pub mod generic_fused;
 pub mod generic_gemm;
 pub mod generic_mmq;
+pub mod generic_mq8;
 pub mod generic_rda;
 pub mod generic_seq;
 pub mod ggml_convert;
@@ -34,6 +35,7 @@ pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
         .chain(generic_seq::ABIS.iter())
         .chain(generic_elem::ABIS.iter())
         .chain(generic_mmq::ABIS.iter())
+        .chain(generic_mq8::ABIS.iter())
         .chain(generic_rda::ABIS.iter())
         .chain(generic_fused::ABIS.iter())
         .copied()
@@ -46,6 +48,7 @@ pub fn work_specs() -> impl Iterator<Item = &'static WorkSpecV1> {
         .chain(generic_seq::WORK.iter())
         .chain(generic_elem::WORK.iter())
         .chain(generic_mmq::WORK.iter())
+        .chain(generic_mq8::WORK.iter())
         .chain(generic_rda::WORK.iter())
         .chain(generic_fused::WORK.iter())
         .copied()
@@ -87,6 +90,7 @@ mod tests {
                 + super::generic_seq::ABIS.len()
                 + super::generic_elem::ABIS.len()
                 + super::generic_mmq::ABIS.len()
+                + super::generic_mq8::ABIS.len()
                 + super::generic_rda::ABIS.len()
                 + super::generic_fused::ABIS.len()
         );

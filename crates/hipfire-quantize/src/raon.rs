@@ -42,7 +42,9 @@ use rayon::prelude::*;
 
 use crate::dequant::{dequantize_mxfp8_e8m0_strict, to_f32};
 use crate::hfq::{write_hfq, write_hfq_streamed, HfqIndexEntry, HfqTensor, QuantType, TensorSpill};
-use crate::quant_fwht::{gen_fwht_signs, quantize_mq4g256v2_symmetric, MQ4V2_GROUP_BYTES};
+use crate::quant_fwht::{
+    gen_fwht_signs, quantize_mq4g256v2_symmetric, quantize_mq8g256, MQ4V2_GROUP_BYTES,
+};
 use crate::quant_q4::quantize_q8f16;
 
 pub(crate) const RAON_ARCH_ID: u32 = 19;
@@ -50,6 +52,24 @@ pub(crate) const RAON_MODEL_TYPE: &str = "raon1_mini";
 /// Pinned official checkpoint revision this recipe was written against.
 pub(crate) const SOURCE_REVISION: &str = "8c9b802acacdbda9df16606689fcf437cf7262fb";
 pub(crate) const RECIPE: &str = "raon-mq4v2-symmetric-qt44-experts-q8f16-attn/v2";
+/// Recipe of the opt-in `--raon-attn-mq8` build: attention-class projections with
+/// `K % 256 == 0` are MQ8G256 (qt14, sign seeds 42/1042); everything else is unchanged.
+pub(crate) const RECIPE_MQ8_ATTN: &str = "raon-mq4v2-symmetric-qt44-experts-mq8g256-attn/v1";
+/// Bytes per MQ8G256 group of 256 weights: F16 scale + 256 x i8.
+const MQ8G256_GROUP_BYTES: usize = 258;
+/// Attention projections (`self_attn.<proj>`) eligible for MQ8G256 when `K % 256 == 0`: RDA
+/// q/k/v/g/o and MLA q_a/kv_a/kv_b/g/o. `q_b` (K 576) and the small RDA gate heads
+/// (`f_a/f_b/b_proj/rda_w_proj`) keep Q8F16.
+const MQ8_ATTN_PROJS: [&str; 8] = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "g_proj",
+    "o_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "kv_b_proj",
+];
 pub(crate) const MXFP8_BLOCK_K: usize = 32;
 /// Rotation group width of MQ4G256V2; physical K of padded tensors rounds up to it.
 const GROUP: usize = 256;
@@ -66,6 +86,8 @@ const COPY_CHUNK: usize = 4 * 1024 * 1024;
 pub(crate) enum Storage {
     /// Q8F16 (qt3), 32-element blocks.
     Q8F16,
+    /// MQ8G256 (qt14), natural K already divisible by 256; no AWQ sidecar.
+    Mq8G256,
     /// Q8F16 with natural K zero-padded to a multiple of 256 (1088→1280).
     Q8F16Padded,
     /// Symmetric qt44, natural K already divisible by 256.
@@ -95,6 +117,27 @@ impl Storage {
             self,
             Storage::Qt44Padded | Storage::Q8F16Padded | Storage::Bf16Padded
         )
+    }
+}
+
+/// True for an attention projection weight that `--raon-attn-mq8` writes as MQ8G256
+/// whenever its natural K is a multiple of 256 (see [`MQ8_ATTN_PROJS`]).
+pub(crate) fn is_mq8_attn_class(name: &str) -> bool {
+    layer_rest(name).is_some_and(|(_, rest)| {
+        rest.strip_prefix("self_attn.")
+            .and_then(|p| p.strip_suffix(".weight"))
+            .is_some_and(|p| MQ8_ATTN_PROJS.contains(&p))
+    })
+}
+
+/// Storage of tensor `name` (natural width `k`) given the base class from
+/// [`classify`]: with `attn_mq8`, eligible attention projections with `k % 256 == 0`
+/// become [`Storage::Mq8G256`]; otherwise `base` is returned unchanged.
+pub(crate) fn attn_mq8_storage(name: &str, k: usize, base: Storage, attn_mq8: bool) -> Storage {
+    if attn_mq8 && base == Storage::Q8F16 && k % GROUP == 0 && is_mq8_attn_class(name) {
+        Storage::Mq8G256
+    } else {
+        base
     }
 }
 
@@ -815,6 +858,34 @@ fn convert(src: &SourceIndex, name: &str, storage: Storage) -> Result<JobOut, St
                 out.padded = Some((name.to_string(), k, phys));
             }
         }
+        Storage::Mq8G256 => {
+            if shape.len() != 2 {
+                return Err(format!("{name}: MQ8G256 needs a 2-D weight, got {shape:?}"));
+            }
+            let (rows, k) = (shape[0], shape[1]);
+            if k == 0 || k % GROUP != 0 {
+                return Err(format!(
+                    "{name}: MQ8G256 needs [N, K%256==0], got {shape:?}"
+                ));
+            }
+            // Same sign seeds as `--format mq8` (pipeline.rs). Rows are whole groups, so
+            // per-row-chunk output concatenates to the whole-tensor byte stream.
+            let signs1 = gen_fwht_signs(42, GROUP);
+            let signs2 = gen_fwht_signs(1042, GROUP);
+            let bytes: Vec<u8> = data
+                .par_chunks(ROWS_PER_UNIT * k)
+                .map(|c| quantize_mq8g256(c, &signs1, &signs2))
+                .collect::<Vec<_>>()
+                .concat();
+            out.tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::MQ8G256,
+                shape: vec![rows as u32, k as u32],
+                group_size: GROUP as u32,
+                data: bytes,
+                spilled_len: 0,
+            });
+        }
         Storage::Q8F16 | Storage::Q8F16Padded => {
             if shape.len() != 2 {
                 return Err(format!("{name}: Q8F16 needs a 2-D weight, got {shape:?}"));
@@ -983,6 +1054,7 @@ pub(crate) fn run_recipe(
     format: &str,
     symmetric: bool,
     tier: Option<&str>,
+    attn_mq8: bool,
 ) -> Result<RaonSummary, String> {
     if format != "mq4" || !symmetric || tier != Some("xt") {
         return Err(format!(
@@ -990,18 +1062,37 @@ pub(crate) fn run_recipe(
              (got format={format}, mq4v2-symmetric={symmetric}, tier={tier:?})"
         ));
     }
-    run_cli(input, output)
+    run_cli_with(input, output, attn_mq8)
 }
 
 /// Convert the official Raon-1-mini checkpoint in `input` into the symmetric
 /// qt44 control artifact at `output`, then read the artifact back and verify it.
 pub(crate) fn run_cli(input: &Path, output: &Path) -> Result<RaonSummary, String> {
+    run_cli_with(input, output, false)
+}
+
+/// [`run_cli`] with the opt-in `attn_mq8` recipe ([`RECIPE_MQ8_ATTN`]).
+pub(crate) fn run_cli_with(
+    input: &Path,
+    output: &Path,
+    attn_mq8: bool,
+) -> Result<RaonSummary, String> {
     let shared = shared_ffn_storage()?;
-    let recipe = recipe_with_shared(RECIPE, shared.as_str());
+    let base_recipe = if attn_mq8 { RECIPE_MQ8_ATTN } else { RECIPE };
+    let recipe = recipe_with_shared(base_recipe, shared.as_str());
     let cfg_path = input.join("config.json");
     let cfg = read_json(&cfg_path)?.ok_or_else(|| format!("{} not found", cfg_path.display()))?;
     let src = SourceIndex::open(input)?;
-    let jobs = src.validate(&cfg)?;
+    let mut jobs = src.validate(&cfg)?;
+    if attn_mq8 {
+        for (name, storage) in jobs.iter_mut() {
+            let k = src
+                .get(name)
+                .and_then(|(m, _)| m.shape.get(1).copied())
+                .unwrap_or(0);
+            *storage = attn_mq8_storage(name, k, *storage, true);
+        }
+    }
     eprintln!(
         "raon: {} source weight tensors validated ({} routed MXFP8)",
         jobs.len(),
@@ -1094,7 +1185,7 @@ pub(crate) fn run_cli(input: &Path, output: &Path) -> Result<RaonSummary, String
             )
         })
         .collect();
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "architecture": RAON_MODEL_TYPE,
         "config": cfg,
         "tokenizer": tokenizer,
@@ -1121,6 +1212,9 @@ pub(crate) fn run_cli(input: &Path, output: &Path) -> Result<RaonSummary, String
             "source_sha256": source_sha,
         },
     });
+    if attn_mq8 {
+        metadata["hipfire_raon"]["attn"] = "mq8g256".into();
+    }
     let metadata_json = serde_json::to_string(&metadata).map_err(|e| format!("metadata: {e}"))?;
     write_hfq(
         output,
@@ -1191,6 +1285,9 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
         return Err("artifact metadata lacks the chat template".to_string());
     }
     let (shared, scope) = shared_ffn_of_metadata(&meta)?;
+    let attn_mq8 = m("hipfire_quant_recipe")
+        .and_then(|v| v.as_str())
+        .is_some_and(|r| r.starts_with(RECIPE_MQ8_ATTN));
     let padding = meta
         .pointer("/hipfire_raon/padded_tensors")
         .and_then(|v| v.as_object())
@@ -1234,11 +1331,16 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
             // The head is admitted at either codec; the producer records its choice.
             ("lm_head.weight", 3) => Storage::Q8F16,
             ("lm_head.weight", 44) => Storage::Qt44,
-            _ => classify_scoped(&t.name, Storage::Q8F16, shared, scope)?,
+            _ => {
+                let base = classify_scoped(&t.name, Storage::Q8F16, shared, scope)?;
+                let k = t.shape.get(1).map_or(0, |&k| k as usize);
+                attn_mq8_storage(&t.name, k, base, attn_mq8)
+            }
         };
         let ok_qt = match storage {
             Storage::Q8F16 | Storage::Q8F16Padded => t.quant_type == 3,
             Storage::Qt44 | Storage::Qt44Padded => t.quant_type == 44,
+            Storage::Mq8G256 => t.quant_type == 14,
             Storage::Bf16 | Storage::Bf16Padded => t.quant_type == 16,
             Storage::Lossless => matches!(t.quant_type, 1 | 2),
             Storage::F32 => t.quant_type == 2,
@@ -1252,12 +1354,12 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
         }
         // Geometry is checked for qt44 tensors and for every always-active FFN weight
         // (whatever codec the artifact stores them in).
-        if storage.is_qt44() || is_shared_ffn_weight(&t.name) {
+        if storage.is_qt44() || storage == Storage::Mq8G256 || is_shared_ffn_weight(&t.name) {
             if t.shape.len() != 2 {
                 return Err(format!("{}: malformed {storage:?} entry", t.name));
             }
             let want_group = match storage {
-                Storage::Qt44 | Storage::Qt44Padded => GROUP as u32,
+                Storage::Qt44 | Storage::Qt44Padded | Storage::Mq8G256 => GROUP as u32,
                 Storage::Q8F16 | Storage::Q8F16Padded => 32,
                 _ => 0,
             };
@@ -1311,6 +1413,15 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
                     ));
                 }
                 let want_bytes = match storage {
+                    Storage::Mq8G256 => {
+                        if phys % GROUP != 0 {
+                            return Err(format!(
+                                "{}: MQ8G256 physical K {phys} % 256 != 0",
+                                t.name
+                            ));
+                        }
+                        rows * (phys / GROUP) * MQ8G256_GROUP_BYTES
+                    }
                     Storage::Q8F16 | Storage::Q8F16Padded => {
                         if phys % 32 != 0 {
                             return Err(format!("{}: Q8F16 physical K {phys} % 32 != 0", t.name));

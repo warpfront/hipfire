@@ -26,6 +26,7 @@ pub use sealed_moe::{
     MoeRouterInput, MoeSharedContribution, PrefillRouteMode, ResourceAlias, SealedMoeCall,
 };
 pub(crate) mod moe_program;
+pub mod mq8_attn;
 pub mod q8_prefill;
 pub(crate) mod qt44_qt53_prefill;
 pub mod slab_moe_decode;
@@ -41,6 +42,9 @@ pub use moe_program::{
     SingleExpertTableCache, GROUPED_MOE_IU4_MIN_ROWS,
 };
 pub use moe_program::{MoeStage, SealedMoeOp};
+pub use mq8_attn::{
+    mq8_acts_current, mq8_gemv_fused, mq8_gemv_rows, mq8_prefill_gemm, mq8_quantize,
+};
 pub use q8_prefill::{
     grouped_sym_tier_admits, prefill_quant_admitted, q8_0_f16_x_shareable, q8_0_prefill_gemm,
     q8_0_prefill_gemm_f16x, q8_0_prefill_gemm_prepared, q8_0_prefill_prepare, q8_0_prefill_runs,

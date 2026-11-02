@@ -66,7 +66,8 @@
 //! * OMOD results that would flush a non-zero denormal (sign of the flushed zero).
 //! * DPP with FI=1 and an out-of-range source (the BC/FI table disagrees with its prose).
 //!
-//! Not qualified on any arch: `v_med3_num_f32` (not modeled), the gfx1151 `v_div_scale_f32` exponent domains its sweep
+//! Not qualified on any arch: `v_med3_num_f32` with a NaN operand (a NaN-free operand set is the plain median of
+//! `v_med3_f32`; a NaN operand is an error), the gfx1151 `v_div_scale_f32` exponent domains its sweep
 //! leaves open (gfx1201 has the full exponent-field receipt, see [`div_scale_chain`]), BF16/FP8 encoders. Finite
 //! operands of `v_div_fmas_f32` under VCC are unqualified on every arch but gfx1201.
 //!
@@ -1511,8 +1512,9 @@ fn vector(
         }
         // Median of three: the ISA pseudocode's max3/max chain. A NaN operand (the pseudocode returns min3 for it, whose NaN
         // rule is not measured) and a median zero whose operand zeros differ in sign (max of +0 and -0 is not specified)
-        // are errors.
-        "v_med3_f32" => {
+        // are errors. gfx12 `v_med3_num_f32` (a NaN operand loses to a number) is the same median for NaN-free operands;
+        // its NaN behaviour is not measured here, so a NaN operand stays an error for both opcodes.
+        "v_med3_f32" | "v_med3_num_f32" => {
             let (a, b, c) = (fnum(0)?, fnum(1)?, fnum(2)?);
             let max3 = a.max(b).max(c);
             let r = if max3 == a {
@@ -2387,15 +2389,15 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         let value = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
         return s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value);
     }
-    // RDNA4 SOP2: low 64 bits of unsigned add/multiply, no SCC input or output.
+    // RDNA4 SOP2: low 64 bits of unsigned add/subtract/multiply, no SCC input or output.
     // Read both pairs before writing: the native address arithmetic aliases its destination.
-    if matches!(name, "s_mul_u64" | "s_add_nc_u64") {
+    if matches!(name, "s_mul_u64" | "s_add_nc_u64" | "s_sub_nc_u64") {
         let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
         let b = s.read_wide(o.get(2).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
-        let value = if name == "s_mul_u64" {
-            a.wrapping_mul(b)
-        } else {
-            a.wrapping_add(b)
+        let value = match name {
+            "s_mul_u64" => a.wrapping_mul(b),
+            "s_sub_nc_u64" => a.wrapping_sub(b),
+            _ => a.wrapping_add(b),
         };
         return s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value);
     }

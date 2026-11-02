@@ -68,6 +68,12 @@ required-features = ["lab"]
 name = "weight_slab_smoke"
 required-features = ["lab"]
 
+# MQ8G256 decode / verify lab (M2): identity of the row-exact multi-row GEMV vs the
+# single-row decode GEMV, and Q8_0 vs MQ8G256 node timing at the Raon attention shapes.
+[[example]]
+name = "mq8_decode_lab"
+required-features = ["lab"]
+
 # ---------------------------------------------------------------------------
 # Archived research probes.
 #
@@ -95,6 +101,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "pm_aco_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq8_prefill_lab"
 required-features = ["lab"]
 
 [[example]]

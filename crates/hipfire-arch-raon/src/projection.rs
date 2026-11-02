@@ -12,16 +12,30 @@
 //! existing exact bit-level round-trip kernel (`Gpu::bf16_round_trip_f32_strided`).
 //!
 //! Supported weight dtypes: `MQ4G256V2` (qt44, optional AWQ sidecar),
-//! `Q8_0` (Q8F16) and `F32`. The loader widens F16/BF16 small tensors to F32,
-//! so those never reach this layer; anything else is a named error, never a
-//! silent per-token loop.
+//! `Q8_0` (Q8F16), `MQ8G256` (qt14 attention class, device layout B) and `F32`. The loader
+//! widens F16/BF16 small tensors to F32, so those never reach this layer; anything else is a
+//! named error, never a silent per-token loop.
+//!
+//! # MQ8G256 (layout B)
+//!
+//! The weights are stored FWHT256-rotated int8, so every route rotates + quantizes the F32
+//! activation plane once (`Gpu::mq8_quantize_x`, one batched launch for all rows) and consumes
+//! the same [`Mq8Activations`](rdna_compute::Mq8Activations) everywhere: prefill = `gemm_mq8g256_gemm`
+//! (the `_bf16` epilogue when the output is rounded), decode (n = 1) and 2-row row-exact verify =
+//! `gemv_mq8g256_b_x` (rotate + quantize fused into the GEMV, no shared plane), row-exact verify of
+//! 3+ rows = one shared `mq8_quantize_x` + `gemv_mq8g256_rows_exact_b` (row `r` bit-identical to the
+//! decode step on that row). The route is
+//! selected by the weight's format alone: the prefill activation tier does not apply (there is no
+//! F16-activation form of a rotated weight), and nothing here reads an environment variable
+//! except the shared `HIPFIRE_RAON_A8_REUSE` / `HIPFIRE_RAON_A8_FUSE_ROUND` switches.
 
 use hipfire_dispatch::pipeline::{
+    mq8_acts_current, mq8_gemv_fused, mq8_gemv_rows, mq8_prefill_gemm, mq8_quantize,
     q8_0_f16_x_shareable, q8_0_prefill_gemm_f16x, q8_0_prefill_gemm_prepared, q8_0_prefill_prepare,
     PrefillActTier, PreparedA8,
 };
 use hipfire_runtime::llama::{weight_gemm, weight_gemv, weight_gemv_rows_exact, WeightTensor};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{mq8g256_b_bytes, DType, Gpu, GpuTensor, Mq8Activations};
 
 /// Output rounding applied after the projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +44,23 @@ pub enum OutRound {
     Exact,
     /// Round every output element to BF16 (PLAN §1.3 GEMM-output boundary).
     Bf16,
+}
+
+/// An activation plane quantized once for the projections of one node that read it
+/// ([`prepare_a8`]): the Q8_0 A8 quantization, or the MQ8G256 rotated int8 plane.
+#[derive(Clone, Copy, Debug)]
+pub enum PreparedAct {
+    Q8(PreparedA8),
+    /// `x` is the source plane's device address (a different plane is never served).
+    Mq8 {
+        acts: Mq8Activations,
+        x: *const std::ffi::c_void,
+    },
+}
+
+/// Whether `w` is an MQ8G256 attention-class weight (device layout B).
+pub fn is_mq8(w: &WeightTensor) -> bool {
+    w.gpu_dtype == DType::MQ8G256
 }
 
 fn check(
@@ -64,8 +95,20 @@ fn check(
     }
     match w.gpu_dtype {
         DType::MQ4G256V2 | DType::Q8_0 | DType::F32 => Ok(()),
+        DType::MQ8G256 => {
+            if w.k == 0 || w.k % 256 != 0 || w.buf.buf.size() < mq8g256_b_bytes(w.m, w.k) {
+                return Err(format!(
+                    "raon projection {what}: MQ8G256 weight [{} x {}] needs K % 256 == 0 and {} layout-B bytes (buffer {})",
+                    w.m,
+                    w.k,
+                    mq8g256_b_bytes(w.m, w.k),
+                    w.buf.buf.size()
+                ));
+            }
+            Ok(())
+        }
         other => Err(format!(
-            "raon projection {what}: weight dtype {other:?} is not routed (expected qt44 / Q8F16 / F32)"
+            "raon projection {what}: weight dtype {other:?} is not routed (expected qt44 / Q8F16 / MQ8G256 / F32)"
         )),
     }
 }
@@ -91,6 +134,9 @@ pub fn project_row(
     round: OutRound,
 ) -> Result<(), String> {
     check(w, x, y, 1, "row")?;
+    if is_mq8(w) {
+        return mq8_project(gpu, w, x, y, 1, round, None, true);
+    }
     weight_gemv(gpu, w, x, y).map_err(|e| format!("raon projection (row): {e:?}"))?;
     if round == OutRound::Bf16 {
         round_bf16_rows(gpu, y, 1, w.m)?;
@@ -118,6 +164,9 @@ pub fn project_rows(
     if rows == 1 {
         return project_row(gpu, w, x, y, round);
     }
+    if is_mq8(w) {
+        return mq8_project(gpu, w, x, y, rows, round, None, rows_exact(&gpu.arch, rows));
+    }
     if !rows_exact(&gpu.arch, rows) {
         return project_rows_batched(gpu, w, x, y, rows, round, tier);
     }
@@ -127,7 +176,7 @@ pub fn project_rows(
         // `gemv_f32`), so each row runs the decode projection itself.
         DType::MQ4G256V2 | DType::F32 => per_row_decode(gpu, w, x, y, rows),
         DType::Q8_0 => weight_gemv_rows_exact(gpu, w, x, y, rows).map_err(|e| e.to_string()),
-        other => unreachable!("dtype {other:?} rejected by check()"),
+        other => unreachable!("dtype {other:?} rejected by check() or routed to MQ8"),
     }
     .map_err(|e| format!("raon projection (rows={rows}): {e}"))?;
     if round == OutRound::Bf16 {
@@ -159,24 +208,46 @@ fn a8_reuse_enabled() -> bool {
     *ON
 }
 
-/// Quantize the activation plane `x[rows, w.k]` once for every A8 Q8_0 projection of a node that
-/// reads it (RDA q/k/v/g, MLA q_a/kv_a/g); `w` is any one consumer (its `k` and dtype are the
-/// shared contract). `None` (nothing launched) when the reuse switch is off, the weight is not
-/// Q8_0, or the quantized route is not admitted at this `tier`/`rows`, in which case every consumer
-/// takes its ordinary route. The result is valid for one node: pass it to [`project_prepared`] for
-/// consumers of the same `x` before anything else quantizes (a stale value is detected and ignored).
+/// Quantize the activation plane `x[rows, w.k]` once for every projection of a node that reads it
+/// (RDA q/k/v/g, MLA q_a/kv_a/g); `w` is any one consumer (its `k` and dtype are the shared
+/// contract). Q8_0: the A8 quantization at `rows > 1`. MQ8G256: the rotated int8 plane at any
+/// `rows` (decode and verify share it too), whatever `tier` is. `None` (nothing launched) when the
+/// reuse switch is off, the weight is neither, or the Q8_0 quantized route is not admitted at this
+/// `tier`/`rows`, in which case every consumer takes its ordinary route. The result is valid for
+/// one node: pass it to [`project_prepared`] for consumers of the same `x` before anything else
+/// quantizes (a stale value is detected and ignored; a plane of the other format is never served).
 pub fn prepare_a8(
     gpu: &mut Gpu,
     w: &WeightTensor,
     x: &GpuTensor,
     rows: usize,
     tier: PrefillActTier,
-) -> Result<Option<PreparedA8>, String> {
-    if rows <= 1 || w.gpu_dtype != DType::Q8_0 || !a8_reuse_enabled() {
+) -> Result<Option<PreparedAct>, String> {
+    if !a8_reuse_enabled() {
         return Ok(None);
     }
-    q8_0_prefill_prepare(gpu, tier, x, w.m, w.k, rows)
-        .map_err(|e| format!("raon A8 prepare (rows={rows}): {e}"))
+    match w.gpu_dtype {
+        DType::MQ8G256 => {
+            if rows == 0 {
+                return Err("raon MQ8 prepare: zero rows".into());
+            }
+            // Decode and row-exact 2-row verify run the fused-rotate GEMV per projection: no
+            // shared plane to prepare (the producer launch would only add work).
+            if rows == 1 || (rows == 2 && rows_exact(&gpu.arch, rows)) {
+                return Ok(None);
+            }
+            let acts = mq8_quantize(gpu, x, rows, w.k)
+                .map_err(|e| format!("raon MQ8 prepare (rows={rows}): {e}"))?;
+            Ok(Some(PreparedAct::Mq8 {
+                acts,
+                x: x.buf.as_ptr() as *const std::ffi::c_void,
+            }))
+        }
+        DType::Q8_0 if rows > 1 => q8_0_prefill_prepare(gpu, tier, x, w.m, w.k, rows)
+            .map(|p| p.map(PreparedAct::Q8))
+            .map_err(|e| format!("raon A8 prepare (rows={rows}): {e}")),
+        _ => Ok(None),
+    }
 }
 
 /// [`project_rows_batched`] whose A8 Q8_0 route consumes `prepared` (see [`prepare_a8`]) instead of
@@ -191,12 +262,19 @@ fn project_batched(
     rows: usize,
     round: OutRound,
     tier: PrefillActTier,
-    prepared: Option<&PreparedA8>,
+    prepared: Option<&PreparedAct>,
 ) -> Result<(), String> {
     check(w, x, y, rows, "rows")?;
     if rows == 1 {
         return project_row(gpu, w, x, y, round);
     }
+    if is_mq8(w) {
+        return mq8_project(gpu, w, x, y, rows, round, prepared, false);
+    }
+    let prepared = match prepared {
+        Some(PreparedAct::Q8(p)) => Some(p),
+        _ => None,
+    };
     let mut rounded = false;
     match w.gpu_dtype {
         DType::MQ4G256V2 => weight_gemm(gpu, w, x, y, rows).map_err(|e| format!("{e:?}")),
@@ -247,12 +325,90 @@ pub fn project_prepared(
     rows: usize,
     round: OutRound,
     tier: PrefillActTier,
-    prepared: Option<&PreparedA8>,
+    prepared: Option<&PreparedAct>,
 ) -> Result<(), String> {
+    if is_mq8(w) {
+        check(w, x, y, rows, "rows")?;
+        return mq8_project(
+            gpu,
+            w,
+            x,
+            y,
+            rows,
+            round,
+            prepared,
+            rows == 1 || rows_exact(&gpu.arch, rows),
+        );
+    }
     if rows_exact(&gpu.arch, rows) {
         return project_rows(gpu, w, x, y, rows, round, tier);
     }
     project_batched(gpu, w, x, y, rows, round, tier, prepared)
+}
+
+/// MQ8G256 projection `Y[rows, m] = X[rows, k] W^T`. The activation plane is `prepared` when it
+/// still describes `x` (same plane, rows, k, no quantizer ran since), else quantized here.
+/// `exact`: decode (`rows == 1`) and row-exact verify blocks run the GEMV routes, each row
+/// bit-identical to the decode step on that row; otherwise the prefill GEMM, which rounds to BF16
+/// in its epilogue when asked (bit-identical to a separate round pass). Capture-safe after the
+/// eager warm pass: plain launches over the Gpu-owned producer scratch.
+#[allow(clippy::too_many_arguments)]
+fn mq8_project(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    round: OutRound,
+    prepared: Option<&PreparedAct>,
+    exact: bool,
+) -> Result<(), String> {
+    if exact && rows <= 2 {
+        return mq8_fused_small(gpu, w, x, y, rows, round);
+    }
+    let acts = match prepared {
+        Some(PreparedAct::Mq8 { acts, x: px })
+            if *px == x.buf.as_ptr() as *const std::ffi::c_void
+                && acts.rows() == rows
+                && acts.k() == w.k
+                && mq8_acts_current(gpu, acts) =>
+        {
+            *acts
+        }
+        _ => mq8_quantize(gpu, x, rows, w.k)
+            .map_err(|e| format!("raon projection (MQ8 quantize, rows={rows}): {e}"))?,
+    };
+    let mut rounded = false;
+    if exact {
+        mq8_gemv_rows(gpu, &w.buf, &acts, y, w.m)
+    } else {
+        rounded = round == OutRound::Bf16 && a8_fuse_round_enabled();
+        mq8_prefill_gemm(gpu, &w.buf, &acts, y, w.m, rounded)
+    }
+    .map_err(|e| format!("raon projection (MQ8, rows={rows}): {e}"))?;
+    if round == OutRound::Bf16 && !rounded {
+        round_bf16_rows(gpu, y, rows, w.m)?;
+    }
+    Ok(())
+}
+
+/// MQ8G256 decode (`rows == 1`) / 2-row row-exact verify: `Gpu::gemv_mq8g256_b_x` rotates and
+/// quantizes `x` inside the GEMV (one launch, no producer, no shared plane); every row is
+/// bit-identical to `mq8_quantize_x` + the row-exact GEMV. Capture-safe after one eager call.
+fn mq8_fused_small(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    round: OutRound,
+) -> Result<(), String> {
+    mq8_gemv_fused(gpu, &w.buf, x, rows, y, w.m, w.k)
+        .map_err(|e| format!("raon projection (MQ8 fused, rows={rows}): {e}"))?;
+    if round == OutRound::Bf16 {
+        round_bf16_rows(gpu, y, rows, w.m)?;
+    }
+    Ok(())
 }
 
 /// `rows` launches of the decode projection (`weight_gemv`) on row views: exact by

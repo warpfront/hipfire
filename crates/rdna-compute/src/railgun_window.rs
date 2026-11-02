@@ -459,6 +459,7 @@ impl Gpu {
             int4_mmq_x_scratch,
             int4_mmq_down_scratch,
             q8_a8_x_scratch,
+            mq8_x_scratch,
             int8_mmq_x_scratch,
             mq4v2_fp8_x_scratch,
             mq4v2_fp8_half_sums_scratch,

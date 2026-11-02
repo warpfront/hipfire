@@ -243,6 +243,13 @@ pub enum SiteWeight {
         m: usize,
         k: usize,
     },
+    /// MQ8G256 (qt14, layout B) attention-class weight `[m, k]`: always W8A8 on the FWHT256-rotated
+    /// int8 activation (the weights are stored rotated, so no F16 activation route exists); the
+    /// tier only labels it. `can_run` is `A8` on an arch with the MQ8 kernels.
+    Mq8 {
+        m: usize,
+        k: usize,
+    },
     /// qt44 (`MQ4G256V2`) weight; `symmetric`: loader-verified `zp == -8 * sc`; `ffn`: the site
     /// has the grouped/one-expert qt44 cores (routed, shared, dense; not the attention-class
     /// projections).
@@ -260,6 +267,7 @@ impl SiteWeight {
     pub fn of(w: &WeightTensor, symmetric: bool, ffn: bool) -> Self {
         match w.gpu_dtype {
             DType::Q8_0 => Self::Q8 { m: w.m, k: w.k },
+            DType::MQ8G256 => Self::Mq8 { m: w.m, k: w.k },
             DType::MQ4G256V2 => Self::Qt44 {
                 symmetric,
                 m: w.m,
@@ -285,9 +293,19 @@ impl SiteWeight {
         if let Self::Q8 { m, k } = *self {
             hipfire_dispatch::pipeline::q8_0_weight_admits(arch, tier, m, k)?;
         }
+        if let Self::Mq8 { k, .. } = *self {
+            if tier != PrefillActTier::A8 {
+                return Err("MQ8G256 has no A4/FP8 route");
+            }
+            if !rdna_compute::mq8_admits(arch, k) {
+                return Err(
+                    "MQ8G256 prefill needs gfx1200/gfx1201/gfx1100/gfx1151 and K % 256 == 0",
+                );
+            }
+        }
         match *self {
             // Shape and arch conditions were checked by `q8_0_weight_admits` above.
-            Self::Q8 { .. } => Ok(()),
+            Self::Q8 { .. } | Self::Mq8 { .. } => Ok(()),
             Self::Qt44 {
                 symmetric,
                 m,
@@ -751,5 +769,37 @@ mod tests {
             .resolve("gfx1151", &w);
         assert_eq!(plan.effective.get(S::MlaQ), F16);
         assert_eq!(plan.effective.get(S::RoutedGateUp), A8);
+    }
+
+    #[test]
+    fn mq8_weights_run_a8_on_the_mq8_arches_only() {
+        let mq8 = SiteWeight::Mq8 { m: 5120, k: 2560 };
+        let q8 = SiteWeight::Q8 { m: 7680, k: 576 };
+        // A8 is the only tier of the rotated int8 route.
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let r = effective_tier(arch, A8, &[mq8]);
+            assert_eq!(
+                (r.effective, r.runnable, r.total, r.reason),
+                (A8, 1, 1, None),
+                "{arch}"
+            );
+        }
+        for t in [A4, Fp8] {
+            let r = effective_tier(R9700, t, &[mq8]);
+            assert_eq!(
+                (r.effective, r.reason),
+                (F16, Some("MQ8G256 has no A4/FP8 route"))
+            );
+        }
+        // K = 576 cannot be MQ8G256 (the quantizer keeps q_b on Q8F16): no route.
+        let r = effective_tier(R9700, A8, &[SiteWeight::Mq8 { m: 7680, k: 576 }]);
+        assert_eq!(r.effective, F16);
+        assert!(r.reason.unwrap().contains("K % 256"));
+        // An MLA site mixes MQ8 q_a with the Q8F16 q_b: the MQ8 weight keeps the tier.
+        let r = effective_tier(R9700, A8, &[mq8, q8]);
+        assert_eq!((r.effective, r.total), (A8, 2));
+        assert!(r.runnable >= 1);
+        // An F16 request is the kill switch of the Q8F16 weights; it never has a reason.
+        assert_eq!(effective_tier(R9700, F16, &[mq8]).reason, None);
     }
 }

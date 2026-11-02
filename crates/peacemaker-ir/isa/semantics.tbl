@@ -46,6 +46,7 @@ s_add_co_i32	alu
 s_add_co_u32	alu
 s_add_i32	alu
 s_add_nc_u64	alu
+s_sub_nc_u64	alu
 s_add_u32	alu
 s_addc_u32	alu
 s_addk_co_i32	alu
@@ -501,6 +502,7 @@ v_fmac_f32_e64	alu
 v_trunc_f32_e32	alu
 v_floor_f32_e32	alu
 v_med3_f32	alu
+v_med3_num_f32	alu
 v_frexp_exp_i32_f32_e32	alu
 v_frexp_mant_f32_e32	alu
 v_frexp_mant_f32_e64	alu

@@ -245,6 +245,12 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     pub mq4v2_symmetric: bool,
 
+    /// Raon-1-mini only: write attention-class projections with K % 256 == 0 (RDA q/k/v/g/o,
+    /// MLA q_a/kv_a/kv_b/g/o) as MQ8G256 (qt14, FWHT256 sign seeds 42/1042) from the BF16
+    /// source instead of Q8F16. Records recipe `raon-...-mq8g256-attn/v1`; default unchanged.
+    #[arg(long)]
+    pub raon_attn_mq8: bool,
+
     /// Encode MQ3V2 with a per-128 symmetric grid while retaining the existing
     /// affine header layout. The stored zero is `-4*d`, so code 4 maps to zero.
     #[arg(long)]
@@ -518,6 +524,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("imatrix", &[Main]),
     ("awq_alpha", &[Main]),
     ("mq4v2_symmetric", &[Raon, Main]),
+    ("raon_attn_mq8", &[Raon]),
     ("hessian_dir", &[Main]),
     ("tier_ratio", &[Main]),
     ("q8_router", &[Main]),

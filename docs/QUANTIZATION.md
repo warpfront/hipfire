@@ -144,6 +144,19 @@ Flash-Next bench fixture”) and the registry rows in [MODELS.md](MODELS.md).
   `crates/hipfire-arch-raon/src/precision.rs`; `f16` is the kill switch, `<site>=f16` a
   per-site one).
 
+  **MQ8 attention variant (`hipfire-quantize --raon-attn-mq8`, opt-in, default byte-unchanged).**
+  The 125 attention-class projections with K % 256 == 0 (RDA q/k/v/g/o, MLA
+  q_a/kv_a/kv_b/g/o) are written as MQ8G256 (qt 14: FWHT256 with the MQ sign seeds 42/1042,
+  one f16 scale per 256, int8 codes; recipe `raon-mq4v2-symmetric-qt44-experts-mq8g256-attn/v1`)
+  from the BF16 source; `q_b` (K 576), the RDA gate heads (`f_a/f_b/b_proj/rda_w_proj`), the
+  FFN and `lm_head` keep their classes. The model file selects the route (no environment
+  flag): the loader repacks each qt 14 tensor to an aligned scale-plane + code-plane layout
+  (same VRAM), and prefill (int8 GEMM), decode (GEMV) and row-exact verify (per-row bit-identical
+  to decode) all run W8A8 on the FWHT256-rotated, once-quantized activation, so the
+  `HIPFIRE_RAON_PREFILL_PRECISION` table does not apply to those tensors. Supported on
+  gfx1200/gfx1201/gfx1100/gfx1151 only; other devices refuse the file at load and need the
+  default Q8F16 build.
+
 **Historical sweep vs current registry.** The `mq4-xt` / `mq4` / `mq4 pro` ladder
 cells in [ladder.md](quant-formats/ladder.md) are the 2026-08 candidate sweep on
 dense Qwen3.8-27B (a measurement grid, not registry cards). The shipped XTS

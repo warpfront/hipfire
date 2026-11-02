@@ -59,7 +59,7 @@ use crate::moe::{
 };
 use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
 use crate::projection::{
-    prepare_a8, project, project_prepared, project_shared_f16, share_f16_x, OutRound,
+    is_mq8, prepare_a8, project, project_prepared, project_shared_f16, share_f16_x, OutRound,
 };
 use crate::rda::{
     rda_forward_rows_taped, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
@@ -978,8 +978,9 @@ fn mla_mixer(
     let q_tier = work.site_tiers.get(RaonPrecisionSite::MlaQ);
     let kv_tier = work.site_tiers.get(RaonPrecisionSite::MlaKv);
     let go_tier = work.site_tiers.get(RaonPrecisionSite::MlaGo);
-    // q_a / kv_a / g read the same `x`: quantize it once for whichever of them runs A8.
-    let prep = if [q_tier, kv_tier, go_tier].contains(&PrefillActTier::A8) {
+    // q_a / kv_a / g read the same `x`: quantize it once for whichever of them runs A8, or for the
+    // MQ8G256 weights (whose rotated int8 route does not depend on the tier).
+    let prep = if is_mq8(&w.q_a_proj) || [q_tier, kv_tier, go_tier].contains(&PrefillActTier::A8) {
         prepare_a8(gpu, &w.q_a_proj, x, rows, PrefillActTier::A8)?
     } else {
         None
