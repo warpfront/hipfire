@@ -185,7 +185,7 @@ Full alias set and product-ladder controls. Common extras:
 | `--fixed-tier <spec>` | Per-class codec overrides, e.g. `lm_head:mq6v2,ssm_out:mq6v2`. Classes: `lm_head,embed,router,attn,ssm_out` (plus `attn_full` where applicable). Dtypes: `q8,mq2v2,mq3v2,mq4v2,mq5v2,mq6v2` (+ limited legacy). Env: `HIPFIRE_FIXED_TIER`. |
 | `--imatrix <gguf>` | GGUF-format imatrix for activation-aware recipes |
 | `--hessian-dir <dir>` | GPTQ-E8 Hessians |
-| `--awq` / `--awq-alpha` / `--awq-a4-aware` | AWQ pre-scale (default alpha 0.55). `--awq-a4-aware` is MQ4V2-only and selects an alpha per shared activation group from 0.35/0.45/0.55/0.65/0.75 by sampled W4A4 block-output error, using the imatrix RMS profile and the runtime-exact four-candidate `block_i4_128` fake quantizer. Fused qkvza/gate-up siblings share the anchor projection's alpha so their single runtime inverse scale remains valid. |
+| `--awq` / `--awq-alpha` / `--awq-a4-aware` | AWQ pre-scale (default alpha 0.55). `--awq-a4-aware` is MQ4V2-only and selects an alpha per shared activation group from 0.05/0.15/0.25/0.35/0.55/0.75 by sampled W4A4 block-output error (the low band is the one the 27B MQ4 alpha sweep measured best on KLD), using the imatrix RMS profile and the runtime-exact four-candidate `block_i4_128` fake quantizer. Fused qkvza/gate-up siblings share the anchor projection's alpha so their single runtime inverse scale remains valid. |
 | `--kmap-dense` / `--kmap-mode` / `--no-kmap` / `--uniform` | K-map promotion policy |
 | `--q8-router` / `--no-q8-conv1d` | Protect routers / conv1d |
 | `--reap-overlay` / `--reap-bake` / `--reap-out` / `--reap-arch` | REAP plan paths |
