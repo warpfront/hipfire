@@ -1263,10 +1263,20 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         }
         if let Some(c) = conditional {
             for t in &c.tables {
+                // A launch whose bound is zero never reads the table (the sealed-table
+                // bind discharges it as vacuous without an allocation), so an argument
+                // that is no allocation - a null optional pointer - is fine there.
+                let zero_bound = match t.bound {
+                    TableBound::Const(c) => c == 0,
+                    TableBound::Kernarg(at) => launch
+                        .kernarg
+                        .get(at as usize..at as usize + 4)
+                        .is_some_and(|b| b == [0u8; 4]),
+                };
                 let is_resource = args.iter().any(|(offset, arg)| {
                     *offset == t.table_arg_offset && matches!(arg, Arg::Resource { .. })
                 });
-                if !is_resource {
+                if !is_resource && !zero_bound {
                     refusals.push(format!(
                         "sealed table argument +{} is not a bound allocation",
                         t.table_arg_offset

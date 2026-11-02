@@ -1444,6 +1444,39 @@ fn discharged(w: &SealedTableWitness) -> Vec<usize> {
     w.discharged_cases().iter().map(|c| c.0).collect()
 }
 
+/// The kernel in a mode that takes no table at all: the table argument is a null optional pointer and
+/// `n = 0`.
+pub(crate) fn null_table_launch(k: &KernelRecord) -> LaunchRecord {
+    let mut l = gather_launch(node_facts(k).unwrap(), 0, 0);
+    l.allocations = vec![(8, Ok(out_binding()))];
+    l
+}
+
+#[test]
+fn a_null_table_pointer_with_a_zero_bound_is_authored_and_bound_as_vacuous() {
+    let k = record();
+    // Authored: not HipDirect (the table is never read), the argument stays a constant.
+    let l = null_table_launch(&k);
+    let authored = author("gfx1201", &[l]);
+    assert!(
+        matches!(&authored.nodes[0].lowering, Lowering::Conditional { reason } if reason.contains("sealed_table")),
+        "{:?}",
+        authored.nodes[0].lowering
+    );
+    assert!(authored.nodes[0].kref.is_some());
+    // Bound beside a real table node: discharged vacuous, nothing sealed for it.
+    let fx = Fixture::with(&k, 4, vec![null_table_launch(&k)], true);
+    let w = fx.bind().expect("both nodes are discharged");
+    assert_eq!(discharged(&w), vec![0, 1]);
+    assert!(w.nodes()[1].tables.is_empty());
+    assert_eq!(w.nodes()[1].vacuous, vec![0]);
+    // A null pointer with a nonzero bound is still refused.
+    let l = gather_launch(node_facts(&k).unwrap(), 0, 4);
+    assert!(
+        matches!(authored_reason(l), Lowering::HipDirect { reason } if reason.contains("not a bound allocation"))
+    );
+}
+
 #[test]
 fn a_zero_bound_node_is_vacuous_beside_a_real_table_node() {
     // Node 0: a real 4-entry table (mode 2). Node 1: the same kernel with the
