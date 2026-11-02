@@ -103,16 +103,26 @@ fn decode_step_inner(
         .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|e| format!("lfm3: htod pos: {e:?}"))?;
 
-    // Embedding → residual stream h. Normally a Q8 table lookup; the VL prefill
-    // overrides this with a projected visual embedding at image-token positions.
+    // Embedding → residual stream h. Normally a Q8 table lookup; a safetensors
+    // Dir source widens F16/BF16 to an F32 table (dispatched via embed_format).
+    // The VL prefill overrides this with a projected visual embedding.
     if let Some(e) = embed {
         let bytes: Vec<u8> = e.iter().flat_map(|&f| f.to_le_bytes()).collect();
         gpu.hip
             .memcpy_htod(&state.h.buf, &bytes)
             .map_err(|e| format!("lfm3: htod embed: {e:?}"))?;
     } else {
-        gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
-            .map_err(|e| format!("lfm3: embed lookup: {e:?}"))?;
+        // Dispatch on the table's storage format: HFQ ships Q8_0, a safetensors
+        // Dir source is F16/BF16 → widened to an F32 gather table at load.
+        hipfire_runtime::llama::embedding_lookup_dispatch(
+            gpu,
+            weights.embed_format,
+            &weights.embed,
+            &state.h,
+            token_id,
+            hidden,
+        )
+        .map_err(|e| format!("lfm3: embed lookup: {e:?}"))?;
     }
 
     for (l, layer) in weights.layers.iter().enumerate() {
