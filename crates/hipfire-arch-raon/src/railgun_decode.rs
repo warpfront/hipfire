@@ -19,6 +19,10 @@
 //! * `1` forces the owner (whatever the arch or corpus) and logs every
 //!   decline once per kind.
 //!
+//! With no corpus anywhere the owner (unless `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS=0`)
+//! builds the per-user one once, right after the decode graph's warm-up step,
+//! from the objects the process loaded (see [`crate::railgun_provision`]).
+//!
 //! A step through the owner:
 //!
 //! 1. **Admission checks** ([`check_admission`]): exact gfx1201 or exact gfx1100
@@ -83,6 +87,9 @@ use crate::forward::{
     admit_decode_context, decode_binding, decode_body, mla_route, stage_decode_token_on_stream,
 };
 use crate::mla::MlaRoute;
+use crate::railgun_provision::{
+    locate_binary, provision, BinaryLookup, ProvisionSpec, BINARY, ENV_LOCAL_CORPUS, TIMEOUT,
+};
 
 /// `HIPFIRE_RAON_RAILGUN`: `auto` (default) | `1` | `0` (hard kill).
 pub const ENV_ENABLE: &str = "HIPFIRE_RAON_RAILGUN";
@@ -205,6 +212,9 @@ pub enum RaonRailgunRefusal {
     NotWarm,
     /// `HIPFIRE_RAON_RAILGUN_CORPUS` is unset.
     CorpusUnset,
+    /// The first-load local receipt corpus could not be built (the exact
+    /// reason of `railgun_provision`).
+    CorpusProvision(String),
     /// The corpus could not be opened under the loaded toolchain.
     Corpus(String),
     /// The decode body could not be planned.
@@ -260,6 +270,7 @@ impl RaonRailgunRefusal {
             Self::AbsorbedRoute => "absorbed_route",
             Self::NotWarm => "not_warm",
             Self::CorpusUnset => "corpus_unset",
+            Self::CorpusProvision(_) => "corpus_provision",
             Self::Corpus(_) => "corpus",
             Self::Plan(_) => "plan",
             Self::NoReceipt { .. } => "no_receipt",
@@ -308,6 +319,7 @@ impl fmt::Display for RaonRailgunRefusal {
             Self::AbsorbedRoute => write!(f, "the absorbed MLA route is not certified"),
             Self::NotWarm => write!(f, "the decode graph warm-up step has not run"),
             Self::CorpusUnset => write!(f, "{ENV_CORPUS} is unset"),
+            Self::CorpusProvision(e) => write!(f, "local receipt corpus: {e}"),
             Self::Corpus(e) => write!(f, "receipt corpus: {e}"),
             Self::Plan(e) => write!(f, "plan sink: {e}"),
             Self::NoReceipt { node, symbol, why } => {
@@ -373,6 +385,17 @@ pub struct Structural<'a> {
     pub host_weights: bool,
 }
 
+/// Where the receipt corpus stands this step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorpusState<'a> {
+    /// A directory to open.
+    Ready(&'a str),
+    /// The first-load build was refused or failed; the exact reason.
+    Refused(&'a str),
+    /// None configured, found or buildable.
+    Unset,
+}
+
 /// What can change from one step to the next.
 #[derive(Clone, Debug)]
 pub struct StepFacts<'a> {
@@ -380,7 +403,7 @@ pub struct StepFacts<'a> {
     pub dump_armed: bool,
     pub absorbed_route: bool,
     pub warmed: bool,
-    pub corpus_dir: Option<&'a str>,
+    pub corpus: CorpusState<'a>,
 }
 
 /// The first structural reason the context is refused, in a fixed order
@@ -435,8 +458,10 @@ pub fn check_admission(s: &Structural<'_>, step: &StepFacts<'_>) -> Result<(), R
     if !step.warmed {
         return Err(R::NotWarm);
     }
-    if step.corpus_dir.is_none_or(str::is_empty) {
-        return Err(R::CorpusUnset);
+    match step.corpus {
+        CorpusState::Ready(d) if !d.is_empty() => {}
+        CorpusState::Refused(why) => return Err(R::CorpusProvision(why.to_owned())),
+        CorpusState::Ready(_) | CorpusState::Unset => return Err(R::CorpusUnset),
     }
     Ok(())
 }
@@ -477,6 +502,9 @@ pub struct OwnerPlan {
     pub corpus_dir: Option<String>,
     /// `1`: log every decline once per kind.
     pub loud: bool,
+    /// No corpus exists anywhere and a local one may be built from the loaded
+    /// objects once the decode graph has warmed.
+    pub provision: bool,
 }
 
 /// Why a bundle got no owner.
@@ -500,56 +528,87 @@ impl fmt::Display for NoOwner {
     }
 }
 
-/// Decide whether a bundle gets an owner. `env_corpus` is
-/// `HIPFIRE_RAON_RAILGUN_CORPUS`, `pack_corpus` the directory beside the
-/// installed kernel pack, `has_index` whether a directory holds a corpus.
+/// The places a corpus can come from.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Candidates<'a> {
+    /// `HIPFIRE_RAON_RAILGUN_CORPUS`.
+    pub env: Option<&'a str>,
+    /// The directory beside the installed kernel pack.
+    pub pack: Option<&'a str>,
+    /// The per-user directory a first-load build publishes to.
+    pub local: Option<&'a str>,
+    /// `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS` (default on): a missing corpus may
+    /// be built into `local`.
+    pub may_provision: bool,
+}
+
+/// The first of `dirs` that holds a corpus.
+fn first_corpus<'a>(
+    dirs: [Option<&'a str>; 2],
+    has_index: &dyn Fn(&str) -> bool,
+) -> Option<&'a str> {
+    dirs.into_iter().flatten().find(|d| has_index(d))
+}
+
+/// Decide whether a bundle gets an owner. `has_index` says whether a
+/// directory holds a corpus.
 ///
 /// `Off` creates nothing and looks at nothing. `Force` always creates the
-/// owner, with the explicit corpus, else the pack's when it holds one (an
-/// absent corpus then declines every step, loudly). `Auto` creates it only
-/// when the structural checks pass and a corpus is found: the explicit
-/// directory when set (it must hold a corpus), else the pack's.
+/// owner, with the explicit corpus, else the pack's or the per-user one when
+/// it holds a corpus; with none it may build the per-user one, and otherwise
+/// declines every step loudly. `Auto` creates it only when the structural
+/// checks pass and a corpus is found (the explicit directory when set, which
+/// must hold one; else the pack's, else the per-user one) or may be built.
 pub fn decide_owner(
     mode: RailgunMode,
     s: &Structural<'_>,
-    env_corpus: Option<&str>,
-    pack_corpus: Option<&str>,
+    c: &Candidates<'_>,
     has_index: &dyn Fn(&str) -> bool,
 ) -> Result<OwnerPlan, NoOwner> {
-    let env_corpus = env_corpus.filter(|d| !d.is_empty());
+    let env = c.env.filter(|d| !d.is_empty());
+    let buildable = c.may_provision && c.local.is_some();
     match mode {
         RailgunMode::Off => Err(NoOwner::Killed),
-        RailgunMode::Force => Ok(OwnerPlan {
-            corpus_dir: env_corpus
-                .or_else(|| pack_corpus.filter(|d| has_index(d)))
-                .map(str::to_owned),
-            loud: true,
-        }),
+        RailgunMode::Force => {
+            let dir = env.or_else(|| first_corpus([c.pack, c.local], has_index));
+            Ok(OwnerPlan {
+                corpus_dir: dir.map(str::to_owned),
+                loud: true,
+                provision: dir.is_none() && buildable,
+            })
+        }
         RailgunMode::Auto => {
             check_structural(s).map_err(NoOwner::Refused)?;
-            let dir = match (env_corpus, pack_corpus) {
-                (Some(d), _) if has_index(d) => d,
-                (Some(d), _) => {
-                    return Err(NoOwner::NoCorpus(format!(
+            if let Some(d) = env {
+                return if has_index(d) {
+                    Ok(OwnerPlan {
+                        corpus_dir: Some(d.to_owned()),
+                        loud: false,
+                        provision: false,
+                    })
+                } else {
+                    Err(NoOwner::NoCorpus(format!(
                         "{ENV_CORPUS}={d} holds no receipt corpus"
                     )))
-                }
-                (None, Some(d)) if has_index(d) => d,
-                (None, Some(d)) => {
-                    return Err(NoOwner::NoCorpus(format!(
-                        "no receipt corpus beside the installed kernel pack ({d}); set {ENV_CORPUS}"
-                    )))
-                }
-                (None, None) => {
-                    return Err(NoOwner::NoCorpus(format!(
-                        "no installed kernel pack to pair a receipt corpus with; set {ENV_CORPUS}"
-                    )))
-                }
-            };
-            Ok(OwnerPlan {
-                corpus_dir: Some(dir.to_owned()),
-                loud: false,
-            })
+                };
+            }
+            match first_corpus([c.pack, c.local], has_index) {
+                Some(d) => Ok(OwnerPlan {
+                    corpus_dir: Some(d.to_owned()),
+                    loud: false,
+                    provision: false,
+                }),
+                None if buildable => Ok(OwnerPlan {
+                    corpus_dir: None,
+                    loud: false,
+                    provision: true,
+                }),
+                None => Err(NoOwner::NoCorpus(format!(
+                    "no receipt corpus found (installed pack: {}, per-user: {}); set {ENV_CORPUS}",
+                    c.pack.unwrap_or("none"),
+                    c.local.unwrap_or("none"),
+                ))),
+            }
         }
     }
 }
@@ -1233,6 +1292,19 @@ pub struct RaonRailgunStats {
     pub last_rebuild_cause: Option<String>,
 }
 
+/// The first-load build of the per-user receipt corpus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Provision {
+    /// Not wanted: a corpus exists, or building one is off.
+    Off,
+    /// Wanted, not yet run (waits for the decode graph's warm-up step).
+    Pending(Box<ProvisionSpec>),
+    /// Built and published at this directory.
+    Done(String),
+    /// Refused or failed; the exact reason. Never re-run in this process.
+    Failed(String),
+}
+
 /// The per-bundle owner. Created by `RaonBundle::new` per the tri-state
 /// `HIPFIRE_RAON_RAILGUN` (see [`decide_owner`]); never exists under `0`.
 pub struct RaonRailgunOwner {
@@ -1243,6 +1315,7 @@ pub struct RaonRailgunOwner {
     /// Whether the HIP device's PCI address resolved (arches that need it).
     pci_ok: Option<bool>,
     corpus_dir: Option<String>,
+    provision: Provision,
     corpus: Option<Result<WindowCorpus, String>>,
     ctx: Option<RailgunLoweringContext>,
     table: Option<Result<CacheTable, String>>,
@@ -1283,7 +1356,9 @@ impl RaonRailgunOwner {
     /// before reading anything else. An unrecognised spelling fails closed to
     /// `0` with a message. In `auto` an explicitly set
     /// `HIPFIRE_RAON_RAILGUN_CORPUS` that holds no corpus is reported once;
-    /// every other reason for no owner is silent.
+    /// every other reason for no owner is silent. With no corpus anywhere and
+    /// `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS` not `0`, the owner is created
+    /// waiting to build the per-user corpus after the decode graph's warm-up.
     pub(crate) fn from_config(b: &RaonBundle, gpu: &Gpu) -> Option<Box<Self>> {
         let raw = hipfire_config::developer_var(ENV_ENABLE).ok();
         let mode = parse_mode(raw.as_deref()).unwrap_or_else(|e| {
@@ -1303,6 +1378,8 @@ impl RaonRailgunOwner {
         let pack_corpus = gpu
             .railgun_pack_corpus_dir()
             .map(|p| p.to_string_lossy().into_owned());
+        let prov = gpu.railgun_provision_context();
+        let local_corpus = prov.local_corpus_dir.to_string_lossy().into_owned();
         let band = b.weights.band.label();
         // `graph_mode` already carries a retained-replay load (the route
         // resolution picked eager), so the live replay state is not re-read.
@@ -1319,12 +1396,26 @@ impl RaonRailgunOwner {
         let plan = decide_owner(
             mode,
             &structural,
-            env_corpus.as_deref(),
-            pack_corpus.as_deref(),
+            &Candidates {
+                env: env_corpus.as_deref(),
+                pack: pack_corpus.as_deref(),
+                local: Some(&local_corpus),
+                may_provision: hipfire_config::developer_bool(ENV_LOCAL_CORPUS, true),
+            },
             &|dir| Path::new(dir).join(railgun_corpus::CORPUS_INDEX).is_file(),
         );
         match plan {
-            Ok(plan) => Some(Box::new(Self::new(plan, &gpu.arch, model_digest(b)))),
+            Ok(plan) => {
+                let spec = plan.provision.then(|| ProvisionSpec {
+                    program: format!("raon-ar-decode-{}", prov.arch),
+                    arch: prov.arch,
+                    toolchain_id: prov.toolchain_id,
+                    hot_dir: prov.hot_dir,
+                    pack_dir: prov.installed_pack_dir,
+                    out_dir: prov.local_corpus_dir,
+                });
+                Some(Box::new(Self::new(plan, &gpu.arch, spec, model_digest(b))))
+            }
             Err(NoOwner::NoCorpus(why)) if env_corpus.is_some() => {
                 eprintln!("[raon-railgun] auto: HIP graph route ({why})");
                 None
@@ -1333,12 +1424,13 @@ impl RaonRailgunOwner {
         }
     }
 
-    fn new(plan: OwnerPlan, arch: &str, model_digest: String) -> Self {
+    fn new(plan: OwnerPlan, arch: &str, spec: Option<ProvisionSpec>, model_digest: String) -> Self {
         Self {
             arch: arch.to_owned(),
             policy: arch_policy(arch),
             pci_ok: None,
             corpus_dir: plan.corpus_dir,
+            provision: spec.map_or(Provision::Off, |s| Provision::Pending(Box::new(s))),
             corpus: None,
             ctx: None,
             table: None,
@@ -1350,6 +1442,64 @@ impl RaonRailgunOwner {
             logged_kinds: BTreeSet::new(),
             auto_logged: false,
         }
+    }
+
+    /// Where the first-load corpus build stands: `off`, `pending`,
+    /// `done:<dir>` or `refused:<reason>`.
+    pub fn provision_status(&self) -> String {
+        match &self.provision {
+            Provision::Off => "off".to_owned(),
+            Provision::Pending(_) => "pending".to_owned(),
+            Provision::Done(dir) => format!("done:{dir}"),
+            Provision::Failed(why) => format!("refused:{why}"),
+        }
+    }
+
+    /// Run the pending first-load build, once, blocking. The caller has
+    /// checked that the decode graph has warmed (every decode module is in
+    /// the hot cache) and that nothing else declines the step.
+    fn provision_now(&mut self) {
+        if !matches!(self.provision, Provision::Pending(_)) {
+            return;
+        }
+        let Provision::Pending(spec) = std::mem::replace(&mut self.provision, Provision::Off)
+        else {
+            return;
+        };
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(Path::to_path_buf));
+        let home_bin = hipfire_config::hipfire_home().ok().map(|h| h.join("bin"));
+        let path = std::env::var_os("PATH");
+        let binary = locate_binary(
+            &BinaryLookup {
+                exe_dir: exe_dir.as_deref(),
+                home_bin: home_bin.as_deref(),
+                path: path.as_deref(),
+            },
+            BINARY,
+        );
+        if binary.is_some() {
+            eprintln!(
+                "[raon-railgun] building the local receipt corpus for this install (first load, \
+                 once): {}",
+                spec.out_dir.display()
+            );
+        }
+        self.provision = match provision(&spec, binary.as_deref(), TIMEOUT) {
+            Ok(done) => {
+                eprintln!(
+                    "[raon-railgun] local receipt corpus built in {} ms: {}",
+                    done.millis,
+                    done.out_dir.display()
+                );
+                let dir = done.out_dir.to_string_lossy().into_owned();
+                self.corpus_dir = Some(dir.clone());
+                self.corpus = None;
+                Provision::Done(dir)
+            }
+            Err(why) => Provision::Failed(why),
+        };
     }
 
     pub fn stats(&self) -> RaonRailgunStats {
@@ -1430,12 +1580,29 @@ impl RaonRailgunOwner {
             self.device_identity_ok(gpu)
         };
         let structural = observe_structural(b, gpu, &band, gpu.replay.is_enabled(), identity);
+        let (tap_armed, dump_armed) = (
+            b.spec.census_tap.is_some(),
+            hipfire_dispatch::pipeline::moe_capture::enabled(),
+        );
+        let absorbed_route = mla_route(&b.work, &b.state, pos + 1) == MlaRoute::Absorbed;
+        let warmed = b.graph.warmed;
+        if matches!(self.provision, Provision::Pending(_))
+            && warmed
+            && !(tap_armed || dump_armed || absorbed_route)
+            && check_structural(&structural).is_ok()
+        {
+            self.provision_now();
+        }
         let step = StepFacts {
-            tap_armed: b.spec.census_tap.is_some(),
-            dump_armed: hipfire_dispatch::pipeline::moe_capture::enabled(),
-            absorbed_route: mla_route(&b.work, &b.state, pos + 1) == MlaRoute::Absorbed,
-            warmed: b.graph.warmed,
-            corpus_dir: self.corpus_dir.as_deref(),
+            tap_armed,
+            dump_armed,
+            absorbed_route,
+            warmed,
+            corpus: match (&self.corpus_dir, &self.provision) {
+                (Some(dir), _) => CorpusState::Ready(dir),
+                (None, Provision::Failed(why)) => CorpusState::Refused(why),
+                (None, _) => CorpusState::Unset,
+            },
         };
         if let Err(r) = check_admission(&structural, &step) {
             self.note_decline(&r);

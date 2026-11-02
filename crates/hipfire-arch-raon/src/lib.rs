@@ -19,6 +19,7 @@ pub mod precision;
 pub mod prefill;
 pub mod projection;
 pub mod railgun_decode;
+pub mod railgun_provision;
 pub mod rda;
 pub mod rollback;
 pub mod session;

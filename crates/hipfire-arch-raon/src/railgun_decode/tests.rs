@@ -6,6 +6,7 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -282,7 +283,7 @@ fn ok_facts() -> Facts {
             dump_armed: false,
             absorbed_route: false,
             warmed: true,
-            corpus_dir: Some("corpus"),
+            corpus: CorpusState::Ready("corpus"),
         },
     )
 }
@@ -340,10 +341,14 @@ fn every_cheap_admission_check_declines_with_its_exact_reason() {
         ("dumps", |a| a.1.dump_armed = true, R::DumpArmed),
         ("absorbed", |a| a.1.absorbed_route = true, R::AbsorbedRoute),
         ("cold graph", |a| a.1.warmed = false, R::NotWarm),
-        ("no corpus", |a| a.1.corpus_dir = None, R::CorpusUnset),
+        (
+            "no corpus",
+            |a| a.1.corpus = CorpusState::Unset,
+            R::CorpusUnset,
+        ),
         (
             "empty corpus",
-            |a| a.1.corpus_dir = Some(""),
+            |a| a.1.corpus = CorpusState::Ready(""),
             R::CorpusUnset,
         ),
     ];
@@ -538,6 +543,16 @@ fn the_variable_parses_as_auto_1_or_0_and_defaults_to_auto() {
     }
 }
 
+/// The explicit and pack candidates only: no per-user directory, no build.
+fn c<'a>(env: Option<&'a str>, pack: Option<&'a str>) -> Candidates<'a> {
+    Candidates {
+        env,
+        pack,
+        local: None,
+        may_provision: false,
+    }
+}
+
 fn has_index(dirs: &'static [&'static str]) -> impl Fn(&str) -> bool {
     move |d| dirs.contains(&d)
 }
@@ -557,7 +572,7 @@ fn zero_is_a_hard_kill_that_looks_at_nothing() {
     for arch in [GFX1201, GFX1100] {
         s.arch = arch;
         assert_eq!(
-            decide_owner(RailgunMode::Off, &s, Some("env"), Some("pack"), &probe),
+            decide_owner(RailgunMode::Off, &s, &c(Some("env"), Some("pack")), &probe),
             Err(NoOwner::Killed)
         );
     }
@@ -575,14 +590,14 @@ fn auto_without_a_corpus_creates_no_owner() {
     // No pack at all (objects are JIT-compiled), a pack without a corpus, and
     // an explicit directory without one: no owner in each case.
     for (env, pack) in [(None, None), (None, Some("pack")), (Some("env"), None)] {
-        match decide_owner(RailgunMode::Auto, &s, env, pack, &none) {
+        match decide_owner(RailgunMode::Auto, &s, &c(env, pack), &none) {
             Err(NoOwner::NoCorpus(why)) => assert!(why.contains(ENV_CORPUS), "{why}"),
             other => panic!("expected NoCorpus, got {other:?}"),
         }
     }
     // An empty explicit directory is the same as unset.
     assert!(matches!(
-        decide_owner(RailgunMode::Auto, &s, Some(""), None, &none),
+        decide_owner(RailgunMode::Auto, &s, &c(Some(""), None), &none),
         Err(NoOwner::NoCorpus(_))
     ));
 }
@@ -591,11 +606,12 @@ fn auto_without_a_corpus_creates_no_owner() {
 fn auto_creates_the_owner_for_an_explicit_or_pack_corpus_quietly() {
     let s = structural();
     let both = has_index(&["env", "pack"]);
-    let plan = |env, pack| decide_owner(RailgunMode::Auto, &s, env, pack, &both);
+    let plan = |env, pack| decide_owner(RailgunMode::Auto, &s, &c(env, pack), &both);
     let want = |dir: &str| {
         Ok(OwnerPlan {
             corpus_dir: Some(dir.into()),
             loud: false,
+            provision: false,
         })
     };
     assert_eq!(plan(Some("env"), Some("pack")), want("env"));
@@ -605,7 +621,7 @@ fn auto_creates_the_owner_for_an_explicit_or_pack_corpus_quietly() {
     // silently replaced by it when it holds nothing.
     let only_pack = has_index(&["pack"]);
     assert!(matches!(
-        decide_owner(RailgunMode::Auto, &s, Some("env"), Some("pack"), &only_pack),
+        decide_owner(RailgunMode::Auto, &s, &c(Some("env"), Some("pack")), &only_pack),
         Err(NoOwner::NoCorpus(w)) if w.contains("env")
     ));
 }
@@ -646,7 +662,7 @@ fn auto_refuses_a_structurally_unsuitable_context_before_looking_for_a_corpus() 
         let mut s = structural();
         mutate(&mut s);
         assert_eq!(
-            decide_owner(RailgunMode::Auto, &s, Some("env"), Some("pack"), &probe),
+            decide_owner(RailgunMode::Auto, &s, &c(Some("env"), Some("pack")), &probe),
             Err(NoOwner::Refused(want))
         );
     }
@@ -659,11 +675,12 @@ fn one_forces_the_owner_loudly_whatever_the_context() {
     s.arch = "gfx1100";
     s.graph_forward_disabled = true;
     let pack_only = has_index(&["pack"]);
-    let plan = |env, pack| decide_owner(RailgunMode::Force, &s, env, pack, &pack_only);
+    let plan = |env, pack| decide_owner(RailgunMode::Force, &s, &c(env, pack), &pack_only);
     let loud = |dir: Option<&str>| {
         Ok(OwnerPlan {
             corpus_dir: dir.map(str::to_owned),
             loud: true,
+            provision: false,
         })
     };
     assert_eq!(plan(Some("env"), Some("pack")), loud(Some("env")));
@@ -675,7 +692,7 @@ fn one_forces_the_owner_loudly_whatever_the_context() {
 }
 
 fn owner(plan: OwnerPlan) -> RaonRailgunOwner {
-    RaonRailgunOwner::new(plan, GFX1201, "model".into())
+    RaonRailgunOwner::new(plan, GFX1201, None, "model".into())
 }
 
 #[test]
@@ -683,8 +700,9 @@ fn an_owner_of_an_unadmitted_arch_has_no_policy_and_no_cache_table() {
     let plan = |loud| OwnerPlan {
         corpus_dir: Some("c".into()),
         loud,
+        provision: false,
     };
-    let mut o = RaonRailgunOwner::new(plan(false), "gfx1151", "m".into());
+    let mut o = RaonRailgunOwner::new(plan(false), "gfx1151", None, "m".into());
     assert!(o.policy.is_none());
     assert_eq!(
         o.cache_table().err(),
@@ -692,7 +710,7 @@ fn an_owner_of_an_unadmitted_arch_has_no_policy_and_no_cache_table() {
             arch: "gfx1151".into()
         })
     );
-    let o = RaonRailgunOwner::new(plan(false), GFX1100, "m".into());
+    let o = RaonRailgunOwner::new(plan(false), GFX1100, None, "m".into());
     assert_eq!(o.policy, arch_policy(GFX1100));
 }
 
@@ -701,6 +719,7 @@ fn the_forced_owner_logs_each_kind_once_and_counts_every_decline() {
     let mut o = owner(OwnerPlan {
         corpus_dir: None,
         loud: true,
+        provision: false,
     });
     assert!(o.is_forced());
     for r in [
@@ -729,6 +748,7 @@ fn the_auto_owner_stays_quiet_for_the_routine_warm_up_and_logs_one_line() {
     let mut o = owner(OwnerPlan {
         corpus_dir: Some("corpus".into()),
         loud: false,
+        provision: false,
     });
     assert!(!o.is_forced());
     o.note_decline(&RaonRailgunRefusal::NotWarm);
@@ -757,6 +777,7 @@ fn every_refusal_has_a_distinct_kind_and_a_message() {
         R::AbsorbedRoute,
         R::NotWarm,
         R::CorpusUnset,
+        R::CorpusProvision("x".into()),
         R::Corpus("x".into()),
         R::Plan("x".into()),
         R::NoReceipt {
@@ -1422,4 +1443,166 @@ fn replacing_a_quiescent_program_drops_the_old_one() {
     assert_eq!(log.lock().unwrap().dropped, 1);
     exec.install(built(&log, key()));
     assert_eq!(exec.submit(), StepOutcome::Completed);
+}
+
+// ----------------------------------------------------- first-load provisioning
+
+fn cands<'a>(local: Option<&'a str>, may_provision: bool) -> Candidates<'a> {
+    Candidates {
+        env: None,
+        pack: Some("pack"),
+        local,
+        may_provision,
+    }
+}
+
+#[test]
+fn auto_without_any_corpus_waits_to_build_the_per_user_one() {
+    let s = structural();
+    let none = has_index(&[]);
+    assert_eq!(
+        decide_owner(RailgunMode::Auto, &s, &cands(Some("local"), true), &none),
+        Ok(OwnerPlan {
+            corpus_dir: None,
+            loud: false,
+            provision: true,
+        })
+    );
+}
+
+#[test]
+fn the_consent_variable_off_means_no_build_and_no_owner() {
+    let s = structural();
+    let none = has_index(&[]);
+    match decide_owner(RailgunMode::Auto, &s, &cands(Some("local"), false), &none) {
+        Err(NoOwner::NoCorpus(why)) => assert!(why.contains("local"), "{why}"),
+        other => panic!("expected NoCorpus, got {other:?}"),
+    }
+    // Forced: the owner exists, declines loudly, builds nothing.
+    assert_eq!(
+        decide_owner(RailgunMode::Force, &s, &cands(Some("local"), false), &none),
+        Ok(OwnerPlan {
+            corpus_dir: None,
+            loud: true,
+            provision: false,
+        })
+    );
+}
+
+#[test]
+fn an_existing_corpus_is_used_and_never_rebuilt() {
+    let s = structural();
+    let local_only = has_index(&["local"]);
+    let want = |dir: &str, loud| {
+        Ok(OwnerPlan {
+            corpus_dir: Some(dir.into()),
+            loud,
+            provision: false,
+        })
+    };
+    // The pack's corpus wins over the per-user one; the per-user one is found.
+    let both = has_index(&["pack", "local"]);
+    for mode in [RailgunMode::Auto, RailgunMode::Force] {
+        let loud = mode == RailgunMode::Force;
+        assert_eq!(
+            decide_owner(mode, &s, &cands(Some("local"), true), &both),
+            want("pack", loud)
+        );
+        assert_eq!(
+            decide_owner(mode, &s, &cands(Some("local"), true), &local_only),
+            want("local", loud)
+        );
+    }
+}
+
+#[test]
+fn an_explicit_directory_without_a_corpus_is_never_replaced_by_a_build() {
+    let s = structural();
+    let none = has_index(&[]);
+    let explicit = Candidates {
+        env: Some("env"),
+        ..cands(Some("local"), true)
+    };
+    assert!(matches!(
+        decide_owner(RailgunMode::Auto, &s, &explicit, &none),
+        Err(NoOwner::NoCorpus(w)) if w.contains("env")
+    ));
+}
+
+#[test]
+fn a_structurally_unsuitable_context_never_builds_a_corpus() {
+    let mut s = structural();
+    s.arch = "gfx1151";
+    let none = has_index(&[]);
+    assert_eq!(
+        decide_owner(RailgunMode::Auto, &s, &cands(Some("local"), true), &none),
+        Err(NoOwner::Refused(RaonRailgunRefusal::WrongArch {
+            arch: "gfx1151".into()
+        }))
+    );
+}
+
+#[test]
+fn a_refused_build_declines_the_step_with_the_exact_reason() {
+    let (s, mut step) = ok_facts();
+    step.corpus = CorpusState::Refused("railgun-jit-corpus not found");
+    assert_eq!(
+        check_admission(&s, &step),
+        Err(RaonRailgunRefusal::CorpusProvision(
+            "railgun-jit-corpus not found".into()
+        ))
+    );
+}
+
+/// A spec whose output parent cannot be created (it sits under a regular
+/// file), so a run is refused before anything is spawned, whoever runs it.
+fn blocked_spec(tag: &str) -> (ProvisionSpec, PathBuf) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/railgun-owner-tests")
+        .join(format!("{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let hot = root.join("cache/gfx1201");
+    std::fs::create_dir_all(&hot).expect("hot dir");
+    std::fs::write(root.join("blocker"), b"file").expect("blocker");
+    let spec = ProvisionSpec {
+        arch: "gfx1201".into(),
+        program: "raon-ar-decode-gfx1201".into(),
+        toolchain_id: "t".into(),
+        hot_dir: hot,
+        pack_dir: None,
+        out_dir: root.join("blocker/railgun-corpus/gfx1201"),
+    };
+    (spec, root)
+}
+
+#[test]
+fn the_build_is_pending_until_run_and_runs_only_once_per_process() {
+    let plan = OwnerPlan {
+        corpus_dir: None,
+        loud: false,
+        provision: true,
+    };
+    let (spec, root) = blocked_spec("once");
+    let mut o = RaonRailgunOwner::new(plan, GFX1201, Some(spec), "model".into());
+    assert_eq!(o.provision_status(), "pending");
+    // The run is refused (the corpus parent cannot be created): that is the
+    // owner's final answer for this process.
+    o.provision_now();
+    let first = o.provision_status();
+    assert!(first.starts_with("refused:"), "{first}");
+    assert!(o.corpus_dir.is_none());
+    // A second call has nothing pending: it neither re-runs nor changes state.
+    o.provision_now();
+    assert_eq!(o.provision_status(), first);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_owner_with_a_corpus_never_builds() {
+    let o = owner(OwnerPlan {
+        corpus_dir: Some("corpus".into()),
+        loud: false,
+        provision: false,
+    });
+    assert_eq!(o.provision_status(), "off");
 }

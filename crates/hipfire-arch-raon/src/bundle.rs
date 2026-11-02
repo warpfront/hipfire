@@ -738,6 +738,12 @@ impl RaonBundle {
         self.railgun.as_ref().map(|o| o.is_forced())
     }
 
+    /// Where the owner's first-load receipt corpus build stands (`off`, `pending`,
+    /// `done:<dir>`, `refused:<reason>`); `None` when the bundle has no owner.
+    pub fn railgun_provision_status(&self) -> Option<String> {
+        self.railgun.as_ref().map(|o| o.provision_status())
+    }
+
     /// Railgun owner counters; `None` when the bundle has no owner.
     pub fn railgun_stats(&self) -> Option<RaonRailgunStats> {
         self.railgun.as_ref().map(|o| o.stats())
