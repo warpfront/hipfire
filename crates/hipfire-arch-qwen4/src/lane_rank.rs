@@ -377,6 +377,15 @@ impl LocalLaneRank<'_> {
             )
             .map_err(|e| e.to_string())?;
         gpu.take_device_wait_error().map_err(|e| e.to_string())?;
+        // The window's forward is retired on this rank: the D2 expert tail (when installed)
+        // judges it and rewrites its decode tables before the next window launches.
+        if let Some(gather) = bundle
+            .execution
+            .as_ref()
+            .and_then(crate::gpu_forward::Qwen4GpuForward::mtp_ep_gather)
+        {
+            hipfire_dispatch::families::moe::MoeRowGather::decode_step_end(gather.hook, gpu);
+        }
 
         // A sampled lane's argmax picks are replaced by its sampler's draws
         // (`lane_sample_step`: one D2H of the request's logits rows); a
