@@ -30,4 +30,5 @@ pub use dispatch::{
     LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,
 };
 pub use feature_flags::FeatureFlags;
+pub use attention::q8_flash_tile_size;
 pub use kernels::GEMV_SRC;

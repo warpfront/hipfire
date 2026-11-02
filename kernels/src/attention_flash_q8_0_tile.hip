@@ -130,13 +130,19 @@ __global__ void attention_flash_q8_0_tile(
     float* q_lds  = sdata + tile_size;
 
     // Load Q into LDS. 32 threads × 4 values × n_halves = head_dim values.
+    // HEAD96-1: head_dim is a multiple of 32 but NOT always of 128 (the
+    // LFM2-style audio encoder uses 96). d_base < head_dim ⇒ d_base + 3 <
+    // head_dim (both multiples of 4), so a single guard drops exactly the
+    // out-of-range lanes; without it the tail threads read past q/q_lds.
     const float* q_head = q + h * head_dim;
     for (int half = 0; half < n_halves; half++) {
         const int d_base = half * 128 + tid * 4;
-        q_lds[d_base + 0] = q_head[d_base + 0];
-        q_lds[d_base + 1] = q_head[d_base + 1];
-        q_lds[d_base + 2] = q_head[d_base + 2];
-        q_lds[d_base + 3] = q_head[d_base + 3];
+        if (d_base < head_dim) {
+            q_lds[d_base + 0] = q_head[d_base + 0];
+            q_lds[d_base + 1] = q_head[d_base + 1];
+            q_lds[d_base + 2] = q_head[d_base + 2];
+            q_lds[d_base + 3] = q_head[d_base + 3];
+        }
     }
     __syncthreads();
 
@@ -165,7 +171,14 @@ __global__ void attention_flash_q8_0_tile(
         float partial2 = 0.0f;
         float partial3 = 0.0f;
         for (int half = 0; half < n_halves; half++) {
+            // HEAD96-1: the thread's K block must exist for this head
+            // (head_dim 96 → 3 blocks, k_bi up to 3). Out-of-range threads
+            // previously read the NEXT kv head's block and folded its values
+            // into the wave-reduced score. They now contribute exactly 0 but
+            // STILL join the __shfl_xor reduction below (skipping it would
+            // read non-participating lanes and desynchronize the wave).
             const int k_bi = half * 4 + tid / 8;
+            if (k_bi < blocks_per_head) {
             const int k_blk_off = (kv_head_block_start + k_bi) * 34;
             const unsigned char* kb0 = k_cache + (size_t)t0 * row_stride + k_blk_off;
             const unsigned char* kb1 = k_cache + (size_t)t1 * row_stride + k_blk_off;
@@ -208,6 +221,7 @@ __global__ void attention_flash_q8_0_tile(
                       + qb_thread[1] * (ks3 * (float)k31)
                       + qb_thread[2] * (ks3 * (float)k32)
                       + qb_thread[3] * (ks3 * (float)k33);
+            }
         }
 #if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
         partial0 = hipfire_attention_reduce_sum_xor(partial0);
@@ -233,7 +247,9 @@ __global__ void attention_flash_q8_0_tile(
         int t = tile_start + t_local;
         float partial = 0.0f;
         for (int half = 0; half < n_halves; half++) {
+            // HEAD96-1: same block-range guard as the 4-wide loop above.
             const int k_bi = half * 4 + tid / 8;
+            if (k_bi < blocks_per_head) {
             const int k_blk_off = (kv_head_block_start + k_bi) * 34;
             const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off;
             float ks = (float)*((const _Float16*)kb);
@@ -242,6 +258,7 @@ __global__ void attention_flash_q8_0_tile(
                      + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1]))
                      + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
                      + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
+            }
         }
 #if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
         partial = hipfire_attention_reduce_sum_xor(partial);
@@ -306,6 +323,15 @@ __global__ void attention_flash_q8_0_tile(
     //              head_dim output dims are written, not just first 128) ═══
     for (int half = 0; half < n_halves; half++) {
         const int d_base = half * 128 + tid * 4;
+        // HEAD96-1 (the nondeterminism): with head_dim 96, threads 24-31
+        // reached d_base 96..127 and WROTE p[2 + d_base] past the row end —
+        // into the NEXT tile's (or head's) {tile_max, tile_sum, out} row.
+        // Those stray writes raced with the owning blocks' writes (block
+        // execution order is undefined), so the reduce combined different
+        // bytes run to run — the audio encoder's outputs were different on
+        // every identical request. Only write lanes that exist; skipped
+        // threads hold out = 0 and touch no V memory.
+        if (d_base >= head_dim) continue;
         const int bi = d_base / 32;
         const int bj_base = d_base % 32;
         const int v_blk_off = (kv_head_block_start + bi) * 34;
