@@ -684,6 +684,80 @@ pub(crate) fn safetensors_to_ggml_name(name: &str) -> Option<String> {
     Some(format!("blk.{layer_idx}.{translated}.weight"))
 }
 
+/// Grouped-V-head geometry of a hybrid linear-attention model (Qwen3.5/3.6/3.8
+/// GatedDeltaNet).
+///
+/// llama.cpp's HF→GGUF converter reorders the `linear_attn.out_proj` **input**
+/// axis from HF's grouped order (`h = k_head * n_v_per_k + v_slot`) to ggml's
+/// tiled order (`t = v_slot * n_k_heads + k_head`) so `ggml_repeat` can replace
+/// the interleaved repeat (llama.cpp `conversion/qwen.py`,
+/// `_LinearAttentionVReorderBase`, PR #19468). An imatrix produced on that GGUF
+/// therefore stores `ssm_out.in_sum2` in tiled order, while the HF weight (and
+/// this quantizer) consume grouped order. AWQ pre-scales HF columns, so the
+/// tiled vector MUST be mapped back to grouped order first; otherwise every
+/// 128-channel head block gets another head's scale.
+///
+/// Only `out_proj`'s input axis is affected. `in_proj_{qkv,z,a,b}`, `conv1d`,
+/// `A_log` and `dt_bias` are reordered along their output axis, which does not
+/// touch `in_sum2` (a per-input-channel statistic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaHeadOrder {
+    pub n_k_heads: usize,
+    pub n_v_per_k: usize,
+    pub head_v_dim: usize,
+}
+
+impl LaHeadOrder {
+    /// Length of the out_proj input axis (`n_k_heads * n_v_heads * head_v_dim`).
+    pub(crate) fn span(&self) -> usize {
+        self.n_k_heads * self.n_v_per_k * self.head_v_dim
+    }
+
+    /// Tiled (llama.cpp / imatrix) head index for a grouped (HF) head index.
+    pub(crate) fn tiled_index(&self, hf_head: usize) -> usize {
+        (hf_head % self.n_v_per_k) * self.n_k_heads + hf_head / self.n_v_per_k
+    }
+
+    /// Re-index a tiled imatrix vector into HF grouped order.
+    pub(crate) fn to_grouped(&self, raw: &[f32]) -> Result<Vec<f32>, String> {
+        if raw.len() != self.span() {
+            return Err(format!(
+                "length {} != n_k_heads({}) * n_v_per_k({}) * head_v_dim({}) = {}",
+                raw.len(),
+                self.n_k_heads,
+                self.n_v_per_k,
+                self.head_v_dim,
+                self.span()
+            ));
+        }
+        let d = self.head_v_dim;
+        let mut out = vec![0.0f32; raw.len()];
+        for h in 0..self.n_k_heads * self.n_v_per_k {
+            let t = self.tiled_index(h);
+            out[h * d..(h + 1) * d].copy_from_slice(&raw[t * d..(t + 1) * d]);
+        }
+        Ok(out)
+    }
+}
+
+/// Read the linear-attention geometry from a model config. Returns `None` when
+/// the checkpoint has no grouped V heads (no `linear_*` fields, or
+/// `n_v_heads == n_k_heads`, where tiled and grouped order coincide).
+pub(crate) fn la_head_geometry(config: &serde_json::Value) -> Option<LaHeadOrder> {
+    let text = config.get("text_config").unwrap_or(config);
+    let n_k_heads = text.get("linear_num_key_heads")?.as_u64()? as usize;
+    let n_v_heads = text.get("linear_num_value_heads")?.as_u64()? as usize;
+    let head_v_dim = text.get("linear_value_head_dim")?.as_u64()? as usize;
+    if n_k_heads == 0 || head_v_dim == 0 || n_v_heads % n_k_heads != 0 {
+        return None;
+    }
+    Some(LaHeadOrder {
+        n_k_heads,
+        n_v_per_k: n_v_heads / n_k_heads,
+        head_v_dim,
+    })
+}
+
 /// Load an llama.cpp-compatible imatrix GGUF file and build a lookup
 /// keyed by ggml-style tensor name. The GGUF stores per-linear-layer
 /// pairs:
@@ -695,17 +769,38 @@ pub(crate) fn safetensors_to_ggml_name(name: &str) -> Option<String> {
 /// (Qwen3.5 dense + Qwen3.6 dense are the first cohort targets; A3B MoE
 /// is deferred to a future iteration that handles n_mat > 1).
 ///
-/// Returns `HashMap<ggml_name, Vec<f32>>` with the .in_sum2 values keyed by
-/// the BASE tensor name (the ".in_sum2" suffix stripped).
-pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<String, Vec<f32>> {
+/// Loaded imatrix table plus the non-fatal observations the caller logs.
+/// Fail-closed problems (bad file, unusable geometry, wrong length) are the
+/// `Err` side of [`load_imatrix`] so tests can assert them without stderr.
+#[derive(Debug)]
+pub(crate) struct ImatrixLoad {
+    pub table: HashMap<String, Vec<f32>>,
+    pub warnings: Vec<String>,
+}
+
+/// Returns `Ok(ImatrixLoad)` keyed by the BASE tensor name (the ".in_sum2"
+/// suffix stripped); `Err` is an operator-facing fail-closed message.
+pub(crate) fn load_imatrix(
+    path: &Path,
+    la: Option<LaHeadOrder>,
+    apply_la_head_fix: bool,
+) -> Result<ImatrixLoad, String> {
     use gguf_input::GgmlType;
-    let gguf = gguf_input::GgufFile::open(path).unwrap_or_else(|e| {
-        eprintln!("error: failed to open imatrix file {}: {e}", path.display());
-        std::process::exit(1);
-    });
+    let gguf = gguf_input::GgufFile::open(path)
+        .map_err(|e| format!("failed to open imatrix file {}: {e}", path.display()))?;
+    if apply_la_head_fix && la.is_none() {
+        return Err(
+            "--awq-fix-la-head-order needs a model config with linear_num_key_heads / \
+             linear_num_value_heads / linear_value_head_dim (Qwen3.5+ GatedDeltaNet); this \
+             checkpoint exposes none, so the V-head geometry cannot be derived"
+                .into(),
+        );
+    }
 
     let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut fixed_la_out = 0usize;
+    let mut la_out_entries = 0usize;
     let mut total_entries = 0usize;
     let mut skipped_moe = 0usize;
     for t in &gguf.tensors {
@@ -714,10 +809,10 @@ pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<Stri
             None => continue, // ignore .counts and any other entries
         };
         if t.dtype != GgmlType::F32 {
-            eprintln!(
+            warnings.push(format!(
                 "warning: imatrix entry {} has non-F32 dtype {:?}; skipping",
                 t.name, t.dtype
-            );
+            ));
             continue;
         }
         // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE. Skip multi-mat
@@ -741,37 +836,48 @@ pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<Stri
                 data[off + 3],
             ]));
         }
-        if fix_la_head_order
-            && (name.ends_with(".linear_attn.out_proj.weight") || name.ends_with(".ssm_out.weight"))
-        {
-            assert_eq!(
-                k,
-                48 * 128,
-                "{name}: Qwen3.8 LA out_proj must have 48 V-heads x 128"
-            );
-            let raw = values;
-            values = vec![0.0; k];
-            // llama.cpp stores three V heads per K head (V-major/K-minor);
-            // HF out_proj columns use K-major/V-minor. HF head h reads raw
-            // head (h % 3)*16 + h/3. No reordering of W or runtime sidecar.
-            for h in 0..48 {
-                let raw_h = (h % 3) * 16 + h / 3;
-                values[h * 128..(h + 1) * 128]
-                    .copy_from_slice(&raw[raw_h * 128..(raw_h + 1) * 128]);
+        if name.ends_with(".linear_attn.out_proj.weight") || name.ends_with(".ssm_out.weight") {
+            la_out_entries += 1;
+            if apply_la_head_fix {
+                let order = la.expect("geometry checked before the loop");
+                match order.to_grouped(&values) {
+                    Ok(fixed) => {
+                        values = fixed;
+                        fixed_la_out += 1;
+                    }
+                    Err(error) => {
+                        return Err(format!("--awq-fix-la-head-order: {name}: {error}"));
+                    }
+                }
             }
-            fixed_la_out += 1;
         }
         map.insert(name, values);
         total_entries += 1;
     }
-    if fix_la_head_order {
-        assert_eq!(
-            fixed_la_out, 48,
-            "Qwen3.8 LA imatrix head fix expected 48 out_proj tensors, found {fixed_la_out}"
-        );
+    if apply_la_head_fix {
+        let order = la.expect("geometry checked before the loop");
+        if fixed_la_out == 0 {
+            return Err(
+                "--awq-fix-la-head-order matched no linear-attention out_proj entries; \
+                 the imatrix carries none (or none survived the dense filter)"
+                    .into(),
+            );
+        }
         eprintln!(
-            "imatrix: corrected V-head order for {fixed_la_out} linear-attention out_proj tensors"
+            "imatrix: re-indexed llama.cpp tiled V-head order -> HF grouped order on \
+             {fixed_la_out} linear-attention out_proj tensors (n_k_heads={}, n_v_per_k={}, \
+             head_v_dim={})",
+            order.n_k_heads, order.n_v_per_k, order.head_v_dim
         );
+    } else if let Some(order) = la {
+        if order.n_v_per_k > 1 && la_out_entries > 0 {
+            warnings.push(format!(
+                "imatrix: {la_out_entries} linear-attention out_proj entries carry llama.cpp's \
+                 tiled V-head order; pass --awq-fix-la-head-order to re-index them to HF grouped \
+                 order for AWQ (n_k_heads={}, n_v_per_k={}, head_v_dim={})",
+                order.n_k_heads, order.n_v_per_k, order.head_v_dim
+            ));
+        }
     }
 
     eprintln!(
@@ -792,11 +898,13 @@ pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<Stri
                  dense table empty (MoE-only imatrix; expert AWQ uses the raw GGUF)"
             );
         } else {
-            eprintln!("error: imatrix file contains no usable .in_sum2 entries");
-            std::process::exit(1);
+            return Err("imatrix file contains no usable .in_sum2 entries".into());
         }
     }
-    map
+    Ok(ImatrixLoad {
+        table: map,
+        warnings,
+    })
 }
 
 /// Look up imatrix per-channel weights for a given safetensors tensor name.
@@ -2639,5 +2747,242 @@ mod hf_snapshot_tests {
             pick_hf_snapshot(repo.path()).unwrap(),
             repo.path().join("snapshots/aaaa-new")
         );
+    }
+}
+
+/// `--awq-fix-la-head-order` contracts. The imatrix is recorded on the
+/// llama.cpp GGUF, whose converter reorders `linear_attn.out_proj`'s input axis
+/// from HF grouped order to ggml tiled order (`conversion/qwen.py`,
+/// `_LinearAttentionVReorderBase`). These pin the inverse permutation for both
+/// shipped geometries and the fail-closed length check.
+#[cfg(test)]
+mod la_head_order_tests {
+    use super::{la_head_geometry, LaHeadOrder};
+
+    /// Tiled vector where every 128-block carries its own head index.
+    fn tiled(n_heads: usize, head_dim: usize) -> Vec<f32> {
+        (0..n_heads * head_dim)
+            .map(|i| (i / head_dim) as f32)
+            .collect()
+    }
+
+    fn grouped(order: &LaHeadOrder) -> Vec<f32> {
+        let n_heads = order.n_k_heads * order.n_v_per_k;
+        order
+            .to_grouped(&tiled(n_heads, order.head_v_dim))
+            .expect("shape matches geometry")
+    }
+
+    /// Qwen3.8-27B (16 K heads, 3 V per K): must reproduce the historical
+    /// hardcoded mapping `raw[(h % 3) * 16 + h / 3]` exactly.
+    #[test]
+    fn three_per_k_matches_the_historical_qwen38_mapping() {
+        let order = LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 3,
+            head_v_dim: 128,
+        };
+        assert_eq!(order.span(), 48 * 128);
+        let raw = tiled(48, 128);
+        let fixed = order.to_grouped(&raw).unwrap();
+        for h in 0..48 {
+            let raw_h = (h % 3) * 16 + h / 3;
+            assert_eq!(
+                &fixed[h * 128..(h + 1) * 128],
+                &raw[raw_h * 128..(raw_h + 1) * 128],
+                "HF head {h} must read tiled head {raw_h}"
+            );
+        }
+    }
+
+    /// Qwen3.6-35B-A3B (16 K heads, 2 V per K): the tiled vector is a
+    /// de-interleave of even/odd HF heads.
+    #[test]
+    fn two_per_k_deinterleaves_even_and_odd_heads() {
+        let order = LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 2,
+            head_v_dim: 128,
+        };
+        assert_eq!(order.span(), 4096);
+        let fixed = grouped(&order);
+        assert_eq!(fixed[0], 0.0); // HF 0 <- tiled 0
+        assert_eq!(fixed[128], 16.0); // HF 1 <- tiled 16
+        assert_eq!(fixed[256], 1.0); // HF 2 <- tiled 1
+        assert_eq!(fixed[30 * 128], 15.0); // HF 30 <- tiled 15
+        assert_eq!(fixed[31 * 128], 31.0); // HF 31 <- tiled 31
+        for h in 0..32 {
+            assert_eq!(fixed[h * 128], ((h % 2) * 16 + h / 2) as f32);
+        }
+    }
+
+    /// Equal K/V head counts need no permutation, and a length that does not
+    /// match the geometry is refused instead of silently producing garbage.
+    #[test]
+    fn identity_when_one_v_per_k_and_length_is_checked() {
+        let order = LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 1,
+            head_v_dim: 128,
+        };
+        let raw = tiled(16, 128);
+        assert_eq!(order.to_grouped(&raw).unwrap(), raw);
+
+        let three = LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 3,
+            head_v_dim: 128,
+        };
+        assert!(three.to_grouped(&raw).is_err());
+    }
+
+    /// Geometry is read from the nested text config (VL checkpoints) or the
+    /// root, and absent for models without grouped V heads.
+    #[test]
+    fn geometry_comes_from_the_model_config() {
+        let vl: serde_json::Value = serde_json::from_str(
+            r#"{"text_config":{"linear_num_key_heads":16,"linear_num_value_heads":32,
+                "linear_value_head_dim":128}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            la_head_geometry(&vl),
+            Some(LaHeadOrder {
+                n_k_heads: 16,
+                n_v_per_k: 2,
+                head_v_dim: 128,
+            })
+        );
+
+        let root: serde_json::Value = serde_json::from_str(
+            r#"{"linear_num_key_heads":16,"linear_num_value_heads":48,
+                "linear_value_head_dim":128}"#,
+        )
+        .unwrap();
+        assert_eq!(la_head_geometry(&root).unwrap().n_v_per_k, 3);
+
+        // Full-attention-only checkpoint: no linear fields.
+        let dense: serde_json::Value =
+            serde_json::from_str(r#"{"model_type":"qwen3","num_hidden_layers":28}"#).unwrap();
+        assert_eq!(la_head_geometry(&dense), None);
+    }
+}
+
+/// End-to-end contracts for the imatrix loader itself: a real (minimal) GGUF
+/// file in, the grouped re-index / warning / fail-closed outcomes out.
+#[cfg(test)]
+mod imatrix_load_tests {
+    use super::{load_imatrix, LaHeadOrder};
+    use std::path::{Path, PathBuf};
+
+    fn order() -> LaHeadOrder {
+        LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 2,
+            head_v_dim: 128,
+        }
+    }
+
+    fn tiled(n_heads: usize, head_dim: usize) -> Vec<f32> {
+        (0..n_heads * head_dim)
+            .map(|i| (i / head_dim) as f32)
+            .collect()
+    }
+
+    /// Minimal GGUF v3: no metadata KV (so alignment defaults to 32), 1-D F32
+    /// tensors laid out in declaration order.
+    fn write_imatrix(dir: &Path, tensors: &[(&str, Vec<f32>)]) -> PathBuf {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let mut offset = 0u64;
+        for (name, data) in tensors {
+            out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // GGML_TYPE_F32
+            out.extend_from_slice(&offset.to_le_bytes());
+            offset += (data.len() * 4) as u64;
+        }
+        while out.len() % 32 != 0 {
+            out.push(0);
+        }
+        for (_name, data) in tensors {
+            for value in data {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let path = dir.join("imatrix.gguf");
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    #[test]
+    fn reindexes_tiled_out_proj_into_grouped_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_imatrix(
+            dir.path(),
+            &[("blk.0.ssm_out.weight.in_sum2", tiled(32, 128))],
+        );
+        let loaded = load_imatrix(&path, Some(order()), true).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let got = &loaded.table["blk.0.ssm_out.weight"];
+        for h in 0..32 {
+            assert_eq!(got[h * 128], ((h % 2) * 16 + h / 2) as f32);
+        }
+    }
+
+    #[test]
+    fn flag_off_keeps_tiled_values_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = tiled(32, 128);
+        let path = write_imatrix(dir.path(), &[("blk.0.ssm_out.weight.in_sum2", raw.clone())]);
+        let loaded = load_imatrix(&path, Some(order()), false).unwrap();
+        assert_eq!(loaded.table["blk.0.ssm_out.weight"], raw);
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(
+            loaded.warnings[0].contains("tiled V-head order"),
+            "{}",
+            loaded.warnings[0]
+        );
+        assert!(loaded.warnings[0].contains("--awq-fix-la-head-order"));
+    }
+
+    #[test]
+    fn wrong_length_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_imatrix(
+            dir.path(),
+            &[("blk.0.ssm_out.weight.in_sum2", vec![1.0f32; 2048])],
+        );
+        let error = load_imatrix(&path, Some(order()), true).unwrap_err();
+        assert!(error.contains("length 2048"), "{error}");
+    }
+
+    #[test]
+    fn missing_geometry_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_imatrix(
+            dir.path(),
+            &[("blk.0.ssm_out.weight.in_sum2", tiled(32, 128))],
+        );
+        let error = load_imatrix(&path, None, true).unwrap_err();
+        assert!(error.contains("linear_num_key_heads"), "{error}");
+    }
+
+    #[test]
+    fn no_out_proj_entries_fails_closed_but_loads_without_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let dense = vec![1.0f32; 2048];
+        let path = write_imatrix(dir.path(), &[("blk.0.attn_qkv.weight.in_sum2", dense)]);
+        let error = load_imatrix(&path, Some(order()), true).unwrap_err();
+        assert!(error.contains("matched no"), "{error}");
+
+        let loaded = load_imatrix(&path, Some(order()), false).unwrap();
+        assert!(loaded.table.contains_key("blk.0.attn_qkv.weight"));
+        assert!(loaded.warnings.is_empty());
     }
 }
