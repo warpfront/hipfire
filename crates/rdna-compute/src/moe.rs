@@ -3758,6 +3758,128 @@ impl Gpu {
         }
         result
     }
+    /// Pinned-owner variant of [`Self::qwen4_ep_owner_assign`] (the certified builder kernel
+    /// [`QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL`], whose output bytes are
+    /// [`qwen4_ep_owner_map_pinned`]'s). gfx1201 only, like the unpinned launcher.
+    ///
+    /// `pins` is a device `u8[512]`: per expert the owner rank it is pinned to, or
+    /// [`QWEN4_EP_OWNER_PIN_FREE`] (`0xFF`). A routed pinned expert is owned by its pin; the routed
+    /// free experts are dealt `idx_free % ranks` in ascending id order (`idx_free` counts routed
+    /// free experts only); `live_*` and `slot_owner` derive from those owners exactly as in the
+    /// unpinned law. With all pins `0xFF` every output byte equals the unpinned launcher's.
+    ///
+    /// Pin validity (`0xFF` or `< ranks`, see [`qwen4_ep_owner_pins_check`]) is the caller's
+    /// host-side check of its host copy: the launcher holds only the device tensor (reading it back
+    /// would stall the stream). The kernel is safe on an unchecked table: a byte `>= ranks` other
+    /// than `0xFF` is treated as free, never as an out-of-range owner.
+    /// Stream-ordered on the active stream; the next launcher reading the live tables, and any
+    /// later writer of `pins`, must follow it on the same stream.
+    pub fn qwen4_ep_owner_assign_pinned(
+        &mut self,
+        topk_indices: &GpuTensor,
+        slots: usize,
+        ranks: usize,
+        self_rank: usize,
+        tables: &Qwen4EpOwnerTables,
+        pins: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("qwen4_ep_owner_assign_pinned: {what}"),
+            ))
+        };
+        if !qwen4_ep_owner_assign_pm_arch(&self.arch) {
+            return refuse(&format!(
+                "the pinned-ownership kernel is a gfx1201 builder module (device is {}); no hipcc fallback",
+                self.arch
+            ));
+        }
+        if !(2..=QWEN4_EP_OWNER_ASSIGN_MAX_RANKS).contains(&ranks) || self_rank >= ranks {
+            return refuse(&format!(
+                "ranks must be 2..={QWEN4_EP_OWNER_ASSIGN_MAX_RANKS} and self_rank < ranks"
+            ));
+        }
+        if slots == 0 || slots > QWEN4_EP_OWNER_EXPERTS {
+            return refuse("slots must be 1..=512");
+        }
+        if topk_indices.buf.size() < slots * std::mem::size_of::<i32>() {
+            return refuse("topk_indices holds fewer than `slots` ids");
+        }
+        if pins.buf.size() < QWEN4_EP_OWNER_EXPERTS {
+            return refuse("pins holds fewer than 512 bytes");
+        }
+        if !tables.is_complete() {
+            return refuse("a table address is null");
+        }
+        self.ensure_embedded_kernel(
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_MODULE,
+            kernels::QWEN4_EP_OWNER_ASSIGN_PINNED_PM_GFX1201,
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL,
+        )?;
+        let ids = topk_indices.buf.as_ptr();
+        let full_gate_up = tables.full_gate_up as *mut c_void;
+        let full_down = tables.full_down as *mut c_void;
+        let live_gate_up = tables.live_gate_up as *mut c_void;
+        let live_down = tables.live_down as *mut c_void;
+        let slot_owner = tables.slot_owner as *mut c_void;
+        let dummy_gate_up = tables.dummy_gate_up as u64;
+        let dummy_down = tables.dummy_down as u64;
+        let pins_ptr = pins.buf.as_ptr();
+        let slots_i32 = slots as i32;
+        let ranks_i32 = ranks as i32;
+        let self_i32 = self_rank as i32;
+        let mut params = [
+            &ids as *const _ as *mut c_void,
+            &full_gate_up as *const _ as *mut c_void,
+            &full_down as *const _ as *mut c_void,
+            &live_gate_up as *const _ as *mut c_void,
+            &live_down as *const _ as *mut c_void,
+            &slot_owner as *const _ as *mut c_void,
+            &dummy_gate_up as *const _ as *mut c_void,
+            &dummy_down as *const _ as *mut c_void,
+            &slots_i32 as *const _ as *mut c_void,
+            &ranks_i32 as *const _ as *mut c_void,
+            &self_i32 as *const _ as *mut c_void,
+            &pins_ptr as *const _ as *mut c_void,
+        ];
+        let bytes = QWEN4_EP_OWNER_EXPERTS * 9 * 4 + slots * 8;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL,
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL,
+            [1, 1, 1],
+            [QWEN4_EP_OWNER_EXPERTS as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ids);
+                b.push_ptr(full_gate_up);
+                b.push_ptr(full_down);
+                b.push_ptr(live_gate_up);
+                b.push_ptr(live_down);
+                b.push_ptr(slot_owner);
+                b.push_u64(dummy_gate_up);
+                b.push_u64(dummy_down);
+                b.push_i32(slots_i32);
+                b.push_i32(ranks_i32);
+                b.push_i32(self_i32);
+                // `pins` is the 8-byte-aligned pointer at 80; the blob pads the 4 bytes at 76.
+                b.push_ptr(pins_ptr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 }
 
 /// Experts per layer `qwen4_ep_owner_assign` handles (Flash-Next's 512; one
@@ -3770,6 +3892,12 @@ pub const QWEN4_EP_OWNER_EXPERTS: usize = 512;
 pub const QWEN4_EP_OWNER_ASSIGN_PM_MODULE: &str = "qwen4_ep_owner_assign_pm_gfx1201";
 /// Device symbol of the builder kernel.
 pub const QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL: &str = "qwen4_ep_owner_assign_pm_gfx1201";
+/// Module key of the embedded certified builder (PeaceMaker) image of
+/// [`Gpu::qwen4_ep_owner_assign_pinned`] (`peacemaker-isa emit --kernel
+/// qwen4_ep_owner_assign_pinned_pm --arch gfx1201`).
+pub const QWEN4_EP_OWNER_ASSIGN_PINNED_PM_MODULE: &str = "qwen4_ep_owner_assign_pinned_pm_gfx1201";
+/// Device symbol of the pinned builder kernel.
+pub const QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL: &str = "qwen4_ep_owner_assign_pinned_pm_gfx1201";
 
 /// The balanced-ownership kernel ships as a gfx1201 builder module only
 /// (expert parallelism is a gfx1201 feature); every other device refuses.
@@ -4188,6 +4316,88 @@ pub fn qwen4_ep_owner_map(
     (owners, slot_owners)
 }
 
+/// Pin byte of an expert the pinned assignment may place freely.
+pub const QWEN4_EP_OWNER_PIN_FREE: u8 = 0xFF;
+
+/// Host-side validation of a pin table for [`Gpu::qwen4_ep_owner_assign_pinned`]: exactly
+/// [`QWEN4_EP_OWNER_EXPERTS`] bytes, each [`QWEN4_EP_OWNER_PIN_FREE`] or an owner rank `< ranks`.
+/// The device kernel never trusts a pin: a byte `>= ranks` that is not `0xFF` is treated as free,
+/// so a table that fails this check cannot index out of range, but it is a caller bug and the
+/// code that fills the device table from its host copy MUST refuse it here (the launcher holds
+/// only the device tensor and cannot read it back without stalling the stream).
+pub fn qwen4_ep_owner_pins_check(pins: &[u8], ranks: usize) -> Result<(), String> {
+    if pins.len() != QWEN4_EP_OWNER_EXPERTS {
+        return Err(format!(
+            "pins hold {} bytes, expected {QWEN4_EP_OWNER_EXPERTS}",
+            pins.len()
+        ));
+    }
+    match pins
+        .iter()
+        .enumerate()
+        .find(|&(_, &pin)| pin != QWEN4_EP_OWNER_PIN_FREE && usize::from(pin) >= ranks)
+    {
+        Some((expert, pin)) => Err(format!(
+            "expert {expert} pinned to rank {pin}, but only {ranks} ranks (a free expert is 0xFF)"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Host reference of `qwen4_ep_owner_assign_pinned` (the byte twin of the kernel): `owners[e]`
+/// for a routed expert is its pin when `pins[e]` is a rank (`< ranks`, not `0xFF`), otherwise
+/// `idx_free(e) % ranks` with `idx_free(e)` the number of routed FREE experts with a smaller id
+/// (a pin byte `>= ranks` other than `0xFF` is treated as free, as on the device); `None` for an
+/// expert no slot routes to. `slot_owners[s]` is the owner of `ids[s]`, `-1` for a negative or
+/// out-of-range id. With every pin [`QWEN4_EP_OWNER_PIN_FREE`] the result equals
+/// [`qwen4_ep_owner_map`]. `pins.len()` must equal `n_exp`.
+pub fn qwen4_ep_owner_map_pinned(
+    ids: &[i32],
+    n_exp: usize,
+    ranks: usize,
+    pins: &[u8],
+) -> (Vec<Option<usize>>, Vec<i32>) {
+    assert!(
+        ranks >= 1,
+        "qwen4_ep_owner_map_pinned: ranks must be at least 1"
+    );
+    assert_eq!(
+        pins.len(),
+        n_exp,
+        "qwen4_ep_owner_map_pinned: one pin byte per expert"
+    );
+    let in_range = |id: i32| usize::try_from(id).ok().filter(|&expert| expert < n_exp);
+    let mut routed = vec![false; n_exp];
+    for &id in ids {
+        if let Some(expert) = in_range(id) {
+            routed[expert] = true;
+        }
+    }
+    let mut owners = vec![None; n_exp];
+    let mut dealt = 0usize;
+    for (expert, &is_routed) in routed.iter().enumerate() {
+        if !is_routed {
+            continue;
+        }
+        let pin = usize::from(pins[expert]);
+        if pins[expert] != QWEN4_EP_OWNER_PIN_FREE && pin < ranks {
+            owners[expert] = Some(pin);
+        } else {
+            owners[expert] = Some(dealt % ranks);
+            dealt += 1;
+        }
+    }
+    let slot_owners = ids
+        .iter()
+        .map(|&id| {
+            in_range(id)
+                .and_then(|expert| owners[expert])
+                .map_or(-1, |owner| owner as i32)
+        })
+        .collect();
+    (owners, slot_owners)
+}
+
 #[cfg(test)]
 mod owner_map_tests {
     use super::*;
@@ -4477,6 +4687,313 @@ mod owner_map_tests {
                 }
             }
         }
+    }
+    fn pinned_pins(state: &mut u64, ranks: usize, kind: usize) -> Vec<u8> {
+        (0..EXPERTS)
+            .map(|_| {
+                let r = lcg(state);
+                let rank = ((r >> 8) % ranks as u64) as u8;
+                match kind {
+                    // Every expert free.
+                    0 => QWEN4_EP_OWNER_PIN_FREE,
+                    // Every expert pinned.
+                    1 => rank,
+                    // About half pinned.
+                    2 => {
+                        if r % 2 == 0 {
+                            rank
+                        } else {
+                            QWEN4_EP_OWNER_PIN_FREE
+                        }
+                    }
+                    // About one in ten pinned.
+                    3 => {
+                        if r % 10 == 0 {
+                            rank
+                        } else {
+                            QWEN4_EP_OWNER_PIN_FREE
+                        }
+                    }
+                    // Invalid pin bytes (`ranks..=254`) mixed in: the kernel treats them as free.
+                    _ => match r % 4 {
+                        0 => rank,
+                        1 => ranks as u8 + ((r >> 16) % (255 - ranks as u64)) as u8,
+                        _ => QWEN4_EP_OWNER_PIN_FREE,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn pinned_ids(state: &mut u64, slots: usize, kind: usize) -> Vec<i32> {
+        (0..slots)
+            .map(|_| match (kind, lcg(state) % 11) {
+                (_, 0) => -1,
+                (_, 1) => [512, 513, i32::MIN, i32::MAX, -513][(lcg(state) % 5) as usize],
+                // Uniform with repeats.
+                (0, _) => (lcg(state) % EXPERTS as u64) as i32,
+                // A narrow range: many duplicates.
+                (1, _) => (lcg(state) % 24) as i32,
+                // Wave boundaries.
+                _ => ((lcg(state) % 16) * 32 + [0, 31][(lcg(state) % 2) as usize] as u64) as i32,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pinned_reference_with_every_expert_free_equals_the_unpinned_reference() {
+        let mut state = 0xA11F_AEE0_5EED_0001u64;
+        let free = vec![QWEN4_EP_OWNER_PIN_FREE; EXPERTS];
+        for ranks in [2usize, 3, 4] {
+            for slots in [0usize, 1, 10, 40, 80, 200, 512] {
+                for kind in 0..3 {
+                    let ids = pinned_ids(&mut state, slots, kind);
+                    assert_eq!(
+                        qwen4_ep_owner_map_pinned(&ids, EXPERTS, ranks, &free),
+                        qwen4_ep_owner_map(&ids, EXPERTS, ranks),
+                        "ranks {ranks} slots {slots} kind {kind}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_experts_keep_their_pin_and_free_experts_deal_among_the_free() {
+        // Routed ids sorted: 3, 17, 40, 41, 100. Experts 17 and 41 pinned to rank 1 and rank 0.
+        let ids = [100, 3, 41, 17, 40, 17, -1, 600];
+        let mut pins = vec![QWEN4_EP_OWNER_PIN_FREE; EXPERTS];
+        pins[17] = 1;
+        pins[41] = 0;
+        // A pin on an unrouted expert changes nothing.
+        pins[250] = 1;
+        let (owners, slots) = qwen4_ep_owner_map_pinned(&ids, EXPERTS, 2, &pins);
+        // Free routed: 3, 40, 100 dealt 0, 1, 0.
+        assert_eq!(owners[3], Some(0));
+        assert_eq!(owners[17], Some(1));
+        assert_eq!(owners[40], Some(1));
+        assert_eq!(owners[41], Some(0));
+        assert_eq!(owners[100], Some(0));
+        assert_eq!(owners.iter().flatten().count(), 5);
+        assert_eq!(owners[250], None);
+        assert_eq!(slots, vec![0, 0, 0, 1, 1, 1, -1, -1]);
+    }
+
+    #[test]
+    fn pinned_reference_all_pinned_follows_the_pins() {
+        let mut state = 0xA11F_AEE0_5EED_0002u64;
+        for ranks in [2usize, 3, 4] {
+            let pins = pinned_pins(&mut state, ranks, 1);
+            let ids = pinned_ids(&mut state, 80, 0);
+            let (owners, slots) = qwen4_ep_owner_map_pinned(&ids, EXPERTS, ranks, &pins);
+            for (expert, owner) in owners.iter().enumerate() {
+                if let Some(owner) = owner {
+                    assert_eq!(*owner, usize::from(pins[expert]));
+                }
+            }
+            for (slot, id) in ids.iter().enumerate() {
+                let expected = usize::try_from(*id)
+                    .ok()
+                    .filter(|&e| e < EXPERTS)
+                    .map_or(-1, |e| i32::from(pins[e]));
+                assert_eq!(slots[slot], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_reference_deals_the_free_experts_in_balance() {
+        let mut state = 0xA11F_AEE0_5EED_0003u64;
+        for ranks in [2usize, 3, 4] {
+            for kind in [2usize, 3] {
+                let pins = pinned_pins(&mut state, ranks, kind);
+                let ids = pinned_ids(&mut state, 200, 0);
+                let (owners, _) = qwen4_ep_owner_map_pinned(&ids, EXPERTS, ranks, &pins);
+                let mut free = vec![0usize; ranks];
+                for (expert, owner) in owners.iter().enumerate() {
+                    if let (Some(owner), true) = (owner, pins[expert] == QWEN4_EP_OWNER_PIN_FREE) {
+                        free[*owner] += 1;
+                    }
+                }
+                let (lo, hi) = (free.iter().min().unwrap(), free.iter().max().unwrap());
+                assert!(hi - lo <= 1, "ranks {ranks} kind {kind}: {free:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_reference_treats_out_of_range_pin_bytes_as_free() {
+        let ids = [5, 9, 12];
+        let mut pins = vec![QWEN4_EP_OWNER_PIN_FREE; EXPERTS];
+        pins[9] = 2;
+        let free =
+            qwen4_ep_owner_map_pinned(&ids, EXPERTS, 2, &vec![QWEN4_EP_OWNER_PIN_FREE; EXPERTS]);
+        assert_eq!(
+            qwen4_ep_owner_map_pinned(&ids, EXPERTS, 2, &pins),
+            free,
+            "a pin >= n_ranks is free, never an out-of-range owner"
+        );
+        assert!(qwen4_ep_owner_pins_check(&pins, 2).is_err());
+        assert!(qwen4_ep_owner_pins_check(&pins, 3).is_ok());
+        assert!(qwen4_ep_owner_pins_check(&pins[..EXPERTS - 1], 3).is_err());
+        assert!(qwen4_ep_owner_pins_check(&[QWEN4_EP_OWNER_PIN_FREE; EXPERTS], 2).is_ok());
+    }
+
+    #[test]
+    fn the_pinned_image_exports_the_launcher_symbol() {
+        let image = kernels::QWEN4_EP_OWNER_ASSIGN_PINNED_PM_GFX1201;
+        let symbol = QWEN4_EP_OWNER_ASSIGN_PINNED_PM_SYMBOL.as_bytes();
+        assert!(image.windows(4).any(|w| w == b"\x7fELF"), "no device ELF");
+        assert!(
+            image.windows(symbol.len()).any(|w| w == symbol),
+            "symbol missing from the image"
+        );
+        assert_eq!(
+            QWEN4_EP_OWNER_ASSIGN_PINNED_PM_MODULE,
+            "qwen4_ep_owner_assign_pinned_pm_gfx1201"
+        );
+    }
+
+    /// Device oracle of `Gpu::qwen4_ep_owner_assign_pinned` against the host reference
+    /// `qwen4_ep_owner_map_pinned`: ranks 2, 3 and 4 (every self rank), every pin pattern (all free,
+    /// all pinned, mixed, sparse, invalid bytes), uniform / duplicate-heavy / wave-boundary ids with
+    /// negative and out-of-range ids, slot counts 1..=512. The all-free pattern is also compared
+    /// byte for byte with the unpinned device kernel. Prints the mismatching-byte total (must be 0).
+    /// Needs a gfx1201 GPU; never run by the CPU-only gate.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn pinned_kernel_matches_the_host_reference() {
+        let mut gpu = match crate::gpu_test::init() {
+            Ok(gpu) if qwen4_ep_owner_assign_pm_arch(&gpu.arch) => gpu,
+            _ => panic!("pinned oracle: no gfx1201 device (the pinned kernel is gfx1201 only)"),
+        };
+        const TAIL: usize = 16;
+        let to_bytes = |v: &[u64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let full_gate_up: Vec<u64> = (0..EXPERTS as u64)
+            .map(|e| 0x1_0000_0000 + e * 0x100)
+            .collect();
+        let full_down: Vec<u64> = (0..EXPERTS as u64)
+            .map(|e| 0x2_0000_0000 + e * 0x80)
+            .collect();
+        let (dummy_gate_up, dummy_down) = (0xD000_0000u64, 0xE000_0000u64);
+        let upload =
+            |gpu: &mut Gpu, bytes: &[u8]| gpu.upload_raw(bytes, &[bytes.len()]).expect("upload");
+        let download = |gpu: &mut Gpu, tensor: &GpuTensor, len: usize| {
+            let mut raw = vec![0u8; len];
+            gpu.hip
+                .memcpy_dtoh(&mut raw, &tensor.buf)
+                .expect("download");
+            raw
+        };
+        let full_gate_up_gpu = upload(&mut gpu, &to_bytes(&full_gate_up));
+        let full_down_gpu = upload(&mut gpu, &to_bytes(&full_down));
+        let mut state = 0x7E57_0D18_91A5_C0DEu64;
+        let (mut launches, mut mismatching_bytes, mut identity_launches) = (0usize, 0usize, 0usize);
+        let differing = |a: &[u8], b: &[u8]| {
+            a.iter().zip(b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len())
+        };
+        for ranks in [2usize, 3, 4] {
+            for slots in [10usize, 40, 80, 1, 7, 33, 200, 512] {
+                for rep in 0..15usize {
+                    let pin_kind = rep % 5;
+                    let ids = pinned_ids(&mut state, slots, rep % 3);
+                    let pins = pinned_pins(&mut state, ranks, pin_kind);
+                    let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+                    let ids_gpu = upload(&mut gpu, &id_bytes);
+                    let pins_gpu = upload(&mut gpu, &pins);
+                    let (owners, slot_owners) =
+                        qwen4_ep_owner_map_pinned(&ids, EXPERTS, ranks, &pins);
+                    let expected_slots: Vec<u8> = slot_owners
+                        .iter()
+                        .flat_map(|o| o.to_le_bytes())
+                        .chain(std::iter::repeat(0x5Au8).take(4 * (EXPERTS - slots) + TAIL))
+                        .collect();
+                    for rank in 0..ranks {
+                        // Fresh sentinel-filled outputs per launch: a missed write is a mismatch.
+                        let live_gate_up_gpu = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+                        let live_down_gpu = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+                        let owners_gpu = upload(&mut gpu, &vec![0x5Au8; 4 * EXPERTS + TAIL]);
+                        let tables = Qwen4EpOwnerTables {
+                            full_gate_up: full_gate_up_gpu.buf.as_ptr() as usize,
+                            full_down: full_down_gpu.buf.as_ptr() as usize,
+                            live_gate_up: live_gate_up_gpu.buf.as_ptr() as usize,
+                            live_down: live_down_gpu.buf.as_ptr() as usize,
+                            slot_owner: owners_gpu.buf.as_ptr() as usize,
+                            dummy_gate_up: dummy_gate_up as usize,
+                            dummy_down: dummy_down as usize,
+                        };
+                        gpu.qwen4_ep_owner_assign_pinned(
+                            &ids_gpu, slots, ranks, rank, &tables, &pins_gpu,
+                        )
+                        .expect("pinned launch");
+                        gpu.hip.device_synchronize().expect("sync");
+                        let live_gu = download(&mut gpu, &live_gate_up_gpu, EXPERTS * 8);
+                        let live_dn = download(&mut gpu, &live_down_gpu, EXPERTS * 8);
+                        let slot_raw = download(&mut gpu, &owners_gpu, 4 * EXPERTS + TAIL);
+                        let expected_gu: Vec<u8> = (0..EXPERTS)
+                            .flat_map(|e| {
+                                let mine = owners[e] == Some(rank);
+                                (if mine { full_gate_up[e] } else { dummy_gate_up }).to_le_bytes()
+                            })
+                            .collect();
+                        let expected_dn: Vec<u8> = (0..EXPERTS)
+                            .flat_map(|e| {
+                                let mine = owners[e] == Some(rank);
+                                (if mine { full_down[e] } else { dummy_down }).to_le_bytes()
+                            })
+                            .collect();
+                        let bad = differing(&live_gu, &expected_gu)
+                            + differing(&live_dn, &expected_dn)
+                            + differing(&slot_raw, &expected_slots);
+                        mismatching_bytes += bad;
+                        assert_eq!(
+                            bad, 0,
+                            "ranks {ranks} rank {rank} slots {slots} rep {rep} pin kind {pin_kind}: {bad} mismatching bytes\nids {ids:?}\npins {pins:?}"
+                        );
+                        // All experts free: byte for byte the unpinned device kernel.
+                        if pin_kind == 0 {
+                            let old_live_gate_up = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+                            let old_live_down = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+                            let old_owners = upload(&mut gpu, &vec![0x5Au8; 4 * EXPERTS + TAIL]);
+                            let old_tables = Qwen4EpOwnerTables {
+                                live_gate_up: old_live_gate_up.buf.as_ptr() as usize,
+                                live_down: old_live_down.buf.as_ptr() as usize,
+                                slot_owner: old_owners.buf.as_ptr() as usize,
+                                ..tables
+                            };
+                            gpu.qwen4_ep_owner_assign(&ids_gpu, slots, ranks, rank, &old_tables)
+                                .expect("unpinned launch");
+                            gpu.hip.device_synchronize().expect("sync");
+                            let old_gu = download(&mut gpu, &old_live_gate_up, EXPERTS * 8);
+                            let old_dn = download(&mut gpu, &old_live_down, EXPERTS * 8);
+                            let old_slots = download(&mut gpu, &old_owners, 4 * EXPERTS + TAIL);
+                            let bad_identity = differing(&live_gu, &old_gu)
+                                + differing(&live_dn, &old_dn)
+                                + differing(&slot_raw, &old_slots);
+                            mismatching_bytes += bad_identity;
+                            assert_eq!(
+                                bad_identity, 0,
+                                "all-free pinned kernel differs from the unpinned kernel: ranks {ranks} rank {rank} slots {slots} rep {rep}"
+                            );
+                            identity_launches += 1;
+                            for t in [old_live_gate_up, old_live_down, old_owners] {
+                                gpu.free_tensor(t).expect("free old");
+                            }
+                        }
+                        launches += 1;
+                        for t in [live_gate_up_gpu, live_down_gpu, owners_gpu] {
+                            gpu.free_tensor(t).expect("free");
+                        }
+                    }
+                    gpu.free_tensor(ids_gpu).expect("free ids");
+                    gpu.free_tensor(pins_gpu).expect("free pins");
+                }
+            }
+        }
+        println!(
+            "pinned oracle: {launches} launches ({identity_launches} also byte-identical to the unpinned kernel), {mismatching_bytes} mismatching bytes"
+        );
+        assert_eq!(mismatching_bytes, 0);
     }
 }
 

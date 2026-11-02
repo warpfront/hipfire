@@ -10945,6 +10945,16 @@ pub const EP_GATHER_ROWS_BY_SLOT_OWNER_SRC: &str =
 pub const QWEN4_EP_OWNER_ASSIGN_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_ep_owner_assign_pm_gfx1201.hxaco");
 
+/// Certified builder (PeaceMaker) module of the pinned-owner variant of the Flash-Next
+/// expert-parallel balanced ownership, gfx1201 only (`peacemaker-isa emit --kernel
+/// qwen4_ep_owner_assign_pinned_pm --arch gfx1201`, M7 obligation-free, native bundle with the
+/// shipped `host-x86_64-unknown-linux-gnu-` host entry): the unpinned kernel's twelve-argument
+/// extension with a `pins` byte table (owner rank, or `0xFF` free); the byte twin of the host
+/// reference `qwen4_ep_owner_map_pinned`. `Gpu::qwen4_ep_owner_assign_pinned` refuses every
+/// other architecture.
+pub const QWEN4_EP_OWNER_ASSIGN_PINNED_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_ep_owner_assign_pinned_pm_gfx1201.hxaco");
+
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile mask
 /// (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`), gfx1201 (`peacemaker-isa emit --kernel
 /// ep_tile_mask_pm --arch gfx1201`, M7 obligation-free): a copy of the grouped-GEMM tile

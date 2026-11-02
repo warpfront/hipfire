@@ -85,6 +85,7 @@ pub mod kernels {
     pub mod qwen4_bf16_rows_gfx1100;
     /// BF16 singleton-DAG verify twins: fixed eight-row physical tiles, logical rows 1..64, ordinary x4 and k4 HC entries.
     pub mod qwen4_bf16_rows_wide;
+    pub mod qwen4_ep_owner_assign_pinned_pm;
     pub mod qwen4_ep_owner_assign_pm;
     pub mod qwen4_lane_rows;
     pub mod qwen4_lane_rows_mq6;

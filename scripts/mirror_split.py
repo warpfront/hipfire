@@ -135,6 +135,7 @@ PEACEMAKER_KERNELS = [
     "qsa_select_bf16_pm_gfx1151",
     "qwen4_lane_rows_pm_gfx1151",
     "qwen4_ep_owner_assign_pm_gfx1201",
+    "qwen4_ep_owner_assign_pinned_pm_gfx1201",
     "ep_tile_mask_pm_gfx1100",
     "ep_tile_mask_pm_gfx1201",
     "ep_gather_grouped_rows_by_tile_owner_pm_gfx1100",

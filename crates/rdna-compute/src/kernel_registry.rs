@@ -8391,6 +8391,7 @@ fn walked_arch_images(arch: &str) -> &'static [&'static [u8]] {
             kernels::MQ4_FP8_VERIFY_PM_GFX1201,
             kernels::MQ4V2_FP8_FRAGMENT_REPACK_GFX1201,
             kernels::QWEN4_EP_OWNER_ASSIGN_PM_GFX1201,
+            kernels::QWEN4_EP_OWNER_ASSIGN_PINNED_PM_GFX1201,
             kernels::EP_TILE_MASK_PM_GFX1201,
             kernels::EP_TILE_PULL_PM_GFX1201,
             kernels::EP_TILE_PULL_N8_PM_GFX1201,

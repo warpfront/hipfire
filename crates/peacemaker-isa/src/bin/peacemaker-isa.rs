@@ -116,6 +116,7 @@ const USAGE: &str = "usage: peacemaker-isa emit --kernel fold_magic --arch gfx12
        peacemaker-isa emit --kernel qsa_select --epi score|score32|score-bf16|score-bf16-rows32|select|all|bf16 --arch gfx1151 --out FILE --proof FILE
        peacemaker-isa emit --kernel spec_sampling_rows_pm|spec_accept_pm --arch gfx1151|gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel qwen4_ep_owner_assign_pinned_pm --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
@@ -473,6 +474,15 @@ fn spec_accept(arch: Arch) -> Result<(String, Vec<u8>), String> {
 /// The PM balanced-ownership assignment kernel of the Flash-Next EP exchange (`qwen4_ep_owner_assign_pm_gfx1201`), one symbol per module.
 fn qwen4_ep_owner_assign(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::qwen4_ep_owner_assign_pm::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// The PM pinned-owner assignment kernel of the Flash-Next EP exchange (`qwen4_ep_owner_assign_pinned_pm_gfx1201`), one symbol per module.
+fn qwen4_ep_owner_assign_pinned(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) =
+        peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::emit_module(arch)?;
     Ok((
         text,
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
@@ -1786,6 +1796,7 @@ fn run() -> Result<(), String> {
             "spec_sampling_rows_pm" => spec_sampling_rows(arch)?,
             "spec_accept_pm" => spec_accept(arch)?,
             "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
+            "qwen4_ep_owner_assign_pinned_pm" => qwen4_ep_owner_assign_pinned(arch)?,
             "ep_tile_mask_pm" => ep_tile_mask(arch)?,
             "moe_slot_ops_pm" => moe_slot_ops(arch)?,
             "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
@@ -1876,6 +1887,7 @@ fn run() -> Result<(), String> {
     let spec_pm = kernel == "spec_sampling_rows_pm"
         || kernel == "spec_accept_pm"
         || kernel == "qwen4_ep_owner_assign_pm"
+        || kernel == "qwen4_ep_owner_assign_pinned_pm"
         || kernel == "ep_tile_mask_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_n8_pm"
@@ -1900,7 +1912,7 @@ fn run() -> Result<(), String> {
         && !mtp_det
         && (shape.is_some() || m7.is_some())
     {
-        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, fa_prefill_pm, fa_prefill_fp8_pm, fa_qprep_pm, iu4_c8_producer_pm, gdn_chunk_prep_pm, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, moe_rotate_i4_pm, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, moe_slot_ops_v2_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
+        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, fa_prefill_pm, fa_prefill_fp8_pm, fa_qprep_pm, iu4_c8_producer_pm, gdn_chunk_prep_pm, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, moe_rotate_i4_pm, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, qwen4_ep_owner_assign_pinned_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, moe_slot_ops_v2_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
     }
     if spec_pm && co.is_none() && (shape.is_some() || m7.is_some()) {
         return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into());
@@ -2154,6 +2166,12 @@ fn run() -> Result<(), String> {
             (
                 peacemaker_isa::kernels::qwen4_ep_owner_assign_pm::symbol(arch),
                 peacemaker_isa::kernels::qwen4_ep_owner_assign_pm::contract(arch, &e),
+            )
+        } else if kernel == "qwen4_ep_owner_assign_pinned_pm" {
+            let e = peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::emit(arch)?;
+            (
+                peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::symbol(arch),
+                peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::contract(arch, &e),
             )
         } else if kernel == "ep_tile_mask_pm" {
             let e = peacemaker_isa::kernels::ep_tile_mask::emit(arch)?;
