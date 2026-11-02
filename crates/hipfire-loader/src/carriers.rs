@@ -3283,6 +3283,20 @@ pub fn qwen4_ep_vram_layers(
                         config.num_hidden_layers,
                     )
                     .and_then(|shadow_bytes| {
+                        // Weight shadows stay dedicated VRAM (the ordinary decoupled census) and
+                        // none is hosted in the donors, unless `HIPFIRE_EP_UNIT_RESERVE_SHADOWS=1`
+                        // (S4). Measured on 2xR9700 (j6728): the reserve's historical floor
+                        // (4,597 MiB) dominates the census, so hosting the shadows frees no unit
+                        // (8,740 either way) and costs 9 vs 7 donors: pp16384 +7% prefill time.
+                        let shadow_bytes =
+                            if hipfire_config::developer_var(QWEN4_EP_UNIT_RESERVE_SHADOWS_ENV)
+                                .as_deref()
+                                == Ok("1")
+                            {
+                                shadow_bytes
+                            } else {
+                                Vec::new()
+                            };
                         qwen4_ep_units_donor_plan(&Qwen4EpUnitsDonorInputs {
                             path,
                             base: &base,
@@ -3391,6 +3405,10 @@ pub fn qwen4_ep_vram_layers(
 /// budgeted against its census, whole-resident donor layers) instead of forcing it off. Default
 /// off: the flag behaves as before.
 const QWEN4_EP_UNIT_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE";
+
+/// `HIPFIRE_EP_UNIT_RESERVE_SHADOWS=1` (lab, default off): under `HIPFIRE_EP_UNIT_RESERVE=1`, host
+/// the weight shadows in the donor segments (S4) instead of keeping them dedicated VRAM.
+const QWEN4_EP_UNIT_RESERVE_SHADOWS_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE_SHADOWS";
 
 fn qwen4_ep_unit_reserve_on() -> bool {
     hipfire_config::developer_var(QWEN4_EP_UNIT_RESERVE_ENV).as_deref() == Ok("1")
