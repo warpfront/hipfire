@@ -1536,6 +1536,8 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "md5 0.8.1",
+ "railgun",
+ "railgun-corpus",
  "rdna-compute",
  "serde",
  "serde_json",

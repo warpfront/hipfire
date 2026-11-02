@@ -18,6 +18,9 @@ use crate::forward::{
     forward_rows, forward_token, require_whole_band, stage_decode_token,
     stage_decode_token_on_stream, BandInput, RaonWork,
 };
+use crate::railgun_decode::{
+    RaonRailgunAttempt, RaonRailgunOwner, RaonRailgunRefusal, RaonRailgunStats,
+};
 use crate::session::session_stride;
 use crate::spec_impl::RaonSpecState;
 use crate::state::{RaonPrefillScratch, RaonState};
@@ -72,10 +75,10 @@ impl DecodeMode {
 /// Decode graph bookkeeping of one bundle. The recorded graph itself lives in
 /// `gpu.graphs` (the generic AR graph slot) keyed by `binding`.
 #[derive(Default)]
-struct DecodeGraph {
+pub(crate) struct DecodeGraph {
     /// One real eager decode step ran, so every kernel module the decode body
     /// launches is loaded before any capture (a capture cannot load modules).
-    warmed: bool,
+    pub(crate) warmed: bool,
     /// Binding the graph in `gpu.graphs` was recorded with; 0 = none.
     binding: u64,
     captures: u64,
@@ -146,7 +149,7 @@ pub struct RaonBundle {
     pub eos: Vec<u32>,
     prefill_mode: PrefillMode,
     decode_mode: DecodeMode,
-    graph: DecodeGraph,
+    pub(crate) graph: DecodeGraph,
     /// Prefill precision policy resolved at load ([`crate::precision`]): the request and the
     /// effective tier of every site.
     precision: RaonPrecisionPlan,
@@ -159,6 +162,10 @@ pub struct RaonBundle {
     /// Prefill snapshot cache shared by every session; `None` = off. Taken out
     /// of the bundle while it drives the bundle as its `SessionState`.
     pub(crate) session: Option<SessionDriver>,
+    /// The railgun decode owner: `Some` only when `HIPFIRE_RAON_RAILGUN=1`
+    /// (default off). `None` keeps the decode route byte-identical and
+    /// allocation-free.
+    pub(crate) railgun: Option<Box<RaonRailgunOwner>>,
 }
 
 impl RaonBundle {
@@ -213,7 +220,7 @@ impl RaonBundle {
                     Err(e) => eprintln!("raon1_mini: mirror budget refit failed ({e}); keeping the admission estimate"),
                 }
                 let eos = config.eos_token_ids.clone();
-                Ok(Self {
+                let mut bundle = Self {
                     config,
                     weights,
                     state,
@@ -227,7 +234,10 @@ impl RaonBundle {
                     spec: RaonSpecState::default(),
                     gpu_arch: arch,
                     session: None,
-                })
+                    railgun: None,
+                };
+                bundle.railgun = RaonRailgunOwner::from_config(&bundle);
+                Ok(bundle)
             }
             Err(e) => {
                 if let Err(fe) = scratch.free_gpu(gpu) {
@@ -642,6 +652,11 @@ impl RaonBundle {
     }
 
     fn decode_step_in(&mut self, gpu: &mut Gpu, token: Option<u32>) -> Result<(), String> {
+        if let Some(why) = self.railgun.as_ref().and_then(|o| o.quarantine_reason()) {
+            return Err(format!(
+                "raon1_mini: the railgun decode owner is quarantined (unknown quiescence): {why}"
+            ));
+        }
         let pos = self.state.n_tokens();
         if pos + 1 > self.state.max_seq() {
             return Err(format!(
@@ -678,8 +693,45 @@ impl RaonBundle {
                     self.weights.band.is_last(),
                 )
             }
-            (DecodeMode::Graph, token) => self.decode_step_graph(gpu, token, pos),
+            (DecodeMode::Graph, token) => {
+                if let (Some(token), true) = (token, self.railgun.is_some()) {
+                    // A refusal runs the HIP graph step below exactly once; the
+                    // owner never retries a submitted token through it.
+                    if let RaonRailgunAttempt::Completed = self.railgun_decode_try(gpu, token)? {
+                        return Ok(());
+                    }
+                }
+                self.decode_step_graph(gpu, token, pos)
+            }
         }
+    }
+
+    /// One decode step through the railgun program (see
+    /// [`crate::railgun_decode`]). `Declined` promises that no token, position
+    /// or RDA state was consumed or mutated (context admission excepted): the
+    /// caller then runs the HIP-graph step exactly once. `Err` is fatal to the
+    /// request. [`RaonRailgunRefusal::Disabled`] when the bundle has no owner.
+    pub fn railgun_decode_try(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+    ) -> Result<RaonRailgunAttempt, String> {
+        let Some(mut owner) = self.railgun.take() else {
+            return Ok(RaonRailgunAttempt::Declined(RaonRailgunRefusal::Disabled));
+        };
+        let r = owner.try_step(self, gpu, token);
+        self.railgun = Some(owner);
+        r
+    }
+
+    /// Railgun owner counters; `None` when `HIPFIRE_RAON_RAILGUN` is off.
+    pub fn railgun_stats(&self) -> Option<RaonRailgunStats> {
+        self.railgun.as_ref().map(|o| o.stats())
+    }
+
+    /// The decode route as an enum (the owner admits only `Graph`).
+    pub(crate) fn decode_route(&self) -> DecodeMode {
+        self.decode_mode
     }
 
     /// Graph route of [`decode_step`](Self::decode_step).
@@ -976,7 +1028,19 @@ impl RaonBundle {
             spec,
             gpu_arch: _,
             session,
+            railgun,
         } = self;
+        if railgun.as_ref().is_some_and(|o| o.is_quarantined()) {
+            // The railgun queue may still be executing against these tensors:
+            // freeing them under unknown activity is never allowed, so they
+            // (and the owner's program and tables) are leaked.
+            eprintln!(
+                "raon1_mini: free_all: the railgun decode owner is quarantined; leaking the \
+                 bundle's device tensors instead of freeing them"
+            );
+            std::mem::forget((weights, state, scratch, work, graph, spec, session, railgun));
+            return;
+        }
         if let Some(mut session) = session {
             session.clear(gpu);
         }
