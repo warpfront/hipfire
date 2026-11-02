@@ -191,6 +191,12 @@ pub const FORMAT_EXPERT_PTRS_E8P_PLANAR: FormatId =
 pub const FORMAT_EXPERT_PTRS_W3_PLANAR: FormatId =
     FormatId("qwen4_moe.expert_ptr_table.u64.mq3_i4_planar");
 
+/// Expert pointer table of the drop-zero planar MQ4 GEMMs (DESIGN F1): `table[e]` = base of expert
+/// `e`'s planar `MQ4G256V2P`/`MQ4G128V2P` tensor `[M, K]`: `[codes: M*K/2 B][scales: M*(K/128)
+/// f16]` (`hipfire_runtime::mq4_planar`), weight `sc * (q - 8)`.
+pub const FORMAT_EXPERT_PTRS_MQ4_PLANAR: FormatId =
+    FormatId("qwen4_moe.expert_ptr_table.u64.mq4_xts_planar");
+
 // ---------------------------------------------------------------------------
 // Params and expressions
 // ---------------------------------------------------------------------------
@@ -349,6 +355,10 @@ const NOTE_TABLE_E8P: &str = "u64 per expert; entries point at planar E8P-I4 ten
 const NOTE_TABLE_W3: &str = "u64 per expert; entries point at planar MQ3-I4 tensors \
      [codes: M*K*3/8 B][scales: M*(K/128) f16] (gate rows then up rows for gate/up) whose \
      extent is the loader's contract, not checked here; the kernel indexes only e < n_experts";
+const NOTE_TABLE_MQ4P: &str = "u64 per expert; entries point at drop-zero planar MQ4 tensors \
+     [codes: M*K/2 B][scales: M*(K/128) f16] (gate rows then up rows for gate/up; the scale plane \
+     starts at byte M*K/2) whose extent is the loader's contract, not checked here; the kernel \
+     indexes only e < n_experts";
 
 const OP_TILE_IDS: OperandV1 = OperandV1 {
     name: "expert_tile_ids",
@@ -469,6 +479,36 @@ const OPS_DOWN_W3: [OperandV1; 5] = [
     OP_TILE_IDS,
     OP_SORTED,
     op_xq(FORMAT_XQ_DOWN_ROT128_FLAT_SLOTS, EXT_XQ_FLAT, NOTE_XQ_FLAT),
+    op_y(FORMAT_Y_DOWN_BF16, EXT_Y_DOWN, NOTE_Y_DOWN),
+];
+const OPS_GATE_UP_P: [OperandV1; 5] = [
+    op_table_planar(FORMAT_EXPERT_PTRS_MQ4_PLANAR, NOTE_TABLE_MQ4P),
+    OP_TILE_IDS,
+    OP_SORTED,
+    op_xq(
+        FORMAT_XQ_GATE_UP_FWHT256_TOKEN_ROWS,
+        EXT_XQ_FLAT,
+        NOTE_XQ_FLAT,
+    ),
+    op_y(FORMAT_Y_GATE_UP_SWIGLU_BF16, EXT_Y_GATE_UP, NOTE_Y_GATE_UP),
+];
+const OPS_DOWN_P: [OperandV1; 5] = [
+    op_table_planar(FORMAT_EXPERT_PTRS_MQ4_PLANAR, NOTE_TABLE_MQ4P),
+    OP_TILE_IDS,
+    OP_SORTED,
+    op_xq(FORMAT_XQ_DOWN_ROT128_FLAT_SLOTS, EXT_XQ_FLAT, NOTE_XQ_FLAT),
+    op_y(FORMAT_Y_DOWN_BF16, EXT_Y_DOWN, NOTE_Y_DOWN),
+];
+const OPS_DOWN_GP_P: [OperandV1; 5] = [
+    op_table_planar(FORMAT_EXPERT_PTRS_MQ4_PLANAR, NOTE_TABLE_MQ4P),
+    OP_TILE_IDS,
+    OP_SORTED,
+    op_xq(
+        FORMAT_XQ_DOWN_ROT128_GROUPED_POSITION,
+        EXT_XQ_GP,
+        "plane stride is m_total records per epoch (x_src_rows is ignored by the kernel); \
+         sorted_slot_index still marks padding rows and dead tiles",
+    ),
     op_y(FORMAT_Y_DOWN_BF16, EXT_Y_DOWN, NOTE_Y_DOWN),
 ];
 
@@ -659,6 +699,16 @@ const OBJ_W3_GFX1201: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_iu4_sym_w3_pm_gfx1201",
     artifact: "kernels/qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco",
     sha256: "b1c05e645d424491e3d1dd69e6145ab2d6081fb97474662fd1fa14351ba5200f",
+};
+const OBJ_P_GFX1201: ObjectRefV1 = ObjectRefV1::Embedded {
+    module: "qwen4_moe_iu4_sym_p_pm_gfx1201",
+    artifact: "kernels/qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco",
+    sha256: "7caed8e79c4d5ca07d379dfafc794475cb733a1d71874713a07d9f916b0d62dc",
+};
+const OBJ_DOWN_GP_P_GFX1201: ObjectRefV1 = ObjectRefV1::Embedded {
+    module: "qwen4_moe_down_gp_p_pm_gfx1201",
+    artifact: "kernels/qwen4_moe_down_gp_p_pm_gfx1201.hxaco",
+    sha256: "96aa9191de0b24615b034ea001eaa14859a10a8c3141f594dba43e814e8b0050",
 };
 
 const fn export(
@@ -1018,6 +1068,63 @@ const GFX1201_DOWN_W3: ExportV1 = export(
     C_NT1_DOWN,
 );
 
+// DESIGN F1: drop-zero planar MQ4 gfx1201 NT4/NT8 entries (`qwen4_moe_iu4_sym_p_pm_gfx1201`,
+// `qwen4_moe_down_gp_p_pm_gfx1201`): the shipped entries' block, LDS, grid and constants.
+const GFX1201_GATE_UP_P_NT4: ExportV1 = export(
+    "qwen4_moe_gate_up_silu_iu4_sym_p_pm_gfx1201_nt4",
+    Arch::Gfx1201,
+    OBJ_P_GFX1201,
+    128,
+    8192,
+    GRID_X_RR1,
+    C_NT4_GATE_UP,
+);
+const GFX1201_GATE_UP_P_NT8: ExportV1 = export(
+    "qwen4_moe_gate_up_silu_iu4_sym_p_pm_gfx1201_nt8",
+    Arch::Gfx1201,
+    OBJ_P_GFX1201,
+    128,
+    16384,
+    GRID_X_RR1,
+    C_NT8_GATE_UP,
+);
+const GFX1201_DOWN_P_NT4: ExportV1 = export(
+    "qwen4_moe_down_iu4_sym_p_pm_gfx1201_nt4",
+    Arch::Gfx1201,
+    OBJ_P_GFX1201,
+    128,
+    0,
+    GRID_X_RR1,
+    C_NT4_DOWN,
+);
+const GFX1201_DOWN_P_NT8: ExportV1 = export(
+    "qwen4_moe_down_iu4_sym_p_pm_gfx1201_nt8",
+    Arch::Gfx1201,
+    OBJ_P_GFX1201,
+    128,
+    0,
+    GRID_X_RR1,
+    C_NT8_DOWN,
+);
+const GFX1201_DOWN_GP_P_NT4: ExportV1 = export(
+    "qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt4",
+    Arch::Gfx1201,
+    OBJ_DOWN_GP_P_GFX1201,
+    128,
+    0,
+    GRID_X_RR1,
+    C_NT4_DOWN,
+);
+const GFX1201_DOWN_GP_P_NT8: ExportV1 = export(
+    "qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt8",
+    Arch::Gfx1201,
+    OBJ_DOWN_GP_P_GFX1201,
+    128,
+    0,
+    GRID_X_RR1,
+    C_NT8_DOWN,
+);
+
 /// Hidden words of the hipcc NT4 entries (they read `blockDim`, so hipcc keeps the
 /// implicit-arg block). Measured on the same build as above; the layout is the
 /// toolchain's and is not pinned by an object, and the ordinary `kernelParams` launch
@@ -1307,6 +1414,58 @@ pub static QWEN4_MOE_SYM_DOWN_W3: KernelAbiV1 = KernelAbiV1 {
     exports: &[GFX1201_DOWN_W3],
 };
 
+/// DESIGN F1: drop-zero planar MQ4 (`MQ4G256V2P`) gate/up, gfx1201 NT4/NT8. Numerics, params and
+/// domain of the shipped builder gate/up; only the expert tensors' layout differs.
+pub static QWEN4_MOE_SYM_GATE_UP_P: KernelAbiV1 = KernelAbiV1 {
+    id: "qwen4_moe_sym.gate_up_p.pm",
+    version: 1,
+    wave: 32,
+    numeric: NUMERIC_GATE_UP_SWIGLU,
+    params: &PARAMS,
+    operands: &OPS_GATE_UP_P,
+    fields: &FIELDS,
+    hidden: &[],
+    explicit_bytes: 64,
+    segment_bytes: 64,
+    segment_align: 8,
+    domain: &DOMAIN_GATE_UP,
+    exports: &[GFX1201_GATE_UP_P_NT4, GFX1201_GATE_UP_P_NT8],
+};
+
+/// DESIGN F1: drop-zero planar MQ4 (`MQ4G128V2P`) down, gfx1201 NT4/NT8.
+pub static QWEN4_MOE_SYM_DOWN_P: KernelAbiV1 = KernelAbiV1 {
+    id: "qwen4_moe_sym.down_p.pm",
+    version: 1,
+    wave: 32,
+    numeric: NUMERIC_DOWN,
+    params: &PARAMS,
+    operands: &OPS_DOWN_P,
+    fields: &FIELDS,
+    hidden: &[],
+    explicit_bytes: 64,
+    segment_bytes: 64,
+    segment_align: 8,
+    domain: &DOMAIN_DOWN,
+    exports: &[GFX1201_DOWN_P_NT4, GFX1201_DOWN_P_NT8],
+};
+
+/// DESIGN F1: drop-zero planar MQ4 grouped-position down twins, gfx1201 NT4/NT8.
+pub static QWEN4_MOE_SYM_DOWN_GP_P: KernelAbiV1 = KernelAbiV1 {
+    id: "qwen4_moe_sym.down_gp_p.pm",
+    version: 1,
+    wave: 32,
+    numeric: NUMERIC_DOWN,
+    params: &PARAMS,
+    operands: &OPS_DOWN_GP_P,
+    fields: &FIELDS,
+    hidden: &[],
+    explicit_bytes: 64,
+    segment_bytes: 64,
+    segment_align: 8,
+    domain: &DOMAIN_DOWN,
+    exports: &[GFX1201_DOWN_GP_P_NT4, GFX1201_DOWN_GP_P_NT8],
+};
+
 /// Every contract of this family, in a stable order.
 pub static ABIS: &[&KernelAbiV1] = &[
     &QWEN4_MOE_SYM_GATE_UP,
@@ -1320,4 +1479,7 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &QWEN4_MOE_SYM_DOWN_E8P,
     &QWEN4_MOE_SYM_GATE_UP_W3,
     &QWEN4_MOE_SYM_DOWN_W3,
+    &QWEN4_MOE_SYM_GATE_UP_P,
+    &QWEN4_MOE_SYM_DOWN_P,
+    &QWEN4_MOE_SYM_DOWN_GP_P,
 ];

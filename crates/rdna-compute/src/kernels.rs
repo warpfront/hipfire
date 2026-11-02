@@ -3216,6 +3216,10 @@ pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC: &str =
 /// predecessor.
 pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r16.gfx1151.hip");
+/// DESIGN F1: drop-zero planar (`MQ4G128V2P`) twin of
+/// [`GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC`] (gfx11+/gfx12 wave32), whole groups only.
+pub const GEMM_MQ4G128V2P_MOE_GROUPED_TOP10_O8_R16_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2p_moe_grouped_top10_o8_r16.gfx1201.hip");
 /// gfx1151 X-in-LDS bitwise twin of the O8×R16 QT53 grouped down above. Same
 /// per-output decode and wave32 reduction association; four waves per block
 /// (32 rows) share each group's X chunk through LDS instead of every 8-row
@@ -3232,6 +3236,11 @@ pub const GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
 /// to the O2×R8 sibling.
 pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4.gfx1151.hip");
+/// DESIGN F1: drop-zero planar (`MQ4G256V2P`) twin of
+/// [`GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC`], compiled on gfx1201 for the
+/// short-prefill/verify gate/up arm (same ABI, grid, accumulation and reduction order).
+pub const GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_O4_R8_X4_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2p_moe_grouped_top10_o4_r8_x4.gfx1201.hip");
 /// gfx1151 bitwise twin of the O4×R8 X4 QT44 grouped gate/up above. Same
 /// per-output decode and static four-chain reduction; only the scheduling
 /// differs (fully unrolled ten-group walk, waves per block, prefetch depth).
@@ -3735,6 +3744,19 @@ pub const GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen4_gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip")
 );
 
+/// DESIGN F1: the drop-zero planar (`MQ4G256V2P`, qt=137) twin of
+/// [`GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC`]: same sealed top-k=10 ABI, grid and
+/// arithmetic over the planar `[codes][scales]` expert tensors (`zp = -8*sc`).
+pub const GEMV_MQ4G256V2P_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC: &str = concat!(
+    "#define gemv_mq4g256v2p_moe_gate_up_k8_indexed_batched gemv_mq4g256v2p_moe_gate_up_top10_indexed_batched\n",
+    include_str!("../../../kernels/src/qwen4_gemv_mq4g256v2p_moe_gate_up_k8_indexed_batched.hip")
+);
+
+/// DESIGN F1: the drop-zero planar (`MQ4G128V2P`, qt=138) twin of
+/// [`GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC`] (decode down, expanded rows).
+pub const GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded.hip");
+
 /// MQ6G256V2 (qt=47) N-batched sister of
 /// [`GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_SRC`]. Same batched ABI as the
 /// HFQ4/MQ4V2 batched gate_up; 200 B dual-half + 6-bit payload decode only.
@@ -4085,6 +4107,11 @@ pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_SIMT_SRC: &str =
 /// a grouped kernel and no gfx12 variant.
 pub const GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_wmma.gfx12.hip");
+
+/// DESIGN F1: drop-zero planar (`MQ4G256V2P`, qt=137) twin of
+/// [`GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC`]: same grid/ABI/fp16 arithmetic over the planar tensors.
+pub const GEMM_MQ4G256V2P_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2p_moe_grouped_wmma.gfx12.hip");
 
 /// Arch-selecting source pair for the qt44 grouped MoE GEMM. Mirrors
 /// [`mq3g256_lloyd_moe_grouped_wmma_source`]; do NOT bypass it with the bare
@@ -4538,6 +4565,18 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco");
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco");
+/// DESIGN F1: drop-zero planar twin of [`QWEN4_MOE_IU4_SYM_PM_GFX1201`] (module
+/// `qwen4_moe_iu4_sym_p_pm_gfx1201`, `peacemaker-isa emit --kernel qwen4_moe_sym_p --arch gfx1201`):
+/// the NT4/NT8 gate/up(silu) and down entries over `MQ4G256V2P`/`MQ4G128V2P` tensors, 64-byte
+/// ABI unchanged, byte-identical outputs. The shipped image is untouched.
+pub const QWEN4_MOE_IU4_SYM_P_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco");
+/// DESIGN F1: drop-zero planar twin of the grouped-position down bundle
+/// [`QWEN4_MOE_DOWN_GP_PM_GFX1201`] (module `qwen4_moe_down_gp_p_pm_gfx1201`): the planar
+/// `qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt{4,8}` entries and the byte-identical
+/// `moe_rotate_i4_gp_pm_gfx1201` producer.
+pub const QWEN4_MOE_DOWN_GP_P_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_down_gp_p_pm_gfx1201.hxaco");
 /// Separate measured gfx1151 streamed NT8 gate/up, 64-byte ABI, 208 VGPR.
 /// No incumbent module bytes move. Source: emit --kernel qwen4_moe_sym
 /// --epi gate_up_stream8 --arch gfx1151; adjacent ISA contract pins resources.

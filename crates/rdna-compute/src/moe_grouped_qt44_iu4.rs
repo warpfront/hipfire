@@ -337,6 +337,7 @@ impl Gpu {
         rf: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.require_shipped_mq4_experts("grouped qt44 symmetric IU4/A8/FP8 launch")?;
         let err = |what: &str| hip_bridge::HipError::new(0, what);
         let gfx11 = matches!(self.arch.as_str(), "gfx1100" | "gfx1151");
         let supported = match act {

@@ -345,6 +345,25 @@ fn qwen4_moe_sym_w3_nt4(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), Stri
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
     ))
 }
+/// F1 drop-zero planar MQ4 (`WeightCodec::Mq4SymPlanar`) grouped IU4 MoE entries, gfx1201 NT4/NT8: `--epi all` (default) is the
+/// `qwen4_moe_iu4_sym_p_pm_gfx1201` module; `gate_up_ntN`/`down_ntN` one entry.
+fn qwen4_moe_sym_p(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::qwen4_moe_sym::{self, Spec, WeightCodec};
+    if epi == "all" {
+        let (_, text, proof) = qwen4_moe_sym::emit_module_codec(arch, WeightCodec::Mq4SymPlanar)?;
+        return Ok((
+            text,
+            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+        ));
+    }
+    let mut spec = Spec::from_epi(epi, arch)?;
+    spec.codec = WeightCodec::Mq4SymPlanar;
+    let e = qwen4_moe_sym::emit(spec)?;
+    Ok((
+        e.s_text,
+        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// E8P-I4 (`WeightCodec::E8pI4`) grouped IU4 MoE entries, gfx1201 NT1 only: `--epi all` (default) is the
 /// `qwen4_moe_iu4_sym_e8p_pm_gfx1201` module (both entries plus their `_acc` qualification entries);
 /// `gate_up`/`down` one shipped-shape entry, `gate_up_acc`/`down_acc` one F32 qualification entry.
@@ -553,6 +572,19 @@ fn mq6_i8_gemm(epi: &str, tile: Option<&str>, arch: Arch) -> Result<(String, Vec
 /// Grouped-position down plane (gfx1201): the grouped producer plus the down NT4/NT8 twins as one module.
 fn qwen4_moe_down_gp(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::qwen4_moe_down_gp::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// F1 drop-zero planar grouped-position down plane (gfx1201): the same producer plus the planar down NT4/NT8 twins, module
+/// `qwen4_moe_down_gp_p_pm_gfx1201`.
+fn qwen4_moe_down_gp_planar(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::qwen4_moe_sym::WeightCodec;
+    let (_, text, proof) = peacemaker_isa::kernels::qwen4_moe_down_gp::emit_module_codec(
+        arch,
+        WeightCodec::Mq4SymPlanar,
+    )?;
     Ok((
         text,
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
@@ -1787,6 +1819,7 @@ fn run() -> Result<(), String> {
             "qwen4_moe_sym_w3" => qwen4_moe_sym_w3(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_moe_sym_w3_nt4" => qwen4_moe_sym_w3_nt4(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_moe_sym_e8p" => qwen4_moe_sym_e8p(epi.as_deref().unwrap_or("all"), arch)?,
+            "qwen4_moe_sym_p" => qwen4_moe_sym_p(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_moe_sym_gfx11_e8p" => {
                 qwen4_moe_sym_gfx11_e8p(epi.as_deref().unwrap_or("all"), arch)?
             }
@@ -1800,6 +1833,7 @@ fn run() -> Result<(), String> {
             "ep_tile_mask_pm" => ep_tile_mask(arch)?,
             "moe_slot_ops_pm" => moe_slot_ops(arch)?,
             "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
+            "qwen4_moe_down_gp_p_pm" => qwen4_moe_down_gp_planar(arch)?,
             "moe_slot_ops_v2_pm" => moe_slot_ops_v2(arch)?,
             "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
                 peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,

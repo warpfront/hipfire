@@ -97,6 +97,8 @@ pub(crate) enum MoeSymCodec {
     E8p,
     /// MQ3-I4 (W3) planar tensors.
     W3,
+    /// Drop-zero planar MQ4 tensors (`MQ4G256V2P` gate/up, `MQ4G128V2P` down, DESIGN F1).
+    Mq4Planar,
 }
 
 /// Storage formats of the five operands of a `qwen4_moe_sym` launch, in contract
@@ -112,6 +114,7 @@ pub(crate) fn moe_sym_formats(
         (MoeSymCodec::Mq4, true) => moe::FORMAT_EXPERT_PTRS_DOWN_QT53,
         (MoeSymCodec::E8p, _) => moe::FORMAT_EXPERT_PTRS_E8P_PLANAR,
         (MoeSymCodec::W3, _) => moe::FORMAT_EXPERT_PTRS_W3_PLANAR,
+        (MoeSymCodec::Mq4Planar, _) => moe::FORMAT_EXPERT_PTRS_MQ4_PLANAR,
     };
     let (x_format, y_format) = if !down {
         (

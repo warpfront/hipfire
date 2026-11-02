@@ -15923,7 +15923,22 @@ impl Gpu {
                 "gemm_mq4g256v2_moe_grouped_wmma_k2: wave32 WMMA required",
             ));
         }
-        let (kernel_name, kernel_src) = kernels::mq4g256v2_moe_grouped_wmma_source(is_gfx12);
+        let (kernel_name, kernel_src) = if self.mq4_experts_planar {
+            // DESIGN F1: the drop-zero planar twin exists for the gfx12 source only.
+            if !is_gfx12 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "gemm_mq4g256v2_moe_grouped_wmma: the drop-zero planar experts have a gfx12 \
+                     kernel only",
+                ));
+            }
+            (
+                "gemm_mq4g256v2p_moe_grouped_wmma_gfx12",
+                kernels::GEMM_MQ4G256V2P_MOE_GROUPED_WMMA_GFX12_SRC,
+            )
+        } else {
+            kernels::mq4g256v2_moe_grouped_wmma_source(is_gfx12)
+        };
         // The BF16-output entries exist in the gfx11 source only, in #774's
         // copy, which the shipped `_k2` module also takes on gfx1151.
         let kernel_src = if !is_gfx12 && (gfx11_entry.is_some() || self.arch_caps.is_gfx1151()) {
@@ -50655,18 +50670,32 @@ impl Gpu {
         few: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const MODULE: &str = "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4";
-        let (func, slots) = if few {
-            ("gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4", 2)
+        // DESIGN F1: the drop-zero planar twin module (same ABI, grid and arithmetic).
+        let planar = self.mq4_experts_planar;
+        let (module, src): (&'static str, &'static str) = if planar {
+            (
+                "gemm_mq4g256v2p_moe_grouped_top10_o4_r8_x4",
+                kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_O4_R8_X4_GFX1201_SRC,
+            )
         } else {
-            (MODULE, 8)
+            (
+                "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4",
+                kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC,
+            )
         };
-        self.ensure_kernel(
-            MODULE,
-            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC,
-            func,
-        )?;
-        const FUNC: &str = MODULE;
+        let (func, slots) = if few {
+            (
+                if planar {
+                    "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4"
+                } else {
+                    "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4"
+                },
+                2,
+            )
+        } else {
+            (module, 8)
+        };
+        self.ensure_kernel(module, src, func)?;
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();
@@ -50691,7 +50720,7 @@ impl Gpu {
         ];
         let bytes =
             grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", module, bytes);
         let result = self.launch_maybe_blob(
             func,
             [
@@ -50823,6 +50852,7 @@ impl Gpu {
         grouped_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.require_shipped_mq4_experts("gemm_mq4g256v2_moe_grouped_top10_simt")?;
         const FUNC: &str = "gemm_mq4g256v2_moe_grouped_top10_simt";
         self.ensure_kernel(
             FUNC,
@@ -51030,10 +51060,14 @@ pub(crate) const QWEN4_MOE_DOWN_GP_PM_MODULE: &str = "qwen4_moe_down_gp_pm_gfx12
 /// The entry a down launch runs: `func` itself, or with a grouped-position plane its `..._gp` twin
 /// (NT8 for the host-mapped width, NT4 otherwise).
 fn qwen4_moe_down_gp_entry(func: &'static str, grouped_plane: bool) -> &'static str {
-    match (grouped_plane, func.ends_with("_nt8")) {
-        (false, _) => func,
-        (true, true) => QWEN4_MOE_DOWN_GP_PM_ENTRIES[1],
-        (true, false) => QWEN4_MOE_DOWN_GP_PM_ENTRIES[0],
+    // DESIGN F1: a planar entry (`..._sym_p_pm_...`) takes the planar grouped-position twin.
+    let planar = func.contains("_sym_p_pm_");
+    match (grouped_plane, func.ends_with("_nt8"), planar) {
+        (false, _, _) => func,
+        (true, true, false) => QWEN4_MOE_DOWN_GP_PM_ENTRIES[1],
+        (true, false, false) => QWEN4_MOE_DOWN_GP_PM_ENTRIES[0],
+        (true, true, true) => QWEN4_MOE_DOWN_GP_P_PM_ENTRIES[1],
+        (true, false, true) => QWEN4_MOE_DOWN_GP_P_PM_ENTRIES[0],
     }
 }
 
@@ -51043,7 +51077,12 @@ fn qwen4_moe_down_gp_image(
     kernel: &MoeSymIu4Kernel,
     grouped_plane: bool,
 ) -> (&'static str, &'static [u8]) {
-    if grouped_plane {
+    if grouped_plane && kernel.module == QWEN4_MOE_SYM_P_PM_MODULE_GFX1201 {
+        (
+            QWEN4_MOE_DOWN_GP_P_PM_MODULE,
+            kernels::QWEN4_MOE_DOWN_GP_P_PM_GFX1201,
+        )
+    } else if grouped_plane {
         (
             QWEN4_MOE_DOWN_GP_PM_MODULE,
             kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201,
@@ -51921,6 +51960,51 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
     },
 ];
 
+/// Module key of the drop-zero planar IU4 bundle (DESIGN F1, `kernels::QWEN4_MOE_IU4_SYM_P_PM_GFX1201`).
+pub(crate) const QWEN4_MOE_SYM_P_PM_MODULE_GFX1201: &str = "qwen4_moe_iu4_sym_p_pm_gfx1201";
+/// Module key of the drop-zero planar grouped-position down bundle.
+pub(crate) const QWEN4_MOE_DOWN_GP_P_PM_MODULE: &str = "qwen4_moe_down_gp_p_pm_gfx1201";
+/// Grouped-position down entries `[nt4, nt8]` of [`QWEN4_MOE_DOWN_GP_P_PM_MODULE`].
+pub(crate) const QWEN4_MOE_DOWN_GP_P_PM_ENTRIES: [&str; 2] = [
+    "qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt4",
+    "qwen4_moe_down_iu4_sym_p_gp_pm_gfx1201_nt8",
+];
+
+/// The gfx1201 aggregate symmetric-IU4 descriptor for drop-zero planar experts (DESIGN F1): the
+/// shipped gfx1201 row with the planar module, image and entries. Same 64-byte ABI, tiles, block
+/// and LDS; selected by [`Gpu::qwen4_moe_sym_kernel`] when the device is bound to the planar layout.
+static MOE_SYM_IU4_GFX1201_MQ4_PLANAR: MoeSymIu4Kernel = MoeSymIu4Kernel {
+    arch: "gfx1201",
+    qt: crate::expert_capabilities::QT_MQ4_XTS,
+    module: QWEN4_MOE_SYM_P_PM_MODULE_GFX1201,
+    image: kernels::QWEN4_MOE_IU4_SYM_P_PM_GFX1201,
+    entries: [
+        [
+            "qwen4_moe_gate_up_silu_iu4_sym_p_pm_gfx1201_nt4",
+            "qwen4_moe_down_iu4_sym_p_pm_gfx1201_nt4",
+        ],
+        [
+            "qwen4_moe_gate_up_silu_iu4_sym_p_pm_gfx1201_nt8",
+            "qwen4_moe_down_iu4_sym_p_pm_gfx1201_nt8",
+        ],
+    ],
+    tiles_per_cta: [4, 8],
+    block_threads: [128, 128],
+    lds_bytes: [[8192, 0], [16384, 0]],
+    max_slots: QWEN4_MOE_SYM_PM_MAX_SLOTS,
+    down_row_repeat: None,
+    hipcc_twin: None,
+    gate_producer: MoeSymIu4GateProducer {
+        module: "mq_rotate_x_i4",
+        require_c2: false,
+    },
+    down_producer: MoeSymIu4DownProducer::Hipcc {
+        module: QWEN4_MOE_ROTATE128_I4,
+    },
+    checker: moe_sym_iu4_checker_gfx1201,
+    default_requested: true,
+};
+
 /// The aggregate symmetric-IU4 MoE descriptor of `(caps' arch, qt)`: `None` unless the device has
 /// IU4 WMMA hardware ([`crate::arch_caps::ArchCaps::has_iu4_wmma`]) and the K2 inventory
 /// ([`crate::expert_capabilities::raw_inventory`], [`crate::expert_capabilities::Route::PrefillK2`])
@@ -52406,13 +52490,47 @@ impl Gpu {
     /// (QT44 gate/up, QT53 down), `None` without shipped kernels
     /// ([`moe_sym_iu4_kernel`]).
     pub fn qwen4_moe_sym_kernel(&self) -> Option<&'static MoeSymIu4Kernel> {
-        moe_sym_iu4_kernel(&self.arch_caps, crate::expert_capabilities::QT_MQ4_XTS)
+        let kernel = moe_sym_iu4_kernel(&self.arch_caps, crate::expert_capabilities::QT_MQ4_XTS)?;
+        if self.mq4_experts_planar {
+            // DESIGN F1: drop-zero planar experts run the planar PM bundle (gfx1201 only).
+            return (kernel.arch == "gfx1201").then_some(&MOE_SYM_IU4_GFX1201_MQ4_PLANAR);
+        }
+        Some(kernel)
     }
 
     /// Monotonic launch census of the aggregate MoE route since this `Gpu` was created
     /// ([`MoeRouteLaunchCensus`]); window it with [`MoeRouteLaunchCensus::since`].
     pub fn moe_route_launch_census(&self) -> MoeRouteLaunchCensus {
         self.moe_route_census
+    }
+
+    /// Declare that the routed-expert tensors this device's Qwen4 MQ4 MoE launchers read
+    /// are in the drop-zero planar layout (`MQ4G256V2P` / `MQ4G128V2P`, DESIGN F1): the
+    /// decode, grouped F16/F32 and IU4 launchers then bind their planar kernels. Called
+    /// once by the loader before any forward; one layout for every layer of the load.
+    pub fn set_mq4_experts_planar(&mut self, planar: bool) {
+        self.mq4_experts_planar = planar;
+    }
+
+    /// Whether [`Gpu::set_mq4_experts_planar`] is in force.
+    pub fn mq4_experts_planar(&self) -> bool {
+        self.mq4_experts_planar
+    }
+
+    /// Refuse a launcher that has no drop-zero planar twin while the device is bound to the
+    /// planar expert layout (it would decode the planar bytes as the shipped layout).
+    pub(crate) fn require_shipped_mq4_experts(&self, what: &str) -> HipResult<()> {
+        if self.mq4_experts_planar {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "{what}: no drop-zero planar (MQ4G256V2P/MQ4G128V2P) twin; the device is \
+                     bound to the planar expert layout (HIPFIRE_QWEN4_EXPERT_DROP_ZERO=0 keeps \
+                     the shipped layout)"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn qwen4_moe_sym_require(&self, what: &str) -> HipResult<&'static MoeSymIu4Kernel> {
@@ -54234,7 +54352,11 @@ impl Gpu {
         let grid = [(dims[0] / (64 * rr)) as u32, tiles_y, 1];
         self.bind_thread()?;
         let operands = crate::kernel_abi::moe_sym_bindings(
-            crate::kernel_abi::MoeSymCodec::Mq4,
+            if self.mq4_experts_planar {
+                crate::kernel_abi::MoeSymCodec::Mq4Planar
+            } else {
+                crate::kernel_abi::MoeSymCodec::Mq4
+            },
             down,
             grouped_plane,
             [ptrs, tiles, sorted, y],

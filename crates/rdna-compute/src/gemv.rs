@@ -18032,6 +18032,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.require_shipped_mq4_experts("gemv_mq4g256v2_moe_gate_up_k8_indexed")?;
         // Default gfx1100 exact-shape route: removes dead workgroups, LDS
         // staging, and the barrier while preserving one-wave/row arithmetic
         // exactly. The generic kernel remains the fallback for other shapes
@@ -18241,6 +18242,7 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.require_shipped_mq4_experts("gemv_mq4g256v2_moe_gate_up_k8_indexed_batched")?;
         if batch_size > GRID_YZ_MAX {
             // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
             // launch row pieces with every per-token pointer advanced to its
@@ -18348,7 +18350,10 @@ impl Gpu {
         )?;
         // Only the frozen eager admission selects the physical eight-token PM
         // tile. Narrow, capture and generic prefill keep their original ABI.
-        if batch_size > 8 && self.row_tile_twin_enabled(WideTwinFamily::Mq4, batch_size) {
+        if batch_size > 8
+            && !self.mq4_experts_planar
+            && self.row_tile_twin_enabled(WideTwinFamily::Mq4, batch_size)
+        {
             if m != 1280 || k != 2560 {
                 return Err(hip_bridge::HipError::new(
                     1,
@@ -18458,12 +18463,21 @@ impl Gpu {
             ))?;
             return Ok(());
         }
-        const FUNC: &str = "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched";
-        self.ensure_kernel(
-            FUNC,
-            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
-            FUNC,
-        )?;
+        // DESIGN F1: drop-zero planar experts bind the planar twin module (same ABI, grid and
+        // arithmetic; the shipped module and symbols are untouched).
+        let planar = self.mq4_experts_planar;
+        let (func_name, src): (&'static str, &'static str) = if planar {
+            (
+                "gemv_mq4g256v2p_moe_gate_up_top10_indexed_batched",
+                kernels::GEMV_MQ4G256V2P_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
+            )
+        } else {
+            (
+                "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
+                kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
+            )
+        };
+        self.ensure_kernel(func_name, src, func_name)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -18485,15 +18499,15 @@ impl Gpu {
             &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * 10 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
         if k == 2560 && m.is_multiple_of(8) {
             // Eight rows per block share an LDS copy of x (same row values).
-            const ROWS8: &str = "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched";
-            self.ensure_kernel(
-                FUNC,
-                kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
-                ROWS8,
-            )?;
+            let rows8 = if planar {
+                "gemv_mq4g256v2p_moe_gate_up_k2560_rows8_indexed_batched"
+            } else {
+                "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched"
+            };
+            self.ensure_kernel(func_name, src, rows8)?;
             let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &pp as *const _ as *mut c_void,
@@ -18506,7 +18520,7 @@ impl Gpu {
                 &n_experts_val as *const _ as *mut c_void,
             ];
             let result = self.launch_maybe_blob(
-                ROWS8,
+                rows8,
                 [m as u32 / 8, 10, batch_size as u32],
                 [256, 1, 1],
                 0,
@@ -18550,7 +18564,7 @@ impl Gpu {
             return Ok(());
         }
         let result = self.launch_maybe_blob(
-            FUNC,
+            func_name,
             [m as u32, 10, batch_size as u32],
             [32, 1, 1],
             0,

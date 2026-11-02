@@ -965,6 +965,17 @@ pub enum DType {
     E8PI4G128R256,
     /// E8P-I4 down (qt=136): E8P codec, R128 FWHT. Planar like qt=135.
     E8PI4G128R128,
+    /// MQ4-XTS gate/up with the redundant zero dropped (qt=137, DESIGN F1,
+    /// `HIPFIRE_QWEN4_EXPERT_DROP_ZERO`): the symmetric MQ4G256V2 payload
+    /// repacked planar, `[M*K/2 B nibble codes][M*(K/128) f16 scales]`, with
+    /// `zp = -8*sc` derived in the kernels. Row `r` codes at `r*K/2`; scale of
+    /// (row, 128-col group g) at `M*K/2 + 2*(r*(K/128)+g)`. Typed-qwen4 routed
+    /// expert tensors only (loader-produced, never in a file); no per-row
+    /// stride (`row_bytes()` is `None`). See `hipfire_runtime::mq4_planar`.
+    MQ4G256V2P,
+    /// MQ4-XTS down with the zero dropped (qt=138): planar like qt=137 over
+    /// the MQ4G128V2 payload.
+    MQ4G128V2P,
     /// ggml Q4_K (GGUF type 12), served as-is: 144 B per 256 elements, 4.5 bpw.
     /// Distinct from the legacy llama `Q4K` until that path is cut over to the
     /// ggml kernels. Consumed only by the GGUF-native route (decode mmvq GEMV,
@@ -1044,6 +1055,8 @@ impl DType {
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
             | DType::E8PI4G128R128
+            | DType::MQ4G256V2P
+            | DType::MQ4G128V2P
             | DType::GgmlQ4K
             | DType::GgmlQ5K
             | DType::GgmlQ6K
@@ -1105,7 +1118,9 @@ impl DType {
             | DType::MQ2I4G128R256
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
-            | DType::E8PI4G128R128 => None,
+            | DType::E8PI4G128R128
+            | DType::MQ4G256V2P
+            | DType::MQ4G128V2P => None,
             _ => None,
         }
     }
@@ -1139,6 +1154,25 @@ impl DType {
     /// Whether this is one of the typed-qwen4-only planar MQ-I4 formats.
     pub fn is_mq_i4(self) -> bool {
         self.mq_i4_name().is_some()
+    }
+
+    /// Whether this is one of the two drop-zero planar MQ4 routed-expert
+    /// formats (qt=137 gate/up, qt=138 down): the loader-produced layout of
+    /// the symmetric MQ4-XTS experts, never a file wire type.
+    pub fn is_mq4_planar(self) -> bool {
+        matches!(self, DType::MQ4G256V2P | DType::MQ4G128V2P)
+    }
+
+    /// The shipped-layout dtype a drop-zero planar dtype was repacked from
+    /// (`MQ4G256V2P` -> `MQ4G256V2`, `MQ4G128V2P` -> `MQ4G128V2`); every other
+    /// dtype is returned unchanged. Route resolution reads the canonical
+    /// dtype, the launchers read the layout.
+    pub fn shipped_layout(self) -> DType {
+        match self {
+            DType::MQ4G256V2P => DType::MQ4G256V2,
+            DType::MQ4G128V2P => DType::MQ4G128V2,
+            other => other,
+        }
     }
 
     /// Whether a `WeightTensor` of this dtype should have the
@@ -1676,6 +1710,11 @@ pub struct Gpu {
     /// Monotonic aggregate-MoE launch census ([`Gpu::moe_route_launch_census`]); plain adds,
     /// no locking, bumped after a successful launch submission.
     pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
+    /// The routed-expert weights this device reads through the Qwen4 MQ4 MoE
+    /// launchers are in the drop-zero planar layout (`DType::MQ4G256V2P` /
+    /// `MQ4G128V2P`, DESIGN F1) instead of the shipped qt44/qt53 layout. Set
+    /// once by the loader before any forward; every layer of the load shares one layout.
+    pub(crate) mq4_experts_planar: bool,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -3048,6 +3087,7 @@ impl Gpu {
             arch_caps,
             device_id: id,
             moe_route_census: crate::gemm::MoeRouteLaunchCensus::default(),
+            mq4_experts_planar: false,
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),

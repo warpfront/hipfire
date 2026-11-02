@@ -2596,6 +2596,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC,
             ["gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",]
         );
+        if arch == "gfx1201" {
+            add!(
+                "gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201",
+                kernels::GEMM_MQ4G128V2P_MOE_GROUPED_TOP10_O8_R16_GFX1201_SRC,
+                ["gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201"]
+            );
+        }
         add!(
             "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs",
             kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_XS_GFX1151_SRC,
@@ -2696,6 +2703,25 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
             ]
         );
+        // DESIGN F1: drop-zero planar routed-expert twins (exact gfx1201 only).
+        if arch == "gfx1201" {
+            add!(
+                "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded",
+                kernels::GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
+                [
+                    "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded",
+                    "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded_k640_r4",
+                ]
+            );
+            add!(
+                "gemv_mq4g256v2p_moe_gate_up_top10_indexed_batched",
+                kernels::GEMV_MQ4G256V2P_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
+                [
+                    "gemv_mq4g256v2p_moe_gate_up_k2560_rows8_indexed_batched",
+                    "gemv_mq4g256v2p_moe_gate_up_top10_indexed_batched",
+                ]
+            );
+        }
         add!(
             "grouped_ops",
             crate::grouped_ops::GROUPED_KERNEL_SRC,
@@ -3196,6 +3222,21 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_mq4g256v2_moe_grouped_wmma_gfx12",
             kernels::GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC,
             ["gemm_mq4g256v2_moe_grouped_wmma_gfx12"]
+        );
+        add!(
+            "gemm_mq4g256v2p_moe_grouped_wmma_gfx12",
+            kernels::GEMM_MQ4G256V2P_MOE_GROUPED_WMMA_GFX12_SRC,
+            ["gemm_mq4g256v2p_moe_grouped_wmma_gfx12"]
+        );
+        add!(
+            "gemm_mq4g256v2p_moe_grouped_top10_o4_r8_x4",
+            kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_O4_R8_X4_GFX1201_SRC,
+            [
+                "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4",
+                "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4_inverse",
+                "gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4_inverse_k2560",
+                "gemm_mq4g256v2p_moe_grouped_top10_o4_r8_x4",
+            ]
         );
         add!(
             "gemm_mq6g256v2_residual_wmma_gfx12_bt12_mq5v2",
@@ -8741,6 +8782,14 @@ fn walked_embedded_image(
                 kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201,
             ),
             (
+                "qwen4_moe_iu4_sym_p_pm_gfx1201",
+                kernels::QWEN4_MOE_IU4_SYM_P_PM_GFX1201,
+            ),
+            (
+                "qwen4_moe_down_gp_p_pm_gfx1201",
+                kernels::QWEN4_MOE_DOWN_GP_P_PM_GFX1201,
+            ),
+            (
                 "moe_rotate_i4_pm_gfx1201",
                 kernels::MOE_ROTATE_I4_PM_GFX1201,
             ),
@@ -11497,6 +11546,23 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // DESIGN F1: drop-zero planar routed-expert twins (HIPFIRE_QWEN4_EXPERT_DROP_ZERO, gfx1201).
+        const F1_PLANAR_ADDED_MODULES: [&str; 5] = [
+            "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded",
+            "gemv_mq4g256v2p_moe_gate_up_top10_indexed_batched",
+            "gemm_mq4g256v2p_moe_grouped_wmma_gfx12",
+            "gemm_mq4g256v2p_moe_grouped_top10_o4_r8_x4",
+            "gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201",
+        ];
+        for module in F1_PLANAR_ADDED_MODULES {
+            assert!(by_name.contains_key(module), "missing F1 module {module}");
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -11528,7 +11594,8 @@ mod tests {
                 + Q8_0_MMQ_ACT_ADDED_MODULES.len()
                 + FFN_ROTATE_I8_ADDED_MODULES.len()
                 + QSA_LANES_ADDED_MODULES.len()
-                + DRAFT_SKINNY_TIE_ADDED_MODULES.len(),
+                + DRAFT_SKINNY_TIE_ADDED_MODULES.len()
+                + F1_PLANAR_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

@@ -51,6 +51,8 @@ enum MoeDownKernel {
     /// gfx1151 X-in-LDS twin of [`Self::O8R16`] (four waves share each
     /// group's X).
     XsTwin,
+    /// DESIGN F1 drop-zero planar (`MQ4G128V2P`) twin of [`Self::O8R16`].
+    PlanarO8R16,
 }
 
 impl Gpu {
@@ -3116,18 +3118,37 @@ impl Gpu {
             && self.flags.qwen4_moe_down_r4_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
-        const MODULE: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
-        let (func, rows_per_block) = if r4 {
+        // DESIGN F1: drop-zero planar experts bind the planar twin module (same ABI, grid and
+        // arithmetic); the physical row-tile PM twin reads the shipped layout only.
+        let planar = self.mq4_experts_planar;
+        let (module, src, planar_func): (&'static str, &'static str, bool) = if planar {
             (
-                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
-                4,
+                "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded",
+                kernels::GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
+                true,
             )
         } else {
-            (MODULE, 1)
+            (
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
+                kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
+                false,
+            )
+        };
+        let (func, rows_per_block) = match (r4, planar_func) {
+            (true, true) => (
+                "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded_k640_r4",
+                4,
+            ),
+            (true, false) => (
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
+                4,
+            ),
+            (false, _) => (module, 1),
         };
         // Only the frozen eager admission selects the physical eight-row PM
         // tile. Narrow, capture and generic prefill keep their original ABI.
         if batch_size > 8
+            && !planar
             && self.row_tile_twin_enabled(crate::gemv::WideTwinFamily::Mq4, batch_size)
         {
             if m != 2560 || k != 640 || k_top != 10 {
@@ -3244,11 +3265,7 @@ impl Gpu {
             ))?;
             return Ok(());
         }
-        self.ensure_kernel(
-            MODULE,
-            kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
-            func,
-        )?;
+        self.ensure_kernel(module, src, func)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = hidden_batch.buf.as_ptr();
@@ -3391,6 +3408,8 @@ impl Gpu {
     /// top-10 slot, >= QWEN4_F16_WMMA_MIN_TOKENS tokens, not opted out).
     pub fn qwen4_moe_down_wmma_applies(&self, m: usize, k: usize, x_src_rows: usize) -> bool {
         self.arch_caps.has_wmma_w32()
+            // The WMMA down kernel reads the shipped layout only (DESIGN F1).
+            && !self.mq4_experts_planar
             && m == 2560
             && k == 640
             && self.route_rows(x_src_rows) >= 10 * crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
@@ -3462,6 +3481,7 @@ impl Gpu {
         bf16_out: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.require_shipped_mq4_experts("gemm_mq4g128v2_moe_grouped_wmma_gfx1151")?;
         require_span(
             y_grouped,
             &[grouped_rows, m, if bf16_out { 2 } else { 4 }],
@@ -3567,7 +3587,31 @@ impl Gpu {
             &[grouped_rows, m, 4],
             "gemm_mq4g128v2_moe_grouped_top10 grouped rows",
         )?;
+        // DESIGN F1: drop-zero planar experts bind the planar O8R16 twin; the other down arms
+        // (X-in-LDS twin, generic multirow) read the shipped layout only and refuse.
+        let kernel = if self.mq4_experts_planar {
+            match kernel {
+                MoeDownKernel::O8R16 => MoeDownKernel::PlanarO8R16,
+                _ => {
+                    return Err(hip_bridge::HipError::new(
+                        1,
+                        "gemm_mq4g128v2_moe_grouped_top10: this arm has no drop-zero planar twin \
+                         (only the gfx11+/gfx12 O8R16 arm at M=2560, K=640)",
+                    ))
+                }
+            }
+        } else {
+            kernel
+        };
         let (func, module, source, grid_x, grid_z, block_x) = match kernel {
+            MoeDownKernel::PlanarO8R16 => (
+                "gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201",
+                "gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201",
+                kernels::GEMM_MQ4G128V2P_MOE_GROUPED_TOP10_O8_R16_GFX1201_SRC,
+                m.div_ceil(8),
+                1u32,
+                32u32,
+            ),
             MoeDownKernel::XsTwin => (
                 "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151",
                 "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs",
