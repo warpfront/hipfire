@@ -81,6 +81,23 @@
 //! shares the tier stage's tables, events, prime/after-MoE protocol and
 //! stage buffers; there are no mirrors and nothing to restore. The loader
 //! charges the buffers (`place_routed_experts_units_staged`).
+//!
+//! The BORROWED unit stage (`HIPFIRE_EP_UNIT_STAGE_BORROW=1` with the decoupled reserve,
+//! [`crate::expert_ep_units::EpUnitPlan::stage_borrow_layers`]) replaces the two dedicated buffers
+//! by the device tensors of two whole-resident layers (trunk layers 0 and 1, which precede every
+//! staged layer): parity `p`'s stage is the gate/up tensor (buffer 0) and the down tensor
+//! (buffer 1) of layer `p`. A staged layer's regions (a mixed layer's host arena split into its
+//! gate/up and down blocks, a host layer's or scratch donor's two aggregates) are packed
+//! first-fit into those two tensors ([`unit_stage_layout_bufs`]) and the pointer tables rebase per
+//! buffer ([`unit_stage_table_bufs`]). The lent layer's own bytes are mirrored in pinned host RAM
+//! at load; the S2 borrowed protocol ([`borrowed_after_moe`]) frees a lent layer after its own MoE,
+//! copies the first staged layer of its parity over it, refills L+2 and restores it from the
+//! mirror after the last staged layer of the parity; `join` waits on the restores and
+//! `restore_blocking` recovers any forward that never reached it (every error path already calls
+//! it). Decode and every forward below `min_rows` never overwrite anything. A region that fills a
+//! lent tensor flush has no zeroed tail pad behind it ([`tail_pad_room`]): exactly the S2 donor
+//! stage's own case (its host-layer aggregates fill the donor flush), whose kernel over-read is the
+//! phantom group header documented at `HOST_TAIL_PAD_BYTES`.
 
 use super::*;
 use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
@@ -105,9 +122,12 @@ pub(super) struct SlabStageMeta {
 struct StageCopy {
     /// CPU address of the pinned host owner's bytes.
     src: usize,
-    /// Byte offset inside the parity's stage buffer.
+    /// Byte offset inside the parity's stage buffer `buf`.
     dst: usize,
     len: usize,
+    /// Which of the parity's stage buffers: always 0 for a dedicated stage (one buffer per
+    /// parity); 0 = the lent gate/up tensor, 1 = the lent down tensor for a borrowed unit stage.
+    buf: usize,
 }
 
 /// Staged copies of the layers with a host-tier expert (a per-expert tier
@@ -118,8 +138,10 @@ struct TierStageMeta {
     /// host-tier expert (never staged, reads owner VRAM).
     slots: Vec<Option<usize>>,
     copies: Vec<Vec<StageCopy>>,
-    /// Bytes of each slot's staged payload (the zeroed tail pad follows).
-    used: Vec<usize>,
+    /// Per slot and stage buffer, the end of the staged payload (the zeroed
+    /// tail pad follows, as far as the buffer reaches); `0` for a buffer the
+    /// slot does not use. A dedicated stage uses buffer 0 only.
+    used: Vec<[usize; 2]>,
     /// Keeps both model-level owners alive while the stage exists (tier
     /// stage). The unit stage reads the bundle's pinned arenas, which every
     /// forward holds the bundle for; it keeps a unit `()`.
@@ -284,25 +306,32 @@ pub(super) struct UnitStageLayout {
     pub(super) used: usize,
 }
 
+/// Refuse an empty region or one that overlaps an earlier region of `regions` (`index`).
+fn check_unit_region(regions: &[UnitStageRegion], index: usize) -> Result<(), String> {
+    let region = &regions[index];
+    let end = region
+        .base
+        .checked_add(region.len)
+        .ok_or_else(|| format!("host region {index} overflows the address space"))?;
+    if region.len == 0 {
+        return Err(format!("host region {index} is empty"));
+    }
+    if regions[..index]
+        .iter()
+        .any(|other| region.base < other.base + other.len && other.base < end)
+    {
+        return Err(format!("host region {index} overlaps an earlier region"));
+    }
+    Ok(())
+}
+
 /// Pack `regions` back to back at 256-byte alignment. Empty or overlapping
 /// regions are refused.
 pub(super) fn unit_stage_layout(regions: &[UnitStageRegion]) -> Result<UnitStageLayout, String> {
     let mut cursor = 0usize;
     let mut dst = Vec::with_capacity(regions.len());
     for (index, region) in regions.iter().enumerate() {
-        let end = region
-            .base
-            .checked_add(region.len)
-            .ok_or_else(|| format!("host region {index} overflows the address space"))?;
-        if region.len == 0 {
-            return Err(format!("host region {index} is empty"));
-        }
-        if regions[..index]
-            .iter()
-            .any(|other| region.base < other.base + other.len && other.base < end)
-        {
-            return Err(format!("host region {index} overlaps an earlier region"));
-        }
+        check_unit_region(regions, index)?;
         let at = cursor
             .checked_add(STAGE_ALIGN - 1)
             .ok_or_else(|| "unit stage layout overflows".to_string())?
@@ -315,22 +344,109 @@ pub(super) fn unit_stage_layout(regions: &[UnitStageRegion]) -> Result<UnitStage
     Ok(UnitStageLayout { dst, used: cursor })
 }
 
+/// Where each region of one unit-stage layer sits in its parity's TWO stage buffers (a borrowed
+/// stage: the lent layer's gate/up tensor and down tensor).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct UnitStageLayoutBufs {
+    /// The buffer (0 or 1) of each region.
+    pub(super) buf: Vec<usize>,
+    /// Offset of each region inside its buffer.
+    pub(super) dst: Vec<usize>,
+    /// End of the staged payload of each buffer (`0`: the buffer holds no region); the zeroed
+    /// tail pad starts here.
+    pub(super) used: [usize; 2],
+}
+
+/// First-fit packing of `regions` into two buffers of `caps` bytes: each region goes, back to back
+/// at 256-byte alignment, to buffer 0 if it still fits there, else to buffer 1, else the layer
+/// cannot be staged. Empty or overlapping regions are refused.
+pub(super) fn unit_stage_layout_bufs(
+    regions: &[UnitStageRegion],
+    caps: [usize; 2],
+) -> Result<UnitStageLayoutBufs, String> {
+    let mut used = [0usize; 2];
+    let mut buf = Vec::with_capacity(regions.len());
+    let mut dst = Vec::with_capacity(regions.len());
+    for (index, region) in regions.iter().enumerate() {
+        check_unit_region(regions, index)?;
+        let placed = (0..2).find_map(|candidate| {
+            let at = used[candidate].checked_add(STAGE_ALIGN - 1)? & !(STAGE_ALIGN - 1);
+            let end = at.checked_add(region.len)?;
+            (end <= caps[candidate]).then_some((candidate, at, end))
+        });
+        let Some((candidate, at, end)) = placed else {
+            return Err(format!(
+                "host region {index} of {} B fits neither stage buffer ({} B and {} B, {} B and {} B used)",
+                region.len, caps[0], caps[1], used[0], used[1]
+            ));
+        };
+        used[candidate] = end;
+        buf.push(candidate);
+        dst.push(at);
+    }
+    Ok(UnitStageLayoutBufs { buf, dst, used })
+}
+
+/// The two regions of a mixed layer's host arena (`n` host experts of `gate_up` and `down` bytes,
+/// gate/up block then down block from `base`): staged as two regions so each lands in its own kind
+/// of lent tensor whatever `n` is (a single arena of up to a whole layer fits neither lent tensor).
+pub(super) fn split_mixed_host_arena(
+    base: usize,
+    n: usize,
+    gate_up: usize,
+    down: usize,
+) -> [UnitStageRegion; 2] {
+    [
+        UnitStageRegion {
+            base,
+            len: n * gate_up,
+        },
+        UnitStageRegion {
+            base: base + n * gate_up,
+            len: n * down,
+        },
+    ]
+}
+
 /// A unit-stage layer's little-endian device pointer table and the number of
 /// entries rebased: every entry inside region `i` moves to
 /// `stage_base + dst[i] + (entry - region.base)`, every other entry (the VRAM
 /// arena, the zero dummy) is unchanged.
+#[cfg(test)]
 pub(super) fn unit_stage_table(
     entries: &[usize],
     regions: &[UnitStageRegion],
     dst: &[usize],
     stage_base: usize,
 ) -> Result<(Vec<u8>, usize), String> {
-    if regions.len() != dst.len() {
+    unit_stage_table_bufs(
+        entries,
+        regions,
+        dst,
+        &vec![0; regions.len()],
+        [stage_base, 0],
+    )
+}
+
+/// [`unit_stage_table`] over two stage buffers: an entry inside region `i` moves to
+/// `bases[buf[i]] + dst[i] + (entry - region.base)`.
+pub(super) fn unit_stage_table_bufs(
+    entries: &[usize],
+    regions: &[UnitStageRegion],
+    dst: &[usize],
+    buf: &[usize],
+    bases: [usize; 2],
+) -> Result<(Vec<u8>, usize), String> {
+    if regions.len() != dst.len() || regions.len() != buf.len() {
         return Err(format!(
-            "{} host regions but {} stage offsets",
+            "{} host regions but {} stage offsets and {} stage buffers",
             regions.len(),
-            dst.len()
+            dst.len(),
+            buf.len()
         ));
+    }
+    if buf.iter().any(|&b| b > 1) {
+        return Err("a stage buffer index is above 1".to_string());
     }
     let mut table = Vec::with_capacity(entries.len() * std::mem::size_of::<u64>());
     let mut rebased = 0usize;
@@ -341,7 +457,7 @@ pub(super) fn unit_stage_table(
         {
             Some(region) => {
                 rebased += 1;
-                stage_base
+                bases[buf[region]]
                     .checked_add(dst[region])
                     .and_then(|at| at.checked_add(entry - regions[region].base))
                     .ok_or_else(|| format!("expert {expert} rebased entry overflows"))?
@@ -351,6 +467,14 @@ pub(super) fn unit_stage_table(
         table.extend_from_slice(&value.to_ne_bytes());
     }
     Ok((table, rebased))
+}
+
+/// Bytes of zeroed tail pad a stage buffer of `size` bytes can hold behind a payload ending at
+/// `used`: the kernels' over-read pad ([`ARENA_TAIL_PAD_BYTES`]) as far as the buffer reaches. A
+/// dedicated buffer is sized `used + pad` (the whole pad); a lent tensor that the payload fills
+/// flush has none (`0`), the case the S2 donor stage has always had.
+pub(super) fn tail_pad_room(size: usize, used: usize) -> usize {
+    size.saturating_sub(used).min(ARENA_TAIL_PAD_BYTES)
 }
 
 /// The stage slot of every trunk layer of `rank` under `plan`: layers with a
@@ -1235,13 +1359,18 @@ impl Qwen4ExpertStage {
                             "tier stage: layer {layer} source {src:#x} (+{len}) has no CPU address in the host owner"
                         ))
                     })?;
-                layer_copies.push(StageCopy { src: cpu, dst, len });
+                layer_copies.push(StageCopy {
+                    src: cpu,
+                    dst,
+                    len,
+                    buf: 0,
+                });
             }
             copies.push(layer_copies);
         }
         let used = layouts
             .iter()
-            .map(|(_, layout)| layout.used)
+            .map(|(_, layout)| [layout.used, 0])
             .collect::<Vec<_>>();
         gpu.ensure_capture_stream()?;
         // Staging is an optimisation: stage buffers that do not fit VRAM leave
@@ -1390,9 +1519,18 @@ impl Qwen4ExpertStage {
     /// Per-expert-unit EP stage (D1), or `None` (printed) when it cannot
     /// stage. Every layer of this rank with host experts takes a slot; its
     /// compact decode-table entries that point inside its pinned host region
-    /// are rebased onto the parity's dedicated stage buffer, all others (the
-    /// mixed layer's VRAM arena, the zero dummy) keep their address. Nothing
-    /// is overwritten and nothing is restored.
+    /// are rebased onto the parity's stage buffer, all others (the
+    /// mixed layer's VRAM arena, the zero dummy) keep their address. The dedicated
+    /// stage overwrites nothing and restores nothing.
+    ///
+    /// A plan with a BORROWED stage ([`crate::expert_ep_units::EpUnitPlan::stage_borrow_layers`],
+    /// `HIPFIRE_EP_UNIT_STAGE_BORROW=1`) has no dedicated buffers: parity `p`'s stage is the gate/up
+    /// tensor (buffer 0) and the down tensor (buffer 1) of the whole-resident layer `lent[p]`, which
+    /// precedes every layer it stages. A layer's host regions (a mixed layer's host arena split into
+    /// its gate/up and down blocks, a host layer's or scratch donor's two aggregates) are packed
+    /// first-fit into the two tensors ([`unit_stage_layout_bufs`]); the pointer tables rebase per
+    /// buffer. The lent layer's own bytes are mirrored in pinned host RAM at load and copied back by
+    /// the S2 borrowed-stage protocol ([`borrowed_after_moe`], `slab_join`, `slab_restore_blocking`).
     ///
     /// `host_sources` is the decoupled EP reserve's loan resolver: its layers
     /// are the whole-Resident scratch donors, whose VRAM is scratch during a
@@ -1429,14 +1567,48 @@ impl Qwen4ExpertStage {
         let config = &bundle.config;
         let rank = placement.rank;
         let donors: &[usize] = host_sources.map_or(&[], |sources| sources.layers());
-        let slots = unit_stage_slots(plan, rank, moe.len(), donors);
+        let borrow = plan.stage_borrow_layers();
+        let geometry = plan.geometry();
         let owned = placement.local_count(config.num_experts);
+        // The two tensors (compact gate/up, compact down) one lent layer holds: the two stage
+        // buffers of its parity.
+        let lent_bytes = [
+            owned * geometry.gate_up_bytes as usize,
+            owned * geometry.down_bytes as usize,
+        ];
+        if let Some(lent) = borrow {
+            plan.check_stage_borrow()
+                .map_err(|reason| invalid(format!("unit stage: {reason}")))?;
+            if plan.stage_borrow_buffer_bytes(rank) != lent_bytes.map(|bytes| bytes as u64) {
+                return Err(invalid(format!(
+                    "unit stage: the lent tensors of rank {rank} hold {lent_bytes:?} B, the plan's geometry gives {:?} B",
+                    plan.stage_borrow_buffer_bytes(rank)
+                )));
+            }
+            if let Some(layer) = lent.iter().find(|layer| donors.contains(layer)) {
+                return Err(invalid(format!(
+                    "unit stage: lent stage layer {layer} is also a scratch donor"
+                )));
+            }
+            for layer in lent {
+                if !moe
+                    .get(layer)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|runtime| !runtime.host_mapped())
+                {
+                    return Err(invalid(format!(
+                        "unit stage: lent stage layer {layer} has no device-resident MoE runtime"
+                    )));
+                }
+            }
+        }
+        let slots = unit_stage_slots(plan, rank, moe.len(), donors);
         // (layer, regions, CPU addresses of the regions, layout, expected rebased entries)
         let mut layouts: Vec<(
             usize,
             Vec<UnitStageRegion>,
             Vec<usize>,
-            UnitStageLayout,
+            UnitStageLayoutBufs,
             usize,
         )> = Vec::new();
         for (layer, runtime) in moe.iter().enumerate() {
@@ -1460,6 +1632,11 @@ impl Qwen4ExpertStage {
             }
             if !planned {
                 continue;
+            }
+            if borrow.is_some_and(|lent| layer <= lent[layer % 2]) {
+                return Err(invalid(format!(
+                    "unit stage: staged layer {layer} does not follow the lent layer of its parity"
+                )));
             }
             let mut regions = Vec::with_capacity(2);
             let mut cpu = Vec::with_capacity(2);
@@ -1497,12 +1674,30 @@ impl Qwen4ExpertStage {
                             plan.stage_host_region_bytes(rank, layer)
                         )));
                     }
-                    regions.push(UnitStageRegion {
-                        base: unit.host.buf.as_ptr() as usize,
-                        len: bytes,
-                    });
-                    cpu.push(host.as_ptr() as usize);
-                    unit.map.count(UnitTier::Host)
+                    let base = unit.host.buf.as_ptr() as usize;
+                    let count = unit.map.count(UnitTier::Host);
+                    if borrow.is_some() {
+                        // Two regions (gate/up block, down block): each lands in its own kind
+                        // of lent tensor whatever the host count is.
+                        let split = split_mixed_host_arena(
+                            base,
+                            count,
+                            geometry.gate_up_bytes as usize,
+                            geometry.down_bytes as usize,
+                        );
+                        if split[0].len + split[1].len != bytes {
+                            return Err(invalid(format!(
+                                "unit stage: layer {layer} host arena of {bytes} B is not {count} experts of gate/up plus down"
+                            )));
+                        }
+                        cpu.push(host.as_ptr() as usize);
+                        cpu.push(host.as_ptr() as usize + split[0].len);
+                        regions.extend(split);
+                    } else {
+                        regions.push(UnitStageRegion { base, len: bytes });
+                        cpu.push(host.as_ptr() as usize);
+                    }
+                    count
                 }
                 (false, None) => {
                     let weights = bundle
@@ -1533,8 +1728,15 @@ impl Qwen4ExpertStage {
                     owned
                 }
             };
-            let layout = unit_stage_layout(&regions)
-                .map_err(|reason| invalid(format!("unit stage: layer {layer}: {reason}")))?;
+            let layout = match borrow {
+                None => unit_stage_layout(&regions).map(|single| UnitStageLayoutBufs {
+                    buf: vec![0; regions.len()],
+                    dst: single.dst,
+                    used: [single.used, 0],
+                }),
+                Some(_) => unit_stage_layout_bufs(&regions, lent_bytes),
+            }
+            .map_err(|reason| invalid(format!("unit stage: layer {layer}: {reason}")))?;
             // Every owned host expert of both tables must lie inside the region
             // (validated here with a null stage base, before anything is allocated).
             for (name, entries) in [
@@ -1546,8 +1748,11 @@ impl Qwen4ExpertStage {
                         "unit stage: layer {layer} {name} table length differs from num_experts"
                     )));
                 }
-                let (_, rebased) = unit_stage_table(entries, &regions, &layout.dst, 0)
-                    .map_err(|reason| invalid(format!("unit stage: layer {layer}: {reason}")))?;
+                let (_, rebased) =
+                    unit_stage_table_bufs(entries, &regions, &layout.dst, &layout.buf, [0, 0])
+                        .map_err(|reason| {
+                            invalid(format!("unit stage: layer {layer}: {reason}"))
+                        })?;
                 if rebased != expected {
                     return Err(invalid(format!(
                         "unit stage: layer {layer} {name} table has {rebased} entries in its host region, the plan has {expected} host experts"
@@ -1559,23 +1764,25 @@ impl Qwen4ExpertStage {
         let Some(first_host) = layouts.first().map(|(layer, ..)| *layer) else {
             return off("this rank has no host expert layer or borrowed donor layer");
         };
-        // One buffer per layer parity: the largest staged payload of that
-        // parity plus the zeroed tail pad; the loader charged the largest
-        // region of any layer for each.
-        let capacity = unit_stage_capacity(plan, donors) as usize;
+        // Dedicated stage: one buffer per layer parity, the largest staged payload of that
+        // parity plus the zeroed tail pad; the loader charged the largest region of any layer
+        // for each. A borrowed stage has no buffer of its own (the lent tensors), and
+        // `unit_stage_layout_bufs` already fitted every layer into them.
         let mut sizes = [ARENA_TAIL_PAD_BYTES; 2];
-        for (layer, _, _, layout, _) in &layouts {
-            if layout.used > capacity {
-                return Err(invalid(format!(
-                    "unit stage: layer {layer} stages {} B, above the {capacity} B the placement charged",
-                    layout.used
-                )));
+        if borrow.is_none() {
+            let capacity = unit_stage_capacity(plan, donors) as usize;
+            for (layer, _, _, layout, _) in &layouts {
+                if layout.used[0] > capacity {
+                    return Err(invalid(format!(
+                        "unit stage: layer {layer} stages {} B, above the {capacity} B the placement charged",
+                        layout.used[0]
+                    )));
+                }
+                let need = layout.used[0]
+                    .checked_add(ARENA_TAIL_PAD_BYTES)
+                    .ok_or_else(|| invalid("unit stage buffer size overflows"))?;
+                sizes[layer % 2] = sizes[layer % 2].max(need);
             }
-            let need = layout
-                .used
-                .checked_add(ARENA_TAIL_PAD_BYTES)
-                .ok_or_else(|| invalid("unit stage buffer size overflows"))?;
-            sizes[layer % 2] = sizes[layer % 2].max(need);
         }
         let mut copies = Vec::with_capacity(layouts.len());
         let mut used = Vec::with_capacity(layouts.len());
@@ -1584,32 +1791,82 @@ impl Qwen4ExpertStage {
                 regions
                     .iter()
                     .zip(cpu)
-                    .zip(&layout.dst)
-                    .map(|((region, &src), &dst)| StageCopy {
+                    .zip(layout.dst.iter().zip(&layout.buf))
+                    .map(|((region, &src), (&dst, &buf))| StageCopy {
                         src,
                         dst,
                         len: region.len,
+                        buf,
                     })
                     .collect::<Vec<_>>(),
             );
             used.push(layout.used);
         }
+        // The two tensors (gate/up, down) of a lent layer.
+        let lent_sources = |layer: usize| -> Result<[&TensorRef; 2], Qwen4GpuForwardError> {
+            let weights = bundle
+                .weights
+                .layer(layer)
+                .ok_or_else(|| invalid("lent stage layer is not owned"))?
+                .ffn
+                .moe()
+                .ok_or_else(|| invalid("lent stage layer has no MoE FFN"))?;
+            Ok([&weights.experts_gate_up, &weights.experts_down])
+        };
+        // A borrowed stage's pinned restore copies of the two lent layers sit on top of the
+        // placement's pinned experts: refused here as the S2 stage refuses its own (the loader's
+        // plan-time aggregate check already counted them).
+        if let Some(lent) = borrow {
+            let layer_bytes = (0..placement.ranks)
+                .map(|rank| plan.stage_borrow_buffer_bytes(rank).iter().sum::<u64>())
+                .max()
+                .unwrap_or(0) as usize;
+            let mirror_bytes =
+                crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, placement.ranks)
+                    .map_err(invalid)?;
+            let admitted = crate::expert_residency::check_host_ram(
+                mirror_bytes,
+                rdna_compute::kv_slots::mem_available_bytes(),
+                crate::expert_residency::ttm_pool_estimate(),
+            )
+            .and_then(|()| {
+                crate::expert_residency::check_gtt_cap(
+                    mirror_bytes,
+                    crate::expert_residency::gtt_budget(),
+                )
+            });
+            if let Err(reason) = admitted {
+                return off(&format!(
+                    "restore copies of the lent stage layers: {reason}"
+                ));
+            }
+            for layer in lent {
+                for (kind, source) in lent_sources(layer)?.into_iter().enumerate() {
+                    let owner = bundle.weights.resident(source)?;
+                    if owner.buf.is_host_mapped() || owner.buf.size() < lent_bytes[kind] {
+                        return off("a lent stage layer's expert owner is not device memory of the stage size");
+                    }
+                }
+            }
+        }
         gpu.ensure_capture_stream()?;
         // Staging is an optimisation: buffers that do not fit VRAM leave every
         // host expert read in place.
         let mut buffers = Vec::with_capacity(2);
-        for size in sizes {
-            match gpu.alloc_tensor(&[size], DType::Raw) {
-                Ok(buffer) => buffers.push(buffer),
-                Err(error) => {
-                    for buffer in buffers {
-                        let _ = gpu.free_tensor(buffer);
+        if borrow.is_none() {
+            for size in sizes {
+                match gpu.alloc_tensor(&[size], DType::Raw) {
+                    Ok(buffer) => buffers.push(buffer),
+                    Err(error) => {
+                        for buffer in buffers {
+                            let _ = gpu.free_tensor(buffer);
+                        }
+                        return off(&format!(
+                            "stage buffers of {} and {} MiB do not fit VRAM: {error}",
+                            sizes[0] >> 20,
+                            sizes[1] >> 20
+                        ));
                     }
-                    return off(&format!(
-                        "stage buffers of {} and {} MiB do not fit VRAM: {error}",
-                        sizes[0] >> 20,
-                        sizes[1] >> 20
-                    ));
                 }
             }
         }
@@ -1627,7 +1884,7 @@ impl Qwen4ExpertStage {
             min_rows,
             min_rows_source,
             capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
-            donors: [usize::MAX; 2],
+            donors: borrow.unwrap_or([usize::MAX; 2]),
             donor_views: Vec::new(),
             mirrors: buffers,
             tables: Vec::with_capacity(2 * layouts.len()),
@@ -1637,7 +1894,7 @@ impl Qwen4ExpertStage {
             compact_bound: Vec::new(),
             first_host,
             placement: Some(placement),
-            bytes: [0, 0],
+            bytes: if borrow.is_some() { lent_bytes } else { [0, 0] },
             copy_stream,
             ready: Vec::with_capacity(2),
             free: Vec::with_capacity(2),
@@ -1650,7 +1907,7 @@ impl Qwen4ExpertStage {
                     used,
                     _keepalive: std::sync::Arc::new(()),
                 }),
-                borrowed: false,
+                borrowed: borrow.is_some(),
             }),
         };
         let result = (|| {
@@ -1664,17 +1921,45 @@ impl Qwen4ExpertStage {
                         .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
                 );
             }
+            // The lent layers' own bytes, read back once into pinned restore copies (the S2
+            // stage's mirrors); the views are never freed here, the bundle's weights own them.
+            // Parity-major: `[even gate/up, even down, odd gate/up, odd down]`.
+            for layer in borrow.into_iter().flatten() {
+                for (kind, source) in lent_sources(layer)?.into_iter().enumerate() {
+                    let owner = bundle.weights.resident(source)?;
+                    let view = GpuTensor {
+                        buf: owner.buf.byte_view(0, lent_bytes[kind]),
+                        shape: vec![lent_bytes[kind]],
+                        dtype: DType::Raw,
+                    };
+                    let mut host = vec![0u8; lent_bytes[kind]];
+                    gpu.memcpy_dtoh_auto(&mut host, &view.buf)?;
+                    stage
+                        .mirrors
+                        .push(gpu.upload_raw_host_mapped(&host, &[lent_bytes[kind]])?);
+                    drop(host);
+                    stage.donor_views.push(view);
+                }
+            }
             for (layer, regions, _, layout, _) in &layouts {
                 let runtime = moe[*layer].as_ref().expect("checked above");
-                let stage_base = stage.mirrors[layer % 2].buf.as_ptr() as usize;
+                let base = |buf: usize| {
+                    if borrow.is_some() {
+                        stage.donor_views[2 * (layer % 2) + buf].buf.as_ptr() as usize
+                    } else {
+                        stage.mirrors[layer % 2].buf.as_ptr() as usize
+                    }
+                };
+                let bases = [base(0), if borrow.is_some() { base(1) } else { 0 }];
                 for entries in [
                     &runtime.expert_gate_up_entries,
                     &runtime.expert_down_entries,
                 ] {
-                    let (table, _) = unit_stage_table(entries, regions, &layout.dst, stage_base)
-                        .map_err(|reason| {
-                            invalid(format!("unit stage: layer {layer} table: {reason}"))
-                        })?;
+                    let (table, _) =
+                        unit_stage_table_bufs(entries, regions, &layout.dst, &layout.buf, bases)
+                            .map_err(|reason| {
+                                invalid(format!("unit stage: layer {layer} table: {reason}"))
+                            })?;
                     let tensor = gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?;
                     stage.tables.push(tensor);
                     gpu.memcpy_htod_auto(
@@ -1702,15 +1987,51 @@ impl Qwen4ExpertStage {
                 donors.len()
             )
         };
-        eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through two VRAM stage buffers of {} and {} MiB (resident experts keep their VRAM arena address; nothing overwritten, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows}){donor_note}",
-            stage.min_rows,
-            layouts.len(),
-            sizes[0] >> 20,
-            sizes[1] >> 20,
-            if stage.capture { "stage" } else { "mapped" },
-            stage.min_rows_source.label()
-        );
+        if let Some(lent) = borrow {
+            // The lent tensors end exactly at their payload: a region that fills one has no zeroed
+            // tail pad behind it (the S2 donor stage's own flush case). The allocations' real
+            // slack is only visible here.
+            let slack = lent
+                .iter()
+                .flat_map(|&layer| {
+                    lent_sources(layer)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .filter_map(|(kind, source)| {
+                            bundle
+                                .weights
+                                .resident(source)
+                                .ok()
+                                .map(|owner| owner.buf.size().saturating_sub(lent_bytes[kind]))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through the tensors of layers {} and {} lent as the two parity stage buffers (gate/up {} MiB + down {} MiB each; restored from {} MiB pinned copies after the last staged layer of each parity; lent allocation slack past the payload {slack:?} B; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows}){donor_note}",
+                stage.min_rows,
+                layouts.len(),
+                lent[0],
+                lent[1],
+                lent_bytes[0] >> 20,
+                lent_bytes[1] >> 20,
+                (2 * (lent_bytes[0] + lent_bytes[1])) >> 20,
+                if stage.capture { "stage" } else { "mapped" },
+                stage.min_rows_source.label()
+            );
+        } else {
+            eprintln!(
+                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through two VRAM stage buffers of {} and {} MiB (resident experts keep their VRAM arena address; nothing overwritten, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows}){donor_note}",
+                stage.min_rows,
+                layouts.len(),
+                sizes[0] >> 20,
+                sizes[1] >> 20,
+                if stage.capture { "stage" } else { "mapped" },
+                stage.min_rows_source.label()
+            );
+        }
         hipfire_config::load_summary::note(
             hipfire_config::load_summary::Facet::Prefill,
             format!(
@@ -1755,6 +2076,29 @@ impl Qwen4ExpertStage {
             &self.donor_views[parity]
         } else {
             &self.mirrors[parity]
+        }
+    }
+
+    /// Stage buffer `buf` (0: gate/up side, 1: down side) of `parity` of a unit stage: a
+    /// dedicated stage has the one buffer `mirrors[parity]` (`buf` is 0); a borrowed unit stage
+    /// lends the lent layer's gate/up and down tensors (`donor_views[2 * parity + buf]`).
+    fn unit_buffer(&self, parity: usize, buf: usize) -> &GpuTensor {
+        if self.slab.as_ref().is_some_and(|meta| meta.borrowed) {
+            &self.donor_views[2 * parity + buf]
+        } else {
+            debug_assert_eq!(buf, 0, "a dedicated stage has one buffer per parity");
+            &self.mirrors[parity]
+        }
+    }
+
+    /// Lent tensors per parity: two (gate/up, down) for a borrowed unit stage, one arena for a
+    /// borrowed slab stage. Parity `p`'s tensors are `donor_views[per * p..per * (p + 1)]` and
+    /// their restore copies `mirrors[per * p..per * (p + 1)]`.
+    fn lent_per_parity(&self) -> usize {
+        if self.slab.as_ref().is_some_and(|meta| meta.tier.is_some()) {
+            2
+        } else {
+            1
         }
     }
 
@@ -1829,8 +2173,12 @@ impl Qwen4ExpertStage {
                 .ok_or_else(|| invalid("tier stage layer has no host-tier expert"))?;
             gpu.hip
                 .stream_wait_event(&self.copy_stream, &self.free[parity])?;
-            let buffer = &self.mirrors[parity].buf;
+            if meta.borrowed {
+                // From the first byte issued, the lent layer no longer holds its experts.
+                self.set_state(parity, DonorState::Overwritten);
+            }
             for copy in &tier.copies[slot] {
+                let buffer = &self.unit_buffer(parity, copy.buf).buf;
                 // SAFETY: `copy.src` lies inside a pinned host owner (the lease's
                 // for a tier stage, the bundle's host arena or aggregate for a
                 // unit stage; checked against its range at construction), which
@@ -1843,13 +2191,25 @@ impl Qwen4ExpertStage {
                 )?;
             }
             // The previous occupant may have been larger: re-zero the pad the
-            // kernels' tail over-read can reach past the last staged byte.
-            gpu.hip.memset_async(
-                &buffer.byte_view(tier.used[slot], ARENA_TAIL_PAD_BYTES),
-                0,
-                ARENA_TAIL_PAD_BYTES,
-                &self.copy_stream,
-            )?;
+            // kernels' tail over-read can reach past the last staged byte of each
+            // buffer the slot uses, as far as the buffer reaches (a lent tensor
+            // that the payload fills flush has no pad behind it: the S2 donor
+            // stage's own case).
+            for (buf, &used) in tier.used[slot].iter().enumerate() {
+                if used == 0 {
+                    continue;
+                }
+                let buffer = &self.unit_buffer(parity, buf).buf;
+                let room = tail_pad_room(buffer.size(), used);
+                if room > 0 {
+                    gpu.hip.memset_async(
+                        &buffer.byte_view(used, room),
+                        0,
+                        room,
+                        &self.copy_stream,
+                    )?;
+                }
+            }
             gpu.hip
                 .event_record(&self.ready[parity], Some(&self.copy_stream))?;
             return Ok(());
@@ -1888,6 +2248,21 @@ impl Qwen4ExpertStage {
         layer: usize,
     ) -> Result<(), Qwen4GpuForwardError> {
         if let Some(tier) = self.slab.as_ref().and_then(|meta| meta.tier.as_ref()) {
+            if self.slab.as_ref().is_some_and(|meta| meta.borrowed) {
+                // A borrowed unit stage: the S2 protocol over the lent layers `donors`; a
+                // staged layer (a slot) refills its parity, a lent layer also frees it.
+                return self.borrowed_after_moe_step(
+                    gpu,
+                    layer,
+                    borrowed_after_moe(
+                        self.donors,
+                        moe.len(),
+                        |candidate| tier.slots.get(candidate).copied().flatten().is_some(),
+                        layer,
+                        self.state.get()[layer % 2] == DonorState::Overwritten,
+                    ),
+                );
+            }
             if tier.slots.get(layer).copied().flatten().is_none() {
                 return Ok(());
             }
@@ -1938,17 +2313,45 @@ impl Qwen4ExpertStage {
     /// Copy the donor arena's own prefix back from its pinned host copy once
     /// the last host layer of its parity is done with it, recording `ready`.
     fn slab_enqueue_restore(&self, gpu: &Gpu, parity: usize) -> Result<(), Qwen4GpuForwardError> {
-        let host = gpu
-            .host_bytes(&self.mirrors[parity])
-            .ok_or_else(|| invalid("G2 slab donor restore copy missing"))?;
         gpu.hip
             .stream_wait_event(&self.copy_stream, &self.free[parity])?;
-        gpu.hip
-            .memcpy_htod_async(&self.donor_views[parity].buf, host, &self.copy_stream)?;
+        let per = self.lent_per_parity();
+        for at in per * parity..per * (parity + 1) {
+            let host = gpu
+                .host_bytes(&self.mirrors[at])
+                .ok_or_else(|| invalid("G2 slab donor restore copy missing"))?;
+            gpu.hip
+                .memcpy_htod_async(&self.donor_views[at].buf, host, &self.copy_stream)?;
+        }
         gpu.hip
             .event_record(&self.ready[parity], Some(&self.copy_stream))?;
         self.set_state(parity, DonorState::Restoring);
         Ok(())
+    }
+
+    /// What a borrowed stage does after layer `layer`'s MoE (`step`, from
+    /// [`borrowed_after_moe`]): a lent layer's own MoE frees its tensors, then the next staged
+    /// layer of its parity copies over them, or past the last one the lent layer is restored.
+    fn borrowed_after_moe_step(
+        &self,
+        gpu: &Gpu,
+        layer: usize,
+        step: BorrowedAfterMoe,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let parity = layer % 2;
+        if step.release {
+            // The lent layer's own MoE read its tensors on the compute stream.
+            let compute = gpu
+                .active_stream
+                .as_ref()
+                .ok_or_else(|| invalid("G2 compute stream missing"))?;
+            gpu.hip.event_record(&self.free[parity], Some(compute))?;
+        }
+        match step.next {
+            BorrowedNext::Nothing => Ok(()),
+            BorrowedNext::Enqueue(next) => self.slab_enqueue(gpu, next),
+            BorrowedNext::Restore => self.slab_enqueue_restore(gpu, parity),
+        }
     }
 
     /// End of a staged forward on a borrowed slab stage: the compute stream
@@ -1995,10 +2398,13 @@ impl Qwen4ExpertStage {
             if self.state.get()[parity] == DonorState::Resident {
                 continue;
             }
-            let host = gpu
-                .host_bytes(&self.mirrors[parity])
-                .ok_or_else(|| invalid("G2 slab donor restore copy missing"))?;
-            gpu.hip.memcpy_htod(&self.donor_views[parity].buf, host)?;
+            let per = self.lent_per_parity();
+            for at in per * parity..per * (parity + 1) {
+                let host = gpu
+                    .host_bytes(&self.mirrors[at])
+                    .ok_or_else(|| invalid("G2 slab donor restore copy missing"))?;
+                gpu.hip.memcpy_htod(&self.donor_views[at].buf, host)?;
+            }
             gpu.hip.device_synchronize()?;
             self.set_state(parity, DonorState::Resident);
         }
@@ -3295,5 +3701,388 @@ mod tests {
             unit_stage_capacity(&plan, &[]),
             plan.max_stage_host_region_bytes()
         );
+    }
+
+    // ---- D1 borrowed unit stage (`HIPFIRE_EP_UNIT_STAGE_BORROW`) ----
+
+    /// Bytes of the two tensors (compact gate/up, compact down) of a whole layer of one rank of
+    /// 512 experts over 2 ranks: the two stage buffers of one lent parity.
+    const LENT: [usize; 2] = [256 * UNIT_GU, 256 * UNIT_DN];
+
+    fn region(base: usize, len: usize) -> UnitStageRegion {
+        UnitStageRegion { base, len }
+    }
+
+    #[test]
+    fn borrowed_layout_is_first_fit_into_the_two_lent_tensors() {
+        // A host layer or scratch donor: its two aggregates fill one tensor each.
+        let whole = [
+            region(0x1_0000_0000, LENT[0]),
+            region(0x2_0000_0000, LENT[1]),
+        ];
+        let layout = unit_stage_layout_bufs(&whole, LENT).unwrap();
+        assert_eq!(layout.buf, vec![0, 1]);
+        assert_eq!(layout.dst, vec![0, 0]);
+        assert_eq!(layout.used, LENT);
+        // A mixed layer with `n` host experts: gate/up block then down block. Both blocks share
+        // the lent gate/up tensor (adjacent, as in the host arena) while they fit, else the
+        // down block takes the lent down tensor.
+        for n in [1usize, 125, 170, 171, 255, 256] {
+            let split = split_mixed_host_arena(0x3_0000_0000, n, UNIT_GU, UNIT_DN);
+            assert_eq!(split[0], region(0x3_0000_0000, n * UNIT_GU));
+            assert_eq!(split[1].base, split[0].base + split[0].len, "n {n}");
+            assert_eq!(split[1].len, n * UNIT_DN);
+            let layout = unit_stage_layout_bufs(&split, LENT).unwrap();
+            if n * (UNIT_GU + UNIT_DN) <= LENT[0] {
+                assert_eq!(layout.buf, vec![0, 0], "n {n}");
+                assert_eq!(layout.dst, vec![0, n * UNIT_GU], "n {n}");
+                assert_eq!(layout.used, [n * (UNIT_GU + UNIT_DN), 0], "n {n}");
+            } else {
+                assert_eq!(layout.buf, vec![0, 1], "n {n}");
+                assert_eq!(layout.dst, vec![0, 0], "n {n}");
+                assert_eq!(layout.used, [n * UNIT_GU, n * UNIT_DN], "n {n}");
+            }
+        }
+        // Alignment: each region starts at a 256-byte boundary of its buffer.
+        let odd = [region(0x100, 100), region(0x1000, 100), region(0x2000, 100)];
+        let layout = unit_stage_layout_bufs(&odd, [1000, 1000]).unwrap();
+        assert_eq!(layout.buf, vec![0, 0, 0]);
+        assert_eq!(layout.dst, vec![0, 256, 512]);
+        assert_eq!(layout.used, [612, 0]);
+        // A region that fits neither tensor, an empty and an overlapping region are refused.
+        assert!(unit_stage_layout_bufs(&[region(0, LENT[0] + 1)], LENT).is_err());
+        assert!(
+            unit_stage_layout_bufs(&[region(0, LENT[1]), region(0x10, LENT[0])], LENT).is_err()
+        );
+        let text = unit_stage_layout_bufs(&[region(0, 0)], LENT).unwrap_err();
+        assert!(text.contains("empty"), "{text}");
+        let text = unit_stage_layout_bufs(&[region(0, 64), region(32, 64)], LENT).unwrap_err();
+        assert!(text.contains("overlaps"), "{text}");
+        // The single-buffer layout is untouched.
+        let single = unit_stage_layout(&whole).unwrap();
+        assert_eq!(single.dst, vec![0, LENT[0]]);
+        assert_eq!(single.used, LENT[0] + LENT[1]);
+    }
+
+    #[test]
+    fn borrowed_table_rebases_only_host_entries_each_onto_its_own_buffer() {
+        let regions = [region(0x1000, 0x4000), region(0x5000, 0x2000)];
+        let layout = unit_stage_layout_bufs(&regions, [0x4000, 0x2000]).unwrap();
+        assert_eq!(
+            (layout.buf.clone(), layout.dst.clone()),
+            (vec![0, 1], vec![0, 0])
+        );
+        let (dummy, vram) = (0xdead_0000usize, 0x9_0000usize);
+        let entries = [0x1000, 0x2000, 0x5000, 0x6000, dummy, vram, 0x6fff, 0x7000];
+        let bases = [0x70_0000_0000usize, 0x90_0000_0000];
+        let (table, rebased) =
+            unit_stage_table_bufs(&entries, &regions, &layout.dst, &layout.buf, bases).unwrap();
+        // 0x7000 is one past the second region: not a host entry.
+        assert_eq!(rebased, 5);
+        let out: Vec<usize> = table
+            .chunks_exact(8)
+            .map(|bytes| usize::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            out,
+            vec![
+                bases[0],
+                bases[0] + 0x1000,
+                bases[1],
+                bases[1] + 0x1000,
+                dummy,
+                vram,
+                bases[1] + 0x1fff,
+                0x7000
+            ]
+        );
+        // The single-buffer table is the two-buffer table with every region in buffer 0.
+        let single = unit_stage_layout(&regions).unwrap();
+        let (a, count_a) = unit_stage_table(&entries, &regions, &single.dst, bases[0]).unwrap();
+        let (b, count_b) = unit_stage_table_bufs(
+            &entries,
+            &regions,
+            &single.dst,
+            &[0, 0],
+            [bases[0], bases[1]],
+        )
+        .unwrap();
+        assert_eq!((a, count_a), (b, count_b));
+        // Malformed inputs are refused.
+        assert!(unit_stage_table_bufs(&entries, &regions, &[0], &[0, 1], bases).is_err());
+        assert!(unit_stage_table_bufs(&entries, &regions, &[0, 0], &[0, 2], bases).is_err());
+    }
+
+    #[test]
+    fn borrowed_tail_pad_is_zeroed_only_as_far_as_the_lent_tensor_reaches() {
+        // A dedicated buffer is sized `used + pad`: the whole pad.
+        assert_eq!(
+            tail_pad_room(1000 + ARENA_TAIL_PAD_BYTES, 1000),
+            ARENA_TAIL_PAD_BYTES
+        );
+        // Slack inside a lent tensor behind a smaller payload: the whole pad again.
+        assert_eq!(tail_pad_room(LENT[0], 1 << 20), ARENA_TAIL_PAD_BYTES);
+        // A payload that fills the tensor flush (a whole host layer or scratch donor): no pad,
+        // exactly the S2 donor stage's case.
+        assert_eq!(tail_pad_room(LENT[0], LENT[0]), 0);
+        assert_eq!(tail_pad_room(LENT[1], LENT[1]), 0);
+        // Fewer than a pad of slack: what is there.
+        assert_eq!(tail_pad_room(LENT[1], LENT[1] - 96), 96);
+        assert_eq!(tail_pad_room(10, 20), 0);
+    }
+
+    /// One staged forward of the borrowed protocol over `layers` of a stage with `slots`, stopped
+    /// after the layer `upto - 1` (an aborted forward when `upto < layers`) and joined: every
+    /// event as `(layer whose MoE just ran, event)`, the join's at `upto`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Ev {
+        Free(usize),
+        Enqueue(usize),
+        Restore(usize),
+        JoinRestore(usize),
+    }
+
+    fn simulate_borrowed_forward(
+        slots: &[Option<usize>],
+        lent: [usize; 2],
+        upto: usize,
+    ) -> Vec<(usize, Ev)> {
+        let mut overwritten = [false; 2];
+        let mut events = Vec::new();
+        for layer in 0..upto {
+            let parity = layer % 2;
+            let step = borrowed_after_moe(
+                lent,
+                slots.len(),
+                |candidate| slots[candidate].is_some(),
+                layer,
+                overwritten[parity],
+            );
+            if step.release {
+                events.push((layer, Ev::Free(parity)));
+            }
+            match step.next {
+                BorrowedNext::Nothing => {}
+                BorrowedNext::Enqueue(next) => {
+                    overwritten[parity] = true;
+                    events.push((layer, Ev::Enqueue(next)));
+                }
+                BorrowedNext::Restore => {
+                    overwritten[parity] = false;
+                    events.push((layer, Ev::Restore(parity)));
+                }
+            }
+        }
+        // `slab_join`: a parity still overwritten at the end of the forward is restored.
+        for parity in 0..2 {
+            if overwritten[parity] {
+                events.push((upto, Ev::JoinRestore(parity)));
+            }
+        }
+        events
+    }
+
+    /// 8 layers over 2 ranks, layers 0 and 1 lent, layer 5 a scratch donor, layer 3 mixed (2 of 4
+    /// units resident per rank), layers 2, 4, 6, 7 host: placed by the borrowed planner.
+    fn borrowed_plan() -> EpUnitPlan {
+        let g = donor_geometry(8);
+        let hot: Vec<u32> = [(3usize, 0usize), (3, 2), (3, 1), (3, 3)]
+            .iter()
+            .map(|&(layer, expert)| (layer * g.experts_per_layer + expert) as u32)
+            .collect();
+        let mut order = hot.clone();
+        order.extend((0..g.total_ids() as u32).filter(|id| !hot.contains(id)));
+        let unit = g.unit_bytes();
+        let owned = g.owned_per_layer(0) as u64;
+        let budget = crate::expert_ep_units::ep_unit_stage_table_bytes(&g)
+            + 3 * (owned * unit + 2 * VRAM_ARENA_TAIL_PAD_BYTES)
+            + 2 * unit
+            + 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        crate::expert_ep_units::place_routed_experts_units_borrowed_staged(
+            &g,
+            EpRanking {
+                rank: &order,
+                counts: None,
+                sha256: None,
+            },
+            &vec![budget; g.ranks],
+            &[5],
+            true,
+        )
+        .unwrap()
+        .plan
+    }
+
+    #[test]
+    fn borrowed_schedule_frees_a_lent_layer_before_overwriting_it_and_restores_each_parity_last() {
+        let plan = borrowed_plan();
+        let lent = plan.stage_borrow_layers().unwrap();
+        assert_eq!(lent, [0, 1]);
+        assert_eq!(plan.whole_resident_layers_all_ranks(), vec![0, 1, 5]);
+        assert!(matches!(plan.layer_state(0, 3), EpLayerState::Mixed { .. }));
+        for rank in 0..2 {
+            // The lent layers are whole-Resident: no host region, so no slot of their own.
+            let slots = unit_stage_slots(&plan, rank, 8, &[5]);
+            assert_eq!(slots[0], None);
+            assert_eq!(slots[1], None);
+            assert_eq!(slots.iter().flatten().count(), 6);
+            let events = simulate_borrowed_forward(&slots, lent, 8);
+            assert_eq!(
+                events,
+                vec![
+                    (0, Ev::Free(0)),
+                    (0, Ev::Enqueue(2)),
+                    (1, Ev::Free(1)),
+                    (1, Ev::Enqueue(3)),
+                    (2, Ev::Enqueue(4)),
+                    (3, Ev::Enqueue(5)),
+                    (4, Ev::Enqueue(6)),
+                    (5, Ev::Enqueue(7)),
+                    (6, Ev::Restore(0)),
+                    (7, Ev::Restore(1)),
+                ],
+                "rank {rank}"
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_schedule_never_skips_a_restore_or_overwrites_before_the_lent_moe() {
+        let plan = borrowed_plan();
+        let lent = plan.stage_borrow_layers().unwrap();
+        let full = unit_stage_slots(&plan, 0, 8, &[5]);
+        // Parities with no staged layer (odd layers all resident) and a plan whose even chain is
+        // cut short, besides the full chain, at every abort point of the forward.
+        let even_only: Vec<Option<usize>> = full
+            .iter()
+            .enumerate()
+            .map(|(layer, slot)| slot.filter(|_| layer % 2 == 0))
+            .collect();
+        let none: Vec<Option<usize>> = vec![None; 8];
+        for slots in [&full, &even_only, &none] {
+            for upto in 0..=8 {
+                let events = simulate_borrowed_forward(slots, lent, upto);
+                for parity in 0..2 {
+                    let enqueues: Vec<usize> = events
+                        .iter()
+                        .filter_map(|&(_, ev)| match ev {
+                            Ev::Enqueue(next) if next % 2 == parity => Some(next),
+                            _ => None,
+                        })
+                        .collect();
+                    let restores = events
+                        .iter()
+                        .filter(|(_, ev)| {
+                            matches!(ev, Ev::Restore(p) | Ev::JoinRestore(p) if *p == parity)
+                        })
+                        .count();
+                    // Anything that overwrote a lent layer is restored exactly once, by the
+                    // last staged layer's step or by the join of an aborted forward.
+                    assert_eq!(
+                        restores,
+                        usize::from(!enqueues.is_empty()),
+                        "parity {parity} upto {upto}"
+                    );
+                    // Every staged layer is copied at most once, in layer order, and only
+                    // layers with a slot are ever copied.
+                    assert!(enqueues.windows(2).all(|pair| pair[0] + 2 == pair[1]));
+                    assert!(enqueues.iter().all(|&layer| slots[layer].is_some()));
+                    // The first overwrite of a parity comes after the lent layer's own MoE has
+                    // issued and freed its tensors.
+                    let first = events
+                        .iter()
+                        .position(|&(_, ev)| matches!(ev, Ev::Enqueue(n) if n % 2 == parity));
+                    if let Some(first) = first {
+                        let freed = events
+                            .iter()
+                            .position(|&(_, ev)| ev == Ev::Free(parity))
+                            .expect("a parity that overwrites its lent layer frees it first");
+                        assert!(freed < first, "parity {parity} upto {upto}");
+                        assert!(events[first].0 >= lent[parity], "parity {parity}");
+                        // A staged layer is never copied before the one two layers earlier ran.
+                        assert!(events[first].0 + 2 <= enqueues[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_plan_stages_every_layer_of_every_rank_through_the_two_lent_tensors() {
+        // The real geometry (48 layers x 512 experts x 2 ranks) under a pseudo-random ranking
+        // and 7 scratch donors: every host-bearing layer and donor must pack into the lent
+        // tensors of its rank, a mixed layer whatever its host count.
+        let g = EpUnitGeometry {
+            layers: 48,
+            experts_per_layer: 512,
+            ranks: 2,
+            gate_up_bytes: UNIT_GU as u64,
+            down_bytes: UNIT_DN as u64,
+        };
+        let mut state = 0x5EED_B0A2_0D1u64;
+        let mut order: Vec<u32> = (0..g.total_ids() as u32).collect();
+        for i in (1..order.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            order.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        let unit = g.unit_bytes();
+        let donors = [9usize, 14, 20, 27, 31, 38, 44];
+        for resident_units in [3_000u64, 8_700, 11_000] {
+            let budget = resident_units * unit
+                + 2 * 48 * VRAM_ARENA_TAIL_PAD_BYTES
+                + crate::expert_ep_units::ep_unit_stage_table_bytes(&g);
+            let Ok(staged) = crate::expert_ep_units::place_routed_experts_units_borrowed_staged(
+                &g,
+                EpRanking {
+                    rank: &order,
+                    counts: None,
+                    sha256: None,
+                },
+                &vec![budget; 2],
+                &donors,
+                true,
+            ) else {
+                continue;
+            };
+            let plan = staged.plan;
+            assert_eq!(plan.stage_borrow_layers(), Some([0, 1]));
+            for rank in 0..2 {
+                let caps = plan
+                    .stage_borrow_buffer_bytes(rank)
+                    .map(|bytes| bytes as usize);
+                assert_eq!(caps, LENT);
+                let slots = unit_stage_slots(&plan, rank, 48, &donors);
+                // The lent layers (and nothing before them) are never staged.
+                assert!(slots[0].is_none() && slots[1].is_none());
+                for (layer, slot) in slots.iter().enumerate() {
+                    if slot.is_none() {
+                        continue;
+                    }
+                    let regions = match plan.layer_state(rank, layer) {
+                        EpLayerState::Mixed { host, .. } => split_mixed_host_arena(
+                            0x10_0000_0000 * (layer + 1),
+                            host,
+                            UNIT_GU,
+                            UNIT_DN,
+                        )
+                        .to_vec(),
+                        // A host layer's aggregates and a donor's mirrors are two regions of
+                        // the whole layer's tensors.
+                        _ => vec![
+                            region(0x10_0000_0000 * (layer + 1), LENT[0]),
+                            region(0x10_0000_0000 * (layer + 1) + LENT[0], LENT[1]),
+                        ],
+                    };
+                    let layout = unit_stage_layout_bufs(&regions, caps).unwrap_or_else(|reason| {
+                        panic!("units {resident_units} rank {rank} layer {layer}: {reason}")
+                    });
+                    assert!(layout.used[0] <= caps[0] && layout.used[1] <= caps[1]);
+                    // A layer needing the schedule's parity buffer has a lent layer before it.
+                    assert!(layer > [0usize, 1][layer % 2]);
+                }
+            }
+        }
     }
 }

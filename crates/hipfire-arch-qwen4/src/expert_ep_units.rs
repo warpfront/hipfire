@@ -168,6 +168,10 @@ pub struct EpUnitPlan {
     /// Pooled counts mass of the units each rank keeps and of all units it owns.
     coverage: Vec<Option<(u64, u64)>>,
     rank_budget_bytes: Option<Vec<u64>>,
+    /// The two whole-resident layers (even, odd parity) a borrowed unit stage lends as its
+    /// parity buffers ([`place_routed_experts_units_borrowed_staged`]); `None` for every other
+    /// plan (the dedicated stage, or no unit stage).
+    stage_borrow: Option<[usize; 2]>,
 }
 
 impl EpUnitPlan {
@@ -435,6 +439,7 @@ pub fn place_routed_experts_units(
                 ranking_sha256: None,
                 coverage: vec![None; g.ranks],
                 rank_budget_bytes: None,
+                stage_borrow: None,
             })
         }
         EpUnitSource::Ranking {
@@ -455,7 +460,20 @@ pub fn place_routed_experts_units(
 /// ranking plan placed with no forced layer. Returns fewer than `count` layers only when the model
 /// has fewer.
 pub fn ep_unit_donor_layers(unforced: &EpUnitPlan, count: usize) -> Vec<usize> {
-    let mut layers: Vec<usize> = (0..unforced.geometry.layers).collect();
+    ep_unit_donor_layers_excluding(unforced, count, &[])
+}
+
+/// [`ep_unit_donor_layers`] that never picks a layer of `excluded`: the borrowed unit stage's two
+/// stage layers ([`EP_UNIT_STAGE_BORROW_LAYERS`]) are lent as stage buffers and must not also be
+/// scratch donors. Returns fewer than `count` layers when fewer remain.
+pub fn ep_unit_donor_layers_excluding(
+    unforced: &EpUnitPlan,
+    count: usize,
+    excluded: &[usize],
+) -> Vec<usize> {
+    let mut layers: Vec<usize> = (0..unforced.geometry.layers)
+        .filter(|layer| !excluded.contains(layer))
+        .collect();
     layers.sort_by_key(|&layer| {
         (
             std::cmp::Reverse(unforced.layer_resident_units(layer)),
@@ -604,6 +622,7 @@ fn place_ranking(
         ranking_sha256: ranking.sha256.map(str::to_owned),
         coverage,
         rank_budget_bytes: Some(rank_budget_bytes.to_vec()),
+        stage_borrow: None,
     })
 }
 
@@ -1298,6 +1317,66 @@ impl EpUnitPlan {
             .max()
             .unwrap_or(0)
     }
+
+    /// The two whole-resident layers a borrowed unit stage lends as its parity buffers (even
+    /// layer first), `None` for a plan with the dedicated stage or none.
+    pub fn stage_borrow_layers(&self) -> Option<[usize; 2]> {
+        self.stage_borrow
+    }
+
+    /// Bytes of the two tensors (compact gate/up, compact down) one lent stage layer of `rank`
+    /// holds: its owned experts' aggregates, the two buffers of a parity.
+    pub fn stage_borrow_buffer_bytes(&self, rank: usize) -> [u64; 2] {
+        let owned = self.geometry.owned_per_layer(rank) as u64;
+        [
+            owned * self.geometry.gate_up_bytes,
+            owned * self.geometry.down_bytes,
+        ]
+    }
+
+    /// The borrowed stage's lent bytes per parity (both tensors) of the largest rank.
+    fn stage_borrow_parity_bytes(&self) -> u64 {
+        (0..self.geometry.ranks)
+            .map(|rank| self.stage_borrow_buffer_bytes(rank).iter().sum::<u64>())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The invariants of a borrowed stage: the lent layers are `[even, odd]` trunk layers,
+    /// whole-resident on every rank (their own experts are what is lent and restored), and
+    /// precede every layer of their parity that needs staging (a lent layer's own MoE must have
+    /// read its tensors before the first staged copy overwrites them). `Ok` for a plan without a
+    /// borrowed stage.
+    pub fn check_stage_borrow(&self) -> Result<(), String> {
+        let Some(lent) = self.stage_borrow else {
+            return Ok(());
+        };
+        if lent[0] % 2 != 0 || lent[1] % 2 != 1 {
+            return Err(format!(
+                "EP unit stage: the lent layers {lent:?} are not an (even, odd) pair"
+            ));
+        }
+        for rank in 0..self.geometry.ranks {
+            for layer in lent {
+                if layer >= self.geometry.layers
+                    || self.layer_state(rank, layer) != EpLayerState::Resident
+                {
+                    return Err(format!(
+                        "EP unit stage: the lent layer {layer} is not a whole-resident trunk layer on rank {rank}"
+                    ));
+                }
+            }
+            for layer in 0..self.geometry.layers {
+                if self.stage_host_region_bytes(rank, layer) > 0 && layer <= lent[layer % 2] {
+                    return Err(format!(
+                        "EP unit stage: layer {layer} of rank {rank} needs staging but does not follow the lent layer {} of its parity",
+                        lent[layer % 2]
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The switches that decide whether an EP rank builds a unit stage.
@@ -1363,10 +1442,16 @@ pub fn ep_unit_stage_builds(stage_on: bool, plan: Option<&EpUnitPlan>, rank: usi
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EpUnitStageCharge {
     /// Payload capacity `C` of each of the two stage buffers (largest host
-    /// region of any layer of any rank); `0` when no stage is built.
+    /// region of any layer of any rank); `0` when no stage is built. A borrowed stage
+    /// ([`Self::borrowed`]) reports the lent bytes per parity (both lent tensors of the largest
+    /// rank), which are NOT charged.
     pub capacity: u64,
-    /// `2 * (C + pad)` plus the stage pointer tables; `0` when `capacity` is.
+    /// `2 * (C + pad)` plus the stage pointer tables; `0` when `capacity` is. A borrowed stage
+    /// charges only the pointer tables.
     pub bytes: u64,
+    /// The whole-resident layers lent as the parity buffers
+    /// ([`place_routed_experts_units_borrowed_staged`]); `None` for the dedicated stage.
+    pub borrowed: Option<[usize; 2]>,
 }
 
 /// Device bytes of the stage pointer tables of every trunk layer (two tables
@@ -1385,12 +1470,25 @@ fn ep_unit_stage_charge_for(capacity: u64, tables: u64) -> EpUnitStageCharge {
             .saturating_add(EP_UNIT_STAGE_PAD_BYTES)
             .saturating_mul(2)
             .saturating_add(tables),
+        borrowed: None,
     }
 }
 
 /// The stage VRAM of the FINAL `plan`: zero unless some rank builds a unit
-/// stage ([`ep_unit_stage_builds`]), else `C` = the plan's largest host region.
+/// stage ([`ep_unit_stage_builds`]), else `C` = the plan's largest host region. A plan with a
+/// borrowed stage ([`EpUnitPlan::stage_borrow_layers`]) charges only the stage pointer tables.
 pub fn ep_unit_plan_stage_charge(plan: &EpUnitPlan, stage_on: bool) -> EpUnitStageCharge {
+    if let Some(lent) = plan.stage_borrow {
+        return if stage_on {
+            EpUnitStageCharge {
+                capacity: plan.stage_borrow_parity_bytes(),
+                bytes: ep_unit_stage_table_bytes(plan.geometry()),
+                borrowed: Some(lent),
+            }
+        } else {
+            EpUnitStageCharge::default()
+        };
+    }
     let builds =
         (0..plan.geometry().ranks).any(|rank| ep_unit_stage_builds(stage_on, Some(plan), rank));
     if !builds {
@@ -1406,6 +1504,14 @@ pub fn ep_unit_plan_stage_charge(plan: &EpUnitPlan, stage_on: bool) -> EpUnitSta
 pub fn ep_unit_stage_receipt(stage: &EpUnitStageCharge) -> String {
     if stage.capacity == 0 {
         "stage none".to_string()
+    } else if let Some(lent) = stage.borrowed {
+        format!(
+            "stage borrowed from layers [{}, {}] ({} MiB lent per parity, {} KiB pointer tables charged)",
+            lent[0],
+            lent[1],
+            stage.capacity >> 20,
+            stage.bytes >> 10
+        )
     } else {
         format!(
             "stage {} MiB x 2 charged ({} MiB with tables)",
@@ -1542,6 +1648,68 @@ pub fn place_routed_experts_units_forced_staged(
                 .collect::<Vec<_>>(),
             forced_layers,
         )
+    })
+}
+
+/// The two whole-resident layers a borrowed unit stage lends as its parity buffers (even, odd):
+/// the first two trunk layers, which precede every layer that needs staging (a mixed or host
+/// layer, a scratch donor), so each lent layer's own MoE has read its tensors before the first
+/// staged copy overwrites them.
+pub const EP_UNIT_STAGE_BORROW_LAYERS: [usize; 2] = [0, 1];
+
+/// [`place_routed_experts_units_forced_staged`] with a BORROWED unit stage
+/// (`HIPFIRE_EP_UNIT_STAGE_BORROW=1`): instead of two dedicated stage buffers the stage lends two
+/// whole-resident layers, [`EP_UNIT_STAGE_BORROW_LAYERS`], as its parity buffers (their gate/up and
+/// down tensors are overwritten by staged copies after their own MoE and restored from pinned host
+/// copies). Those layers are forced whole-resident on every rank first and count against the budget
+/// like any resident layer; the dedicated stage charge is zero and only the stage pointer tables are
+/// charged. `scratch_donors` (the decoupled reserve's whole-layer donors) must not include a lent
+/// layer ([`ep_unit_donor_layers_excluding`]). Refuses when the stage is off, the model has no layer
+/// beyond the lent ones, a donor is a lent layer, or the plan is a whole-layer split (the donor
+/// stage serves it).
+pub fn place_routed_experts_units_borrowed_staged(
+    geometry: &EpUnitGeometry,
+    ranking: EpRanking<'_>,
+    rank_budget_bytes: &[u64],
+    scratch_donors: &[usize],
+    stage_on: bool,
+) -> Result<EpUnitStagedPlan, String> {
+    let lent = EP_UNIT_STAGE_BORROW_LAYERS;
+    if !stage_on {
+        return Err("EP unit stage: a borrowed stage needs the unit stage on".to_string());
+    }
+    if geometry.layers <= lent[1] + 1 {
+        return Err(format!(
+            "EP unit stage: a borrowed stage needs a layer beyond the lent layers {lent:?}, the model has {} layers",
+            geometry.layers
+        ));
+    }
+    if let Some(layer) = scratch_donors.iter().find(|layer| lent.contains(layer)) {
+        return Err(format!(
+            "EP unit stage: the scratch donor layer {layer} is a lent stage layer {lent:?}"
+        ));
+    }
+    let tables = ep_unit_stage_table_bytes(geometry);
+    let forced: Vec<usize> = lent.iter().chain(scratch_donors).copied().collect();
+    let budgets: Vec<u64> = rank_budget_bytes
+        .iter()
+        .map(|budget| budget.saturating_sub(tables))
+        .collect();
+    let mut plan = place_routed_experts_units_forced(geometry, ranking, &budgets, &forced)?;
+    if ep_unit_stage_kind(Some(&plan)) != EpUnitStageKind::Units {
+        return Err(
+            "EP unit stage: the plan is a whole-layer split, which takes the donor stage"
+                .to_string(),
+        );
+    }
+    plan.stage_borrow = Some(lent);
+    plan.check_stage_borrow()?;
+    let stage = ep_unit_plan_stage_charge(&plan, true);
+    Ok(EpUnitStagedPlan {
+        plan,
+        stage,
+        iterations: 1,
+        converged: true,
     })
 }
 
@@ -2897,6 +3065,7 @@ mod ep_unit_stage_tests {
         let charge = EpUnitStageCharge {
             capacity: 640 << 20,
             bytes: (1280 << 20) + 8192,
+            borrowed: None,
         };
         let line = ep_unit_stage_receipt(&charge);
         assert!(line.starts_with("stage 640 MiB x 2 charged"), "{line}");

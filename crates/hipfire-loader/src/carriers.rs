@@ -3356,22 +3356,36 @@ pub fn qwen4_ep_vram_layers(
                             } else {
                                 Vec::new()
                             };
-                        qwen4_ep_units_donor_plan(&Qwen4EpUnitsDonorInputs {
-                            path,
-                            base: &base,
-                            dims,
-                            config: &config,
-                            ranks,
-                            free_per_rank,
-                            non_expert,
-                            stacks: &stacks,
-                            stage_on,
-                            suffix,
-                            lane_bytes,
-                            host: &attempt.host,
-                            shadow_bytes: &shadow_bytes,
-                            reserve_no_shadows: attempt.decoupled_reserve_no_shadows,
-                        })
+                        let borrow_on = qwen4_ep_unit_stage_borrow_on();
+                        let run = |stage_borrow: bool| {
+                            qwen4_ep_units_donor_plan(&Qwen4EpUnitsDonorInputs {
+                                path,
+                                base: &base,
+                                dims,
+                                config: &config,
+                                ranks,
+                                free_per_rank,
+                                non_expert,
+                                stacks: &stacks,
+                                stage_on,
+                                suffix,
+                                lane_bytes,
+                                host: &attempt.host,
+                                stage_borrow,
+                                shadow_bytes: &shadow_bytes,
+                                reserve_no_shadows: attempt.decoupled_reserve_no_shadows,
+                            })
+                        };
+                        if borrow_on {
+                            run(true).or_else(|why| {
+                                eprintln!(
+                                    "qwen4 EP unit stage: borrowed stage not applied ({why}); the dedicated unit stage is planned instead"
+                                );
+                                run(false)
+                            })
+                        } else {
+                            run(false)
+                        }
                     });
                     match planned {
                         Ok(done) => Some(done),
@@ -3436,10 +3450,16 @@ pub fn qwen4_ep_vram_layers(
                         stacks,
                         stage_on,
                         &[],
+                        false,
                     )?
                 }
             };
-            if staged.stage.capacity > 0 {
+            if let Some(lent) = staged.stage.borrowed {
+                eprintln!(
+                    "qwen4 EP expert stage: borrowed from whole-resident layers {lent:?} (parity buffers = their gate/up + down tensors, restored from pinned copies) + {} KiB pointer tables charged to every rank before the ranking walk; no dedicated stage buffers",
+                    staged.stage.bytes >> 10
+                );
+            } else if staged.stage.capacity > 0 {
                 eprintln!(
                     "qwen4 EP expert stage: {} MiB x 2 dedicated stage buffers + {} KiB pointer tables charged to every rank before the ranking walk ({} placements, {})",
                     staged.stage.capacity >> 20,
@@ -3478,6 +3498,34 @@ fn qwen4_ep_unit_reserve_on() -> bool {
             .as_deref(),
         hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
     )
+}
+
+/// `HIPFIRE_EP_UNIT_STAGE_BORROW=1` (with `HIPFIRE_EP_UNIT_RESERVE=1`): the unit stage lends two
+/// whole-resident layers as its parity buffers instead of two dedicated VRAM buffers.
+const QWEN4_EP_UNIT_STAGE_BORROW_ENV: &str = "HIPFIRE_EP_UNIT_STAGE_BORROW";
+
+fn qwen4_ep_unit_stage_borrow_on() -> bool {
+    hipfire_config::developer_var(QWEN4_EP_UNIT_STAGE_BORROW_ENV).as_deref() == Ok("1")
+}
+
+/// Pinned host bytes of the restore copies a borrowed unit stage keeps for `rank`: both
+/// tensors (gate/up, down) of each of the two lent layers plus the four allocation pads
+/// (`expert_stage_mirror_bytes(layer_bytes, 1)`'s formula); `0` without a borrowed stage.
+fn qwen4_unit_borrow_restore_bytes(
+    plan: &hipfire_arch_qwen4::expert_ep_units::EpUnitPlan,
+    rank: usize,
+) -> u64 {
+    let Some(lent) = plan.stage_borrow_layers() else {
+        return 0;
+    };
+    let [gate_up, down] = plan.stage_borrow_buffer_bytes(rank);
+    (gate_up.saturating_add(down))
+        .saturating_mul(lent.len() as u64)
+        .saturating_add(
+            (lent.len() as u64)
+                .saturating_mul(2)
+                .saturating_mul(hipfire_arch_qwen4::expert_residency::HOST_MAPPED_PAD_BYTES),
+        )
 }
 
 /// The per-expert plan sidecar of this load, or `None` for today's whole-layer placement.
@@ -3618,6 +3666,7 @@ fn qwen4_ep_unit_plan(
     stacks: (Vec<u64>, Vec<u64>),
     stage_on: bool,
     forced_layers: &[usize],
+    stage_borrow: bool,
 ) -> Result<hipfire_arch_qwen4::expert_ep_units::EpUnitStagedPlan, String> {
     use hipfire_arch_qwen4::expert_ep_units as units;
     let flag = units::EP_EXPERT_HOTSET_ENV;
@@ -3645,17 +3694,30 @@ fn qwen4_ep_unit_plan(
             units::EP_UNIT_BUDGET_DELTA_ENV
         );
     }
+    let ranking = units::EpRanking {
+        rank: sidecar.rank(),
+        counts: Some(sidecar.counts()),
+        sha256: Some(sidecar.sha256()),
+    };
+    let budgets = units::ep_unit_apply_budget_delta(
+        units::ep_unit_rank_budgets(free_per_rank, non_expert, reserve_total),
+        budget_delta_mib,
+    );
+    if stage_borrow {
+        // `forced_layers` are the scratch donors; the planner forces the two lent stage layers.
+        return units::place_routed_experts_units_borrowed_staged(
+            &geometry,
+            ranking,
+            &budgets,
+            forced_layers,
+            stage_on,
+        )
+        .map_err(|error| format!("qwen4: {flag}: {error}"));
+    }
     units::place_routed_experts_units_forced_staged(
         &geometry,
-        units::EpRanking {
-            rank: sidecar.rank(),
-            counts: Some(sidecar.counts()),
-            sha256: Some(sidecar.sha256()),
-        },
-        &units::ep_unit_apply_budget_delta(
-            units::ep_unit_rank_budgets(free_per_rank, non_expert, reserve_total),
-            budget_delta_mib,
-        ),
+        ranking,
+        &budgets,
         forced_layers,
         stage_on,
     )
@@ -3678,6 +3740,10 @@ struct Qwen4EpUnitsDonorInputs<'a> {
     suffix: &'a hipfire_arch_qwen4::ep_reserve::EpReservePlan,
     lane_bytes: u64,
     host: &'a Qwen4EpReserveHost<'a>,
+    /// `HIPFIRE_EP_UNIT_STAGE_BORROW=1`: the unit stage lends two whole-resident layers
+    /// ([`hipfire_arch_qwen4::expert_ep_units::EP_UNIT_STAGE_BORROW_LAYERS`]) instead of two
+    /// dedicated buffers; the scratch donors never include them.
+    stage_borrow: bool,
     /// The weight-shadow members (`decode_share_shadows::plan_shadow_region(..).spans()` order,
     /// bytes each) the donor segments host beside the scratch roots
     /// ([`qwen4_ep_shadow_member_bytes`]). Empty: no shadow applies on this arch/config and the
@@ -3728,7 +3794,7 @@ fn qwen4_ep_units_donor_plan(
         .ok_or("the decoupled reserve plus the lane store overflows")?;
     let geometry = ep::EpRankGeometry::flash_next(input.config, input.ranks)
         .ok_or("the rank geometry overflows")?;
-    let plan_with = |forced: &[usize]| {
+    let plan_with = |forced: &[usize], borrow: bool| {
         qwen4_ep_unit_plan(
             input.path,
             input.base,
@@ -3740,12 +3806,19 @@ fn qwen4_ep_units_donor_plan(
             input.stacks.clone(),
             input.stage_on,
             forced,
+            borrow,
         )
     };
-    // The unforced plan ranks the layers; the donor count is the shortest prefix of that
-    // preference order whose whole layers pack the reserve's remaining roots.
-    let unforced = plan_with(&[])?;
-    let candidates = units::ep_unit_donor_layers(&unforced.plan, geometry.trunk_layers);
+    // The unforced plan (dedicated stage) ranks the layers; the donor count is the shortest
+    // prefix of that preference order whose whole layers pack the reserve's remaining roots.
+    let unforced = plan_with(&[], false)?;
+    let lent = if input.stage_borrow {
+        hipfire_arch_qwen4::expert_ep_units::EP_UNIT_STAGE_BORROW_LAYERS.to_vec()
+    } else {
+        Vec::new()
+    };
+    let candidates =
+        units::ep_unit_donor_layers_excluding(&unforced.plan, geometry.trunk_layers, &lent);
     let probe_capacity = ep::EpReserveCapacity {
         free_per_rank: input.free_per_rank.to_vec(),
         non_expert_bytes: input.non_expert,
@@ -3764,7 +3837,7 @@ fn qwen4_ep_units_donor_plan(
     )
     .map_err(|refusal| format!("qwen4: {refusal}"))?;
     let forced: Vec<usize> = candidates[..probe.donor_layers.len()].to_vec();
-    let staged = plan_with(&forced)?;
+    let staged = plan_with(&forced, input.stage_borrow)?;
     for rank in 0..input.ranks {
         let resident = staged.plan.whole_resident_layers(rank);
         if let Some(layer) = forced.iter().find(|layer| !resident.contains(layer)) {
@@ -3774,7 +3847,9 @@ fn qwen4_ep_units_donor_plan(
         }
     }
     let host_experts = (0..input.ranks).fold(0u64, |total, rank| {
-        total.saturating_add(staged.plan.host_pinned_bytes(rank))
+        total
+            .saturating_add(staged.plan.host_pinned_bytes(rank))
+            .saturating_add(qwen4_unit_borrow_restore_bytes(&staged.plan, rank))
     });
     let allowance = qwen4_ep_reserve_host_allowance(input.host)?;
     let capacity = ep::EpReserveCapacity {
@@ -6372,7 +6447,10 @@ fn load_qwen4_rank_unscoped(
     };
     let ep_reserve_mirror_bytes = ep_reserve
         .as_deref()
-        .map_or(0, qwen4_ep_reserve_mirror_host_bytes);
+        .map_or(0, qwen4_ep_reserve_mirror_host_bytes)
+        .saturating_add(ep_units.as_deref().map_or(0, |units| {
+            qwen4_unit_borrow_restore_bytes(units, ep.map_or(0, |placement| placement.rank))
+        }));
     // Freeze the original capacity inputs before placement, materialization or
     // capture growth. Pool readings are separate instants, not a free-memory
     // delta and not evidence of an old model's original preload basis.
@@ -17220,6 +17298,7 @@ mod ep_unit_plan_tests {
             (vec![512 * 1_740_800; 48], vec![512 * 870_400; 48]),
             true,
             &[],
+            false,
         )
         .unwrap_err();
         assert!(

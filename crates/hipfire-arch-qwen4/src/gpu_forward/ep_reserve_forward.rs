@@ -518,7 +518,8 @@ impl EpStageHostSources {
 pub(crate) struct EpReserveStageFacts {
     /// The stage's first host (staged) layer.
     pub first_host: usize,
-    /// The stage's S2 donor layers (the unit stage has none: `[usize::MAX; 2]`).
+    /// The stage's S2 donor layers (the dedicated unit stage has none: `[usize::MAX; 2]`; a
+    /// borrowed unit stage names its two lent layers, which must not be scratch donors).
     pub donors: [usize; 2],
     pub min_rows: usize,
     /// The stage reads every plan donor layer from its own unit-stage slot.
@@ -536,6 +537,16 @@ pub(crate) fn ep_reserve_stage_refusal(
 ) -> Option<String> {
     let rows_bad = stage.min_rows <= resident_rows;
     if plan.explicit_donors {
+        let lent_donor = plan
+            .donor_layers
+            .iter()
+            .find(|layer| stage.donors.contains(layer));
+        if let Some(layer) = lent_donor {
+            return Some(format!(
+                "EP reserve stage mismatch: scratch donor layer {layer} is also a lent stage layer {:?}",
+                stage.donors
+            ));
+        }
         if rows_bad || !stage.serves_donor_layers {
             return Some(format!(
                 "EP reserve stage mismatch: the unit stage serves the scratch donors {:?}: {} / \
@@ -2485,6 +2496,26 @@ mod tests {
             &facts(0, [usize::MAX; 2], RESIDENT, true)
         )
         .is_some());
+    }
+
+    #[test]
+    fn a_borrowed_unit_stage_never_lends_a_scratch_donor() {
+        let plan = explicit_plan();
+        let facts = |donors| EpReserveStageFacts {
+            first_host: 2,
+            donors,
+            min_rows: 4096,
+            serves_donor_layers: true,
+        };
+        // Lent layers 0 and 1 are not scratch donors of this plan: admitted.
+        assert_eq!(
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts([0, 1])),
+            None
+        );
+        // A lent layer that is also a scratch donor would be overwritten while it is scratch.
+        let text = ep_reserve_stage_refusal(&plan, RESIDENT, &facts([2, 3]))
+            .expect("a lent scratch donor is refused");
+        assert!(text.contains("scratch donor layer 3"), "{text}");
     }
 
     #[test]

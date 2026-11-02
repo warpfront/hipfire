@@ -6053,7 +6053,10 @@ pub(crate) struct Qwen4ExpertStage {
     /// dedicated VRAM buffers (in `mirrors`) or, when `borrowed`, two
     /// resident slab layers (`donors`, `donor_views`) restored from pinned
     /// copies in `mirrors`. A per-expert tier stage and an EP unit stage
-    /// (`new_units`) are dedicated-buffer stages with per-layer slots.
+    /// (`new_units`) are dedicated-buffer stages with per-layer slots; a unit stage over a plan
+    /// with a borrowed stage (`EpUnitPlan::stage_borrow_layers`) is a `borrowed` tier-shaped
+    /// stage: `donors` are its two lent layers, `donor_views`/`mirrors` hold two tensors
+    /// (gate/up, down) per parity.
     slab: Option<slab_stage::SlabStageMeta>,
 }
 
