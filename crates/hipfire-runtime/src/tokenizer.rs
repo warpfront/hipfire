@@ -59,7 +59,12 @@ const RAON_PRETOK_RUST_REGEX: &str = r" ?[一-龥぀-ゟ゠-ヿ]+| ?(?:[\p{L}--[
 const RAON_PRETOK_MARKER: &str = "[一-龥";
 
 fn raon_like(pattern: &str) -> bool {
-    pattern.contains(RAON_PRETOK_MARKER) && (pattern.contains("(?!") || pattern.contains("(?="))
+    // The general path emulates the `\s+(?!\S)|` tail itself; any other lookaround needs Raon.
+    let rest = pattern.replace(WS_LOOKAHEAD_ALT, "");
+    pattern.contains(RAON_PRETOK_MARKER)
+        && ["(?=", "(?!", "(?<=", "(?<!"]
+            .iter()
+            .any(|l| rest.contains(l))
 }
 
 /// Bookkeeping for the emulated `\s+(?!\S)` alternative.
@@ -307,8 +312,10 @@ fn default_pretokenizer() -> &'static Gpt2Pretokenizer {
 /// honored whole or not at all. Other stage types (`ByteLevel`,
 /// string-pattern `Split`, …) are ignored, as before.
 ///
-/// A chain containing the Raon CJK-class regex is exact-or-error: any other
-/// behavior/invert or an inexact pattern text is `Err`, never the fallback.
+/// A `Split` regex with the Raon CJK class and a lookaround other than the
+/// `\s+(?!\S)` tail (see `raon_like`) is exact-or-error: anything but the
+/// exact Raon pattern with `Isolated`/`invert=false` is `Err`, never the
+/// fallback. A CJK class without such lookaround takes the general path.
 fn pretokenizer_from_hf_json(
     pre: &serde_json::Value,
 ) -> Result<Option<Gpt2Pretokenizer>, TokenizerError> {
@@ -332,7 +339,7 @@ fn pretokenizer_from_hf_json(
                     if re != RAON_PRETOK_PATTERN || (behavior, invert) != (Some("Isolated"), false)
                     {
                         *fatal = Some(format!(
-                            "CJK-class Split is only supported as the exact Raon pattern with \
+                            "CJK-class Split with lookaround is only supported as the exact Raon pattern with \
                              behavior=Isolated invert=false (got behavior={behavior:?}, \
                              invert={invert}, exact_pattern={})",
                             re == RAON_PRETOK_PATTERN
@@ -5018,6 +5025,29 @@ mod raon_pretok_tests {
         .expect("DS4 pre-tokenizer selected");
         assert_eq!(pre.splitters.len(), 2);
         assert!(pre.splitters[1].number_groups.is_none());
+    }
+
+    /// A CJK class with only the general `\s+(?!\S)|\s+` tail stays on the
+    /// general path; any other lookaround (lookbehind included) is refused,
+    /// never the canonical fallback.
+    #[test]
+    fn cjk_split_lookaround_needs_raon() {
+        let ws = r"[一-龥぀-ゟ゠-ヿ]+| ?\p{L}+|\p{N}{1,3}|\s*[\r\n]+|\s+(?!\S)|\s+";
+        let pre = pretokenizer_from_hf_json(&split_node(ws, "Isolated", false)).unwrap();
+        assert!(pre.expect("general path").splitters[0].ws_tail.is_some());
+        for re in [
+            r"(?<![A-Za-z])[一-龥぀-ゟ゠-ヿ]+",
+            r"[一-龥぀-ゟ゠-ヿ]+(?=\p{N})",
+            r"(?:(?![一-龥])\p{L})+|[一-龥]+",
+        ] {
+            assert!(
+                matches!(
+                    pretokenizer_from_hf_json(&split_node(re, "Isolated", false)),
+                    Err(TokenizerError::UnsupportedPreTokenizer { .. })
+                ),
+                "{re}"
+            );
+        }
     }
 
     fn hf_path() -> Option<std::path::PathBuf> {

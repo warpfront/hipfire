@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **Fixed: DeepSeek V4 loads again (broken since `6001ffbe8`, including v0.4.5: `unsupported pre_tokenizer: CJK-class Split is only supported as the exact Raon pattern`).** The Raon exact-or-error rule now applies only to a CJK-class `Split` regex with a lookaround other than the general `\s+(?!\S)` tail; DeepSeek's plain `[一-龥぀-ゟ゠-ヿ]+` Split takes the general path again. DS4 token ids and `config_digest` equal `7b06705f1`; Raon is unchanged.
 - **Perf (default on, exact gfx1201 Flash-Next EP2 trunk shard, `HIPFIRE_QWEN4_TRUNK_A8_X4_SHARD=0` kills; existing entry and its Route-A twin, byte-identical): the trunk-shard GDN group at 17..=32 verify rows runs as one `m32n32_x4` launch instead of four singles.** The shard group (`qkv` 5120 \| `z` 3072 \| `a` 24 \| `b` 24 rows, K 2560) took the single-matrix rule of its largest member, `m64n32`, which has no x4 entry; the multi-part rule now takes `gemm_mq6sym_i8_set_m32n32_x4_gfx1201` for a largest member of 5120..=6143 rows.
   - Kernel bench (R9700 C, cold rotating weights, fabric j8784, unconfounded): four singles 61.3-64.5 us -> one x4 launch 40.6-41.2 us per GDN layer at 17..32 rows; byte check 0 mismatching words of 100.8M.
   - Identity (EP2 A,C, fabric j8795, unconfounded): lane oracle IDS_EQUAL, 32/32 verify dumps byte-equal (1,174,199,924 bytes), served C1 replies byte-equal, served A/B 0 unexplained diffs. Lane trace: `m32n32_x4` 120 -> 480, `m64n32` 960 -> 96, `m64n16y` 960 -> 384 launches.
