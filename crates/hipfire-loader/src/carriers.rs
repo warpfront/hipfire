@@ -3125,7 +3125,7 @@ pub fn qwen4_ep_vram_layers(
             spans.ranks(),
             1,
         ))
-            .map_err(|error| format!("qwen4: {error}"))?;
+        .map_err(|error| format!("qwen4: {error}"))?;
     }
     let unit_reserve = units_path.is_some() && qwen4_ep_unit_reserve_on();
     let request = if units_path.is_some() && !unit_reserve && request.attempts() {
