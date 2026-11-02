@@ -4180,12 +4180,22 @@ fn gpu_block_attractor_token(
 fn acquire_daemon_lock() -> std::fs::File {
     use std::io::{Seek, Write};
 
+    // HIPFIRE_HOME-aware (Phase 5d VRAM coexistence): two serve processes
+    // (small + omni) each spawn a daemon, and the singleton lock must be
+    // per-instance, not per-HOME. HIPFIRE_HOME is the CLI's own root override
+    // (hipfire-config Paths), so the daemon honors the same variable.
     #[cfg(unix)]
-    let home = std::env::var("HOME").expect("HOME environment variable not set");
+    let home = match std::env::var("HIPFIRE_HOME") {
+        Ok(dir) if !dir.is_empty() => dir,
+        _ => std::env::var("HOME").expect("HOME environment variable not set"),
+    };
     #[cfg(windows)]
-    let home = std::env::var("USERPROFILE").expect("USERPROFILE environment variable not set");
+    let home = match std::env::var("HIPFIRE_HOME") {
+        Ok(dir) if !dir.is_empty() => dir,
+        _ => std::env::var("USERPROFILE").expect("USERPROFILE environment variable not set"),
+    };
 
-    let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
+    let hipfire_dir = std::path::PathBuf::from(&home).join(".hipfire");
     std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
     let pid_path = hipfire_dir.join("daemon.pid");
 
