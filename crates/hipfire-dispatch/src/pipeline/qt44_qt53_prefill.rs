@@ -1861,7 +1861,6 @@ pub(crate) fn tile_mask(
             "qt44 tile mask: the owner-routed chunk exchange needs the symmetric IU4 arm or the F16 WMMA grouped route".into(),
         ));
     }
-    tile_exchange_eager_only(gpu, "mask")?;
     let (rank, table, n_exp) = tx.exchange.owners();
     if n_exp != p.n_exp {
         return Err(DispatchError::Hip(format!(
@@ -1869,14 +1868,56 @@ pub(crate) fn tile_mask(
             p.n_exp
         )));
     }
+    let tiles = grouped_tiles(grouped_rows);
+    let mask_only = tx.exchange.mask_only();
+    if !mask_only {
+        tile_exchange_eager_only(gpu, "mask")?;
+    }
     hip(gpu.ep_tile_mask(
         p.expert_tile_ids,
         tx.tile_ids_owned,
         table,
-        grouped_tiles(grouped_rows),
+        tiles,
         n_exp,
         rank,
-    ))
+    ))?;
+    if mask_only {
+        // Partial mask (trunk shard): the masked tiles' grouped down rows are never written
+        // (the GEMMs exit on the sentinel) and nothing is pulled into them, so they must read
+        // as exact +0 BF16 rows, what the zero-dummy-table route wrote. Owned tiles overwrite
+        // their rows in the down GEMM that follows.
+        zero_grouped_down(gpu, p, grouped_rows)?;
+    }
+    Ok(())
+}
+
+/// Bytes of the BF16 grouped down rows `[grouped_rows, down_m]` the partial mask clears.
+fn grouped_down_bytes(grouped_rows: usize, down_m: usize) -> Option<usize> {
+    grouped_rows
+        .checked_mul(down_m)?
+        .checked_mul(std::mem::size_of::<u16>())
+}
+
+/// Stream-ordered zero fill of `y_down_grouped[..grouped_rows]` (BF16 rows).
+fn zero_grouped_down(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    let bytes = grouped_down_bytes(grouped_rows, p.down_m)
+        .filter(|&bytes| bytes <= p.y_down_grouped.buf.size())
+        .ok_or_else(|| {
+            DispatchError::Hip(format!(
+                "qt44 tile mask: {grouped_rows} grouped rows of {} BF16 exceed the grouped down buffer",
+                p.down_m
+            ))
+        })?;
+    match gpu.active_stream.as_ref() {
+        Some(stream) => hip(gpu
+            .hip
+            .memset_async(&p.y_down_grouped.buf, 0, bytes, stream)),
+        None => hip(gpu.hip.memset(&p.y_down_grouped.buf, 0, bytes)),
+    }
 }
 
 /// Owner-routed EP chunk MoE, between the mutation fence and the combine: fill every
@@ -2338,7 +2379,7 @@ fn down_stage(
                 grouped_rows,
                 total_slots,
             ))?;
-            if let Some(tx) = p.ep_tile_exchange {
+            if let Some(tx) = p.ep_tile_exchange.filter(|tx| !tx.exchange.mask_only()) {
                 tx.exchange
                     .before_down(gpu)
                     .map_err(|error| DispatchError::Hip(format!("qt44 tile exchange: {error}")))?;
@@ -2366,7 +2407,7 @@ fn down_stage(
             grouped_rows,
             total_slots,
         ))?;
-        if let Some(tx) = p.ep_tile_exchange {
+        if let Some(tx) = p.ep_tile_exchange.filter(|tx| !tx.exchange.mask_only()) {
             // The peer reads this rank's `y_down_grouped` between its producer
             // and completion events of the previous layer's exchange: no write
             // before its pull completed.
@@ -2409,7 +2450,7 @@ fn down_stage(
         } else {
             hip(gpu.rotate_x_mq_128_v2_f16(p.rot_batch, p.mi, total_slots))?
         };
-        if let Some(tx) = p.ep_tile_exchange {
+        if let Some(tx) = p.ep_tile_exchange.filter(|tx| !tx.exchange.mask_only()) {
             // The peer reads this rank's `y_down_grouped` between its producer and
             // completion events of the previous layer's exchange: no write before its
             // pull completed.
@@ -4504,5 +4545,127 @@ mod hc_ar_tests {
         assert_eq!((local.rows, local.hidden), (rows, 2560));
         assert!(local.state_bf16 && local.row_fold.is_none());
         assert!(HcSharedDown::offer(&write(Some(&NoReduce))).is_none());
+    }
+}
+
+#[cfg(test)]
+mod partial_mask_tests {
+    use super::*;
+
+    /// The kernel law of `ep_tile_mask_pm_*` (the G1 runner's CPU reference):
+    /// `owned[t] = 0 <= id < n && owner[id] == rank ? id : -1`.
+    fn mask(ids: &[i32], owners: &[i32], rank: i32) -> Vec<i32> {
+        ids.iter()
+            .map(|&id| match usize::try_from(id) {
+                Ok(e) if e < owners.len() && owners[e] == rank => id,
+                _ => -1,
+            })
+            .collect()
+    }
+
+    /// The grouped layout's tile ids: one 16-row tile per started 16 slots of each expert in
+    /// ascending expert order, then the `-1` padding tail to `capacity` tiles.
+    fn tile_ids(counts: &[usize], capacity: usize) -> Vec<i32> {
+        let mut ids: Vec<i32> = Vec::new();
+        for (expert, &count) in counts.iter().enumerate() {
+            ids.extend(std::iter::repeat(expert as i32).take(count.div_ceil(16)));
+        }
+        assert!(ids.len() <= capacity);
+        ids.resize(capacity, -1);
+        ids
+    }
+
+    fn live(ids: &[i32]) -> usize {
+        ids.iter().filter(|&&id| id >= 0).count()
+    }
+
+    #[test]
+    fn owned_only_tile_counts_partition_the_unmasked_tiles_static_owners() {
+        let counts: Vec<usize> = (0..16).map(|e| (e * 7 + 3) % 40).collect();
+        let ids = tile_ids(&counts, 96);
+        let owners: Vec<i32> = (0..16).map(|e| e % 2).collect();
+        let (r0, r1) = (mask(&ids, &owners, 0), mask(&ids, &owners, 1));
+        // Each rank keeps exactly the tiles of its experts and nothing else.
+        for (rank, owned) in [(0usize, &r0), (1, &r1)] {
+            let expect: usize = counts
+                .iter()
+                .enumerate()
+                .filter(|(e, _)| e % 2 == rank)
+                .map(|(_, &c)| c.div_ceil(16))
+                .sum();
+            assert_eq!(live(owned), expect, "rank {rank}");
+        }
+        // The two ranks' tile sets partition the unmasked live tiles (nothing computed twice).
+        assert_eq!(live(&r0) + live(&r1), live(&ids));
+        for t in 0..ids.len() {
+            assert_eq!(
+                [r0[t], r1[t]].iter().filter(|&&id| id >= 0).count(),
+                usize::from(ids[t] >= 0)
+            );
+            for owned in [&r0, &r1] {
+                assert!(owned[t] == ids[t] || owned[t] == -1);
+            }
+        }
+        // Routed work per rank drops to the owned share, strictly below the unmasked count.
+        assert!(live(&r0) < live(&ids) && live(&r1) < live(&ids));
+    }
+
+    #[test]
+    fn balanced_owner_tables_mask_by_the_table_not_by_parity() {
+        let counts = vec![33, 1, 16, 17, 0, 48, 5, 5];
+        let ids = tile_ids(&counts, 24);
+        // Balanced assignment: rank 0 owns the heavy experts 0, 2, 5.
+        let owners = [0, 1, 0, 1, 1, 0, 1, 1];
+        let r0 = mask(&ids, &owners, 0);
+        assert_eq!(
+            r0.iter()
+                .filter(|&&id| id >= 0)
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 0, 0, 2, 5, 5, 5]
+        );
+        let r1 = mask(&ids, &owners, 1);
+        assert_eq!(live(&r0) + live(&r1), live(&ids));
+        // A layer with every expert on one rank: the other rank launches no tile at all.
+        let all_zero = [0; 8];
+        assert_eq!(live(&mask(&ids, &all_zero, 1)), 0);
+        assert_eq!(live(&mask(&ids, &all_zero, 0)), live(&ids));
+    }
+
+    #[test]
+    fn an_all_non_owned_routing_masks_every_tile_and_padding_stays_sentinel() {
+        // Every token routed to odd experts: rank 0 owns none of them.
+        let counts: Vec<usize> = (0..8).map(|e| if e % 2 == 1 { 20 } else { 0 }).collect();
+        let ids = tile_ids(&counts, 12);
+        let owners: Vec<i32> = (0..8).map(|e| e % 2).collect();
+        let r0 = mask(&ids, &owners, 0);
+        assert!(r0.iter().all(|&id| id == -1), "{r0:?}");
+        // Padding tiles and out-of-table ids are never live.
+        let odd = [-1, 99, i32::MAX, i32::MIN, 3];
+        assert_eq!(mask(&odd, &owners, 1), [-1, -1, -1, -1, 3]);
+    }
+
+    #[test]
+    fn host_mapped_and_unit_layers_mask_alike() {
+        // The mask reads only the tile id and the owner table: a host-mapped layer (wider
+        // expert-run tile in the GEMM) and a one-expert unit layer produce the same
+        // ownership partition.
+        for experts in [1usize, 2, 3, 8] {
+            let counts: Vec<usize> = (0..experts).map(|e| 16 * (e + 1)).collect();
+            let ids = tile_ids(&counts, 64);
+            let owners: Vec<i32> = (0..experts as i32).map(|e| e % 2).collect();
+            assert_eq!(
+                live(&mask(&ids, &owners, 0)) + live(&mask(&ids, &owners, 1)),
+                live(&ids)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_fill_covers_exactly_the_grouped_bf16_rows() {
+        assert_eq!(grouped_down_bytes(16, 4096), Some(16 * 4096 * 2));
+        assert_eq!(grouped_down_bytes(0, 4096), Some(0));
+        assert_eq!(grouped_down_bytes(usize::MAX, 2), None);
+        assert_eq!(grouped_tiles(33), 3);
     }
 }

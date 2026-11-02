@@ -3645,18 +3645,21 @@ fn ep_lever_on(value: Option<&str>) -> bool {
 
 /// Whether an EP load admits the owner-routed tile route object (its buffers, the transport
 /// every rank registers with, the host rendezvous the EP reserve crosses): the lever (default
-/// on, exact `0` off) and, with the trunk shard, only on a reserve-sharing load. The shard's
-/// FFN of every forward is this rank's partial reduced by the fused all-reduce of its HC
-/// write, and the owner-routed tile exchange completes the routed FFN on every rank (it would
-/// double the routed half in the reduction), so under the shard the route is admitted solely as
-/// the reserve's rendezvous carrier: its chunk exchange never runs, the partial chunk route
-/// takes every wide call (`forward_chunk_tile`).
+/// on, exact `0` off) and, with the trunk shard, only where something uses it: a reserve-sharing
+/// load (the reserve's rendezvous carrier) or the partial tile mask (`pmask`, default on under
+/// the shard: [`trunk_shard_pmask_env_on`]). The shard's FFN of every forward is this rank's
+/// partial reduced by the fused all-reduce of its HC write, and the owner-routed tile exchange
+/// completes the routed FFN on every rank (it would double the routed half in the reduction), so
+/// under the shard the route's chunk exchange NEVER runs: the partial chunk route takes every wide
+/// call (`forward_chunk_tile`), and with the mask it drops the non-owned experts' tiles through
+/// the route's owner table.
 fn ep_owner_routed_prefill_on(
     value: Option<&str>,
     trunk_shard: bool,
     reserve_sharing: bool,
+    pmask: bool,
 ) -> bool {
-    ep_lever_on(value) && (!trunk_shard || reserve_sharing)
+    ep_lever_on(value) && (!trunk_shard || reserve_sharing || pmask)
 }
 
 fn qwen4_ep_owner_routed_prefill_enabled(reserve_sharing: bool) -> bool {
@@ -3666,6 +3669,7 @@ fn qwen4_ep_owner_routed_prefill_enabled(reserve_sharing: bool) -> bool {
             .as_deref(),
         crate::weights::trunk_shard::trunk_shard_requested(),
         reserve_sharing,
+        trunk_shard_pmask_env_on(),
     )
 }
 
@@ -3675,6 +3679,60 @@ fn qwen4_ep_owner_routed_prefill_enabled(reserve_sharing: bool) -> bool {
 /// experts the zero dummy, no peer expert read).
 fn ep_stage_chunk_route(tile_admitted: bool, trunk_shard: bool) -> bool {
     tile_admitted || trunk_shard
+}
+
+/// `HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK` (developer, default ON under the trunk shard, exact `0` is the
+/// kill switch): under the trunk shard,
+/// a wide chunk on the symmetric IU4 / F16 WMMA grouped route masks the NON-owned experts'
+/// tiles out of the grouped gate/up and down launches (the owner-routed route's tile mask, with
+/// no exchange) instead of running them on the zero dummy tables, so a rank's routed grouped
+/// GEMM work drops to its owned half. Needs the admitted owner-routed tile route object (its
+/// owner table and masked-id buffer; a reserve-sharing shard load); otherwise the compact
+/// zero-dummy route is bound unchanged.
+pub const QWEN4_EP_TRUNK_SHARD_PMASK_ENV: &str = "HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK";
+
+/// The partial tile mask switch (default on).
+fn trunk_shard_pmask_env_on() -> bool {
+    hipfire_config::developer_bool(QWEN4_EP_TRUNK_SHARD_PMASK_ENV, true)
+}
+
+/// Whether the partial-mask route is asked for: the shard's partial chunk route AND the switch.
+fn trunk_partial_mask_on(trunk_chunk_partial: bool, env_on: bool) -> bool {
+    trunk_chunk_partial && env_on
+}
+
+/// The tile route's transport seen as a MASK-ONLY exchange (the trunk shard's partial chunk
+/// route): same owner table, never a peer wait or pull. Every rank's owned-slot partial is
+/// completed by the all-reduce of its FFN HC write.
+struct PartialMaskExchange<'a>(&'a (dyn MoeTileExchange + Send + Sync));
+
+impl MoeTileExchange for PartialMaskExchange<'_> {
+    fn owners(&self) -> (usize, &GpuTensor, usize) {
+        self.0.owners()
+    }
+
+    fn mask_only(&self) -> bool {
+        true
+    }
+
+    fn before_down(&self, _gpu: &mut Gpu) -> Result<(), String> {
+        Err("partial tile mask never waits on a peer".into())
+    }
+
+    fn host_barrier(&self, what: u8, epoch: u32) -> Result<(), String> {
+        self.0.host_barrier(what, epoch)
+    }
+
+    fn exchange(
+        &self,
+        _gpu: &mut Gpu,
+        _layer_idx: u16,
+        _tile_ids: &GpuTensor,
+        _y_down_grouped: &GpuTensor,
+        _tiles: usize,
+    ) -> Result<(), String> {
+        Err("partial tile mask never pulls peer rows".into())
+    }
 }
 
 /// The symmetric-IU4 verdict the compact chunk tables take under the trunk-shard partial
@@ -15809,6 +15867,15 @@ impl Qwen4GpuForward {
                     .map_err(|error| invalid(format!("EP tile exchange: {error}")))?;
             }
         }
+        // Partial mask (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`): the shard's wide chunk on a
+        // layer the owner-routed route admits masks the non-owned tiles, no exchange.
+        let partial_mask_route = tile_route.filter(|_| {
+            trunk_partial_mask_on(trunk_chunk_partial, trunk_shard_pmask_env_on())
+                && ep_reserve_forward::ep_tile_active(ep, gpu, &config, n, route_n)
+        });
+        let partial_mask_exchange: Option<PartialMaskExchange<'_>> = partial_mask_route
+            .and_then(|route| route.hook.as_deref())
+            .map(PartialMaskExchange);
         let tile_route = tile_route.filter(|_| tile_active);
         // G2 expert stage under EP: a full-table chunk reads another rank's donor VRAM, so every
         // rank drains its stage donors and crosses a host barrier before ANY rank launches it.
@@ -16056,6 +16123,18 @@ impl Qwen4GpuForward {
                     // unfused shared down writes the ordinary scratch.
                     binding.shared_down_out = Some(&self.scratch.moe_down_expanded);
                 }
+            }
+            if let (Some(route), Some(mask), Qwen4FfnBinding::Moe(binding)) = (
+                partial_mask_route,
+                partial_mask_exchange.as_ref(),
+                &mut description.ffn,
+            ) {
+                // Partial mask: drop the non-owned experts' tiles from the grouped launches
+                // (their rows are zero-filled); no exchange, the all-reduce completes the FFN.
+                binding.tile_exchange = Some(MoeTileExchangeParams {
+                    exchange: mask,
+                    tile_ids_owned: &route.tile_ids_owned,
+                });
             }
             if let (Some(route), Qwen4FfnBinding::Moe(binding)) = (tile_route, &mut description.ffn)
             {
@@ -21187,21 +21266,44 @@ mod ep_rank_generic_tests {
     /// under the shard only as the EP reserve's rendezvous carrier. Without the shard the
     /// lever is exactly the shared EP lever rule, reserve or not.
     #[test]
-    fn trunk_shard_admits_the_owner_routed_route_only_for_a_reserve_sharing_load() {
+    fn trunk_shard_admits_the_owner_routed_route_for_a_reserve_or_the_partial_mask() {
         for value in [None, Some("1"), Some(""), Some("true"), Some("0")] {
             for reserve in [false, true] {
-                assert_eq!(
-                    ep_owner_routed_prefill_on(value, false, reserve),
-                    ep_lever_on(value)
-                );
+                for pmask in [false, true] {
+                    assert_eq!(
+                        ep_owner_routed_prefill_on(value, false, reserve, pmask),
+                        ep_lever_on(value)
+                    );
+                }
             }
-            assert!(!ep_owner_routed_prefill_on(value, true, false), "{value:?}");
+            assert!(
+                !ep_owner_routed_prefill_on(value, true, false, false),
+                "{value:?}"
+            );
             assert_eq!(
-                ep_owner_routed_prefill_on(value, true, true),
+                ep_owner_routed_prefill_on(value, true, true, false),
+                ep_lever_on(value),
+                "{value:?}"
+            );
+            assert_eq!(
+                ep_owner_routed_prefill_on(value, true, false, true),
                 ep_lever_on(value),
                 "{value:?}"
             );
         }
+    }
+
+    /// The partial mask needs BOTH the shard's partial chunk route and the switch (default off).
+    #[test]
+    fn partial_mask_needs_the_partial_chunk_route_and_the_switch() {
+        assert_eq!(
+            QWEN4_EP_TRUNK_SHARD_PMASK_ENV,
+            "HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK"
+        );
+        assert!(!trunk_partial_mask_on(false, false));
+        assert!(!trunk_partial_mask_on(false, true));
+        assert!(!trunk_partial_mask_on(true, false));
+        assert!(trunk_partial_mask_on(true, true));
     }
 
     /// The G2 expert stage is built on a compact-table chunk route: the admitted tile route

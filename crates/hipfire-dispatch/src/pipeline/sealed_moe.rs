@@ -9658,6 +9658,62 @@ mod tests {
             );
         }
     }
+
+    /// The trunk shard's partial mask: a mask-only exchange lowers the `TileMask` right after
+    /// the scatter and NO `TileExchange` (the all-reduce completes the FFN), on both routes.
+    struct MaskOnlyTileExchange;
+
+    impl crate::families::moe::MoeTileExchange for MaskOnlyTileExchange {
+        fn owners(&self) -> (usize, &GpuTensor, usize) {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn mask_only(&self) -> bool {
+            true
+        }
+
+        fn before_down(&self, _gpu: &mut Gpu) -> Result<(), String> {
+            unreachable!("a mask-only exchange never waits on a peer")
+        }
+
+        fn host_barrier(&self, _what: u8, _epoch: u32) -> Result<(), String> {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn exchange(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _tile_ids: &GpuTensor,
+            _y_down_grouped: &GpuTensor,
+            _tiles: usize,
+        ) -> Result<(), String> {
+            unreachable!("a mask-only exchange never pulls")
+        }
+    }
+
+    #[test]
+    fn mask_only_exchange_lowers_the_mask_and_no_exchange() {
+        for route in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            let route = Some(route);
+            let without = tile_prefill_stages(None, None, route, false).unwrap();
+            let masked =
+                tile_prefill_stages(Some(&MaskOnlyTileExchange), None, route, false).unwrap();
+            assert!(!masked.contains(&MoeStage::TileExchange), "{masked:?}");
+            let scatter = masked
+                .iter()
+                .position(|s| *s == MoeStage::Scatter)
+                .expect("scatter");
+            assert_eq!(masked[scatter + 1], MoeStage::TileMask, "{masked:?}");
+            assert_eq!(masked[scatter + 2], MoeStage::GateUp, "{masked:?}");
+            let mut stripped = masked.clone();
+            stripped.retain(|s| *s != MoeStage::TileMask);
+            assert_eq!(stripped, without, "only the mask stage differs");
+        }
+    }
 }
 
 #[cfg(test)]

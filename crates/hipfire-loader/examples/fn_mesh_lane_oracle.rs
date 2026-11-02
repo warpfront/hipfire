@@ -790,6 +790,49 @@ fn rows_digest(rows: &[String]) -> String {
     sha256_hex(rows.join("\n").as_bytes())
 }
 
+/// KL(p || q) in nats between the softmax of two raw f32 logits rows (f64 log-softmax).
+fn row_kl(reference: &[u8], lane: &[u8]) -> Option<f64> {
+    if reference.len() != lane.len() || reference.len() % 4 != 0 || reference.is_empty() {
+        return None;
+    }
+    let f = |b: &[u8]| -> Vec<f64> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+            .collect()
+    };
+    let (p, q) = (f(reference), f(lane));
+    let lse = |x: &[f64]| -> f64 {
+        let m = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        m + x.iter().map(|v| (v - m).exp()).sum::<f64>().ln()
+    };
+    let (lp, lq) = (lse(&p), lse(&q));
+    let mut kl = 0.0;
+    for i in 0..p.len() {
+        let lpi = p[i] - lp;
+        kl += lpi.exp() * (lpi - (q[i] - lq));
+    }
+    Some(kl)
+}
+
+/// Per-row KL of one lane vs its singleton reference over the rows computed from an identical
+/// context: rows `0..=first id mismatch` (all rows when the ids agree). `(rows, max, mean)`.
+fn lane_kl(
+    reference_raw: &[Vec<u8>],
+    lane_raw: &[Vec<u8>],
+    first_id_mismatch: Option<usize>,
+) -> Option<(usize, f64, f64)> {
+    let rows = lane_raw.len().min(reference_raw.len());
+    let upto = first_id_mismatch.map_or(rows, |m| (m + 1).min(rows));
+    let kls: Vec<f64> = (0..upto)
+        .filter_map(|r| row_kl(&reference_raw[r], &lane_raw[r]))
+        .collect();
+    if kls.is_empty() {
+        return None;
+    }
+    let max = kls.iter().cloned().fold(0.0, f64::max);
+    Some((kls.len(), max, kls.iter().sum::<f64>() / kls.len() as f64))
+}
+
 fn compare(
     reference_ids: &[u32],
     lane_ids: &[u32],
@@ -1310,6 +1353,8 @@ struct LaneRun {
     committed: Vec<u32>,
     /// SHA-256 of the prompt-completing row, then of every AR row (`--logits`).
     logits_sha: Vec<String>,
+    /// The raw f32 logits rows themselves (`--logits`), for the per-row KL check.
+    logits_raw: Vec<Vec<u8>>,
     /// AR rows this lane ran in decode-only steps.
     decode_only_rows: usize,
     admitted: bool,
@@ -1378,6 +1423,8 @@ struct KRun {
     ids: Vec<Vec<u32>>,
     /// Per lane: logits SHA-256 rows (`tokens + 1` with `--logits`, else empty).
     logits_sha: Vec<Vec<String>>,
+    /// Per lane: the raw logits rows (same rows as `logits_sha`).
+    logits_raw: Vec<Vec<Vec<u8>>>,
     steps: usize,
     decode_steps: usize,
     decode_tokens: usize,
@@ -1457,6 +1504,7 @@ fn drive_inner(
             },
             committed: Vec::new(),
             logits_sha: Vec::new(),
+            logits_raw: Vec::new(),
             decode_only_rows: 0,
             admitted: true,
         });
@@ -1557,6 +1605,16 @@ fn drive_inner(
                     .map(|(_, bytes)| Some(sha256_hex(bytes)))
                     .ok_or_else(|| format!("lane {idx}: the step returned no logits row"))
             };
+            let row_raw = || -> Option<Vec<u8>> {
+                if !cfg.want_logits {
+                    return None;
+                }
+                result
+                    .logits
+                    .iter()
+                    .find(|(epoch, _)| *epoch == request.epoch)
+                    .map(|(_, bytes)| bytes.to_vec())
+            };
             let lane = &mut lanes[idx];
             match request.kind {
                 RequestStepKind::Prefill => {
@@ -1578,6 +1636,7 @@ fn drive_inner(
                     };
                     lane.committed.push(*id);
                     lane.logits_sha.extend(row_sha()?);
+                    lane.logits_raw.extend(row_raw());
                 }
                 RequestStepKind::Ar => {
                     lane.progress.ar_steps += 1;
@@ -1596,6 +1655,7 @@ fn drive_inner(
                     }
                     lane.committed.push(*id);
                     lane.logits_sha.extend(row_sha()?);
+                    lane.logits_raw.extend(row_raw());
                     if decode_only {
                         lane.decode_only_rows += 1;
                     }
@@ -1634,6 +1694,7 @@ fn drive_inner(
             .map(|lane| lane.committed[..cfg.tokens].to_vec())
             .collect(),
         logits_sha: lanes.iter().map(|lane| lane.logits_sha.clone()).collect(),
+        logits_raw: lanes.iter().map(|lane| lane.logits_raw.clone()).collect(),
         steps,
         decode_steps,
         decode_tokens,
@@ -1651,6 +1712,8 @@ struct Reference {
     /// SHA-256 of the logits row after the prefill, then after every forward
     /// (`tokens + 1` rows with `--logits`, else empty).
     logits_sha: Vec<String>,
+    /// The raw f32 logits rows (same rows), for the per-row KL check.
+    logits_raw: Vec<Vec<u8>>,
     /// Wall milliseconds of the cold prefill (final-logits read included): the singleton the
     /// lane prefill of the same prompt is compared with.
     prefill_ms: f64,
@@ -1743,12 +1806,13 @@ fn reference_run(
     let mut reference = Reference {
         ids: Vec::with_capacity(tokens),
         logits_sha: Vec::new(),
+        logits_raw: Vec::new(),
         prefill_ms,
     };
     if want_logits {
-        reference
-            .logits_sha
-            .push(sha256_hex(&single.logits_bytes()?));
+        let bytes = single.logits_bytes()?;
+        reference.logits_sha.push(sha256_hex(&bytes));
+        reference.logits_raw.push(bytes);
     }
     for step in 1..=tokens {
         let id = single
@@ -1756,9 +1820,9 @@ fn reference_run(
             .map_err(|x| format!("reference step {step}: {x}"))?;
         reference.ids.push(id);
         if want_logits {
-            reference
-                .logits_sha
-                .push(sha256_hex(&single.logits_bytes()?));
+            let bytes = single.logits_bytes()?;
+            reference.logits_sha.push(sha256_hex(&bytes));
+            reference.logits_raw.push(bytes);
         }
     }
     Ok(reference)
@@ -1873,6 +1937,17 @@ fn run_policy(
                         args.logits
                             .then(|| (reference_logits, run.logits_sha[lane].as_slice())),
                     );
+                    if args.logits {
+                        if let Some((rows, max, mean)) = lane_kl(
+                            &references[index].logits_raw[..tokens + 1],
+                            &run.logits_raw[lane],
+                            comparison.first_mismatch,
+                        ) {
+                            eprintln!(
+                                "[oracle-kl] policy={spec} set={label} lane={lane} prompt={index} rows={rows} max_kl={max:.3e} mean_kl={mean:.3e}"
+                            );
+                        }
+                    }
                     if !comparison.equal {
                         if status == PolicyStatus::Pass {
                             status = PolicyStatus::Fail;
@@ -2484,6 +2559,7 @@ fn drive_mtp_inner(
             k,
             ids,
             logits_sha: vec![Vec::new(); k],
+            logits_raw: vec![Vec::new(); k],
             steps,
             decode_steps,
             decode_tokens,
@@ -3911,6 +3987,7 @@ mod tests {
         Reference {
             ids,
             logits_sha,
+            logits_raw: Vec::new(),
             prefill_ms: prompt.len() as f64,
         }
     }

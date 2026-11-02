@@ -2834,7 +2834,10 @@ fn lower_prefill<'a>(
         if params.ep_row_gather.is_some() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::RowGather))?;
         }
-        if params.ep_tile_exchange.is_some() {
+        if params
+            .ep_tile_exchange
+            .is_some_and(|tx| !tx.exchange.mask_only())
+        {
             append_step(
                 &mut steps,
                 Step::MoeStage(op(state), MoeStage::TileExchange),

@@ -1628,6 +1628,15 @@ pub trait MoeTileExchange {
     /// the pull read them as inputs, never as constants.
     fn owners(&self) -> (usize, &GpuTensor, usize);
 
+    /// Mask-only mode (the trunk shard's partial chunk route): the lowering inserts the
+    /// [`MoeStage::TileMask`](crate::pipeline::MoeStage) stage only, zero-fills the grouped
+    /// down rows the masked tiles never write, and lowers NO `TileExchange`: every rank's
+    /// owned-slot partial is completed by the all-reduce of its HC write, not by pulling a
+    /// peer's rows. `before_down`/`exchange` are never called on a mask-only exchange.
+    fn mask_only(&self) -> bool {
+        false
+    }
+
     /// Enqueue, on the launch stream, the wait that the peer finished pulling
     /// this rank's rows of the previous invocation. Called by the routed down
     /// stage immediately before it writes `y_down_grouped`; a no-op before the
