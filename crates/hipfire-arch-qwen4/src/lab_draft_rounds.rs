@@ -369,6 +369,16 @@ pub(crate) fn probe_round(
     if n < 2 || n != lanes.len() {
         return Ok(());
     }
+    // The probe's own row gathers (serial and batched arms on twins) are not the
+    // round's: the mesh ledger and the protocol's per-round gather count must not
+    // see them.
+    struct TallyGuard(crate::ep::GatherTally);
+    impl Drop for TallyGuard {
+        fn drop(&mut self) {
+            crate::ep::lab_restore_gather_tally(self.0);
+        }
+    }
+    let _tally_guard = TallyGuard(crate::ep::gather_tally());
     // Every rank counts the same rounds, so a cap stops them together.
     static PROBED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let cap: usize = hipfire_config::developer_var(PROBE_MAX_ENV)

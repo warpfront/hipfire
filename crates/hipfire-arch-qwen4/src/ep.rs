@@ -478,6 +478,13 @@ pub(crate) fn gather_tally() -> GatherTally {
     GATHER_TALLY.with(Cell::get)
 }
 
+/// Lab only: put this thread's cumulative tally back to `tally` (the lab round
+/// probe runs extra gathers on scratch twins that must not reach the ledger).
+#[cfg(feature = "lab")]
+pub(crate) fn lab_restore_gather_tally(tally: GatherTally) {
+    GATHER_TALLY.with(|cell| cell.set(tally));
+}
+
 fn note_gather(head: bool, bytes: u64) {
     GATHER_TALLY.with(|cell| {
         let mut tally = cell.get();
