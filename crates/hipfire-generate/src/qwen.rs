@@ -2630,7 +2630,11 @@ fn qwen4_session_target(pp_mesh_active: bool, has_gpus: bool) -> Qwen4SessionTar
 /// mesh with its `Gpus` for the AR route; native MTP never reuses a session
 /// under a mesh, and a mesh without `Gpus` plans no reuse. Disjoint field
 /// borrows, as [`qwen4_bundle_and_mesh`].
-fn plan_qwen4_session(model: &mut LoadedModel, prompt: &[u32], route: SessionRoute) -> usize {
+pub(crate) fn plan_qwen4_session(
+    model: &mut LoadedModel,
+    prompt: &[u32],
+    route: SessionRoute,
+) -> usize {
     let LoadedModel { state, pp_gpus, .. } = model;
     let Some(state) = state.as_deref_mut() else {
         return 0;

@@ -2929,6 +2929,26 @@ fn qwen4_lane_promotion_supported(topology: &str) -> bool {
     topology == "single"
 }
 
+/// A lone request on a topology that refuses singleton promotion (EP, PP) is
+/// admitted straight into the lane driver as a cohort of one. On such a
+/// topology the alternative — run the first arrival as an AR singleton — is a
+/// trap: the singleton cannot be promoted when peers arrive, so a burst on an
+/// idle server serves its first request alone for its whole generation and
+/// only then prefills the rest together. A loaded speculator (explicit
+/// `--spec mtp`, native MTP) keeps the singleton route: whether a one-lane
+/// MTP cohort matches the MTP singleton for a lone request is not measured, so
+/// that configuration is unchanged.
+pub(crate) fn qwen4_lone_lane(topology: &str, has_speculator: bool) -> bool {
+    !qwen4_lane_promotion_supported(topology) && !has_speculator
+}
+
+/// [`qwen4_lone_lane`] for the loaded model (requires a staged lane store).
+pub(crate) fn qwen4_lone_request_takes_lane(m: &LoadedModel) -> bool {
+    m.qwen4().is_some_and(|b| {
+        b.lanes().is_some() && qwen4_lone_lane(b.lane_topology(), m.speculator.is_some())
+    })
+}
+
 /// Qwen4 lane admission: greedy requests, or sampled ones when the store is
 /// sampled (`serve.batch_sampled`) — lanes then draw on the host with the AR
 /// singleton's sampler and the request seed, and MTP lanes verify sampled
@@ -3197,7 +3217,10 @@ pub fn vmm_loaded_ack(
 /// Daemon: batch admission for a staged scheduler. On the VMM route
 /// (`vmm_route`) only when another batched generate is already waiting — a
 /// lonely request keeps the unchanged singleton route (exact singleton
-/// arithmetic/spec); otherwise the fixed-lane predicate.
+/// arithmetic/spec) — except on a Qwen4 EP/PP lane store, where a running
+/// singleton can never be promoted into a lane (`qwen4_lone_request_takes_lane`):
+/// there the lone request enters the lane driver as a cohort of one and later
+/// arrivals join at the next step; otherwise the fixed-lane predicate.
 pub fn batch_request_eligible_for_route(
     vmm_route: bool,
     msg: &serde_json::Value,
@@ -3214,7 +3237,7 @@ pub fn batch_request_eligible_for_route(
             continuous_batch_size,
             serve_continuous_batch,
             pflash_active,
-        ) && inbox.has_pending_batch_generate()
+        ) && (qwen4_lone_request_takes_lane(m) || inbox.has_pending_batch_generate())
     } else {
         is_batch_request_eligible(
             msg,
@@ -8164,6 +8187,30 @@ mod tests {
         assert!(qwen4_lane_promotion_supported("single"));
         assert!(!qwen4_lane_promotion_supported("ep"));
         assert!(!qwen4_lane_promotion_supported("pp"));
+    }
+
+    #[test]
+    fn lone_request_takes_a_lane_exactly_where_promotion_is_refused() {
+        // EP/PP cannot promote a singleton, so the lone request is a lane;
+        // single keeps the singleton (promotion covers it); a speculator keeps
+        // the singleton everywhere.
+        for (topology, speculator, lane) in [
+            ("single", false, false),
+            ("single", true, false),
+            ("ep", false, true),
+            ("pp", false, true),
+            ("ep", true, false),
+            ("pp", true, false),
+        ] {
+            assert_eq!(
+                qwen4_lone_lane(topology, speculator),
+                lane,
+                "{topology} spec={speculator}"
+            );
+            if !speculator {
+                assert_eq!(lane, !qwen4_lane_promotion_supported(topology));
+            }
+        }
     }
 
     #[test]

@@ -41,6 +41,11 @@
 //! and steps through the `pp_*` lane APIs and `Qwen4PpLaneExecutor` over the
 //! mesh's `Gpus`. Promotion of a running singleton into a lane is single-only
 //! (PP and EP refuse it), so the promoted-adoption path only runs on single.
+//! Because an EP/PP singleton could never join its peers, a lone EP/PP request
+//! is not run as a singleton at all: the daemon admits it straight into this
+//! driver (`qwen4_lone_request_takes_lane`), where it is a cohort of one and
+//! every later arrival joins at the next step (`lone_arrival_hands_back` keeps
+//! the singleton only for a request whose session cache would be restored).
 //! Sampled requests (neutral penalties; the lane store's `serve.batch_sampled`)
 //! install a `LaneSampling` right after admission: the lane draws on the host
 //! with the AR singleton's sampler and the request seed, and MTP lanes verify
@@ -69,7 +74,7 @@
 use crate::ar::*;
 use crate::batch::{
     drain_qwen_batch_inbox, handoff_started_in_think, is_vmm_batch_request_eligible,
-    Qwen4PromotedRequest,
+    qwen4_lone_request_takes_lane, Qwen4PromotedRequest,
 };
 use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
@@ -84,6 +89,7 @@ use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::ThinkBudget;
 use hipfire_runtime::external_rows::ServingGuard;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, RowRange, StepOutput,
 };
@@ -94,6 +100,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const ROUTE: GenerationRoute = GenerationRoute::Qwen4Ar;
+
+/// Whether a request just assigned a lane, with no other lane active and none
+/// queued (`lone`), goes back to the singleton route instead of running as a
+/// lane.
+/// - Single device (`lone_lane` false): a request that arrived after the
+///   driver started (`initial` false) hands back, as before; the driver's own
+///   entry cohort never does, because the singleton can be promoted into a lane
+///   when a peer arrives.
+/// - EP/PP (`lone_lane`): the singleton can NOT be promoted, so a lone request
+///   stays a lane (a cohort of one; peers join at the next step) — except when
+///   the singleton route would restore session state (`session_reuse`), which
+///   lanes (cold state, no session cache) cannot.
+pub(crate) fn lone_arrival_hands_back(
+    lone: bool,
+    lone_lane: bool,
+    initial: bool,
+    session_reuse: impl FnOnce() -> bool,
+) -> bool {
+    lone && if lone_lane { session_reuse() } else { !initial }
+}
+
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// The next request epoch of a lane owner: shared by admission and the
@@ -1183,10 +1210,24 @@ pub fn drive_qwen4_lane_batch(
                     .get(&key)
                     .cloned()
                     .ok_or("assigned request missing")?;
-                if !initial.contains(&key)
-                    && sched.inbox.is_empty()
-                    && !controls.iter().flatten().any(|c| c.epoch.is_admitted())
-                {
+                let lone = sched.inbox.is_empty()
+                    && !controls.iter().flatten().any(|c| c.epoch.is_admitted());
+                // The prompt rendered for the session-reuse probe below, kept so
+                // the lane does not render it twice.
+                let mut probed = None;
+                if lone_arrival_hands_back(
+                    lone,
+                    qwen4_lone_request_takes_lane(m),
+                    initial.contains(&key),
+                    || {
+                        let rendered = render_request(m, &req);
+                        let reusable = rendered.as_ref().is_ok_and(|(prompt, _)| {
+                            crate::qwen::plan_qwen4_session(m, prompt, SessionRoute::Ar) > 0
+                        });
+                        probed = Some(rendered);
+                        reusable
+                    },
+                ) {
                     inbox.push_front(handoff_started_in_think(
                         sched,
                         ticket.lane,
@@ -1196,7 +1237,7 @@ pub fn drive_qwen4_lane_batch(
                     )?);
                     continue;
                 }
-                let rendered = render_request(m, &req);
+                let rendered = probed.unwrap_or_else(|| render_request(m, &req));
                 let _scope = BatchAttemptScope::enter_for_generation(
                     &key.id,
                     key.attempt_id,
@@ -1897,5 +1938,192 @@ mod tests {
             !between.contains("continue;"),
             "a failed half must not skip the other half's emission"
         );
+    }
+
+    #[test]
+    fn lone_arrival_hand_back_policy_by_topology() {
+        use super::lone_arrival_hands_back;
+        // Single device: only a post-entry arrival hands back, and the session
+        // probe is never consulted (promotion covers the entry cohort).
+        for (lone, initial, want) in [
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+            (false, true, false),
+        ] {
+            assert_eq!(
+                lone_arrival_hands_back(lone, false, initial, || panic!("single never probes")),
+                want
+            );
+        }
+        // EP/PP: a lone request stays a lane, entry cohort or not, unless the
+        // singleton would restore a session; with peers it never probes.
+        for initial in [false, true] {
+            assert!(!lone_arrival_hands_back(true, true, initial, || false));
+            assert!(lone_arrival_hands_back(true, true, initial, || true));
+            assert!(!lone_arrival_hands_back(false, true, initial, || {
+                panic!("peers present: no probe")
+            }));
+        }
+    }
+
+    /// Scripted lane model: a lane's next id is a pure function of its own
+    /// prompt and position (greedy), never of the cohort it runs in.
+    fn scripted_next(prompt: &[u32], generated: usize) -> u32 {
+        let h = prompt.iter().fold(0x9e37_79b9u32, |h, &t| {
+            h.rotate_left(5) ^ t.wrapping_mul(0x85eb_ca6b)
+        });
+        h.wrapping_add((generated as u32).wrapping_mul(2_654_435_761)) % 50_000
+    }
+
+    /// Daemon + driver admission for `n` requests that reach an idle server at
+    /// once, as `daemon dispatch -> enqueue -> drive_qwen4_lane_batch` does it:
+    /// the daemon sees the FIRST request with no peer visible yet; `late`
+    /// requests arrive only after that first decision (during the first lane
+    /// step); the rest are already in the inbox when the driver first drains.
+    /// Returns the per-step active lane counts (None when the first request
+    /// would have run as a singleton) and every lane's scripted ids.
+    fn simulate_burst(
+        topology: &str,
+        n: usize,
+        late: usize,
+        steps: usize,
+    ) -> Option<(Vec<usize>, Vec<Vec<u32>>)> {
+        use hipfire_engine::scheduler::{
+            BatchPendingRequest, BatchSampling, ContinuousBatchScheduler,
+        };
+        use hipfire_engine::terminal::{
+            batch_announce_terminal, batch_clear_terminal, batch_terminal_generation, AttemptKey,
+        };
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(7000);
+        let base = NEXT.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+        let make = |i: usize| {
+            let attempt = base + i as u64;
+            let id = format!("burst-{attempt}");
+            let admission = batch_announce_terminal(&id, attempt).expect("admission");
+            let key = AttemptKey::new(&id, attempt);
+            BatchPendingRequest {
+                admission,
+                key: key.clone(),
+                original_msg: serde_json::json!({"type": "generate", "id": id}),
+                prompt: format!("p{i}"),
+                prompt_tokens: vec![i as u32 + 1, 7, 11],
+                started_in_think: false,
+                system: None,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                max_think_tokens: 0,
+                max_tokens: steps,
+                client_seed: None,
+                sampling: BatchSampling {
+                    temp: 1.0,
+                    top_p: 0.95,
+                    top_k: Some(20),
+                    min_p: None,
+                    repeat_penalty: 1.0,
+                    presence_penalty: 0.0,
+                    frequency_penalty: 0.0,
+                    repeat_window: 128,
+                },
+            }
+        };
+        // Daemon: `batch_request_eligible_for_route` on the VMM route, first
+        // request, no other batched generate visible.
+        let peer_pending = false;
+        let lone_lane = crate::batch::qwen4_lone_lane(topology, false);
+        if !(lone_lane || peer_pending) {
+            for i in 0..n {
+                batch_clear_terminal(&format!("burst-{}", base + i as u64), base + i as u64);
+            }
+            return None;
+        }
+        let mut sched = ContinuousBatchScheduler::new(8, 4096);
+        let requests: Vec<_> = (0..n).map(make).collect();
+        let keys: Vec<_> = requests.iter().map(|r| r.key.clone()).collect();
+        assert!(sched.enqueue(requests[0].clone()));
+        let initial: std::collections::HashSet<_> = sched.inbox.iter().cloned().collect();
+        let mut arrived = 1;
+        let mut admitted = vec![false; n];
+        let mut lanes: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut ids = vec![Vec::new(); n];
+        let mut active_per_step = Vec::new();
+        for step in 0..steps {
+            // Drain: everything but the `late` tail is in the inbox at the first
+            // drain; the late ones show up after the first step.
+            let due = if step == 0 { n - late } else { n };
+            while arrived < due {
+                assert!(sched.enqueue(requests[arrived].clone()));
+                arrived += 1;
+            }
+            while let Some((key, ticket)) = sched.try_assign_one() {
+                let i = keys.iter().position(|k| *k == key).unwrap();
+                let lone = sched.inbox.is_empty() && !admitted.iter().any(|&a| a);
+                assert!(
+                    !super::lone_arrival_hands_back(
+                        lone,
+                        lone_lane,
+                        initial.contains(&key),
+                        || false
+                    ),
+                    "request {i} must not go back to a singleton"
+                );
+                admitted[i] = true;
+                lanes.push((i, requests[i].prompt_tokens.clone()));
+                let _ = ticket;
+            }
+            active_per_step.push(sched.active_count());
+            for (i, history) in &mut lanes {
+                let next = scripted_next(&requests[*i].prompt_tokens, ids[*i].len());
+                ids[*i].push(next);
+                history.push(next);
+            }
+        }
+        for (i, r) in requests.iter().enumerate() {
+            batch_clear_terminal(&r.key.id, base + i as u64);
+        }
+        Some((active_per_step, ids))
+    }
+
+    #[test]
+    fn simultaneous_arrivals_on_ep_and_pp_decode_as_lanes_from_the_first_step() {
+        for topology in ["ep", "pp"] {
+            for n in [1usize, 4, 8] {
+                let (active, ids) =
+                    simulate_burst(topology, n, 0, 6).expect("EP/PP lone request takes a lane");
+                assert_eq!(active, vec![n; 6], "{topology} C{n}: active from step 0");
+                for (i, lane_ids) in ids.iter().enumerate() {
+                    let solo = (0..6)
+                        .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
+                        .collect::<Vec<_>>();
+                    assert_eq!(lane_ids, &solo, "{topology} C{n} lane {i}: ids unchanged");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_arrivals_join_the_lone_ep_lane_at_the_next_step() {
+        // The daemon dispatched request 0 alone; 7 more land during its first
+        // step: they are lanes at step 1 (active 8), not a queue behind a
+        // singleton, and every lane's ids are the solo ids.
+        let (active, ids) = simulate_burst("ep", 8, 7, 6).expect("lane");
+        assert_eq!(active, vec![1, 8, 8, 8, 8, 8]);
+        // A late lane starts at its own position 0 at the step it joins.
+        for (i, lane_ids) in ids.iter().enumerate() {
+            let expect = if i == 0 { 6 } else { 5 };
+            assert_eq!(lane_ids.len(), expect, "lane {i}");
+            let solo = (0..lane_ids.len())
+                .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
+                .collect::<Vec<_>>();
+            assert_eq!(lane_ids, &solo);
+        }
+    }
+
+    #[test]
+    fn single_device_lone_request_keeps_the_singleton_route() {
+        // Promotion exists on a single device: the lone request stays a
+        // singleton (unchanged), as does any EP/PP server with a speculator.
+        assert!(simulate_burst("single", 8, 0, 3).is_none());
+        assert!(!crate::batch::qwen4_lone_lane("ep", true));
+        assert!(!crate::batch::qwen4_lone_lane("pp", true));
     }
 }
