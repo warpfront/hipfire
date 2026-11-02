@@ -2261,6 +2261,10 @@ struct ServeRuntime {
 struct ServeShared {
     runtime: Mutex<ServeRuntime>,
     meta: Mutex<ServeMeta>,
+    /// The model this serve process was started with (arg or config default).
+    /// /tts requests carry no `model` field (Liquid Agent `speak()` sends only
+    /// {input, voice}), so the route synthesizes against this.
+    default_model: String,
     max_request_bytes: u64,
     admission: Arc<Admission>,
     idle_timeout: Duration,
@@ -2831,6 +2835,7 @@ fn serve_foreground(
             started: Instant::now(),
             last_activity: Instant::now(),
         }),
+        default_model: default_model.clone(),
         max_request_bytes,
         admission: Arc::new(Admission::new(max_queue, queue_timeout)),
         idle_timeout,
@@ -3055,6 +3060,35 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
                 respond_nonstreaming(request, shared, body, guard)?;
             }
         }
+        (&Method::Post, "/tts") => {
+            // Liquid Agent `speak()` (Phase 5a): POST {origin}/tts — note the
+            // path is /tts, NOT /v1/tts (omni.js strips the /v1 prefix from
+            // settings.omniURL). Body {"input": text, "voice": ...}; the
+            // response body IS the 24 kHz mono WAV bytes (audio/wav), no JSON
+            // envelope. `voice` is accepted-and-ignored (LFM3-Omni has one
+            // voice). Client buffers the whole body — no streaming.
+            let body = match read_request_json(&mut request, shared.max_request_bytes) {
+                Ok(body) => body,
+                Err(error) => {
+                    let message = error.to_string();
+                    let status = if message.contains("exceeds") {
+                        413
+                    } else {
+                        400
+                    };
+                    request.respond(openai_error(&message, status))?;
+                    return Ok(());
+                }
+            };
+            let guard = match shared.admission.acquire() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    request.respond(admission_error_response(&error))?;
+                    return Ok(());
+                }
+            };
+            respond_tts(request, shared, body, guard)?;
+        }
         _ => request.respond(openai_error("not found", 404))?,
     }
     Ok(())
@@ -3242,6 +3276,190 @@ fn respond_nonstreaming(
         Err(_) => {
             // Worker died before status — treat as internal failure.
             request.respond(openai_error("generation worker disconnected", 500))?;
+        }
+    }
+    Ok(())
+}
+
+/// Omni TTS step budget for a `/tts` request (Phase 5a). One LM step per text
+/// token or audio frame, 80 ms of audio per frame: 1200 chars of speech ≈ 300
+/// text tokens + ~750–1100 frames (60–90 s), so ~1.25 steps per char + margin
+/// covers it while the natural eos terminates short inputs early. Clamped to
+/// [256, 3072]; the daemon's own cap (4096) and the capacity guard apply there.
+fn tts_max_steps_for_input(input: &str) -> u64 {
+    const FLOOR: u64 = 256;
+    const CEIL: u64 = 3072;
+    let chars = input.chars().count() as u64;
+    (chars + (chars / 4) + 256).clamp(FLOOR, CEIL)
+}
+
+/// Wrap raw mono PCM16 samples in a minimal 44-byte WAV header (the same
+/// layout `wav_bytes` emits and voice.js expects).
+fn pcm16_wav_bytes(pcm: &[u8], rate: u32) -> Vec<u8> {
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&((36 + pcm.len()) as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
+}
+
+/// Drive one omni TTS generate on the daemon and collect the WAV bytes
+/// (Phase 5a). Mirrors `complete_request_attempt`'s runtime locking (the
+/// runtime mutex is held across the whole generate) but with a dedicated
+/// event fold: the omni route emits gen_start → token (the interleaved text —
+/// ignored; the client wants speech, not a transcript echo) → audio (the
+/// whole WAV, base64) → done. The request carries no `messages`/tools — it is
+/// a plain TTS turn over `prompt`.
+fn tts_generate(
+    shared: &ServeShared,
+    input: &str,
+    max_steps: u64,
+    _guard: AdmissionGuard,
+) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let model = shared.default_model.clone();
+    let mut runtime = shared
+        .runtime
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    runtime.ensure_model(&model, &shared.meta, None)?;
+    let required_max_seq = max_steps.saturating_add(1024);
+    if runtime.current_max_seq < required_max_seq {
+        runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
+    }
+    let generate = serde_json::json!({
+        "type": "generate",
+        "id": request_id(),
+        "tts": true,
+        "mode": "interleaved",
+        "prompt": input,
+        "max_tokens": max_steps,
+        "max_steps": max_steps,
+        "attempt_id": next_attempt_id(),
+    });
+    let mut wav: Option<Vec<u8>> = None;
+    let mut streamed_pcm: Vec<u8> = Vec::new();
+    runtime.engine.generate(&generate, |event| {
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            // Batch terminal audio event: the full WAV, base64.
+            Some("audio") => {
+                let b64 = event
+                    .get("audio")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        hipfire_client::ClientError::Protocol(
+                            "tts audio event missing audio field".into(),
+                        )
+                    })?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|error| {
+                        hipfire_client::ClientError::Protocol(format!(
+                            "tts audio base64 decode failed: {error}"
+                        ))
+                    })?;
+                wav = Some(bytes);
+            }
+            // Streaming chunks (the /tts route runs batch today, but collect
+            // defensively: strip each chunk's 44-byte WAV header and concat
+            // the PCM payloads — chunk PCM concatenation is exactly the full
+            // stream per codec_decode_streaming's contract).
+            Some("audio_chunk") => {
+                if let Some(b64) = event.get("audio").and_then(serde_json::Value::as_str) {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                        if bytes.len() > 44 && bytes.starts_with(b"RIFF") {
+                            streamed_pcm.extend_from_slice(&bytes[44..]);
+                        }
+                    }
+                }
+            }
+            // gen_start / token (interleaved text) / done: not audio.
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let wav = match wav {
+        Some(wav) if !wav.is_empty() => wav,
+        _ if !streamed_pcm.is_empty() => pcm16_wav_bytes(&streamed_pcm, 24_000),
+        _ => bail!("tts generated no audio (the interleaved turn produced text only)"),
+    };
+    Ok(wav)
+}
+
+/// POST `/tts` worker + staged-response handshake (modeled on
+/// `respond_nonstreaming`): the worker drives the daemon, then stages the WAV
+/// bytes on the channel and signals the handler, which replies 200
+/// `audio/wav` with Content-Length — or an error status when the worker
+/// failed before any bytes existed.
+fn respond_tts(
+    request: Request,
+    shared: Arc<ServeShared>,
+    body: serde_json::Value,
+    guard: AdmissionGuard,
+) -> Result<()> {
+    let input = body
+        .get("input")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| anyhow!("tts request requires a non-empty \"input\" string"))?
+        .to_owned();
+    // `voice` is accepted-and-ignored: LFM3-Omni has a single voice.
+    let max_steps = tts_max_steps_for_input(&input);
+    let (sender, receiver) = mpsc::channel::<ResponseChunk>();
+    let (status_tx, status_rx) = mpsc::channel::<Result<usize, String>>();
+    thread::spawn(move || {
+        match tts_generate(&shared, &input, max_steps, guard) {
+            Ok(wav) => {
+                let len = wav.len();
+                let (ack_tx, ack_rx) = mpsc::channel();
+                if sender
+                    .send(ResponseChunk {
+                        bytes: wav,
+                        ack: Some(ack_tx),
+                        fail: false,
+                    })
+                    .is_ok()
+                {
+                    let _ = status_tx.send(Ok(len));
+                    // Hold the worker open until the handler's reader consumed
+                    // the bytes (mirrors the nonstreaming ack handshake).
+                    let _ = ack_rx.recv();
+                }
+            }
+            Err(error) => {
+                let _ = status_tx.send(Err(error.to_string()));
+            }
+        }
+    });
+    match status_rx.recv() {
+        Ok(Ok(len)) => {
+            request.respond(Response::new(
+                StatusCode(200),
+                vec![
+                    header("Content-Type", "audio/wav"),
+                    header("Access-Control-Allow-Origin", "*"),
+                ],
+                ChannelReader::new(receiver),
+                Some(len),
+                None,
+            ))?;
+        }
+        Ok(Err(message)) => {
+            request.respond(openai_error(&message, request_error_status(&message)))?;
+        }
+        Err(_) => {
+            request.respond(openai_error("tts worker disconnected", 500))?;
         }
     }
     Ok(())
@@ -4195,6 +4413,7 @@ fn complete_request_attempt(
         .ok_or_else(|| anyhow!("model is required"))?
         .to_owned();
     let image_base64 = request_image_base64(body.get("messages"))?;
+    let audio_base64 = request_audio_base64(body.get("messages"))?;
     let mut runtime = shared
         .runtime
         .lock()
@@ -4237,6 +4456,19 @@ fn complete_request_attempt(
     });
     if let Some(image) = image_base64 {
         generate["image_base64"] = serde_json::Value::String(image);
+    }
+    if let Some(audio) = audio_base64 {
+        // LFM3-Audio ASR path (Phase 5b): the daemon's generate_lfm3_audio
+        // route consumes `prompt` + `system` only (NOT `messages`), so the
+        // audio payload and the leading system message must be forwarded
+        // explicitly — "Perform ASR in English." never reached the route
+        // before. Scoped to the audio path: text routes render the system
+        // turn through `messages` already, and double-forwarding would
+        // duplicate it there.
+        generate["audio_base64"] = serde_json::Value::String(audio);
+        if let Some(system) = leading_system_message(&normalized_messages) {
+            generate["system"] = serde_json::Value::String(system);
+        }
     }
     for (key, config_key) in [
         ("temperature", "generation.temperature"),
@@ -4472,6 +4704,17 @@ fn complete_request_attempt(
                             )?;
                             legacy_done = Some(event.clone());
                         }
+                    }
+                    // Omni audio events on a chat path (Phase 5a): a stray
+                    // audio / audio_chunk (e.g. a "tts":true request racing a
+                    // chat stream) must be dropped DELIBERATELY — forwarding
+                    // them reaches no delta arm and would silently vanish, and
+                    // worse, a future accidental pass-through could corrupt an
+                    // SSE stream with binary audio.
+                    Some("audio") | Some("audio_chunk") => {
+                        eprintln!(
+                            "[hipfire] dropping stray {event_type:?} event on a chat-completions stream"
+                        );
                     }
                     _ => {
                         event_callback(event)?;
@@ -4760,6 +5003,52 @@ fn request_image_base64(messages: Option<&serde_json::Value>) -> Result<Option<S
     Ok(image)
 }
 
+/// Extract the `input_audio` content-part payload (base64 WAV), mirroring
+/// `request_image_base64` (Phase 5b — Liquid Agent `transcribe()`). Accepts a
+/// bare base64 string or a `data:audio/wav;base64,` data URI; `format` must be
+/// `"wav"` when present (400 otherwise). At most one audio part per request.
+fn request_audio_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let mut audio = None;
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(serde_json::Value::as_str) != Some("input_audio") {
+                continue;
+            }
+            let payload = part
+                .pointer("/input_audio/data")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("input_audio content part requires input_audio.data"))?;
+            match part
+                .pointer("/input_audio/format")
+                .and_then(serde_json::Value::as_str)
+            {
+                None | Some("wav") => {}
+                Some(other) => {
+                    bail!("unsupported input_audio format '{other}': only wav is supported")
+                }
+            }
+            // Tolerate a data-URI wrapper (the daemon strips it too).
+            let payload = payload
+                .strip_prefix("data:")
+                .and_then(|rest| rest.split_once(',').map(|(_, tail)| tail))
+                .unwrap_or(payload);
+            if payload.is_empty() {
+                bail!("input_audio part has an empty base64 payload");
+            }
+            if audio.replace(payload.to_owned()).is_some() {
+                bail!("at most one input_audio part is supported per request");
+            }
+        }
+    }
+    Ok(audio)
+}
+
 fn strip_inline_thinking(text: &str) -> String {
     const OPEN: &str = "<think>";
     const CLOSE: &str = "</think>";
@@ -4890,6 +5179,20 @@ fn last_user_prompt(messages: &serde_json::Value) -> Option<String> {
         .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
         .and_then(|message| message.get("content"))
         .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// First non-empty system message, for routes that consume the daemon's
+/// `system` field directly (the LFM3-Audio ASR path; Phase 5b).
+fn leading_system_message(messages: &serde_json::Value) -> Option<String> {
+    messages
+        .as_array()?
+        .iter()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
         .map(str::to_owned)
 }
 
@@ -5173,6 +5476,18 @@ fn forward_sse_stream_event(
     model: &str,
     event: &serde_json::Value,
 ) -> Result<(), hipfire_client::ClientError> {
+    // Deliberate drop for omni audio events (Phase 5a): they carry no chat
+    // delta, and a stray one must never reach the SSE body as anything else.
+    if matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some("audio") | Some("audio_chunk")
+    ) {
+        eprintln!(
+            "[hipfire] dropping stray {:?} event on a chat-completions stream",
+            event.get("type").and_then(serde_json::Value::as_str)
+        );
+        return Ok(());
+    }
     if let Some(delta) = openai_stream_delta_for_event(event) {
         let chunk = serde_json::json!({
             "id": id,
@@ -6407,10 +6722,7 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
-    Ok(engine.generate(
-        &bench_generate_request(prompt, max_tokens),
-        |_| Ok(()),
-    )?)
+    Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
 }
 
 fn bench_probe(
@@ -9319,6 +9631,113 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("remote"));
+    }
+
+    #[test]
+    fn openai_audio_forward_one_base64_payload_and_reject_bad_shapes() {
+        // Liquid Agent transcribe() shape: audio-only user part, bare base64.
+        let messages = serde_json::json!([{
+            "role": "user",
+            "content": [
+                { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } }
+            ]
+        }]);
+        assert_eq!(
+            request_audio_base64(Some(&messages)).unwrap().as_deref(),
+            Some("UklGRg==")
+        );
+        // Data-URI wrapper is tolerated; format defaults when absent.
+        let data_uri = serde_json::json!([{
+            "role": "user",
+            "content": [
+                { "type": "input_audio", "input_audio": { "data": "data:audio/wav;base64,UklGRg==" } }
+            ]
+        }]);
+        assert_eq!(
+            request_audio_base64(Some(&data_uri)).unwrap().as_deref(),
+            Some("UklGRg==")
+        );
+        // Non-wav format → 400.
+        let mp3 = serde_json::json!([{
+            "role": "user",
+            "content": [
+                { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "mp3" } }
+            ]
+        }]);
+        assert!(request_audio_base64(Some(&mp3))
+            .unwrap_err()
+            .to_string()
+            .contains("only wav"));
+        // Two audio parts → 400.
+        let two = serde_json::json!([{
+            "role": "user",
+            "content": [
+                { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } },
+                { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } }
+            ]
+        }]);
+        assert!(request_audio_base64(Some(&two))
+            .unwrap_err()
+            .to_string()
+            .contains("at most one"));
+        // No audio parts → None.
+        let none = serde_json::json!([
+            { "role": "system", "content": "Perform ASR in English." },
+            { "role": "user", "content": [{ "type": "text", "text": "hi" }] }
+        ]);
+        assert_eq!(request_audio_base64(Some(&none)).unwrap(), None);
+    }
+
+    #[test]
+    fn leading_system_message_picks_the_first_nonempty_system() {
+        let messages = serde_json::json!([
+            { "role": "system", "content": "Perform ASR in English." },
+            { "role": "user", "content": [{ "type": "input_audio", "input_audio": { "data": "UklGRg==" } }] }
+        ]);
+        assert_eq!(
+            leading_system_message(&messages).as_deref(),
+            Some("Perform ASR in English.")
+        );
+        let empty_system = serde_json::json!([
+            { "role": "system", "content": "" },
+            { "role": "user", "content": "hi" }
+        ]);
+        assert_eq!(leading_system_message(&empty_system), None);
+        assert_eq!(leading_system_message(&serde_json::json!([])), None);
+    }
+
+    #[test]
+    fn tts_max_steps_scales_with_input_and_stays_clamped() {
+        // ~1.25 steps per char + 256 margin (a short input just gets the margin).
+        assert_eq!(tts_max_steps_for_input("Hi."), 259);
+        assert_eq!(
+            tts_max_steps_for_input(&"a".repeat(1200)),
+            (1200 + 1200 / 4 + 256) as u64
+        );
+        // Ceiling at 3072.
+        assert_eq!(tts_max_steps_for_input(&"a".repeat(40_000)), 3072);
+    }
+
+    #[test]
+    fn pcm16_wav_bytes_writes_a_valid_header() {
+        let pcm = vec![0u8; 4800]; // 0.1 s @ 24 kHz mono
+        let wav = pcm16_wav_bytes(&pcm, 24_000);
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..16], b"WAVEfmt ");
+        assert_eq!(wav.len(), 44 + pcm.len());
+        // RIFF size = 36 + data length.
+        assert_eq!(
+            u32::from_le_bytes([wav[4], wav[5], wav[6], wav[7]]),
+            (36 + pcm.len()) as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            24_000
+        );
+        assert_eq!(
+            u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
+            pcm.len() as u32
+        );
     }
 
     #[test]
@@ -12549,6 +12968,7 @@ for line in sys.stdin:
                     last_activity: Instant::now(),
                 }),
                 max_request_bytes: 8 * 1024 * 1024,
+                default_model: "test-model".to_owned(),
                 admission: Arc::new(Admission::new(4, Duration::from_secs(5))),
                 idle_timeout: Duration::from_secs(0),
                 retry_enabled,
@@ -13395,26 +13815,14 @@ for line in sys.stdin:
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
-        assert_eq!(
-            req.get("type").and_then(|v| v.as_str()),
-            Some("generate")
-        );
-        assert_eq!(
-            req.get("attempt_id").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        let id = req
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        assert_eq!(req.get("type").and_then(|v| v.as_str()), Some("generate"));
+        assert_eq!(req.get("attempt_id").and_then(|v| v.as_u64()), Some(1));
+        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
         assert!(!id.is_empty(), "id must be a non-empty string");
         assert_eq!(
             req.get("prompt").and_then(|v| v.as_str()),
             Some("bench prompt")
         );
-        assert_eq!(
-            req.get("max_tokens").and_then(|v| v.as_u64()),
-            Some(37)
-        );
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
     }
 }

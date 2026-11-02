@@ -5653,7 +5653,9 @@ fn main() {
                                 gpu.replay.transport_name()
                             );
                         }
-                        let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some() || m.lfm3_vision_config.is_some();
+                        let vl = m.vision_config.is_some()
+                            || m.dots_ocr_config.is_some()
+                            || m.lfm3_vision_config.is_some();
                         let audio = m.lfm3_audio_config.is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {
@@ -5761,7 +5763,14 @@ fn main() {
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"audio":{},"cache_capable":{},"retry_reset_eligible":{}}}"#,
-                            arch, dim, layers, vocab, vl, audio, cache_capable, retry_reset_eligible
+                            arch,
+                            dim,
+                            layers,
+                            vocab,
+                            vl,
+                            audio,
+                            cache_capable,
+                            retry_reset_eligible
                         );
 
                         // ── PFlash drafter load (Phase 4.0) ──────────────
@@ -5998,6 +6007,15 @@ fn main() {
                 };
                 // Streaming TTS: emit audio chunks as frames are generated.
                 let tts_stream = msg.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                // Omni step budget override (Phase 5a `/tts`): without it the
+                // route clamps max_tokens → 200 steps ≈ ~13 s of speech; a
+                // long speak() request (1200 chars ≈ 60–90 s) needs ~800–1000
+                // steps. The route still guards this against model capacity.
+                let tts_max_steps = msg
+                    .get("max_steps")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&v| v >= 1)
+                    .map(|v| v as usize);
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -6330,8 +6348,18 @@ fn main() {
                 // a distinct route. Phase 4c.
                 if tts && m.lfm3_depth_weights.is_some() {
                     generate_lfm3_omni(
-                        m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens,
-                        tts_mode, tts_stream,
+                        m,
+                        &mut gpu,
+                        &mut stdout,
+                        id,
+                        prompt,
+                        system,
+                        temp,
+                        top_p,
+                        max_tokens,
+                        tts_mode,
+                        tts_stream,
+                        tts_max_steps,
                     );
                     continue;
                 }
@@ -6353,11 +6381,17 @@ fn main() {
                     let audio_bytes: Vec<u8> = if let Some(b64) = audio_base64 {
                         use base64::Engine as _;
                         match base64::engine::general_purpose::STANDARD.decode(
-                            b64.strip_prefix("data:").and_then(|r| r.split_once(',').map(|(_, a)| a)).unwrap_or(b64),
+                            b64.strip_prefix("data:")
+                                .and_then(|r| r.split_once(',').map(|(_, a)| a))
+                                .unwrap_or(b64),
                         ) {
                             Ok(b) => b,
                             Err(e) => {
-                                write_error(&mut stdout, id, &format!("failed to decode base64 audio: {e}"));
+                                write_error(
+                                    &mut stdout,
+                                    id,
+                                    &format!("failed to decode base64 audio: {e}"),
+                                );
                                 continue;
                             }
                         }
@@ -6365,13 +6399,26 @@ fn main() {
                         match std::fs::read(audio.unwrap()) {
                             Ok(b) => b,
                             Err(e) => {
-                                write_error(&mut stdout, id, &format!("failed to read audio file: {e}"));
+                                write_error(
+                                    &mut stdout,
+                                    id,
+                                    &format!("failed to read audio file: {e}"),
+                                );
                                 continue;
                             }
                         }
                     };
                     generate_lfm3_audio(
-                        m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, &audio_bytes,
+                        m,
+                        &mut gpu,
+                        &mut stdout,
+                        id,
+                        prompt,
+                        system,
+                        temp,
+                        top_p,
+                        max_tokens,
+                        &audio_bytes,
                     );
                 } else if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
@@ -18735,7 +18782,11 @@ fn generate_lfm2moe(
     // string-level EOS guard (all "stop"), so reaching the cap is the sole
     // non-stop cause. The CLI defaults a missing finish_reason to "stop",
     // which mislabeled token-cap truncation as a natural stop.
-    let finish_reason = if generated_count >= max_tokens { "length" } else { "stop" };
+    let finish_reason = if generated_count >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
@@ -18833,7 +18884,9 @@ fn generate_lfm3(
                     (tokenizer.encode(&rendered), opened)
                 }
                 Err(e) => {
-                    eprintln!("[daemon] jinja render failed in lfm3 path ({e}) — falling back to Plain");
+                    eprintln!(
+                        "[daemon] jinja render failed in lfm3 path ({e}) — falling back to Plain"
+                    );
                     (
                         hipfire_runtime::prompt_frame::ChatFrame {
                             tokenizer,
@@ -19055,7 +19108,11 @@ fn generate_lfm3(
     // string-level EOS guard (all "stop"), so reaching the cap is the sole
     // non-stop cause. The CLI defaults a missing finish_reason to "stop",
     // which mislabeled token-cap truncation as a natural stop.
-    let finish_reason = if generated_count >= max_tokens { "length" } else { "stop" };
+    let finish_reason = if generated_count >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
@@ -19110,7 +19167,12 @@ fn generate_lfm3_vl(
     // event or the CLI serve's StreamContractGate rejects the stream. The VL
     // Jinja frame below renders with enable_thinking: true, so the stream
     // starts inside <think>.
-    emit_gen_start(stdout, id, true, gen_start_contract_version_for_arch(m.arch_id));
+    emit_gen_start(
+        stdout,
+        id,
+        true,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_vision_weights.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -19166,7 +19228,11 @@ fn generate_lfm3_vl(
             let bytes = match base64::engine::general_purpose::STANDARD.decode(raw_b64) {
                 Ok(b) => b,
                 Err(e) => {
-                    write_error(stdout, id, &format!("failed to decode base64 image data: {e}"));
+                    write_error(
+                        stdout,
+                        id,
+                        &format!("failed to decode base64 image data: {e}"),
+                    );
                     return;
                 }
             };
@@ -19205,7 +19271,11 @@ fn generate_lfm3_vl(
         match lfm3_vl::vision_forward(gpu, vw, vision_config, &patches, grid_h, grid_w) {
             Ok(v) => v,
             Err(e) => {
-                write_error(stdout, id, &format!("lfm3-vl: vision_forward failed: {e:?}"));
+                write_error(
+                    stdout,
+                    id,
+                    &format!("lfm3-vl: vision_forward failed: {e:?}"),
+                );
                 return;
             }
         }
@@ -19461,7 +19531,11 @@ fn generate_lfm3_vl(
     // string-level EOS guard (all "stop"), so reaching the cap is the sole
     // non-stop cause. The CLI defaults a missing finish_reason to "stop",
     // which mislabeled token-cap truncation as a natural stop.
-    let finish_reason = if generated_count >= max_tokens { "length" } else { "stop" };
+    let finish_reason = if generated_count >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
@@ -19476,6 +19550,33 @@ fn generate_lfm3_vl(
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
         ClientTerminalDecision::Abort => emit_ar_cancelled(stdout, id, generated_count),
     }
+}
+
+/// Splice position for an EMPTY text prompt on the LFM3-Audio ASR path
+/// (Phase 5b). The audio tokens belong inside the user turn — where the HF
+/// processor would have expanded the `<|audio|>` placeholder as the user
+/// content — so anchor on the LAST `<|im_start|>user\n` header in the rendered
+/// template and return the position right after it (start of user content,
+/// matching the with-text path's audio-before-text order). Fallback: the
+/// position right before the assistant generation header (a template that
+/// dropped the empty user turn entirely). None when neither anchor exists.
+fn lfm3_audio_empty_prompt_splice(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    toks: &[u32],
+) -> Option<usize> {
+    let user_hdr = tokenizer.encode("<|im_start|>user\n");
+    if !user_hdr.is_empty() {
+        if let Some(pos) = toks.windows(user_hdr.len()).rposition(|w| w == user_hdr) {
+            return Some(pos + user_hdr.len());
+        }
+    }
+    let asst_hdr = tokenizer.encode("<|im_start|>assistant");
+    if !asst_hdr.is_empty() {
+        if let Some(pos) = toks.windows(asst_hdr.len()).rposition(|w| w == asst_hdr) {
+            return Some(pos);
+        }
+    }
+    None
 }
 
 /// LFM3-Audio ASR path (Phase 3). Mirrors `generate_lfm3_vl`'s shape (render
@@ -19504,7 +19605,12 @@ fn generate_lfm3_audio(
     // event or the CLI serve's StreamContractGate rejects the stream. The ASR
     // prompt uses AssistantPrefix::OpenThink below, so the stream starts
     // inside <think>.
-    emit_gen_start(stdout, id, true, gen_start_contract_version_for_arch(m.arch_id));
+    emit_gen_start(
+        stdout,
+        id,
+        true,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_audio_weights.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -19543,7 +19649,11 @@ fn generate_lfm3_audio(
         match lfm3_audio::audio_forward(gpu, aw, audio_config, &mel, num_frames) {
             Ok(v) => v,
             Err(e) => {
-                write_error(stdout, id, &format!("lfm3-audio: audio_forward failed: {e:?}"));
+                write_error(
+                    stdout,
+                    id,
+                    &format!("lfm3-audio: audio_forward failed: {e:?}"),
+                );
                 return;
             }
         }
@@ -19558,7 +19668,15 @@ fn generate_lfm3_audio(
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let audio_pad_id = {
         let ids = tokenizer.encode("<|audio|>");
-        eprintln!("[lfm3-audio] <|audio|> encodes to {:?} (using {})", ids, if ids.len()==1 {ids[0].to_string()} else {"125031 (fallback)".to_string()});
+        eprintln!(
+            "[lfm3-audio] <|audio|> encodes to {:?} (using {})",
+            ids,
+            if ids.len() == 1 {
+                ids[0].to_string()
+            } else {
+                "125031 (fallback)".to_string()
+            }
+        );
         if ids.len() == 1 {
             ids[0]
         } else {
@@ -19585,11 +19703,28 @@ fn generate_lfm3_audio(
         match frame.render() {
             Ok(rendered) => {
                 let mut toks = tokenizer.encode(&rendered);
-                if !q_tokens.is_empty() {
-                    if let Some(pos) = toks.windows(q_tokens.len()).position(|w| w == q_tokens) {
+                // Splice position: when the request carries text, immediately
+                // before the user-content tokens (audio first, then text — the
+                // HF processor's expansion order). When the prompt is EMPTY
+                // (Liquid Agent transcribe(): an audio-only content part, no
+                // text part) there are no user tokens to search for, so anchor
+                // on the user-turn boundary of the rendered template instead
+                // (Phase 5b — previously the splice was SKIPPED and the
+                // SPLICE-1 guard below hard-errored: "no audio tokens in
+                // context").
+                let splice_pos = if !q_tokens.is_empty() {
+                    toks.windows(q_tokens.len()).position(|w| w == q_tokens)
+                } else {
+                    lfm3_audio_empty_prompt_splice(tokenizer, &toks)
+                };
+                match splice_pos {
+                    Some(pos) => {
                         toks.splice(pos..pos, audio_seq.clone());
-                    } else {
-                        eprintln!("[lfm3-audio] warning: could not locate user content for audio splice");
+                    }
+                    None => {
+                        eprintln!(
+                            "[lfm3-audio] warning: could not locate user content for audio splice"
+                        );
                     }
                 }
                 toks
@@ -19634,7 +19769,7 @@ fn generate_lfm3_audio(
             stdout,
             Some(id),
             &format!(
-                "lfm3-audio: audio splice failed — prompt carries {n_pad_in_prompt} audio_pad placeholders, expected {n_audio_tokens} (user content not found in rendered template)"
+                "lfm3-audio: audio splice failed — prompt carries {n_pad_in_prompt} audio_pad placeholders, expected {n_audio_tokens} (user content / user-turn anchor not found in rendered template)"
             ),
             "validation",
             false,
@@ -19784,7 +19919,11 @@ fn generate_lfm3_audio(
     // string-level EOS guard (all "stop"), so reaching the cap is the sole
     // non-stop cause. The CLI defaults a missing finish_reason to "stop",
     // which mislabeled token-cap truncation as a natural stop.
-    let finish_reason = if generated_count >= max_tokens { "length" } else { "stop" };
+    let finish_reason = if generated_count >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
@@ -19823,6 +19962,7 @@ fn omni_seed() -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn generate_lfm3_omni(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -19835,6 +19975,7 @@ fn generate_lfm3_omni(
     max_tokens: usize,
     mode: &str,
     stream: bool,
+    max_steps_override: Option<usize>,
 ) {
     use hipfire_arch_lfm3_omni as omni;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
@@ -19843,9 +19984,18 @@ fn generate_lfm3_omni(
     // event or the CLI serve's StreamContractGate rejects the stream. The
     // omni prompt ends with the thinking-END marker (<think></think>) before
     // the mode marker, so the stream starts in answer mode.
-    emit_gen_start(stdout, id, false, gen_start_contract_version_for_arch(m.arch_id));
+    emit_gen_start(
+        stdout,
+        id,
+        false,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_depth_weights.is_none() {
-        write_error(stdout, id, "lfm3-omni: tokenizer / lfm3 bundle / depth decoder missing");
+        write_error(
+            stdout,
+            id,
+            "lfm3-omni: tokenizer / lfm3 bundle / depth decoder missing",
+        );
         return;
     }
     let codec_dir = match std::env::var("HIPFIRE_OMNI_CODEC_DIR") {
@@ -19860,6 +20010,18 @@ fn generate_lfm3_omni(
         }
     };
 
+    // Cross-conversation reset (same as generate_lfm3_audio): the omni loop
+    // always builds its own ChatML prompt from position 0, and the LFM3 hybrid
+    // conv+GQA state can't rewind — so a previous request's conv/KV state on
+    // this serve process must not leak into the TTS prefill. Phase 5 runs
+    // chat + /tts turns against ONE daemon, so this reset is load-bearing.
+    // (The early check above guarantees the Lfm3 bundle is present.)
+    if let Some(b) = m.lfm3_mut() {
+        let _ = b.state.reset(gpu);
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
     // Build the prompt: BOS + ChatML user turn + assistant prefix + thinking-end + mode marker.
     // "audio" → <|audio_start|> (pure TTS); "interleaved" → <|mixed_start|> (text+audio blocks).
     let marker = if mode == "interleaved" {
@@ -19868,9 +20030,8 @@ fn generate_lfm3_omni(
         omni::AUDIO_START_TOKEN
     };
     let tok = m.tokenizer.as_ref().unwrap();
-    let chatml = format!(
-        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>"
-    );
+    let chatml =
+        format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>");
     let mut prompt_tokens = tok.encode(&chatml);
     prompt_tokens.insert(0, 124_894); // BOS <|startoftext|>
     prompt_tokens.push(marker);
@@ -19879,8 +20040,38 @@ fn generate_lfm3_omni(
         prompt_tokens.len()
     );
 
-    // max_tokens bounds the generation steps (1 LM step per text token or audio frame). Cap at 200.
-    let max_steps = max_tokens.max(1).min(200);
+    // max_tokens bounds the generation steps (1 LM step per text token or audio
+    // frame). Default clamp 200 (≈13 s of speech); the request `max_steps`
+    // field (Phase 5a `/tts`) raises it for long speech. Both are guarded
+    // against model capacity right after the prompt is built.
+    const OMNI_MAX_STEPS_CAP: usize = 4096;
+    let max_steps = max_steps_override
+        .unwrap_or_else(|| max_tokens.max(1))
+        .clamp(1, OMNI_MAX_STEPS_CAP);
+
+    // Capacity guard (the STREAM-1 class, at the LM level): every step writes
+    // one KV row, so prompt + max_steps must fit state.max_seq or the loop
+    // would run past the KV allocation. Clean error instead of silent OOB.
+    {
+        let cap = m.lfm3().unwrap().state.max_seq;
+        if prompt_tokens.len().saturating_add(max_steps) > cap {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "lfm3-omni: prompt + step budget exceeds context capacity: prompt={} + max_steps={} > capacity={} (lower max_steps or raise max_seq)",
+                    prompt_tokens.len(),
+                    max_steps,
+                    cap
+                ),
+                "context_length",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    }
     let depth_cfg = m.lfm3_depth_config.as_ref().unwrap().clone();
 
     // ── Streaming TTS path: emit audio chunks as frames are generated ──
@@ -19918,16 +20109,17 @@ fn generate_lfm3_omni(
                 return;
             }
         };
-        let cfg_val: serde_json::Value = match std::fs::read_to_string(format!("{codec_dir}/config.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-        {
-            Some(v) => v,
-            None => {
-                write_error(stdout, id, "lfm3-omni: read codec config.json failed");
-                return;
-            }
-        };
+        let cfg_val: serde_json::Value =
+            match std::fs::read_to_string(format!("{codec_dir}/config.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+            {
+                Some(v) => v,
+                None => {
+                    write_error(stdout, id, "lfm3-omni: read codec config.json failed");
+                    return;
+                }
+            };
         let codec_cfg = omni::CodecConfig::from_config_value(&cfg_val);
         let codec_weights = match omni::load_codec_weights(&source, &codec_cfg, gpu) {
             Ok(w) => w,
@@ -20061,8 +20253,14 @@ fn generate_lfm3_omni(
         // silently via `if let Ok` — surface it (the stream still terminates,
         // but the operator sees why audio may be truncated).
         if !codec_cache.finished {
-            match omni::codec_decode_streaming(&codec_cfg, &codec_weights, gpu, &[], &mut codec_cache, true)
-            {
+            match omni::codec_decode_streaming(
+                &codec_cfg,
+                &codec_weights,
+                gpu,
+                &[],
+                &mut codec_cache,
+                true,
+            ) {
                 Ok(tail) => {
                     if !tail.is_empty() {
                         let wav = omni::wav_bytes(&tail, 24_000);
@@ -20201,7 +20399,8 @@ fn generate_lfm3_omni(
             return;
         }
     };
-    let (waveform, sr) = match omni::codec_decode(&codec_cfg, &codec_weights, gpu, &out.audio_codes) {
+    let (waveform, sr) = match omni::codec_decode(&codec_cfg, &codec_weights, gpu, &out.audio_codes)
+    {
         Ok(v) => v,
         Err(e) => {
             // LEAK-1: free the codec weights on the error path.
@@ -23541,7 +23740,7 @@ mod vl_adaptive_admission_tests {
 #[cfg(test)]
 mod qwen_ar_semantic_route_tests {
     use super::{
-        emit_gen_start, emit_ar_cancelled, emit_qwen_ar_done, emit_qwen_ar_info,
+        emit_ar_cancelled, emit_gen_start, emit_qwen_ar_done, emit_qwen_ar_info,
         emit_qwen_ar_open_think_terminal, emit_spec_cancel_after_rollback,
         emit_staged_terminal_done, emit_tool_calls_event, emit_visible_token,
         qwen_ar_apply_cache_action, qwen_ar_cache_action, qwen_ar_done_value,
