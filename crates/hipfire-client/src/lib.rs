@@ -796,6 +796,15 @@ impl Engine {
                         | "aborted"
                         | "done"
                         | "error"
+                        // LFM3-Omni TTS/omni audio payloads: keyed by the
+                        // generate request's id/attempt_id like every other
+                        // in-stream event, so they must reach that request's
+                        // callback (the `/tts` route folds the terminal `audio`
+                        // event into the WAV). They are NOT control-plane
+                        // replies; leaving them unclassified sent them to the
+                        // single control slot and `/tts` never saw the audio.
+                        | "audio"
+                        | "audio_chunk"
                         // One-shot synchronous verbs (`embed`) reply with `id`
                         // and `attempt_id: 0` — the key their caller registers
                         // — so their result belongs to that transaction, not to
