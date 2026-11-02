@@ -19603,12 +19603,12 @@ fn generate_lfm3_audio(
 
     // Contract opener (see generate_lfm3): gen_start must precede every other
     // event or the CLI serve's StreamContractGate rejects the stream. The ASR
-    // prompt uses AssistantPrefix::OpenThink below, so the stream starts
-    // inside <think>.
+    // prompt uses a CLOSED think span (see the framing note at the prompt
+    // build — Phase 5b), so the stream starts in answer mode.
     emit_gen_start(
         stdout,
         id,
-        true,
+        false,
         gen_start_contract_version_for_arch(m.arch_id),
     );
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_audio_weights.is_none() {
@@ -19684,12 +19684,47 @@ fn generate_lfm3_audio(
         }
     };
 
+    // Audio-SPAN fidelity (Phase 5d fix): the HF processor expands an audio
+    // placeholder to `<|vision_start|><|audio|>×N<|vision_end|>` (processor
+    // config audio_markers=true — the same span tokens the Omni SFT data
+    // renders). The bare audio_pad splice (Phase 3) produced coherent
+    // acoustic descriptions on LFM3-Audio-2B but degenerate transcripts on
+    // LFM3-Omni-2B — the Omni SFT expects the span wrapper. Resolve the ids
+    // through the tokenizer like <|audio|> above (processor config pins
+    // <|vision_start|>/<|vision_end|>); the VL route (validated Phase 2)
+    // wraps its image pads the same way.
+    let vision_start_id = {
+        let ids = tokenizer.encode("<|vision_start|>");
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            125_009
+        }
+    };
+    let vision_end_id = {
+        let ids = tokenizer.encode("<|vision_end|>");
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            125_010
+        }
+    };
+
     // ── Prompt build: render the LFM3 chat template, then splice n_audio
     //    <|audio|> tokens before the user content (mirrors the VL vision
-    //    splice; the HF processor expands <|audio|> once per encoder token). ──
+    //    splice; the HF processor expands <|audio|> once per encoder token).
+    //
+    //    THINK FRAMING (Phase 5b): the assistant prefix closes the think span
+    //    (`<think></think>`, thinking OFF). With an OPEN `<think>` (Phase 3's
+    //    OpenThink) the model answered INSIDE the span — the CLI's
+    //    ThinkChannelRouter routed the whole answer to reasoning_content and
+    //    delta.content stayed empty, so Liquid Agent's transcribe() (content
+    //    only) got "". ASR wants the transcript spoken as the answer. ──
     let q_tokens = tokenizer.encode(prompt);
-    let mut audio_seq: Vec<u32> = Vec::with_capacity(n_audio_tokens + 1);
+    let mut audio_seq: Vec<u32> = Vec::with_capacity(n_audio_tokens + 2);
+    audio_seq.push(vision_start_id);
     audio_seq.extend(std::iter::repeat(audio_pad_id).take(n_audio_tokens));
+    audio_seq.push(vision_end_id);
 
     let prompt_tokens: Vec<u32> = if let Some(template) = m.chat_template.as_ref() {
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -19697,7 +19732,7 @@ fn generate_lfm3_audio(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: true,
+            enable_thinking: false,
             bos_token: None,
         };
         match frame.render() {
@@ -19737,7 +19772,7 @@ fn generate_lfm3_audio(
                     tokenizer,
                     system: system_prompt,
                     user: "",
-                    assistant_prefix: AssistantPrefix::OpenThink,
+                    assistant_prefix: AssistantPrefix::ClosedThink,
                     raw: false,
                 }
                 .build_with_user_tokens(&body)
@@ -19750,7 +19785,7 @@ fn generate_lfm3_audio(
             tokenizer,
             system: system_prompt,
             user: "",
-            assistant_prefix: AssistantPrefix::OpenThink,
+            assistant_prefix: AssistantPrefix::ClosedThink,
             raw: false,
         }
         .build_with_user_tokens(&body)
